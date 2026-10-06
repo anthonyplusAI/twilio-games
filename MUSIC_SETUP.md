@@ -1,6 +1,6 @@
 # Music And Sound Setup
 
-Twilio Games serves 25 audio files from `client/public/audio/`: 8 music tracks and 17 sound effects. `client/music-manager.ts` owns contextual music, and `client/sound-effects.ts` owns effects. Vite exposes the directory at `/audio/`.
+Twilio Games serves 28 audio files from `client/public/audio/`: 9 contextual music tracks, 2 Karaoke backing excerpts, and 17 sound effects. `client/music-manager.ts` owns contextual music, `client/sound-effects.ts` owns effects, and Karaoke plays its backing excerpts through its performance audio path. Vite exposes the directory at `/audio/`.
 
 ## Music Inventory
 
@@ -14,6 +14,9 @@ Twilio Games serves 25 audio files from `client/public/audio/`: 8 music tracks a
 | `fighter` | `fighter/music/break-the-guard.mp3` | Loops through the intro, countdown, and fight |
 | `fighter-victory` | `fighter/music/victory.mp3` | Plays once and stops when the track ends |
 | `leaderboard` | `leaderboard/final-ascent.mp3` | Loops |
+| `chess` | `chess/the-marble-gambit.mp3` | Loops during Voice Chess |
+
+Karaoke also serves `karaoke/classic-instrumental-45s.mp3` and `karaoke/thousand-miles-45s.mp3` as performance backing excerpts. They are not `MusicManager` contexts.
 
 `MusicManager` uses one `HTMLAudioElement` and one global instance per page. `switchContext()` resets the selected context to its first track and starts it. Repeating the current context while it is marked as playing does nothing. An `ended` event advances to the next track and wraps to the start unless the context sets `loop: false`; only `fighter-victory` currently does that.
 
@@ -32,6 +35,7 @@ Twilio Games serves 25 audio files from `client/public/audio/`: 8 music tracks a
 | Voice Fighter | Intro begins | `fighter` |
 | Voice Fighter | Knockout event | `fighter-victory` |
 | Voice Trivia | First permitted playback through results | `lobby` |
+| Voice Chess | Display opens through the end of the match | `chess` |
 
 The Fighter track starts at the intro and remains active through countdown and combat. The victory track is a separate, non-looping context. A later lobby or rematch transition replaces it with lobby music.
 
@@ -39,6 +43,8 @@ Voice Trivia reuses the global `lobby` track throughout its display lifecycle. I
 when the page opens and retries on the first pointer or keyboard interaction when browser autoplay
 policy blocks the initial attempt. Its English `3, 2, 1` display starts the shared countdown effect
 once when the authoritative server clock first reaches `3`, matching Racer, Fighter, and Karaoke.
+
+Voice Chess plays the supplied *The Marble Gambit* track as soon as its display opens. If autoplay is blocked, the display retries on the first user gesture or when **Play music** is selected. The music button also respects the global mute preference.
 
 The home page waits for its first click before starting lobby music. Game state transitions call `audio.play()` immediately. A browser autoplay rejection logs `Failed to play track` and leaves playback silent; the manager does not install a global gesture retry. A later context switch, explicit `resume()`, or mute-then-unmute action attempts playback again.
 

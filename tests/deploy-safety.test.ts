@@ -101,12 +101,13 @@ describe('deployment rollback safety', () => {
       .toBeLessThan(workflow.indexOf('--revision-weight "${NEW_REVISION}=100"'));
   });
 
-  it('validates and smokes Voice Trivia before publishing its deployed URL', () => {
+  it('validates Trivia and smokes both Trivia and Chess before publishing their URLs', () => {
     expect(packageManifest.scripts['validate:trivia-bank']).toBe('tsx tools/validate-trivia-bank.ts');
     expect(packageManifest.scripts['smoke:trivia']).toBe('node tools/smoke-trivia.mjs');
     expect(workflow).toContain('npm run validate:trivia-bank');
-    expect(workflow).toContain('/karaoke.html /trivia.html /analytics');
+    expect(workflow).toContain('/karaoke.html /trivia.html /chess.html /analytics');
     expect(workflow).toContain('Voice Trivia:   https://${FQDN}/trivia.html');
+    expect(workflow).toContain('Voice Chess:    https://${FQDN}/chess.html');
     expect(workflow.indexOf('https://${REVISION_FQDN}${route}'))
       .toBeLessThan(workflow.indexOf('--revision-weight "${NEW_REVISION}=100"'));
   });

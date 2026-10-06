@@ -14,13 +14,14 @@
 > call-now uses the approved Phone CTA when configured. Every playable game emits factual results,
 > and the operator can reset Racer leaderboard records for one selected map.
 >
-> **Current implementation delta (2026-08-29):** The canonical registry now has five playable games:
+> **Current implementation delta (2026-10-06):** The canonical registry now has six playable games:
 > Racer, Monsters, and Fighter each admit up to two humans with AI/fewer-human fallback; Karaoke admits
-> one human without AI; Trivia admits one to four humans without AI at `/trivia.html`. The station,
-> messaging game choices (`1` through `5`), automatic selection order, launch routing, factual results,
-> and coin costs all consume that registry. Trivia provides localized category voting, eight-question
-> voice rounds, protected bilingual content, normalized results, and persistent all-time/category
-> leaderboards. Authenticated staff can reset Racer map, Karaoke song, and Trivia board records.
+> one human without AI; Trivia admits one to four humans without AI at `/trivia.html`; Chess admits
+> one human against the computer at `/chess.html`. The station, messaging game choices (`1` through
+> `6`), automatic selection order, launch routing, factual results, and coin costs all consume that
+> registry. Trivia provides localized category voting, eight-question voice rounds, protected bilingual
+> content, normalized results, and persistent all-time/category leaderboards. Chess has no leaderboard.
+> Authenticated staff can reset Racer map, Karaoke song, and Trivia board records.
 
 **Original plan date:** 2026-07-21
 **Status:** Completed historical baseline; retained for decision history
@@ -52,7 +53,7 @@ flow. It is not the current operational source of truth.
 | Racer capacity | **Maximum 2 human players** |
 | Monsters capacity | Maximum 2 human players; AI fills solo play |
 | Fighter capacity | Maximum 2 human players; AI fills solo play |
-| Trivia | Deferred by this original baseline; superseded by the current five-game registry above |
+| Trivia | Deferred by this original baseline; superseded by the current six-game registry above |
 | Browser display voice | No browser `speechSynthesis`; caller audio remains Conversation Relay |
 | Language | Display language flows into QR, chooser, messaging, wallet, queue, and Memory preference |
 | Messaging authority | Signed `POST /sms` owns commands and immediate replies for SMS and WhatsApp |
@@ -338,7 +339,7 @@ Create one canonical registry consumed by scheduler, APIs, display, launch coord
 admission:
 
 > **Historical registry snapshot:** This table preserves the original 2026-07-21 baseline. It
-> predates Karaoke and deferred Trivia; the five-game registry in the current implementation delta
+> predates Karaoke, Trivia, and Chess; the six-game registry in the current implementation delta
 > above supersedes it.
 
 | Game | Route | Human capacity | Minimum | AI fallback | Playable |
@@ -379,9 +380,10 @@ Never claim an engine launch and a file-store write are one transaction.
 Engine completion emits one normalized result into the station coordinator, which completes the
 Arcade match and transitions to results/recruiting.
 
-All five registered games now provide factual authoritative participant results to the station
+All six registered games now provide factual authoritative participant results to the station
 display and result notices. Racer reports place and time; Monsters and Fighter report the outcome;
-Karaoke reports its normalized score; Trivia reports rank and normalized score. Authenticated staff
+Karaoke reports its normalized score; Trivia reports rank and normalized score; Chess reports win,
+loss, or draw. Authenticated staff
 can reset persisted Racer records for one map, Karaoke records for one song, or Trivia records for an
 all-time/category board with a reason.
 

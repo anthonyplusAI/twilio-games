@@ -526,7 +526,7 @@ describe('Arcade messaging commands', () => {
       idempotencyKey: 'message-choice-close', authorization: h.operatorAuthorization,
     });
     const votePrompt = await message(h.service, 'SM-CHOICE-004B', 'COIN');
-    expect(votePrompt.reply).toContain('VOTING IS OPEN! Reply 1 Voice Racer, 2 Voice Monsters, 3 Voice Fighter, 4 Voice Karaoke, 5 Voice Trivia');
+    expect(votePrompt.reply).toContain('VOTING IS OPEN! Reply 1 Voice Racer, 2 Voice Monsters, 3 Voice Fighter, 4 Voice Karaoke, 5 Voice Trivia, 6 Voice Chess');
     const first = await message(h.service, 'SM-CHOICE-005', '1');
     expect(first.reply).toContain('VOTE LOCKED: Voice Racer');
     for(const [index,input] of ['1 Voice Racer','1 racer','voce racer','voice rcaer','Voice Racer!'].entries()){
@@ -536,8 +536,8 @@ describe('Arcade messaging commands', () => {
     expect(changed.reply).toContain('VOTE LOCKED: Voice Monsters');
     expect((await message(h.service,'SM-CHOICE-CONFLICT','1 Voice Fighter')).reply)
       .toContain("That option isn't on the display");
-    expect((await message(h.service, 'SM-CHOICE-007', '6')).reply)
-      .toContain("That option isn't on the display. Reply 1 Voice Racer, 2 Voice Monsters, 3 Voice Fighter, 4 Voice Karaoke, 5 Voice Trivia");
+    expect((await message(h.service, 'SM-CHOICE-007', '7')).reply)
+      .toContain("That option isn't on the display. Reply 1 Voice Racer, 2 Voice Monsters, 3 Voice Fighter, 4 Voice Karaoke, 5 Voice Trivia, 6 Voice Chess");
     const state = h.store.snapshot();
     const entry = Object.values(state.stationReadyEntries).find(candidate => candidate.playerId === joined.playerId)!;
     expect(state.stationRounds[entry.roundId]?.gameChoicesByReadyEntryId).toEqual({ [entry.id]: 'monsters' });
@@ -545,7 +545,7 @@ describe('Arcade messaging commands', () => {
 
   it('keeps Trivia command 5 and aliases stable when display order changes', async () => {
     const h = await harness('coin_only', 'per_player', value => {
-      value.station.automaticSelection.order = ['trivia', 'karaoke', 'fighter', 'monsters', 'racer'];
+      value.station.automaticSelection.order = ['trivia', 'karaoke', 'fighter', 'monsters', 'racer', 'chess'];
     });
     const joined = await message(h.service, 'SM-TRIVIA-JOIN', 'JOIN');
     await message(h.service, 'SM-TRIVIA-NAME', 'Ada');
@@ -565,6 +565,30 @@ describe('Arcade messaging commands', () => {
     const state = h.store.snapshot();
     const entry = Object.values(state.stationReadyEntries).find(candidate => candidate.playerId === joined.playerId)!;
     expect(state.stationRounds[entry.roundId]?.gameChoicesByReadyEntryId).toEqual({ [entry.id]: 'trivia' });
+  });
+
+  it('keeps Chess command 6 and English and Portuguese names stable when display order changes', async () => {
+    const h = await harness('coin_only', 'per_player', value => {
+      value.station.automaticSelection.order = ['chess', 'trivia', 'karaoke', 'fighter', 'monsters', 'racer'];
+    });
+    const joined = await message(h.service, 'SM-CHESS-JOIN', 'JOIN');
+    await message(h.service, 'SM-CHESS-NAME', 'Ada');
+    await message(h.service, 'SM-CHESS-TERMS', 'YES');
+    await message(h.service, 'SM-CHESS-COIN', 'COIN');
+    const recruiting = await h.service.getStation('ARCADE-01');
+    await h.service.closeStationRecruiting({
+      stationId: 'ARCADE-01', expectedRevision: recruiting!.station.revision,
+      idempotencyKey: 'chess-choice-close', authorization: h.operatorAuthorization,
+    });
+
+    expect((await message(h.service, 'SM-CHESS-NUMBER', '6')).reply).toContain('VOTE LOCKED: Voice Chess');
+    for (const [index, alias] of ['CHESS', 'VOICE CHESS', 'XADREZ', 'XADREZ POR VOZ', '6 Voice Chess'].entries()) {
+      expect((await message(h.service, `SM-CHESS-ALIAS-${index}`, alias)).reply)
+        .toContain('VOTE LOCKED: Voice Chess');
+    }
+    const state = h.store.snapshot();
+    const entry = Object.values(state.stationReadyEntries).find(candidate => candidate.playerId === joined.playerId)!;
+    expect(state.stationRounds[entry.roundId]?.gameChoicesByReadyEntryId).toEqual({ [entry.id]: 'chess' });
   });
 
   it('keeps default selection number 4 and localized Karaoke names stable', async () => {

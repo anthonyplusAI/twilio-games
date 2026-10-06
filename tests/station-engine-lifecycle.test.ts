@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { ArcadeApi } from '../server/arcade-api';
 import { BattleServer } from '../server/battle-server';
+import { ChessRoom } from '../server/chess-room';
+import { ChessServer } from '../server/chess-server';
 import { FighterServer } from '../server/fighter-server';
 import { FIGHTER_VICTORY_SECONDS } from '../server/fighter-room';
 import { HttpServer } from '../server/http-server';
@@ -28,11 +30,15 @@ async function harness() {
   const started = vi.fn();
   const completed = vi.fn();
   const abandoned = vi.fn();
+  const isStationEngineRoom = vi.fn((_roomCode: string) => false);
   const arcadeApi = {
     start: vi.fn(async () => {}),
     activateMessagingDelivery: vi.fn(async () => {}),
     stop: vi.fn(async () => {}),
-    isStationEngineRoom: vi.fn(() => false),
+    isStationEngineRoom,
+    stationEnginePhase: vi.fn((_game: string, code: string) => (
+      isStationEngineRoom(code) ? 'PLAYING' : null
+    )),
     stationEngineStarted: started,
     stationEngineCompleted: completed,
     stationEngineAbandoned: abandoned,
@@ -52,11 +58,62 @@ async function harness() {
     clientDir: path.join(directory, 'client'),
   });
   await server.start();
-  const games = server as unknown as { battle: BattleServer; fighter: FighterServer; karaoke: KaraokeServer };
-  return { ...games, started, completed, abandoned };
+  const games = server as unknown as { battle: BattleServer; chess: ChessServer; fighter: FighterServer; karaoke: KaraokeServer };
+  const chessLifecycle = server as unknown as { abandonUnfinishedChessStationRoom(code: string): void };
+  return { ...games, started, completed, abandoned, isStationEngineRoom,
+    abandonChess: (code: string) => chessLifecycle.abandonUnfinishedChessStationRoom(code) };
+}
+
+function seedChessRoom(chess: ChessServer, code: string, fen?: string): ChessRoom {
+  // Use a legal endgame position to exercise the real voice command and station callbacks in a short test.
+  const room = new ChessRoom(code, { humanColor: 'w', initialFen: fen, random: () => 0.2 });
+  (chess as unknown as { rooms: Map<string, ChessRoom> }).rooms.set(code, room);
+  chess.setDisplayAuthenticationRequirement(() => false);
+  return room;
 }
 
 describe('station engine room lifecycle', () => {
+  it.each([
+    { name: 'win', code: 'CHESS-WIN', fen: '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1', move: 'queen to G7', won: true },
+    { name: 'draw', code: 'CHESS-DRAW', fen: '4k3/8/8/8/8/8/7p/4K3 w - - 99 50', move: 'king from E1 to D1', won: null },
+  ])('reports a Chess $name once with the caller outcome', async ({ code, fen, move, won }) => {
+    const { chess, started, completed, abandoned, isStationEngineRoom } = await harness();
+    isStationEngineRoom.mockImplementation(roomCode => roomCode === code);
+    const room = seedChessRoom(chess, code, fen);
+
+    expect(chess.voiceJoin(code, 'Ada', 'CA-chess', 'en-US')).toEqual({ playerId: 'c1', resumed: false });
+    expect(started).toHaveBeenCalledExactlyOnceWith('chess', code);
+    expect(chess.voiceCommand(code, 'CA-chess', move, 'en-US')?.code).toBe('proposed');
+    expect(completed).not.toHaveBeenCalled();
+    expect(chess.voiceCommand(code, 'CA-chess', 'confirm', 'en-US')?.code).toBe('confirmed');
+    expect(room.state().phase).toBe('finished');
+    expect(completed).toHaveBeenCalledExactlyOnceWith('chess', code, [{
+      enginePlayerId: 'c1', rank: 1, completed: true, won,
+      score: null, durationSeconds: null,
+    }]);
+    chess.voiceCommand(code, 'CA-chess', 'help', 'en-US');
+    chess.voiceLeave(code, 'CA-chess');
+    expect(completed).toHaveBeenCalledTimes(1);
+    expect(abandoned).not.toHaveBeenCalled();
+  });
+
+  it('reports an unfinished Chess station match as abandoned once', async () => {
+    const { chess, started, completed, abandoned, isStationEngineRoom, abandonChess } = await harness();
+    const code = 'CHESS-ABANDON';
+    isStationEngineRoom.mockImplementation(roomCode => roomCode === code);
+    seedChessRoom(chess, code);
+
+    expect(chess.voiceJoin(code, 'Ada', 'CA-chess', 'en-US')).toEqual({ playerId: 'c1', resumed: false });
+    expect(started).toHaveBeenCalledExactlyOnceWith('chess', code);
+    chess.voiceLeave(code, 'CA-chess');
+    chess.voiceLeave(code, 'CA-chess');
+    expect(abandoned).not.toHaveBeenCalled(); // The disconnect grace period allows the caller to return.
+    abandonChess(code);
+    abandonChess(code);
+    expect(abandoned).toHaveBeenCalledExactlyOnceWith('chess', code);
+    expect(completed).not.toHaveBeenCalled();
+  });
+
   it('does not start Karaoke on display readiness alone and abandons one dual-ready performance once', async () => {
     const { karaoke, started, completed, abandoned } = await harness();
     const roomCode = 'KARAOKE-LIFECYCLE';

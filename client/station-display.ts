@@ -143,7 +143,7 @@ export function createStationDisplay(): StationDisplay {
       }
       if(latest.station.phase==='RESULTS'&&!engineResultsReady){
         if(resultsFallbackTimer===null)resultsFallbackTimer=setTimeout(()=>{
-          resultsFallbackTimer=null;if(!engineResultsReady&&latest?.station.phase==='RESULTS')renderResultsFallback(resultsFallback,latest.station.results,latest.station.resultSource,latest.station.resultsHeld);
+          resultsFallbackTimer=null;if(!engineResultsReady&&latest?.station.phase==='RESULTS')renderResultsFallback(resultsFallback,latest.station.results,latest.station.resultSource,latest.station.resultsHeld,latest.station.activeGame);
         },1000);
       }else if(latest.station.phase!=='RESULTS'||engineResultsReady){
         if(resultsFallbackTimer!==null)clearTimeout(resultsFallbackTimer);resultsFallbackTimer=null;resultsFallback.hidden=true;
@@ -208,10 +208,12 @@ function buildResultsFallback():HTMLElement{
   const root=document.createElement('section');root.className='station-results-fallback';root.hidden=true;root.setAttribute('aria-live','polite');return root;
 }
 
-function renderResultsFallback(root:HTMLElement,results:PublicStation['results'],source:PublicStation['resultSource'],held:boolean):void{
+function renderResultsFallback(root:HTMLElement,results:PublicStation['results'],source:PublicStation['resultSource'],held:boolean,game:PublicStation['activeGame']):void{
   root.replaceChildren();
   const eyebrow=document.createElement('p');eyebrow.className='station-results-eyebrow';eyebrow.textContent=locale==='pt-BR'?'RESULTADOS FINAIS':'FINAL RESULTS';
-  const title=document.createElement('h1');title.textContent=locale==='pt-BR'?'Placar':'Scoreboard';root.append(eyebrow,title);
+  const title=document.createElement('h1');title.textContent=game==='chess'
+    ?locale==='pt-BR'?'Resultado do duelo':'Duel result'
+    :locale==='pt-BR'?'Placar':'Scoreboard';root.append(eyebrow,title);
   if(!results.length){
     const unavailable=document.createElement('div');unavailable.className='station-results-unavailable';
     unavailable.textContent=source==='RECOVERY'
@@ -221,14 +223,19 @@ function renderResultsFallback(root:HTMLElement,results:PublicStation['results']
   }
   for(const result of results){
     const row=document.createElement('div');row.className=`station-result-row${result.won?' winner':''}`;
-    const rank=document.createElement('strong');rank.textContent=result.rank===null?'—':`#${result.rank}`;
+    const rank=document.createElement('strong');rank.textContent=game==='chess'?'♛':result.rank===null?'—':`#${result.rank}`;
     const name=document.createElement('span');name.textContent=result.displayName;
     const metric=document.createElement('span');metric.className='station-result-metric';
-    metric.textContent=result.score!==null
-      ?`${result.score.toLocaleString(locale)} pts`
-      :result.durationSeconds!==null&&result.durationSeconds>0
-        ?`${result.durationSeconds.toFixed(2)}s`
-        :result.completed?(locale==='pt-BR'?'Concluído':'Complete'):'DNF';
+    if(game==='chess'){
+      metric.textContent=!result.completed?(locale==='pt-BR'?'Interrompido':'Interrupted')
+        :result.won===true?(locale==='pt-BR'?'Vitória':'Victory')
+          :result.won===false?(locale==='pt-BR'?'Derrota':'Defeat')
+            :(locale==='pt-BR'?'Empate':'Draw');
+    }else{
+      metric.textContent=result.score!==null?`${result.score.toLocaleString(locale)} pts`
+        :result.durationSeconds!==null&&result.durationSeconds>0?`${result.durationSeconds.toFixed(2)}s`
+          :result.completed?(locale==='pt-BR'?'Concluído':'Complete'):'DNF';
+    }
     row.append(rank,name,metric);root.append(row);
   }
   const hold=document.createElement('p');hold.className='station-results-hold';hold.textContent=held

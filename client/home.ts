@@ -61,6 +61,7 @@ const copy = locale === 'pt-BR' ? {
   fighterBlurb: 'Transforme cada golpe gritado em um confronto na arena.',
   karaokeBlurb: 'Escolha a música e cante cada palavra no tempo certo.',
   triviaBlurb: 'Responda em voz alta a perguntas rápidas e marque pontos antes dos rivais.',
+  chessBlurb: 'Comande peças encantadas por voz e desafie um mago virtual.',
   freeDescription: 'Escaneie, entre pelo WhatsApp e responda PRONTO quando estiver pronto na tela.',
   freeStep: 'Responda PRONTO na tela',
   vote: 'voto', votes: 'votos', leader: 'Na liderança', tiedLeader: 'Líder empatado', textCommand: 'Envie',
@@ -97,6 +98,7 @@ const copy = locale === 'pt-BR' ? {
   fighterBlurb: 'Turn every shouted move into an arena showdown.',
   karaokeBlurb: 'Pick a song and sing every word on the beat.',
   triviaBlurb: 'Answer quick-fire questions out loud and score before your rivals.',
+  chessBlurb: 'Command enchanted pieces by voice and duel a computer wizard.',
   freeDescription: 'Scan, join, and reply READY when you are at the screen.',
   freeStep: 'Reply READY at the screen',
   vote: 'vote', votes: 'votes', leader: 'Leading', tiedLeader: 'Tied lead', textCommand: 'Text',
@@ -131,10 +133,10 @@ let standaloneLineupKey='__unset__';
 let standalonePageIndex=0;
 const selectionVideos: Partial<Record<PlayableArcadeGame, string>> = {
   racer: '/video/vr-demo.mp4', monsters: '/video/vm-demo.mp4', fighter: '/video/vf-demo.mp4',
-  karaoke: '/video/vk-demo.mp4', trivia: '/video/vt-demo.mp4',
+  karaoke: '/video/vk-demo.mp4', trivia: '/video/vt-demo.mp4', chess: '/video/vc-demo.mp4',
 };
 const gameCommands: Readonly<Record<PlayableArcadeGame, number>> = {
-  racer: 1, monsters: 2, fighter: 3, karaoke: 4, trivia: 5,
+  racer: 1, monsters: 2, fighter: 3, karaoke: 4, trivia: 5, chess: 6,
 };
 const gameBlurbs: Readonly<Record<PlayableArcadeGame, string>> = {
   racer: copy.racerBlurb,
@@ -142,6 +144,7 @@ const gameBlurbs: Readonly<Record<PlayableArcadeGame, string>> = {
   fighter: copy.fighterBlurb,
   karaoke: copy.karaokeBlurb,
   trivia: copy.triviaBlurb,
+  chess: copy.chessBlurb,
 };
 
 interface PreviewConnection {

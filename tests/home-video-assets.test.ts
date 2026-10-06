@@ -122,6 +122,21 @@ describe('home preview media and standalone catalog', () => {
     expect(home.match(/\/video\/vt-demo\.mp4/g)).toHaveLength(1);
   });
 
+  it('ships and wires a compact, silent Voice Chess gameplay preview', () => {
+    const asset = new URL('../client/public/video/vc-demo.mp4', import.meta.url);
+    const bytes = readFileSync(asset);
+    expect(statSync(asset).size).toBeLessThan(2 * 1024 * 1024);
+    const boxes = mp4TopLevelBoxes(bytes);
+    expect(boxes.indexOf('moov')).toBeLessThan(boxes.indexOf('mdat'));
+    const metadata = mp4VideoMetadata(bytes);
+    expect(metadata).toMatchObject({ codec: 'avc1', width: 1280, height: 692 });
+    expect(metadata.framesPerSecond).toBeCloseTo(24, 3);
+    expect(metadata.handlers).not.toContain('soun');
+    expect(home).toContain("chess: '/video/vc-demo.mp4'");
+    expect(home.match(/\/video\/vc-demo\.mp4/g)).toHaveLength(1);
+    expect(html).not.toContain('/video/vc-demo.mp4');
+  });
+
   it('uses exact Conversation Relay product copy in fallback and both locales', () => {
     const english = 'Powered by Twilio Conversation Relay. Your voice is the controller.';
     const portuguese = 'Com tecnologia Twilio ConversationRelay. Sua voz é o controle.';
@@ -131,11 +146,11 @@ describe('home preview media and standalone catalog', () => {
     expect(`${html}\n${home}`).not.toContain('Choose a game on the shared screen. Players call from any phone and use their voices as controllers.');
   });
 
-  it('removes the Trivia coming-soon surface and assigns stable playable option 5', () => {
+  it('removes the Trivia coming-soon surface and assigns stable playable options through Chess at 6', () => {
     expect(html).not.toContain('id="standaloneFuture"');
     expect(html).not.toContain('id="futureTrivia"');
     expect(home).not.toContain('renderComingSoon');
-    expect(home).toContain('racer: 1, monsters: 2, fighter: 3, karaoke: 4, trivia: 5');
+    expect(home).toContain('racer: 1, monsters: 2, fighter: 3, karaoke: 4, trivia: 5, chess: 6');
     expect(css).toContain('[hidden] { display:none !important; }');
   });
 

@@ -6,7 +6,7 @@
  * - Dynamic switching between game contexts
  */
 
-export type GameContext = 'lobby' | 'racer' | 'monsters' | 'fighter' | 'fighter-victory' | 'leaderboard';
+export type GameContext = 'lobby' | 'racer' | 'monsters' | 'fighter' | 'fighter-victory' | 'leaderboard' | 'chess';
 
 const MUTE_STORAGE_KEY = 'twilio-games-music-muted';
 
@@ -42,6 +42,10 @@ export class MusicManager {
     },
     leaderboard: {
       tracks: ['/audio/leaderboard/final-ascent.mp3'],
+      currentTrackIndex: 0,
+    },
+    chess: {
+      tracks: ['/audio/chess/the-marble-gambit.mp3'],
       currentTrackIndex: 0,
     },
   };
@@ -86,7 +90,9 @@ export class MusicManager {
     this.audio.volume = this.volume;
     this.audio.muted = this.isMuted;
     if (this.isMuted) return;
-    this.audio.play().catch((err) => console.error('Failed to play track:', err));
+    this.audio.play().catch((err: unknown) => {
+      if ((err as { name?: string } | null)?.name !== 'NotAllowedError') console.error('Failed to play track:', err);
+    });
   }
 
   /**
@@ -159,6 +165,24 @@ export class MusicManager {
    */
   getIsPlaying(): boolean {
     return this.isPlaying;
+  }
+
+  /** Whether the current track is actually audible (browser autoplay may have blocked it). */
+  getIsAudible(): boolean {
+    return !this.audio.paused && !this.audio.muted;
+  }
+
+  /** Retry playback from a click or key press so browsers can unlock audio. */
+  async playFromGesture(): Promise<boolean> {
+    this.syncMutedPreference();
+    if (this.isMuted) return false;
+    this.isPlaying = true;
+    try {
+      await this.audio.play();
+      return !this.audio.paused;
+    } catch {
+      return false;
+    }
   }
 
   /**

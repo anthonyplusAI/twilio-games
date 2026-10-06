@@ -5,6 +5,7 @@ import { AnalyticsStore, dateRange, validDate } from '../server/analytics-store'
 import { AnalyticsObserver } from '../server/analytics-observer';
 import { KaraokeRoom } from '../server/karaoke-room';
 import { TriviaRoom } from '../server/trivia-room';
+import { ChessRoom } from '../server/chess-room';
 import { analyticsPdf } from '../server/analytics-pdf';
 import { ANALYTICS_GAMES } from '../shared/analytics';
 import { EN_US_ORIGINAL_DEVELOPMENT_SONG } from '../shared/karaoke-songs';
@@ -21,6 +22,86 @@ const finalHits = (song: KaraokeSong, score: number) => song.chart.words.map((wo
 }));
 
 describe('activation analytics', () => {
+  it('records an anonymous Voice Chess match and accepted speech without a leaderboard', async () => {
+    const file = `data/_test-analytics-${process.pid}-${Date.now()}-chess.json`; files.push(file);
+    const today = new Date().toISOString().slice(0, 10);
+    let now = Date.parse(`${today}T12:00:00Z`);
+    const store = new AnalyticsStore(file, 'secret');
+    const observer = new AnalyticsObserver(store, () => now);
+    const room = new ChessRoom('CHESS', { humanColor: 'w' });
+    observer.chessState(room);
+    room.setPlayerConnected(true);
+    observer.chessState(room);
+    observer.voiceCommand('chess');
+    now += 31_000;
+    observer.chessAborted(room.code);
+    await store.flush();
+
+    const report = store.report(today, today, 'chess');
+    expect(report.summary).toMatchObject({ participants: 1, sessions: 1, abandoned: 1, playSeconds: 31, voiceCommands: 1 });
+    expect(report.games.chess.sessions).toBe(1);
+  });
+
+  it('counts distinct Voice Chess callers in a reused room without persisting call IDs', async () => {
+    const file = `data/_test-analytics-${process.pid}-${Date.now()}-chess-callers.json`; files.push(file);
+    const today = new Date().toISOString().slice(0, 10);
+    let now = Date.parse(`${today}T12:00:00Z`);
+    const store = new AnalyticsStore(file, 'secret');
+    const observer = new AnalyticsObserver(store, () => now);
+    const room = new ChessRoom('CHESS', { humanColor: 'w', random: () => 0 });
+
+    for (const callSid of ['CA-first-caller', 'CA-second-caller', 'CA-second-caller']) {
+      room.setPlayerConnected(true);
+      observer.chessState(room);
+      observer.chessBound(room.code, callSid);
+      now += 10_000;
+      observer.chessAborted(room.code);
+      room.setPlayerConnected(false);
+      room.reset();
+    }
+    await store.flush();
+
+    expect(store.report(today, today, 'chess').summary).toMatchObject({
+      participants: 2, sessions: 3, completed: 0, abandoned: 3, playSeconds: 30,
+    });
+    const persisted = readFileSync(file, 'utf8');
+    expect(persisted).not.toMatch(/CA-first-caller|CA-second-caller|CHESS/);
+  });
+
+  it('finalizes a Chess checkmate once and tracks a replay as a separate abandoned session', async () => {
+    const file = `data/_test-analytics-${process.pid}-${Date.now()}-chess-lifecycle.json`; files.push(file);
+    const today = new Date().toISOString().slice(0, 10);
+    let now = Date.parse(`${today}T12:00:00Z`);
+    const store = new AnalyticsStore(file, 'secret');
+    const observer = new AnalyticsObserver(store, () => now);
+    const room = new ChessRoom('MATE', {
+      initialFen: '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1', humanColor: 'w', random: () => 0,
+    });
+    room.setPlayerConnected(true);
+    observer.chessState(room);
+    observer.chessBound(room.code, 'CA-same-caller');
+    expect(room.handleVoiceCommand('queen from G six to G seven').code).toBe('proposed');
+    observer.chessState(room);
+    now += 14_000;
+    expect(room.handleVoiceCommand('confirm').code).toBe('confirmed');
+    expect(room.state().result).toEqual({ reason: 'checkmate', winner: 'w' });
+    observer.chessState(room);
+    observer.chessState(room);
+    observer.chessAborted(room.code);
+
+    room.reset();
+    observer.chessState(room);
+    observer.chessBound(room.code, 'CA-same-caller');
+    now += 9_000;
+    observer.chessAborted(room.code);
+    observer.chessAborted(room.code);
+    await store.flush();
+
+    expect(store.report(today, today, 'chess').summary).toMatchObject({
+      participants: 1, sessions: 2, completed: 1, abandoned: 1, playSeconds: 23,
+    });
+  });
+
   it('persists anonymous daily rollups and aggregates a range', async () => {
     const file = `data/_test-analytics-${process.pid}-${Date.now()}.json`; files.push(file);
     const store = new AnalyticsStore(file, 'secret');
@@ -36,7 +117,7 @@ describe('activation analytics', () => {
     expect(report.summary).toMatchObject({ participants: 3, sessions: 2, completed: 1, abandoned: 1, playSeconds: 136, voiceCommands: 1 });
     expect(report.games.racer.completionRate).toBe(1);
     expect(report.games.karaoke.sessions).toBe(0);
-    expect(ANALYTICS_GAMES).toEqual(['racer', 'monsters', 'fighter', 'karaoke', 'trivia']);
+    expect(ANALYTICS_GAMES).toEqual(['racer', 'monsters', 'fighter', 'karaoke', 'trivia', 'chess']);
     expect(report.selections.maps.map(item => item.name)).toEqual(['neon-city', 'rain']);
     expect(JSON.stringify(await import('node:fs/promises').then(fs => fs.readFile(file, 'utf8')))).not.toContain('room:p1');
   });

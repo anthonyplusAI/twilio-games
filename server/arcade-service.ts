@@ -942,6 +942,7 @@ function parseMessagingGameChoice(value: string): PlayableArcadeGame | null {
   if (value === '3' || value === 'FIGHTER' || value === 'VOICE FIGHTER' || value === 'LUTA' || value === 'LUTA POR VOZ') return 'fighter';
   if (value === '4' || value === 'KARAOKE' || value === 'VOICE KARAOKE' || value === 'KARAOKE POR VOZ') return 'karaoke';
   if (value === '5' || value === 'TRIVIA' || value === 'VOICE TRIVIA' || value === 'QUIZ' || value === 'QUIZ POR VOZ') return 'trivia';
+  if (value === '6' || value === 'CHESS' || value === 'VOICE CHESS' || value === 'XADREZ' || value === 'XADREZ POR VOZ') return 'chess';
   return null;
 }
 
@@ -951,10 +952,11 @@ const MESSAGING_GAME_CHOICE_ALIASES: Readonly<Record<PlayableArcadeGame, readonl
   fighter: ['FIGHTER','VOICE FIGHTER','LUTA','LUTA POR VOZ'],
   karaoke: ['KARAOKE','VOICE KARAOKE','KARAOKE POR VOZ'],
   trivia: ['TRIVIA','VOICE TRIVIA','QUIZ','QUIZ POR VOZ'],
+  chess: ['CHESS','VOICE CHESS','XADREZ','XADREZ POR VOZ'],
 };
 
 const MESSAGING_GAME_BY_NUMBER: Readonly<Record<string, PlayableArcadeGame>> = {
-  '1': 'racer', '2': 'monsters', '3': 'fighter', '4': 'karaoke', '5': 'trivia',
+  '1': 'racer', '2': 'monsters', '3': 'fighter', '4': 'karaoke', '5': 'trivia', '6': 'chess',
 };
 
 function parseTolerantMessagingGameChoice(value:string):PlayableArcadeGame|null {
@@ -998,11 +1000,11 @@ function oneEditOrTranspositionAway(left:string,right:string):boolean {
 }
 
 const MESSAGING_GAME_CHOICE_NAMES: Record<'en-US' | 'pt-BR', Record<PlayableArcadeGame, string>> = {
-  'en-US': { racer: 'Voice Racer', monsters: 'Voice Monsters', fighter: 'Voice Fighter', karaoke: 'Voice Karaoke', trivia: 'Voice Trivia' },
-  'pt-BR': { racer: 'Corrida por Voz', monsters: 'Monstros por Voz', fighter: 'Luta por Voz', karaoke: 'Karaokê por Voz', trivia: 'Quiz por Voz' },
+  'en-US': { racer: 'Voice Racer', monsters: 'Voice Monsters', fighter: 'Voice Fighter', karaoke: 'Voice Karaoke', trivia: 'Voice Trivia', chess: 'Voice Chess' },
+  'pt-BR': { racer: 'Corrida por Voz', monsters: 'Monstros por Voz', fighter: 'Luta por Voz', karaoke: 'Karaokê por Voz', trivia: 'Quiz por Voz', chess: 'Xadrez por Voz' },
 };
 const MESSAGING_GAME_CHOICE_NUMBERS: Record<PlayableArcadeGame, string> = {
-  racer: '1', monsters: '2', fighter: '3', karaoke: '4', trivia: '5',
+  racer: '1', monsters: '2', fighter: '3', karaoke: '4', trivia: '5', chess: '6',
 };
 
 function messagingGameChoiceOptions(config: ArcadeConfigSnapshot, locale: string): string {
@@ -1280,8 +1282,8 @@ const STATION_NOTIFICATION_TTL_MS: Record<ArcadeStationNotificationKind, number>
 };
 
 const STATION_GAME_NAMES: Record<'en-US' | 'pt-BR', Record<PlayableArcadeGame, string>> = {
-  'en-US': { racer: 'Voice Racer', monsters: 'Voice Monsters', fighter: 'Voice Fighter', karaoke: 'Voice Karaoke', trivia: 'Voice Trivia' },
-  'pt-BR': { racer: 'Corrida por Voz', monsters: 'Monstros por Voz', fighter: 'Luta por Voz', karaoke: 'Karaokê por Voz', trivia: 'Quiz por Voz' },
+  'en-US': { racer: 'Voice Racer', monsters: 'Voice Monsters', fighter: 'Voice Fighter', karaoke: 'Voice Karaoke', trivia: 'Voice Trivia', chess: 'Voice Chess' },
+  'pt-BR': { racer: 'Corrida por Voz', monsters: 'Monstros por Voz', fighter: 'Luta por Voz', karaoke: 'Karaokê por Voz', trivia: 'Quiz por Voz', chess: 'Xadrez por Voz' },
 };
 
 function stationNotificationId(
@@ -1335,7 +1337,11 @@ function stationNotificationContent(input: {
         : input.freePlay ? '\n\nResponda PRONTO para entrar na próxima partida.'
           : input.remainingBalance===0 ? '\n\nMostre esta mensagem à equipe para receber ajuda e jogar novamente.'
             : '\n\nResponda MOEDA ou 🪙 para entrar na próxima partida.';
-      const result = input.game === 'karaoke'
+      const result = input.game === 'chess'
+        ? input.won === true ? '\n\nVocê venceu o duelo de magos.'
+          : input.won === false ? '\n\nO mago rival venceu este duelo.'
+            : '\n\nEmpate no duelo de magos. Confira a posição final no tabuleiro.'
+        : input.game === 'karaoke'
         ? input.score === null ? '\n\nConfira sua pontuação na tela.' : `\n\nSua pontuação: ${Math.round(input.score)}.`
         : input.game === 'trivia'
           ? `${input.rank === null ? '\n\nConfira o placar na tela.'
@@ -1373,7 +1379,11 @@ function stationNotificationContent(input: {
       : input.freePlay ? '\n\nReply READY to line up again.'
         : input.remainingBalance===0 ? '\n\nShow this message to booth staff for help getting another play.'
           : '\n\nReply COIN or 🪙 to line up again.';
-    const result = input.game === 'karaoke'
+    const result = input.game === 'chess'
+      ? input.won === true ? '\n\nYou won the wizard duel.'
+        : input.won === false ? '\n\nThe rival wizard won this duel.'
+          : '\n\nThe wizard duel ended in a draw. See the final board position.'
+      : input.game === 'karaoke'
       ? input.score === null ? '\n\nCheck your score on the display.' : `\n\nYour score: ${Math.round(input.score)}.`
       : input.game === 'trivia'
         ? `${input.rank === null ? '\n\nCheck the scoreboard on the display.'

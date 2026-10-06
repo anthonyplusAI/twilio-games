@@ -712,7 +712,7 @@ describe('ArcadeStationRuntime', () => {
       input.station.timings.postGameRecruitingSeconds = 20;
       input.station.games.racer.enabled = false;
       input.station.automaticSelection.policy = 'fixed_priority';
-      input.station.automaticSelection.order = ['fighter', 'monsters', 'racer', 'karaoke', 'trivia'];
+      input.station.automaticSelection.order = ['fighter', 'monsters', 'racer', 'karaoke', 'trivia', 'chess'];
     });
     await h.service.identifyCoinOnly({ playerId: 'p1', idempotencyKey: 'identify:p1' });
     await h.service.insertStationCoin({ stationId: 'expo', playerId: 'p1', idempotencyKey: 'coin:p1' });
@@ -727,6 +727,41 @@ describe('ArcadeStationRuntime', () => {
       station: { phase: 'LOCKED', activeGame: 'fighter' },
     });
     await runtime.stop();
+  });
+
+  it('selects Chess when moved to first priority and skips it when disabled', async () => {
+    for (const chessEnabled of [true, false]) {
+      const h = await harness(input => {
+        input.station.timings.recruitingSeconds = 20;
+        input.station.timings.hardDeadlineSeconds = 25;
+        input.station.timings.postGameRecruitingSeconds = 20;
+        input.station.games.chess.enabled = chessEnabled;
+        input.station.automaticSelection.policy = 'fixed_priority';
+        input.station.automaticSelection.order = [
+          'chess', 'fighter', 'monsters', 'racer', 'karaoke', 'trivia',
+        ];
+      });
+      await h.service.identifyCoinOnly({
+        playerId: 'p1', idempotencyKey: `identify:chess-priority:${chessEnabled}`,
+      });
+      await h.service.insertStationCoin({
+        stationId: 'expo', playerId: 'p1', idempotencyKey: `coin:chess-priority:${chessEnabled}`,
+      });
+      const runtime = h.makeRuntime();
+      await runtime.start();
+      h.setTime(T0 + 21_000); h.fire(); await runtime.flush();
+      expect((await h.service.getStation('expo'))?.station.phase).toBe('GAME_SELECTION');
+      if (!chessEnabled) {
+        await expect(h.service.recordStationGameChoice({
+          stationId: 'expo', playerId: 'p1', game: 'chess', idempotencyKey: 'disabled-chess-vote',
+        })).rejects.toMatchObject({ code: 'GAME_DISABLED' });
+      }
+      h.setTime(T0 + 52_000); h.fire(); await runtime.flush();
+      expect((await h.service.getStation('expo'))?.station).toMatchObject({
+        phase: 'LOCKED', activeGame: chessEnabled ? 'chess' : 'fighter',
+      });
+      await runtime.stop();
+    }
   });
 
   it('resolves vote leaders and applies automatic policy only across tied enabled games', async () => {
@@ -749,7 +784,7 @@ describe('ArcadeStationRuntime', () => {
     });
     const fixed = JSON.parse(JSON.stringify(DEFAULT_ARCADE_CONFIG)) as Record<string, any>;
     fixed.station.automaticSelection.policy = 'fixed_priority';
-    fixed.station.automaticSelection.order = ['fighter', 'monsters', 'racer', 'karaoke', 'trivia'];
+    fixed.station.automaticSelection.order = ['fighter', 'monsters', 'racer', 'karaoke', 'trivia', 'chess'];
     const fixedConfig = parseArcadeConfig(fixed);
     expect(chooseStationGame((await h.service.getStation('expo'))!, fixedConfig.station)).toBe('racer');
 
@@ -772,7 +807,7 @@ describe('ArcadeStationRuntime', () => {
         historical: { game: 'monsters' },
       },
     } as unknown as typeof tied;
-    fixed.station.automaticSelection.order = ['racer', 'monsters', 'fighter', 'karaoke', 'trivia'];
+    fixed.station.automaticSelection.order = ['racer', 'monsters', 'fighter', 'karaoke', 'trivia', 'chess'];
     fixed.station.automaticSelection.policy = 'round_robin';
     const roundRobin = parseArcadeConfig(fixed);
     expect(chooseStationGame(withPreviousMonsters, roundRobin.station)).toBe('fighter');

@@ -3,6 +3,7 @@ import type { BattleRoom } from './battle-room';
 import type { FighterRoom } from './fighter-room';
 import type { KaraokeRoom } from './karaoke-room';
 import type { TriviaRoom } from './trivia-room';
+import type { ChessRoom } from './chess-room';
 import { AnalyticsStore } from './analytics-store';
 import type { AnalyticsGame } from '../shared/analytics';
 
@@ -29,6 +30,7 @@ export class AnalyticsObserver {
   private fighterActive = new Map<string, ActiveMatch>();
   private karaokeActive = new Map<string, ActiveMatch>();
   private triviaActive = new Map<string, ActiveMatch>();
+  private chessActive = new Map<string, ActiveMatch>();
 
   constructor(private readonly store: AnalyticsStore, private readonly now: () => number = Date.now) {}
 
@@ -147,6 +149,38 @@ export class AnalyticsObserver {
     if (active) this.finish('trivia', roomCode, active, false);
   }
 
+  chessState(room: ChessRoom): void {
+    const state = room.state();
+    const active = this.chessActive.get(room.code);
+    const gameKey = String(state.gameId);
+    const live = state.playerConnected && (state.phase === 'playing' || state.phase === 'pending');
+    if (live && (!active || active.key !== gameKey)) {
+      if (active) this.finish('chess', room.code, active, false);
+      this.chessActive.set(room.code, {
+        key: gameKey,
+        startedAt: this.now(),
+        participants: [`chess:${room.code}:caller`],
+        characters: [],
+      });
+      return;
+    }
+    if (active && state.phase === 'finished' && active.key === gameKey) {
+      this.finish('chess', room.code, active, true);
+    }
+  }
+
+  /** Replaces the room fallback with the call identity while keeping the raw SID out of persisted rollups. */
+  chessBound(roomCode: string, callSid: string): void {
+    const active = this.chessActive.get(roomCode);
+    const sid = callSid.trim();
+    if (active && sid) active.participants = [`chess:call:${sid}`];
+  }
+
+  chessAborted(roomCode: string): void {
+    const active = this.chessActive.get(roomCode);
+    if (active) this.finish('chess', roomCode, active, false);
+  }
+
   /** Counts an authoritative accepted command; no command text or recognition payload is accepted. */
   voiceCommand(game: Exclude<AnalyticsGame, 'karaoke'>): void {
     this.store.recordVoiceCommand(game, this.now());
@@ -165,7 +199,7 @@ export class AnalyticsObserver {
   }
 
   private finish(
-    game: 'monsters' | 'fighter' | 'karaoke' | 'trivia',
+    game: 'monsters' | 'fighter' | 'karaoke' | 'trivia' | 'chess',
     roomCode: string,
     match: ActiveMatch,
     completed: boolean,
@@ -178,6 +212,7 @@ export class AnalyticsObserver {
       case 'fighter': this.fighterActive.delete(roomCode); break;
       case 'karaoke': this.karaokeActive.delete(roomCode); break;
       case 'trivia': this.triviaActive.delete(roomCode); break;
+      case 'chess': this.chessActive.delete(roomCode); break;
     }
   }
 }

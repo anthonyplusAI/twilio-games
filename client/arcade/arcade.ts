@@ -10,6 +10,7 @@ import {
   type PlayableArcadeGame,
 } from '../../shared/arcade-games';
 import { gameTitle } from '../../shared/i18n/content';
+import { describeStationParticipantOutcome } from './result-outcome';
 
 type ArcadeMode = 'off' | 'coin_only' | 'lead_capture';
 type PlayableGame = PlayableArcadeGame;
@@ -660,9 +661,8 @@ async function saveMode(event:Event):Promise<void>{
   const selectionPolicy=el<HTMLSelectElement>('admin-selection-policy').value as AdminConfig['station']['automaticSelection']['policy'];
   const selectedOrder=el<HTMLInputElement>('admin-game-order').value.split(',').map(value=>value.trim()) as PlayableGame[];
   const validOrder=selectedOrder.length===PLAYABLE_GAMES.length&&new Set(selectedOrder).size===PLAYABLE_GAMES.length&&selectedOrder.every(game=>PLAYABLE_GAMES.includes(game));
-  if((selectedMode==='off'||selectionPolicy==='fixed_priority')&&!validOrder){setNotice('Choose each game once in the display order.','error');return;}
-  const order=validOrder?selectedOrder:config.station.automaticSelection.order;
-  station.automaticSelection.policy=selectionPolicy;station.automaticSelection.order=order;station.qrRail=el<HTMLSelectElement>('admin-qr-rail').value as AdminConfig['station']['qrRail'];
+  if(!validOrder){setNotice('Choose each game once in the display order.','error');return;}
+  station.automaticSelection.policy=selectionPolicy;station.automaticSelection.order=selectedOrder;station.qrRail=el<HTMLSelectElement>('admin-qr-rail').value as AdminConfig['station']['qrRail'];
   const postGame=settings.postGame as AdminConfig['postGame'];
   postGame.enabled=el<HTMLInputElement>('admin-post-game-enabled').checked;
   postGame.includeCoinBalance=el<HTMLInputElement>('admin-post-game-balance').checked;
@@ -874,12 +874,15 @@ function swapPriorityOrder(changed:HTMLSelectElement):void{
 }
 function renderPrioritySettings():void{
   const standalone=el<HTMLSelectElement>('admin-mode').value==='off';
+  const fixedPriority=!standalone&&el<HTMLSelectElement>('admin-selection-policy').value==='fixed_priority';
   el('selection-policy-field').hidden=standalone;
-  el('priority-order-field').hidden=!standalone&&el<HTMLSelectElement>('admin-selection-policy').value!=='fixed_priority';
-  el('game-order-label').textContent=standalone?'Standalone display order':'Priority order';
+  el('priority-order-field').hidden=false;
+  el('game-order-label').textContent=standalone?'Standalone display order':fixedPriority?'Priority order':'Display order';
   el('game-order-help').textContent=standalone
     ? 'Choose the order of game cards on the standalone screen. The first three appear on page one.'
-    : 'Choose which enabled game wins when priority selection is used.';
+    : fixedPriority
+      ? 'Choose which enabled game wins in priority selection. This also orders game cards.'
+      : 'Choose the order of game cards on the home screen. Automatic selection also uses this order for rotation and ties.';
 }
 function numberField(id:string):number{return Number(el<HTMLInputElement>(id).value);}
 function renderRuntimeSummary():void{
@@ -1295,7 +1298,7 @@ function matchOutcome(view:OperatorStationView):string{
   if(!result.participants.length)return'No participant results';
   return result.participants.map(participant=>{
     const name=view.readyEntries.find(entry=>entry.id===participant.readyEntryId)?.displayName??'Player';
-    const outcome=participant.won?'winner':participant.rank?`place ${participant.rank}`:participant.completed?'completed':'did not finish';
+    const outcome=describeStationParticipantOutcome(view.match!.game,participant);
     return `${name}: ${outcome}${participant.score===null?'':`, score ${participant.score}`}`;
   }).join(' · ');
 }
