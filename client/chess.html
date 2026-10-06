@@ -44,8 +44,22 @@
       <h1 id="status-title">Opening the chamber</h1>
       <p id="status-detail">Preparing your chess board.</p>
       <div id="move-prompt" class="move-prompt">Say a piece and square on your call, then confirm the move.</div>
+      <div class="camera-hint"><span id="camera-hint-pointer" class="camera-hint-pointer">Drag to rotate · right-drag to pan · scroll to zoom · double-click to reset</span><span id="camera-hint-touch" class="camera-hint-touch">One finger rotates · two fingers pan or zoom</span></div>
       <div class="mobile-last"><span id="mobile-last-label">Last move</span><strong id="mobile-last-move">—</strong></div>
     </section>
+
+    <aside id="call-card" class="call-card" aria-labelledby="call-card-title" hidden>
+      <div class="call-card-copy">
+        <span id="call-card-kicker" class="call-card-kicker">YOUR DUEL AWAITS</span>
+        <h2 id="call-card-title">Call to play</h2>
+        <p id="call-card-instructions">Scan with your phone or tap the number.</p>
+      </div>
+      <div id="call-card-qr-frame" class="call-card-qr-frame" hidden>
+        <img id="call-card-qr" alt="Scan to call Voice Chess" />
+      </div>
+      <a id="call-card-number" class="call-card-number" hidden></a>
+      <p id="call-card-availability" class="call-card-availability" role="status">The voice line is unavailable right now.</p>
+    </aside>
 
     <aside class="move-note" aria-live="polite" aria-atomic="true">
       <span id="last-spell-label" class="move-note-label">The last spell</span>

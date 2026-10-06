@@ -1,9 +1,10 @@
+import QRCode from 'qrcode';
 import { DEFAULT_ROOM } from '../../shared/constants';
 import type { ChessColor, ChessEvent, ChessMoveRecord, ChessPiecePlacement,
   ChessPieceType, ChessResult, ChessState } from '../../shared/chess-protocol';
 import { locale } from '../i18n';
 import { createStationDisplay } from '../station-display';
-import { rejectDisplayToken } from '../station-client';
+import { rejectDisplayToken, watchVoiceNumber } from '../station-client';
 import { wireFullscreenToggle } from '../fullscreen-toggle';
 import { getMusicManager } from '../music-manager';
 import { ChessBoardScene } from './chess-board';
@@ -19,6 +20,12 @@ const musicButton = element<HTMLButtonElement>('music-button');
 const musicLabel = element<HTMLSpanElement>('music-label');
 const statusTitle = element<HTMLHeadingElement>('status-title');
 const statusDetail = element<HTMLParagraphElement>('status-detail');
+const callCard = element<HTMLElement>('call-card');
+const callCardInstructions = element<HTMLParagraphElement>('call-card-instructions');
+const callCardQrFrame = element<HTMLDivElement>('call-card-qr-frame');
+const callCardQr = element<HTMLImageElement>('call-card-qr');
+const callCardNumber = element<HTMLAnchorElement>('call-card-number');
+const callCardAvailability = element<HTMLParagraphElement>('call-card-availability');
 const turnLabel = element<HTMLSpanElement>('turn-label');
 const prompt = element<HTMLDivElement>('move-prompt');
 const lastMoveLabel = element<HTMLElement>('last-move');
@@ -54,11 +61,38 @@ let bannerTimer: ReturnType<typeof setTimeout> | null = null;
 let essentialVisualReady = false;
 let hasRenderedRoomState = false;
 let stationReadyMarked = false;
+let phoneNumber = '';
+let phoneQr = '';
+let phoneQrFailed = false;
+let phoneQrGeneration = 0;
 const boardQueue: ChessState[] = [];
 
 document.documentElement.lang = locale;
 document.title = isPortuguese ? 'Xadrez por Voz · Twilio Games' : 'Voice Chess · Twilio Games';
 localizeStaticCopy();
+const stopVoiceNumberUpdates = stationLaunchRequested || stationDisplay.active ? null
+  : watchVoiceNumber(locale, number => {
+    const nextNumber = number.trim();
+    if (nextNumber === phoneNumber && !phoneQrFailed) return;
+    const generation = ++phoneQrGeneration;
+    phoneNumber = nextNumber;
+    phoneQr = '';
+    phoneQrFailed = false;
+    renderCallCard();
+    if (!phoneNumber) return;
+    void QRCode.toDataURL(`tel:${phoneNumber}`, {
+      width: 520, margin: 1, errorCorrectionLevel: 'M',
+      color: { dark: '#000D25', light: '#FFFFFF' },
+    }).then(qr => {
+      if (generation !== phoneQrGeneration) return;
+      phoneQr = qr;
+      renderCallCard();
+    }).catch(() => {
+      if (generation !== phoneQrGeneration) return;
+      phoneQrFailed = true;
+      renderCallCard();
+    });
+  });
 music.setVolume(0.52);
 music.switchContext('chess');
 renderMusicButton();
@@ -141,6 +175,8 @@ void (document.fonts?.ready ?? Promise.resolve()).then(() => new Promise<void>(r
 
 addEventListener('pagehide', () => {
   if (bannerTimer) clearTimeout(bannerTimer);
+  phoneQrGeneration += 1;
+  stopVoiceNumberUpdates?.();
   connection?.close();
   board?.dispose();
   music.stop();
@@ -318,6 +354,42 @@ function renderStatus(): void {
   turnLabel.textContent = label;
   prompt.textContent = hint;
   app.dataset.phase = state?.phase ?? 'connecting';
+  renderCallCard();
+}
+
+function renderCallCard(): void {
+  const waitingForCaller = !stationLaunchRequested && !stationDisplay.active
+    && connectionState === 'connected' && !transportError
+    && latestState !== null && latestState.phase !== 'finished' && !latestState.playerConnected;
+  callCard.hidden = !waitingForCaller;
+  app.dataset.callCard = waitingForCaller ? 'visible' : 'hidden';
+  if (!waitingForCaller) return;
+
+  callCardInstructions.hidden = !phoneNumber;
+  callCardInstructions.textContent = phoneQr
+    ? isPortuguese ? 'Escaneie com o celular ou toque no número.' : 'Scan with your phone or tap the number.'
+    : isPortuguese ? 'Toque no número para ligar e começar.' : 'Tap the number to call and start.';
+  callCard.dataset.qr = phoneQr ? 'ready' : 'missing';
+  callCardQrFrame.hidden = !phoneQr;
+  if (phoneQr) callCardQr.src = phoneQr;
+  else callCardQr.removeAttribute('src');
+
+  callCardNumber.hidden = !phoneNumber;
+  if (phoneNumber) {
+    callCardNumber.href = `tel:${phoneNumber}`;
+    callCardNumber.textContent = phoneNumber;
+    callCardNumber.setAttribute('aria-label', isPortuguese
+      ? `Ligar para jogar Xadrez por Voz: ${phoneNumber}` : `Call to play Voice Chess: ${phoneNumber}`);
+  } else {
+    callCardNumber.removeAttribute('href');
+    callCardNumber.textContent = '';
+  }
+  callCardAvailability.hidden = !!phoneQr;
+  callCardAvailability.textContent = !phoneNumber
+    ? isPortuguese ? 'A linha de voz não está disponível no momento.' : 'The voice line is unavailable right now.'
+    : phoneQrFailed
+      ? isPortuguese ? 'QR indisponível. Use o número exibido.' : 'QR unavailable. Use the number shown.'
+      : isPortuguese ? 'Preparando o código para ligar…' : 'Preparing your call code…';
 }
 
 function renderSides(): void {
@@ -438,6 +510,12 @@ function localizeStaticCopy(): void {
   computerLabel.textContent = 'O Arquimago · Obsidiana';
   element<HTMLElement>('mobile-last-label').textContent = 'Último lance';
   element<HTMLElement>('last-spell-label').textContent = 'O último feitiço';
+  element<HTMLElement>('call-card-kicker').textContent = 'SEU DUELO AGUARDA';
+  element<HTMLElement>('call-card-title').textContent = 'Ligue para jogar';
+  element<HTMLElement>('call-card-instructions').textContent = 'Escaneie com o celular ou toque no número.';
+  callCardQr.alt = 'Escaneie para ligar e jogar Xadrez por Voz';
+  element<HTMLElement>('camera-hint-pointer').textContent = 'Arraste para girar · botão direito para mover · rolagem para ampliar · clique duplo para centralizar';
+  element<HTMLElement>('camera-hint-touch').textContent = 'Um dedo gira · dois dedos movem ou ampliam';
   lastMoveLabel.textContent = 'Nenhum lance ainda';
   lastCaption.textContent = 'As peças aguardam o primeiro comando.';
   resultKicker.textContent = 'Duelo encerrado';

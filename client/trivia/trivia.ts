@@ -1,7 +1,8 @@
 import { DEFAULT_ROOM } from '../../shared/constants';
 import type { TriviaEvent, TriviaState } from '../../shared/trivia-protocol';
+import QRCode from 'qrcode';
 import { createStationDisplay } from '../station-display';
-import { rejectDisplayToken } from '../station-client';
+import { rejectDisplayToken, watchVoiceNumber } from '../station-client';
 import { commonText, injectLanguagePicker, locale } from '../i18n';
 import { injectFullscreenToggle } from '../fullscreen-toggle';
 import { getMusicManager } from '../music-manager';
@@ -45,9 +46,10 @@ const params = pageUrl.searchParams;
 const roomCode = params.get('room') || DEFAULT_ROOM;
 const stationDisplay = createStationDisplay();
 const stationLaunchRequested = params.has('station') || params.has('match') || params.has('launchGeneration');
+const stationMode = stationDisplay.active || stationLaunchRequested;
 let pairingRequired = triviaDisplayPairingRequired(location.hostname, stationLaunchRequested, stationDisplay.displayToken);
 const localKeyboardTestingAllowed = triviaLocalKeyboardTestingAllowed(
-  location.hostname, stationDisplay.active || stationLaunchRequested, roomCode,
+  location.hostname, stationMode, roomCode,
 );
 
 let connection: TriviaConnection | null = null;
@@ -65,6 +67,10 @@ let stageError = '';
 let lastAnnouncementKey = '';
 let countdownAnnouncement = '';
 let questionTimeAnnouncement = '';
+let callNumber = '';
+let callQrCode: string | null = null;
+let callQrLoading = false;
+let callQrGeneration = 0;
 const answerResults = new Map<string, TriviaAnswerResultView>();
 
 document.title = copy.app;
@@ -86,12 +92,38 @@ wireThemeToggle(element('theme-toggle'), {
 });
 musicManager.switchContext('lobby');
 
+const stopVoiceNumberUpdates = stationMode ? () => undefined : watchVoiceNumber(locale, async number => {
+  const generation = ++callQrGeneration;
+  callNumber = number.trim();
+  callQrCode = null;
+  callQrLoading = Boolean(callNumber);
+  render();
+  if (!callNumber) return;
+  try {
+    const qr = await QRCode.toDataURL(`tel:${callNumber}`, {
+      width: 520, margin: 1, color: { dark: '#000D25', light: '#FFFFFF' }, errorCorrectionLevel: 'M',
+    });
+    if (generation !== callQrGeneration) return;
+    callQrCode = qr;
+  } catch {
+    if (generation !== callQrGeneration) return;
+    callQrCode = null;
+  }
+  callQrLoading = false;
+  render();
+});
+
 if (!pairingRequired) connect();
 void prepareEssentialStage();
 render();
 requestAnimationFrame(updateTimeDrivenUi);
 
-addEventListener('pagehide', () => { connection?.close(); musicManager.stop(); }, { once: true });
+addEventListener('pagehide', () => {
+  callQrGeneration += 1;
+  stopVoiceNumberUpdates();
+  connection?.close();
+  musicManager.stop();
+}, { once: true });
 addEventListener('pointerdown', resumeTriviaAudio, { passive: true });
 addEventListener('keydown', event => {
   resumeTriviaAudio();
@@ -256,6 +288,8 @@ function render(): void {
     error: stageError,
     pairingRequired,
     canReplay: isHost && !stationDisplay.active && !stationLaunchRequested,
+    stationMode,
+    callEntry: stationMode ? undefined : { number: callNumber, qrCode: callQrCode, loading: callQrLoading },
   });
   stage.innerHTML = view.html;
   stage.setAttribute('aria-busy', String(!state || state.phase === 'loading'));

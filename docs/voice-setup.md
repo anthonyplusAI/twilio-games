@@ -257,6 +257,8 @@ The common 30-second caller binding and up-to-two Relay recovery attempts apply 
 
 Voice Trivia is the fifth default-enabled game and stable station or Messaging option `5`. Station matches accept 1-4 callers; the default standalone voice route expects one caller. Trivia has no AI opponent and uses deterministic server content and parsing even when `OPENAI_API_KEY` is set. Standalone play opens `/trivia.html?display=1&room=4821`; station play launches `/trivia.html` with a generated room and the current `station`, `match`, and `launchGeneration`. Both use the same-origin `/trivia?display=1` display WebSocket, while callers remain on `/voice`.
 
+The standalone lobby displays the configured locale's call QR and linked number. Station launches use the station `/join` QR rail, which registers visitors before their assigned call is routed into the game.
+
 The voice flow is:
 
 1. In standalone play, each caller says a first name. Station play greets each caller by the registered first name unless it is missing. After all expected callers connect and confirm names, the server leaves `lobby` for `category_select`.
@@ -282,11 +284,13 @@ The display reconnects with exponential delays from 500 ms to 8 seconds, then re
 
 ## Voice Chess
 
-Voice Chess starts a one-caller match against the computer when selected; there is no setup menu. It is enabled by default, is stable station or Messaging option `6`, and randomly assigns the caller White or Black. Standalone play opens `/chess.html?display=1&room=4821`; station play launches `/chess.html` with its generated room and paired display capability. The board is read-only and uses `/chess?display=1`, while the caller stays on `/voice`.
+Voice Chess starts a one-caller match against the computer when selected; there is no setup menu. It is enabled by default, is stable station or Messaging option `6`, and randomly assigns the caller White or Black. Standalone play opens `/chess.html?display=1&room=4821`; station play launches `/chess.html` with its generated room and paired display capability. Viewers can adjust the board camera, but moves are accepted only through the caller's `/voice` session; the board uses `/chess?display=1`.
+
+While the standalone board waits for a caller, it shows the configured locale's call QR and linked number. The card hides once the caller connects. Station launches use the station `/join` QR rail instead.
 
 Say a complete move such as `pawn from E two to E four`, or select a piece first and then name its destination. The phone repeats a legal proposed move; say `confirm` to play it or `cancel` to discard it. Keypad `1`, `0`, and `9` mean confirm, cancel, and help. Ambiguous and illegal moves require a clearer choice. The phone describes the computer's reply, captured pieces, checks, and the result. A standalone caller can say `play again` after the result; station play returns to the next round.
 
-The server validates moves and chooses computer replies. Its default search settings aim for an approachable 800–1200 Elo feel, which has not been measured as a formal rating. The shared display animates moves and captures, plays the supplied *The Marble Gambit* track with a gesture retry for blocked autoplay, and never submits a move. Voice Chess has private activation metrics and station results, but no leaderboard.
+The server validates moves and chooses computer replies. Its default search settings aim for an approachable 800–1200 Elo feel, which has not been measured as a formal rating. The shared display animates moves and captures, plays the supplied *The Marble Gambit* track with a gesture retry for blocked autoplay, and never submits a move. Drag the board to rotate the camera, right-drag or use two fingers to pan, scroll or pinch to zoom, and double-click to reset the view. Voice Chess has private activation metrics and station results, but no leaderboard.
 
 ## Voice Karaoke
 

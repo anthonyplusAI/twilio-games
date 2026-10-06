@@ -64,6 +64,17 @@ html[data-theme="dark"] .scene-kicker { color:#FD7685; }
 .voice-wave { height:30px;display:flex;align-items:center;gap:3px; }
 .voice-wave i { width:3px;height:9px; }.voice-wave i:nth-child(2),.voice-wave i:nth-child(4) { height:22px;animation-delay:-.3s; }.voice-wave i:nth-child(3) { height:29px;animation-delay:-.55s; }
 .voice-banner strong { color:var(--theme-text);font-size:14px; }
+.call-card { width:100%;max-width:620px;display:grid;grid-template-columns:140px minmax(0,1fr);align-items:center;gap:18px;margin-top:18px;padding:15px;border:1px solid var(--theme-border);border-radius:18px;background:var(--vt-card);box-shadow:0 16px 45px var(--theme-shadow); }
+.call-card-text-only { grid-template-columns:minmax(0,1fr); }
+.call-card-qr { width:140px;aspect-ratio:1;display:grid;place-items:center;padding:8px;border-radius:11px;background:#fff; }
+.call-card-qr img { display:block;width:100%;height:100%;object-fit:contain; }
+.call-card-content { min-width:0; }
+.call-card-content>span { color:#EF223A;font:400 10px/1.4 'Twilio Sans Mono',monospace;letter-spacing:.12em;text-transform:uppercase; }
+.call-card-content h2 { margin:5px 0 0;font-size:clamp(23px,2.4vw,31px); }
+.call-card-content p { margin:9px 0 0;color:var(--theme-text-dim);font-size:13px;line-height:1.35; }
+.call-card-phone { display:inline-block;max-width:100%;margin-top:10px;overflow-wrap:anywhere;color:#B10F23;font:700 clamp(17px,2vw,23px)/1.25 'Twilio Sans Text',sans-serif;text-decoration:underline;text-decoration-thickness:1.5px;text-underline-offset:4px; }
+.call-card-phone:focus-visible { outline:2px solid #EF223A;outline-offset:4px;border-radius:3px; }
+html[data-theme="dark"] .call-card-content>span,html[data-theme="dark"] .call-card-phone { color:#FD7685; }
 .stage-card { border:1px solid var(--theme-border);border-radius:22px;background:var(--vt-card);box-shadow:0 30px 80px var(--theme-shadow);backdrop-filter:blur(16px); }
 .roster-card { overflow:hidden;border-top:5px solid #EF223A; }
 .roster-card>header { display:flex;align-items:end;justify-content:space-between;padding:25px 27px 20px;border-bottom:1px solid var(--theme-border); }
@@ -127,7 +138,7 @@ body.station-mode .trivia-controls { margin-right:0; }
 @media (max-width:700px) {
   .stage-header { height:68px;padding:10px 12px; }.stage-brand span { display:none; }.stage-brand img { width:27px;height:27px; }.stage-brand strong { font-size:9px; }.game-home { width:42px;height:42px;justify-content:center;padding:0; }.game-home span { display:none; }.trivia-controls { gap:5px; }.trivia-controls .language-picker { width:111px;min-height:40px;padding:0 7px; }.trivia-controls .language-picker select { width:76px; }.round-control,#music-toggle-container .music-toggle { width:40px;height:40px; }.connection-status { position:fixed;right:13px;bottom:max(12px,env(safe-area-inset-bottom));z-index:60; }.connection-status[data-state="connected"] { display:none; }
   #trivia-stage { inset:68px 0 0; }.scene { min-height:100%;padding:23px 13px max(26px,env(safe-area-inset-bottom)); }.scene-kicker { font-size:9px; }.center-scene h1 { font-size:45px; }
-  .lobby-scene { display:flex;flex-direction:column;justify-content:flex-start; }.hero-copy h1 { font-size:54px; }.hero-copy>p { margin-top:16px;font-size:15px; }.voice-banner { padding:12px;margin-top:17px; }.roster-card>header { padding:18px; }.roster-player { min-height:65px;padding:10px 17px; }
+  .lobby-scene { display:flex;flex-direction:column;justify-content:flex-start; }.hero-copy h1 { font-size:54px; }.hero-copy>p { margin-top:16px;font-size:15px; }.voice-banner { padding:12px;margin-top:17px; }.call-card { grid-template-columns:104px minmax(0,1fr);gap:12px;margin-top:14px;padding:12px; }.call-card-text-only { grid-template-columns:minmax(0,1fr); }.call-card-qr { width:104px;padding:6px; }.call-card-content h2 { font-size:21px; }.call-card-content p { font-size:12px; }.call-card-phone { font-size:17px; }.roster-card>header { padding:18px; }.roster-player { min-height:65px;padding:10px 17px; }
   .scene-heading { display:block;margin-bottom:18px; }.scene-heading h1 { font-size:45px; }.vote-total { position:absolute;top:25px;right:14px;font-size:34px; }.category-grid { gap:7px; }.category-card { min-height:105px;padding:12px; }.category-card>strong { font-size:18px; }.vote-count { top:11px;right:11px; }.vote-count b { font-size:17px; }
   .countdown-scene>strong { font-size:55vw; }.question-scene,.reveal-scene { padding-top:16px; }.question-header { margin-bottom:10px; }.question-header strong { font-size:11px; }.question-header>b { padding:7px;font-size:8px; }
   .question-board { padding:18px 13px;border-radius:17px; }.question-board h1 { font-size:clamp(27px,8vw,39px); }.choice-grid { grid-template-columns:1fr;gap:6px;margin-top:18px; }.choice-grid li { min-height:57px;grid-template-columns:34px 1fr auto;padding:8px 10px; }.choice-grid li>span { width:31px;height:31px;border-radius:8px;font-size:16px; }.choice-grid li>strong { font-size:14px; }.question-timer { margin-top:16px; }.question-timer>strong { font-size:39px; }.answer-status { grid-template-columns:repeat(2,minmax(0,1fr));gap:5px; }.player-pill { min-height:57px;padding:9px 25px 9px 10px; }.player-pill span { font-size:12px; }.player-pill>i { right:10px; }
@@ -136,7 +147,7 @@ body.station-mode .trivia-controls { margin-right:0; }
 }
 
 @media (max-width:400px) {
-  .stage-brand { display:none; }.trivia-controls { position:absolute;right:12px; }.trivia-controls .language-picker { width:94px; }.trivia-controls .language-picker select { width:61px; }.category-grid { grid-template-columns:1fr 1fr; }.category-card>strong { font-size:16px; }.answer-status { grid-template-columns:1fr 1fr; }
+  .stage-brand { display:none; }.trivia-controls { position:absolute;right:12px; }.trivia-controls .language-picker { width:94px; }.trivia-controls .language-picker select { width:61px; }.call-card { grid-template-columns:88px minmax(0,1fr); }.call-card-text-only { grid-template-columns:minmax(0,1fr); }.call-card-qr { width:88px; }.call-card-content h2 { font-size:19px; }.category-grid { grid-template-columns:1fr 1fr; }.category-card>strong { font-size:16px; }.answer-status { grid-template-columns:1fr 1fr; }
 }
 
 @media (max-height:650px) and (min-width:701px) {

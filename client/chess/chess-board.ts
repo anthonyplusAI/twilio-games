@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import { createChessPiece, pieceShardMaterial, pieceSpellColor,
   type ChessColor, type ChessPieceType } from './chess-pieces';
@@ -56,6 +57,9 @@ const sparkGeometry = new THREE.SphereGeometry(0.045, 7, 5);
 const ringGeometry = new THREE.TorusGeometry(0.38, 0.021, 7, 38);
 const slashGeometry = new THREE.TorusGeometry(0.37, 0.028, 7, 32, Math.PI * 1.2);
 const beamGeometry = new THREE.CylinderGeometry(0.035, 0.08, 1, 8);
+// Include the plinth and its corner jewels when keeping the board in frame.
+const boardFrameCorners = [-4.75, 4.75].flatMap(x => [-4.75, 4.75].flatMap(z =>
+  [-0.42, 0.52].map(y => new THREE.Vector3(x, y, z))));
 
 function squarePosition(square: string): THREE.Vector3 | null {
   const file = FILES.indexOf(square[0]?.toLowerCase() ?? '');
@@ -139,6 +143,8 @@ export class ChessBoardScene {
   private readonly scene = new THREE.Scene();
   private readonly camera = new THREE.OrthographicCamera(-8, 8, 5, -5, 0.1, 100);
   private readonly renderer: THREE.WebGLRenderer;
+  private readonly orbit: OrbitControls;
+  private readonly cameraFramePoint = new THREE.Vector3();
   private readonly board = new THREE.Group();
   private readonly pieceLayer = new THREE.Group();
   private readonly coordinateLayer = new THREE.Group();
@@ -156,6 +162,7 @@ export class ChessBoardScene {
   private lastFrameAt = 0;
   private humanColor: ChessColor = 'w';
   private animation: MoveAnimation | null = null;
+  private cameraAdjusted = false;
   private ready = true;
   private onAvailability?: (available: boolean) => void;
 
@@ -169,7 +176,22 @@ export class ChessBoardScene {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.canvas = this.renderer.domElement;
     this.canvas.setAttribute('aria-hidden', 'true');
+    this.canvas.style.cursor = 'grab';
     this.container.append(this.canvas);
+    this.orbit = new OrbitControls(this.camera, this.canvas);
+    this.orbit.enableDamping = !this.reducedMotion;
+    this.orbit.dampingFactor = 0.12;
+    this.orbit.rotateSpeed = 0.72;
+    this.orbit.zoomSpeed = 0.85;
+    this.orbit.screenSpacePanning = false;
+    this.orbit.minPolarAngle = 0.28;
+    this.orbit.maxPolarAngle = 1.24;
+    this.orbit.minZoom = 0.55;
+    this.orbit.maxZoom = 1.65;
+    this.orbit.maxTargetRadius = 1.3;
+    this.orbit.addEventListener('start', this.onCameraStart);
+    this.orbit.addEventListener('end', this.onCameraEnd);
+    this.canvas.addEventListener('dblclick', this.onCameraDoubleClick);
     this.canvas.addEventListener('webglcontextlost', event => {
       event.preventDefault();
       this.ready = false;
@@ -228,8 +250,14 @@ export class ChessBoardScene {
   setHumanColor(color: ChessColor): void {
     if (this.humanColor === color && this.coordinateLayer.children.length) return;
     this.humanColor = color;
+    this.cameraAdjusted = false;
     this.positionCamera();
     this.replaceCoordinates();
+  }
+
+  resetCamera(): void {
+    this.cameraAdjusted = false;
+    this.positionCamera();
   }
 
   setPosition(next: readonly BoardPiece[]): void {
@@ -300,9 +328,27 @@ export class ChessBoardScene {
     if (this.animation) this.finishAnimation(this.animation);
     this.resizeObserver?.disconnect();
     window.removeEventListener('resize', this.resize);
+    this.canvas.removeEventListener('dblclick', this.onCameraDoubleClick);
+    this.orbit.removeEventListener('start', this.onCameraStart);
+    this.orbit.removeEventListener('end', this.onCameraEnd);
+    this.orbit.dispose();
     this.renderer.dispose();
     this.canvas.remove();
   }
+
+  private readonly onCameraStart = (): void => {
+    this.cameraAdjusted = true;
+    this.canvas.style.cursor = 'grabbing';
+  };
+
+  private readonly onCameraEnd = (): void => {
+    this.canvas.style.cursor = 'grab';
+  };
+
+  private readonly onCameraDoubleClick = (event: MouseEvent): void => {
+    event.preventDefault();
+    this.resetCamera();
+  };
 
   private readonly resize = (): void => {
     const width = Math.max(1, this.container.clientWidth);
@@ -310,32 +356,69 @@ export class ChessBoardScene {
     const aspect = width / height;
     // The board needs horizontal room on narrow displays; orthographic scaling avoids clipping.
     const narrow = width < 720 || aspect < 0.78;
-    const visibleHeight = narrow ? Math.max(10.1, 8.75 / aspect) : Math.max(10.2, 11.1 / aspect);
+    const visibleHeight = narrow ? Math.max(10.1, 10.45 / aspect) : Math.max(10.2, 11.1 / aspect);
     this.camera.left = -visibleHeight * aspect / 2;
     this.camera.right = visibleHeight * aspect / 2;
     this.camera.top = visibleHeight / 2;
     this.camera.bottom = -visibleHeight / 2;
     this.camera.updateProjectionMatrix();
-    this.positionCamera();
+    if (this.cameraAdjusted) {
+      this.orbit.update();
+      this.constrainCameraFraming();
+    } else this.positionCamera();
     this.renderer.setSize(width, height, false);
   };
 
   private positionCamera(): void {
+    // Drain any inertial drag before changing sides or resetting the view.
+    const damping = this.orbit.enableDamping;
+    this.orbit.enableDamping = false;
+    this.orbit.update();
+    this.orbit.enableDamping = damping;
     const width = this.container.clientWidth;
     const height = this.container.clientHeight;
     const narrow = width < 720 || width / Math.max(1, height) < 0.78;
     const sign = this.humanColor === 'w' ? 1 : -1;
     const shift = narrow ? -0.75 : 0;
+    this.orbit.maxZoom = 1.65;
+    this.camera.zoom = 1;
     this.camera.position.set(sign * (narrow ? 0.45 : 8.5), (narrow ? 18.5 : 13.1) + shift,
       sign * (narrow ? 14.4 : 13.4));
-    this.camera.lookAt(0, 0.3 + shift, 0);
+    this.orbit.target.set(0, 0.3 + shift, 0);
+    this.orbit.cursor.copy(this.orbit.target);
+    this.camera.lookAt(this.orbit.target);
     this.camera.updateProjectionMatrix();
+    this.orbit.update();
+    this.constrainCameraFraming();
+    this.orbit.saveState();
+  }
+
+  private constrainCameraFraming(): void {
+    this.camera.updateMatrixWorld();
+    let maxX = 0;
+    let maxY = 0;
+    for (const corner of boardFrameCorners) {
+      this.cameraFramePoint.copy(corner).applyMatrix4(this.camera.matrixWorldInverse);
+      maxX = Math.max(maxX, Math.abs(this.cameraFramePoint.x));
+      maxY = Math.max(maxY, Math.abs(this.cameraFramePoint.y));
+    }
+    const fitZoom = Math.min(
+      (this.camera.right - this.camera.left) / (2 * maxX),
+      (this.camera.top - this.camera.bottom) / (2 * maxY),
+    ) * 0.965;
+    this.orbit.maxZoom = Math.max(this.orbit.minZoom, Math.min(1.65, fitZoom));
+    if (this.camera.zoom > this.orbit.maxZoom) {
+      this.camera.zoom = this.orbit.maxZoom;
+      this.camera.updateProjectionMatrix();
+    }
   }
 
   private readonly tick = (now: number): void => {
     const dt = Math.min(0.05, (now - (this.lastFrameAt || now)) / 1000);
     this.lastFrameAt = now;
     if (this.ready) {
+      this.orbit.update();
+      this.constrainCameraFraming();
       this.updateAnimation(now);
       this.updateParticles(now, dt);
       if (!this.reducedMotion) {
