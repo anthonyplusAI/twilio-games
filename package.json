@@ -37,7 +37,7 @@
     "tsx": "^4.10.0",
     "typescript": "^5.4.0",
     "vite": "8.1.2",
-    "vitest": "4.1.9"
+    "vitest": "4.1.11"
   },
   "dependencies": {
     "@gltf-transform/core": "4.4.1",
