@@ -45,6 +45,50 @@ const context = {
 };
 
 describe('Voice Trivia display DOM projection', () => {
+  it('shows the configured call QR and a dial link in the standalone lobby', () => {
+    const rendered = renderTriviaView(state({ phase: 'lobby', players: [] }), {
+      ...context,
+      callEntry: { number: '+15551234567', qrCode: 'data:image/png;base64,example', loading: false },
+    });
+
+    expect(rendered.html).toContain('data-view="lobby"');
+    expect(rendered.html).toContain('src="data:image/png;base64,example"');
+    expect(rendered.html).toContain('href="tel:+15551234567"');
+    expect(rendered.html).toContain('+15551234567');
+    expect(rendered.html).toContain('Scan to call');
+  });
+
+  it('keeps the standalone call QR out of station and pairing screens', () => {
+    const callEntry = { number: '+15551234567', qrCode: 'data:image/png;base64,example', loading: false };
+    const station = renderTriviaView(state({ phase: 'lobby' }), { ...context, stationMode: true, callEntry });
+    expect(station.html).toContain('data-view="lobby"');
+    expect(station.html).not.toContain('tel:+15551234567');
+    expect(station.html).not.toContain('data:image/png;base64,example');
+
+    const pairingError = renderTriviaView(state({ phase: 'lobby' }), {
+      ...context, stationMode: true, pairingRequired: true, callEntry,
+    });
+    expect(pairingError.html).toContain('data-view="pairing"');
+    expect(pairingError.html).not.toContain('tel:+15551234567');
+    expect(pairingError.html).not.toContain('data:image/png;base64,example');
+  });
+
+  it('states when a Portuguese lobby cannot show a call number or QR', () => {
+    const noNumber = renderTriviaView(state({ phase: 'lobby' }), {
+      ...context, locale: 'pt-BR', callEntry: { number: '', qrCode: null, loading: false },
+    });
+    expect(noNumber.html).toContain('Número para ligar indisponível');
+    expect(noNumber.html).not.toContain('href="tel:');
+    expect(noNumber.html).not.toContain('<img src="data:image/png');
+
+    const noQr = renderTriviaView(state({ phase: 'lobby' }), {
+      ...context, locale: 'pt-BR', callEntry: { number: '+5511999999999', qrCode: null, loading: false },
+    });
+    expect(noQr.html).toContain('Código QR indisponível');
+    expect(noQr.html).toContain('href="tel:+5511999999999"');
+    expect(noQr.html).not.toContain('<img src="data:image/png');
+  });
+
   it('renders 1-4 and locked status without active-question answer keys or browser controls', () => {
     const activeQuestion = {
       ...question,

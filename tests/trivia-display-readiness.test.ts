@@ -37,7 +37,10 @@ vi.mock('../client/station-display', () => ({
     markEngineResultsReady() {},
   }),
 }));
-vi.mock('../client/station-client', () => ({ rejectDisplayToken() {} }));
+vi.mock('../client/station-client', () => ({
+  rejectDisplayToken() {},
+  watchVoiceNumber: () => () => undefined,
+}));
 vi.mock('../client/i18n', () => ({
   locale: 'en-US',
   commonText: (key: string) => key,

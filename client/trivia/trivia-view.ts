@@ -15,6 +15,12 @@ export interface TriviaAnswerResultView {
   rawScore: number;
 }
 
+export interface TriviaCallEntryView {
+  number: string;
+  qrCode: string | null;
+  loading: boolean;
+}
+
 export interface TriviaViewContext {
   locale: SupportedLocale;
   roomCode: string;
@@ -24,6 +30,8 @@ export interface TriviaViewContext {
   error?: string;
   pairingRequired?: boolean;
   canReplay?: boolean;
+  stationMode?: boolean;
+  callEntry?: TriviaCallEntryView;
 }
 
 export interface TriviaRenderedView {
@@ -41,6 +49,11 @@ const COPY = {
     pairing: 'Display authorization needed', pairingBody: 'Launch this display from the Twilio Games station.',
     pairingAction: 'Return home', room: 'Room', players: 'Players', lobby: 'The stage is yours.',
     lobbyBody: 'Players join and answer from their phones. This screen never accepts answers.',
+    callLabel: 'Join by phone', callTitle: 'Call to play', callInstructions: 'Scan to call, or tap the number below.',
+    callQrAlt: 'Scan to call Voice Trivia', callNumberLabel: 'Call Voice Trivia at',
+    callUnavailable: 'Call number unavailable. Ask the game host.',
+    callQrPreparing: 'Preparing the call QR code. You can call the number below.',
+    callQrUnavailable: 'QR code unavailable. Call the number below.',
     ready: 'Ready', confirming: 'Confirming name', reconnecting: 'Reconnecting', openSeat: 'Open seat', waiting: 'Waiting',
     category: 'Choose the category', categoryBody: 'Vote by voice. The live totals decide the round.', vote: 'vote', votes: 'votes',
     loading: 'Building the question deck', loadingBody: 'The display is checking fonts and stage readiness.',
@@ -64,6 +77,11 @@ const COPY = {
     pairing: 'Autorização da tela necessária', pairingBody: 'Abra esta tela pela estação Twilio Games.',
     pairingAction: 'Voltar ao início', room: 'Sala', players: 'Jogadores', lobby: 'O palco é de vocês.',
     lobbyBody: 'Os jogadores entram e respondem pelo telefone. Esta tela nunca recebe respostas.',
+    callLabel: 'Entre pelo telefone', callTitle: 'Ligue para jogar', callInstructions: 'Escaneie para ligar ou toque no número abaixo.',
+    callQrAlt: 'Escaneie para ligar para o Quiz por Voz', callNumberLabel: 'Ligar para o Quiz por Voz no número',
+    callUnavailable: 'Número para ligar indisponível. Peça ajuda à equipe do jogo.',
+    callQrPreparing: 'Preparando o código QR. Você pode ligar para o número abaixo.',
+    callQrUnavailable: 'Código QR indisponível. Ligue para o número abaixo.',
     ready: 'Pronto', confirming: 'Confirmando nome', reconnecting: 'Reconectando', openSeat: 'Lugar livre', waiting: 'Aguardando',
     category: 'Escolham a categoria', categoryBody: 'Votem por voz. Os totais ao vivo decidem a rodada.', vote: 'voto', votes: 'votos',
     loading: 'Montando as perguntas', loadingBody: 'A tela está verificando fontes e o palco.',
@@ -123,14 +141,33 @@ export function renderTriviaView(state: TriviaState | null, context: TriviaViewC
 function renderLobby(state: TriviaState, context: TriviaViewContext): TriviaRenderedView {
   const copy = COPY[context.locale];
   const confirmed = state.players.filter(player => player.connected && player.nameConfirmed).length;
+  const callEntry = !context.stationMode && context.callEntry
+    ? renderCallEntry(context.callEntry, context.locale) : '';
   const html = `<section class="scene lobby-scene" data-view="lobby">
     <div class="hero-copy">${kicker(copy.eyebrow)}<h1>${escapeHtml(copy.lobby)}</h1><p>${escapeHtml(copy.lobbyBody)}</p>
       <div class="voice-banner"><span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span><strong>${escapeHtml(copy.tagline)}</strong></div>
+      ${callEntry}
     </div>
     <section class="stage-card roster-card" aria-labelledby="roster-title"><header><div><span>${escapeHtml(copy.room)} ${escapeHtml(state.roomCode)}</span><h2 id="roster-title">${escapeHtml(copy.players)}</h2></div><strong>${state.players.length}/${state.expectedPlayerCount}</strong></header>${renderRoster(state, context.locale)}</section>
   </section>`;
   return rendered(`lobby:${state.players.map(player => `${player.playerId}:${player.connected}:${player.nameConfirmed}`).join('|')}`,
     `${confirmed} ${copy.ready}.`, html);
+}
+
+function renderCallEntry(entry: TriviaCallEntryView, locale: SupportedLocale): string {
+  const copy = COPY[locale];
+  const number = entry.number.trim();
+  const qr = number && entry.qrCode
+    ? `<div class="call-card-qr"><img src="${escapeHtml(entry.qrCode)}" alt="${escapeHtml(copy.callQrAlt)}"></div>` : '';
+  const instruction = !number ? copy.callUnavailable
+    : entry.loading ? copy.callQrPreparing
+      : qr ? copy.callInstructions : copy.callQrUnavailable;
+  return `<section class="call-card${qr ? '' : ' call-card-text-only'}" aria-labelledby="call-card-title">
+    ${qr}<div class="call-card-content"><span>${escapeHtml(copy.callLabel)}</span><h2 id="call-card-title">${escapeHtml(copy.callTitle)}</h2>
+    <p>${escapeHtml(instruction)}</p>${number
+    ? `<a class="call-card-phone" href="tel:${escapeHtml(number)}" aria-label="${escapeHtml(copy.callNumberLabel)} ${escapeHtml(number)}">${escapeHtml(number)}</a>`
+    : ''}</div>
+  </section>`;
 }
 
 function renderCategories(state: TriviaState, context: TriviaViewContext): TriviaRenderedView {

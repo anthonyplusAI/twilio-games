@@ -176,6 +176,8 @@ Deepgram bills against the selected project's credits. Review its balance and **
 
 Voice Trivia is a no-AI, server-authoritative quiz with 1-4 caller capacity. Station matches assign 1-4 callers; the default standalone voice route creates a one-caller roster. Trivia is enabled in fresh settings, appears fifth in the default standalone order, and keeps stable station and Messaging option `5` even when games are disabled or reordered. Standalone uses <http://localhost:5173/trivia.html?display=1&room=4821> and same-origin `/trivia?display=1`; station launches use `/trivia.html` with the generated room plus `station`, `match`, and `launchGeneration` parameters, then authenticate the same `/trivia` WebSocket with the paired display capability.
 
+The standalone Trivia lobby shows a QR code for the configured locale's call number, plus a tappable number. Station launches use the separate station join QR instead.
+
 The caller flow is:
 
 1. Each caller joins through `/voice`. Standalone asks for a first name; station play reuses the registered first name unless it is missing.
@@ -193,11 +195,11 @@ The validated bank contains 200 questions, exactly 25 in each content category, 
 
 ### Voice Chess
 
-Voice Chess opens its 3D wizard board as soon as it is selected, without a setup menu. It is enabled by default, is stable station voting option `6`, and admits one caller against a computer opponent. The server randomly assigns the caller White or Black. The computer's default search settings aim for an approachable 800–1200 Elo feel; that is a playtest target, not a measured rating. The browser display is read-only; callers make moves through the phone. There is no Chess leaderboard.
+Voice Chess opens its 3D wizard board as soon as it is selected, without a setup menu. It is enabled by default, is stable station voting option `6`, and admits one caller against a computer opponent. The server randomly assigns the caller White or Black. The computer's default search settings aim for an approachable 800–1200 Elo feel; that is a playtest target, not a measured rating. The browser display lets viewers adjust the camera, while callers make moves through the phone. There is no Chess leaderboard.
 
-In standalone mode, select Voice Chess on the home page or open <http://localhost:5173/chess.html?display=1&room=4821>, keep that display open, and call the locale-specific Twilio number. At the opening, say `pawn from E two to E four` as White or `pawn from E seven to E five` as Black, or select a piece and then say its destination. The phone repeats the proposed move; say `confirm` to make it or `cancel` to discard it. Keypad `1`, `0`, and `9` also mean confirm, cancel, and help. The phone announces the computer's move, captures, checks, and the result. After a standalone game ends, say `play again` for another match.
+In standalone mode, select Voice Chess on the home page or open <http://localhost:5173/chess.html?display=1&room=4821>, keep that display open, and scan its call QR or use the linked locale-specific Twilio number. The call card leaves the board when a caller connects; station launches use the separate station join QR. At the opening, say `pawn from E two to E four` as White or `pawn from E seven to E five` as Black, or select a piece and then say its destination. The phone repeats the proposed move; say `confirm` to make it or `cancel` to discard it. Keypad `1`, `0`, and `9` also mean confirm, cancel, and help. The phone announces the computer's move, captures, checks, and the result. After a standalone game ends, say `play again` for another match.
 
-The display animates captures and plays the user-supplied *The Marble Gambit* music. If browser autoplay blocks the track, select **Play music** on the display. Station launches open `/chess.html` with the assigned room and paired display automatically; the station then proceeds to its next round after results.
+The display animates captures and plays the user-supplied *The Marble Gambit* music. Drag the board to rotate the camera, right-drag or use two fingers to pan, scroll or pinch to zoom, and double-click to reset the view. Camera gestures do not submit moves. If browser autoplay blocks the track, select **Play music** on the display. Station launches open `/chess.html` with the assigned room and paired display automatically; the station then proceeds to its next round after results.
 
 ### Current Station Model
 
