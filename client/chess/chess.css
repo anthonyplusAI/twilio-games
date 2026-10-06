@@ -1,0 +1,96 @@
+@font-face{font-family:"Twilio Sans Display";src:url('/fonts/TwilioSansDisplay-Extrabold.otf') format('opentype');font-weight:800;font-display:swap}
+@font-face{font-family:"Twilio Sans Text";src:url('/fonts/TwilioSansText-Regular.otf') format('opentype');font-weight:400;font-display:swap}
+@font-face{font-family:"Twilio Sans Text";src:url('/fonts/TwilioSansText-Bold.otf') format('opentype');font-weight:700;font-display:swap}
+@font-face{font-family:"Twilio Sans Mono";src:url('/fonts/TwilioSansMono-Regular.otf') format('opentype');font-display:swap}
+
+:root{color-scheme:dark;--chess-void:#030b1b;--chess-navy:#101d35;--chess-ruby:#ef3049;--chess-ivory:#f2e9d7;--chess-brass:#d1aa71;--chess-blue:#6cc1fa;--chess-muted:#a6b2c9}
+*{box-sizing:border-box}
+html,body{width:100%;height:100%;margin:0;overflow:hidden;background:var(--chess-void);color:var(--chess-ivory);font-family:"Twilio Sans Text",system-ui,sans-serif;font-synthesis:none}
+button,a{font:inherit}
+button:focus-visible,a:focus-visible{outline:2px solid var(--chess-ruby);outline-offset:4px}
+[hidden]{display:none!important}
+.visually-hidden{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
+.chess-app{position:fixed;inset:0;width:100%;height:100%;overflow:hidden;background:radial-gradient(circle at 50% 34%,#172847 0,#070f23 55%,#030817 100%)}
+.board-stage{position:absolute;inset:0;z-index:0}
+.board-stage canvas{display:block;width:100%;height:100%}
+.scene-vignette{position:absolute;inset:0;z-index:1;pointer-events:none;background:linear-gradient(180deg,rgba(3,9,25,.56) 0,transparent 19%,transparent 75%,rgba(2,7,20,.55) 100%),radial-gradient(ellipse at center,transparent 40%,rgba(2,6,16,.5) 100%)}
+.topbar{position:absolute;z-index:5;top:0;left:0;right:0;display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding:max(22px,env(safe-area-inset-top)) max(28px,env(safe-area-inset-right)) 16px max(28px,env(safe-area-inset-left));pointer-events:none}
+.topbar>*{pointer-events:auto}
+.game-brand{display:flex;align-items:center;gap:14px;min-width:0;text-shadow:0 2px 16px rgba(0,0,0,.6)}
+.game-brand img{width:40px;height:40px;flex:none;filter:drop-shadow(0 0 13px rgba(239,48,73,.25))}
+.brand-title{display:flex;flex-direction:column;gap:1px}
+.brand-title strong{font:800 clamp(24px,2.3vw,34px)/.97 "Twilio Sans Display",sans-serif;letter-spacing:-.035em;white-space:nowrap}
+.brand-title span{color:var(--chess-brass);font:12px/1.2 "Twilio Sans Mono",monospace;letter-spacing:.035em}
+.top-controls{display:flex;align-items:center;gap:8px}
+.connection-status{display:inline-flex;align-items:center;gap:8px;min-height:38px;padding:0 12px;margin-right:4px;border:1px solid rgba(214,226,248,.16);border-radius:3px;background:rgba(5,15,33,.73);color:#b8c8dd;font:11px/1 "Twilio Sans Mono",monospace;white-space:nowrap;backdrop-filter:blur(12px)}
+.connection-status i{display:block;width:7px;height:7px;border-radius:50%;background:#f6ac52;box-shadow:0 0 10px #f6ac52}
+.connection-status[data-state="connected"] i{background:#81e5c4;box-shadow:0 0 10px #81e5c4}
+.connection-status[data-state="reconnecting"] i{animation:connectionPulse 1s ease-in-out infinite}
+.connection-status[data-state="closed"] i{background:var(--chess-ruby);box-shadow:0 0 10px var(--chess-ruby)}
+.icon-button{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-width:38px;height:38px;padding:0 10px;border:1px solid rgba(214,226,248,.17);border-radius:3px;background:rgba(5,15,33,.76);color:#d7e4f4;text-decoration:none;cursor:pointer;backdrop-filter:blur(12px);transition:border-color .18s,background .18s,color .18s}
+.icon-button:hover{border-color:var(--chess-ruby);background:rgba(68,17,37,.9);color:#fff}
+.icon-button svg{display:block;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.music-button{min-width:93px;color:var(--chess-brass)}
+.music-button span{font:11px "Twilio Sans Mono",monospace;white-space:nowrap}
+.music-button[data-state="playing"]{border-color:rgba(209,170,113,.5);background:rgba(65,37,37,.74)}
+.music-button[data-state="blocked"]{border-color:rgba(239,48,73,.52);color:#ffd9de}
+.duel-labels{position:absolute;z-index:3;top:100px;left:5vw;right:5vw;display:flex;align-items:center;justify-content:space-between;gap:20px;pointer-events:none}
+.duel-label{display:inline-flex;align-items:center;gap:9px;padding:6px 0;color:#d6dfec;font:12px "Twilio Sans Mono",monospace;text-shadow:0 2px 8px #000}
+.computer-label{text-align:right}
+.label-marker{display:inline-block;width:6px;height:6px;transform:rotate(45deg);background:var(--chess-ruby);box-shadow:0 0 15px var(--chess-ruby)}
+.computer-label .label-marker{background:var(--chess-blue);box-shadow:0 0 15px var(--chess-blue)}
+.status-deck{position:absolute;z-index:5;left:max(28px,env(safe-area-inset-left));bottom:max(24px,env(safe-area-inset-bottom));width:min(350px,32vw);padding:19px 21px 17px;border:1px solid rgba(198,212,235,.17);border-left:3px solid var(--chess-ruby);border-radius:2px;background:linear-gradient(112deg,rgba(10,23,47,.94),rgba(6,14,32,.86));box-shadow:0 18px 50px rgba(0,0,0,.33),inset 0 1px rgba(255,255,255,.07);backdrop-filter:blur(18px)}
+.status-heading{display:flex;align-items:center;gap:9px;color:var(--chess-brass);font:11px "Twilio Sans Mono",monospace;letter-spacing:.04em}
+.turn-icon{font-size:17px;line-height:.7;color:var(--chess-ruby);text-shadow:0 0 16px var(--chess-ruby)}
+.status-deck h1{margin:9px 0 6px;font:800 clamp(28px,2.7vw,38px)/1.03 "Twilio Sans Display",sans-serif;letter-spacing:-.03em}
+.status-deck p{min-height:38px;margin:0;color:#d6e0ee;font-size:13px;line-height:1.45}
+.move-prompt{margin-top:13px;padding-top:12px;border-top:1px solid rgba(213,226,246,.14);color:#aebbd0;font:11px/1.45 "Twilio Sans Mono",monospace}
+.mobile-last{display:none}
+.move-note{position:absolute;z-index:5;right:max(28px,env(safe-area-inset-right));bottom:max(24px,env(safe-area-inset-bottom));width:min(265px,26vw);padding:17px 19px 15px;border:1px solid rgba(209,170,113,.21);border-top:2px solid rgba(209,170,113,.65);border-radius:2px;background:linear-gradient(135deg,rgba(7,17,36,.9),rgba(7,17,36,.74));box-shadow:0 18px 50px rgba(0,0,0,.28);backdrop-filter:blur(16px)}
+.move-note-label{color:var(--chess-brass);font:11px "Twilio Sans Mono",monospace}
+.move-note strong{display:block;margin:7px 0 4px;font:800 clamp(19px,1.7vw,25px)/1.1 "Twilio Sans Display",sans-serif}
+.move-note p{margin:0;color:#aebbd0;font-size:12px;line-height:1.4}
+.event-banner{position:absolute;z-index:6;top:24%;left:50%;width:max-content;max-width:90%;transform:translateX(-50%);pointer-events:none;color:#fff;font:800 clamp(26px,4vw,56px)/.92 "Twilio Sans Display",sans-serif;letter-spacing:-.02em;text-align:center;text-shadow:0 0 18px var(--chess-ruby),0 3px 32px rgba(0,0,0,.9);opacity:0}
+.event-banner.show{animation:eventCall 1.2s ease-out both}
+.result-overlay{position:absolute;z-index:8;inset:0;display:grid;place-items:center;padding:24px;background:radial-gradient(ellipse at center,rgba(6,14,29,.32),rgba(2,7,19,.84));pointer-events:none}
+.result-card{text-align:center;text-shadow:0 3px 24px #000;animation:resultEnter .6s cubic-bezier(.16,.8,.2,1) both}
+.result-mark{display:block;margin-bottom:5px;color:var(--chess-brass);font-size:35px;text-shadow:0 0 25px var(--chess-brass)}
+.result-card>span:not(.result-mark){display:block;color:var(--chess-brass);font:13px "Twilio Sans Mono",monospace;letter-spacing:.06em}
+.result-card strong{display:block;margin:10px 0;font:800 clamp(64px,11vw,150px)/.78 "Twilio Sans Display",sans-serif;letter-spacing:-.06em;text-transform:uppercase}
+.result-card p{margin:18px auto 0;max-width:38ch;color:#e6e1d6;font-size:clamp(14px,1.5vw,19px);line-height:1.4}
+.result-overlay[data-result="loss"] .result-card strong{color:#ff6376;text-shadow:0 0 38px rgba(239,48,73,.47),0 3px 24px #000}
+.result-overlay[data-result="win"] .result-card strong{color:#f7e3b8;text-shadow:0 0 45px rgba(255,201,110,.45),0 3px 24px #000}
+.result-overlay[data-result="draw"] .result-card strong{color:#d4e1f0}
+.fallback-board{position:absolute;z-index:3;top:112px;left:20px;right:20px;text-align:center}
+.fallback-explanation{max-width:42ch;text-align:center;color:#e4e1d6;font-size:13px}
+.fallback-explanation{margin:0 auto}
+.accessible-board{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+body[data-renderer="fallback"] .accessible-board{z-index:3;top:46%;left:50%;width:min(70vh,67vw,620px);height:min(70vh,67vw,620px);margin:0;overflow:visible;clip:auto;white-space:normal;transform:translate(-50%,-50%);border:10px solid #3c2934;border-collapse:collapse;table-layout:fixed;box-shadow:0 10px 35px #000}
+.accessible-board td{width:12.5%;height:12.5%;padding:0;text-align:center;vertical-align:middle;font-size:clamp(18px,4.6vw,43px);line-height:1}
+.accessible-board td.light{background:#d1c4ae;color:#18213b}
+.accessible-board td.dark{background:#33425d;color:#f9ead1}
+.accessible-board td.last{box-shadow:inset 0 0 0 4px #ef3049}
+body[data-renderer="fallback"] .board-stage{display:none}
+body[data-renderer="fallback"] .scene-vignette{display:none}
+
+@keyframes connectionPulse{50%{opacity:.25;box-shadow:0 0 3px #f6ac52}}
+@keyframes eventCall{0%{opacity:0;transform:translate(-50%,12px) scale(.88)}18%,62%{opacity:1;transform:translate(-50%,0) scale(1)}100%{opacity:0;transform:translate(-50%,-12px) scale(1.04)}}
+@keyframes resultEnter{from{opacity:0;transform:translateY(26px) scale(.9)}to{opacity:1;transform:translateY(0) scale(1)}}
+
+@media(max-width:1000px){.duel-labels{top:88px;left:30px;right:30px}.status-deck{width:290px}.move-note{width:230px}}
+@media(max-width:720px){
+  .topbar{padding:max(15px,env(safe-area-inset-top)) max(14px,env(safe-area-inset-right)) 10px max(14px,env(safe-area-inset-left));gap:8px}
+  .game-brand{gap:8px}.game-brand img{width:30px;height:30px}.brand-title strong{font-size:21px}.brand-title span{font-size:9px}
+  .top-controls{gap:5px}.icon-button{min-width:32px;width:32px;height:32px;padding:0}.icon-button svg{width:16px;height:16px}
+  .music-button{width:32px;min-width:32px}.music-button span,.connection-status{display:none}
+  .duel-labels{top:66px;left:15px;right:15px}.duel-label{font-size:9px;gap:5px}
+  .status-deck{left:max(12px,env(safe-area-inset-left));right:max(12px,env(safe-area-inset-right));bottom:max(10px,env(safe-area-inset-bottom));width:auto;padding:12px 14px 10px}
+  .status-heading{font-size:9px}.status-deck h1{margin:5px 0 3px;font-size:25px}.status-deck p{min-height:0;font-size:11px;line-height:1.3}
+  .move-prompt{margin-top:7px;padding-top:7px;font-size:9px;line-height:1.3}
+  .mobile-last{display:flex;gap:7px;align-items:baseline;margin-top:6px;color:#9facbf;font:9px "Twilio Sans Mono",monospace}
+  .mobile-last strong{color:var(--chess-ivory);font:700 10px "Twilio Sans Text",sans-serif}
+  .move-note{display:none}.event-banner{top:18%}.fallback-board{top:75px;left:12px;right:12px}
+  body[data-renderer="fallback"] .accessible-board{width:min(94vw,calc(100vh - 270px));height:min(94vw,calc(100vh - 270px));border-width:6px}
+}
+@media(max-height:640px) and (min-width:721px){.duel-labels{top:73px}.status-deck,.move-note{bottom:12px;padding-top:11px;padding-bottom:10px}.status-deck h1{font-size:26px}.status-deck p{min-height:0}.move-prompt{margin-top:7px;padding-top:7px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}

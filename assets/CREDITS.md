@@ -57,6 +57,20 @@ runtime calibration is derived timing metadata and does not change the rights pr
 The current target-note contours remain conservative and provisional; the calibrated timing file
 does not claim isolated-vocal pitch calibration.
 
+## Voice Chess music
+
+| Runtime file | Track | Source | Rights provenance |
+|---|---|---|---|
+| `client/public/audio/chess/the-marble-gambit.mp3` | The Marble Gambit | User-supplied `The_Marble_Gambit.mp3` | Distribution and reuse rights were not documented in this repository |
+
+## Voice Chess generated preview
+
+`client/public/video/vc-demo.mp4` is an original, silent home/station card preview captured
+locally on 2026-10-06 from this repository's procedural Voice Chess board and pieces. It shows
+the legal line `1. e4 d5 2. exd5 Qxd5 3. Nf3`, including both capture effects, with original
+voice-command captions. The runtime file is a six-second, fast-start H.264 1280x692 24fps MP4
+without an audio stream. No outside footage or music was used.
+
 ## Voice Trivia generated preview
 
 `client/public/video/vt-demo.mp4` is the generated, silent home/station preview for Voice Trivia. The

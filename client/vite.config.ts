@@ -79,6 +79,24 @@ export default defineConfig(({ mode }) => {
         '/game': { target: gameServer, ws: true, bypass: bypassNonWebSocket },
         '/battle': { target: gameServer, ws: true, bypass: bypassNonWebSocket },
         '/fighter': { target: gameServer, ws: true, bypass: bypassNonWebSocket },
+        '/chess': {
+          target: gameServer,
+          ws: true,
+          bypass: bypassNonWebSocket,
+          configure(proxy) {
+            proxy.on('proxyReqWs', (proxyRequest, request) => {
+              const origin = request.headers.origin;
+              const forwardedOrigin = forwardedGameServerOrigin(
+                origin,
+                request.headers.host,
+                expectedGameServerOrigin,
+              );
+              if (forwardedOrigin !== undefined && forwardedOrigin !== origin) {
+                proxyRequest.setHeader('origin', forwardedOrigin);
+              }
+            });
+          },
+        },
         '/karaoke': { target: gameServer, ws: true, bypass: bypassNonWebSocket },
         '/trivia': {
           target: gameServer,
@@ -119,6 +137,7 @@ export default defineConfig(({ mode }) => {
           fighter: resolve(__dirname, 'fighter.html'),              // Voice Fighter gameplay prototype
           karaoke: resolve(__dirname, 'karaoke.html'),              // Voice Karaoke
           trivia: resolve(__dirname, 'trivia.html'),                // Voice Trivia display
+          chess: resolve(__dirname, 'chess.html'),                  // Voice Chess display
           editor: resolve(__dirname, 'editor/index.html'),          // unified Level Editor (/editor)
           garage: resolve(__dirname, 'garage/index.html'),          // model viewer + configurator (/garage)
           analytics: resolve(__dirname, 'analytics/index.html'),    // private activation analytics (/analytics)

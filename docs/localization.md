@@ -1,6 +1,6 @@
 # Localization
 
-Twilio Games supports US English (`en-US`) and Brazilian Portuguese (`pt-BR`) across the home page, all five playable game displays, deterministic voice commands, Conversation Relay transcription, and spoken responses.
+Twilio Games supports US English (`en-US`) and Brazilian Portuguese (`pt-BR`) across the home page, all six playable game displays, deterministic voice commands, Conversation Relay transcription, and spoken responses.
 
 Station entry channels are also localized. English visitors may enter through configured SMS or WhatsApp channels. Portuguese visitors use WhatsApp rather than SMS, and the server rejects Portuguese SMS even if a visitor bypasses the chooser. Lead-capture mode offers localized browser registration to both locales as a visually secondary fallback; messaging remains the preferred path. A phone identity that selected Portuguese on WhatsApp cannot switch to SMS unless it explicitly selects English.
 
@@ -36,14 +36,15 @@ The selected locale drives the Conversation Relay `transcriptionLanguage`, `ttsL
 | Supported locales, fallback resolution, and Twilio language profiles | `shared/i18n/locales.ts` |
 | Translation, formatting, and Unicode command normalization | `shared/i18n/translate.ts` |
 | Shared navigation and music labels | `shared/i18n/common.ts` |
-| Home and five playable-game catalogs | `shared/i18n/home.ts`, `shared/i18n/racer.ts`, `shared/i18n/monsters.ts`, `shared/i18n/fighter.ts`, `shared/i18n/karaoke.ts`, and `shared/i18n/trivia.ts` |
+| Home and five catalog-backed game displays | `shared/i18n/home.ts`, `shared/i18n/racer.ts`, `shared/i18n/monsters.ts`, `shared/i18n/fighter.ts`, `shared/i18n/karaoke.ts`, and `shared/i18n/trivia.ts` |
 | Browser locale persistence and picker | `client/i18n.ts` |
-| Locale-specific lobby number and QR updates | `client/station-client.ts` and the five game entry points |
+| Locale-specific lobby number and QR updates | `client/station-client.ts` and the six game entry points |
 | Dialed-number, station, standalone-display, room, and locale routing | `server/http-server.ts` and `server/arcade-api.ts` |
 | Conversation Relay language attributes and custom parameters | `server/twiml.ts` |
 | Trivia display copy and category labels/aliases | `client/trivia/trivia-view.ts` and `shared/i18n/trivia.ts` |
 | Trivia question schema, localized answer matching, and safe client projection | `shared/trivia.ts` |
 | Trivia protected content editor and persistent store | `client/editor/trivia-question-editor.ts` and `server/trivia-content-store.ts` |
+| Chess display copy and spoken move description | `client/chess/chess.ts` and `shared/chess-intent.ts` |
 
 ## Command And Number Parsers
 
@@ -60,6 +61,7 @@ Commands remain locale-neutral after parsing. For example, `left` and `esquerda`
 | Fighter roster/map selection numbers, ordinals, names, and aliases | `server/fighter-voice.ts` |
 | Karaoke setup and song-selection commands | `server/karaoke-voice.ts` |
 | Trivia category votes, answer letters/numbers/text, and private aliases | `server/trivia-voice.ts` and `shared/trivia.ts` |
+| Chess piece and square selection, move confirmation, and help | `shared/chess-intent.ts` and `server/chess-voice.ts` |
 
 Content IDs also remain stable. Arena, fighter, monster, move, car, track, song, Trivia question, category, and choice names are translated for display and speech without changing IDs or persisted English keys such as `cyberpunk-city` and `Silver Lake`. Voice selection accepts supported localized aliases, canonical names, and selection numbers according to the parser responsible for that game phase.
 

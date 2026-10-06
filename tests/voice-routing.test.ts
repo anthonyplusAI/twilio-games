@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
 import type { ArcadeApi } from '../server/arcade-api';
+import type { StationMatchParticipantsChangedHandler } from '../server/arcade-station-runtime';
+import { GoogleAnalyticsAuth } from '../server/google-analytics-auth';
 import {
   HttpServer,
   karaokeBrowserTestingAllowed,
@@ -38,7 +40,10 @@ async function harness(options: {
   voiceAvailable?: boolean;
   authToken?: string;
   additionalAuthTokens?: readonly string[];
+  analyticsAuth?: GoogleAnalyticsAuth;
   standaloneGameEnabled?: boolean;
+  stationRoomCode?: string;
+  stationPhase?: 'LAUNCHING' | 'PLAYING' | null;
 }) {
   directory = await mkdtemp(path.join(tmpdir(), 'voice-routing-'));
   const stationVoiceRoute = vi.fn(async () => {
@@ -47,18 +52,36 @@ async function harness(options: {
   });
   const voiceLocaleForNumber = vi.fn(() => options.locale ?? 'en-US');
   let activeCheck = 0;
+  const stationEngineStarted = vi.fn();
+  const stationEngineCompleted = vi.fn();
+  const stationEngineAbandoned = vi.fn();
+  let stationParticipantCountHandler: StationMatchParticipantsChangedHandler | null = null;
   const arcadeApi = {
     start: vi.fn(async () => undefined),
     stop: vi.fn(async () => undefined),
     activateMessagingDelivery: vi.fn(async () => undefined),
     getHealthStatus: vi.fn(() => ({ degraded: false })),
-    isStationEngineRoom: vi.fn(() => false),
+    isStationEngineRoom: vi.fn((code: string) => code === options.stationRoomCode),
+    stationEnginePhase: vi.fn((game: string, code: string) => game === 'chess' && code === options.stationRoomCode
+      ? options.stationPhase === undefined ? 'PLAYING' : options.stationPhase : null),
     requiresStationVoiceAssignment: vi.fn(() => {
       const checks = options.activeChecks;
       return checks?.[Math.min(activeCheck++, checks.length - 1)] ?? options.active;
     }),
     voiceLocaleForNumber,
     stationVoiceRoute,
+    resolveStationVoiceSetup: vi.fn(async () => options.stationRoomCode
+      ? { firstName: 'Ada', terminal: false, participantIndex: 0, participantCount: 1 } : null),
+    stationVoiceParticipantConnected: vi.fn(),
+    stationVoiceParticipantDisconnected: vi.fn(),
+    stationVoiceSetupActivity: vi.fn(),
+    stationVoiceCallEnded: vi.fn(),
+    stationEngineStarted,
+    stationEngineCompleted,
+    stationEngineAbandoned,
+    setStationParticipantCountHandler: vi.fn((handler: StationMatchParticipantsChangedHandler) => {
+      stationParticipantCountHandler = handler;
+    }),
     standaloneVoiceAvailable:vi.fn(()=>options.voiceAvailable??true),
     standaloneGameEnabled:vi.fn(()=>options.standaloneGameEnabled ?? true),
   } as unknown as ArcadeApi;
@@ -68,6 +91,7 @@ async function harness(options: {
     authToken: options.authToken,
     additionalAuthTokens: options.additionalAuthTokens,
     validateSignatures: Boolean(options.authToken),
+    analyticsAuth: options.analyticsAuth,
     arcadeApi,
     standaloneVoiceEnabled: options.standaloneVoiceEnabled ?? false,
     fighterDisplayToken: DISPLAY_TOKEN,
@@ -81,7 +105,12 @@ async function harness(options: {
     clientDir: path.join(directory, 'client'),
   });
   const port = await server.start();
-  return { port, stationVoiceRoute, voiceLocaleForNumber };
+  const reconcileStationParticipants = (...args: Parameters<StationMatchParticipantsChangedHandler>) => {
+    if (!stationParticipantCountHandler) throw new Error('station participant handler was not registered');
+    stationParticipantCountHandler(...args);
+  };
+  return { port, stationVoiceRoute, voiceLocaleForNumber, stationEngineStarted,
+    stationEngineCompleted, stationEngineAbandoned, reconcileStationParticipants };
 }
 
 async function incomingCall(port: number, input: {
@@ -102,6 +131,75 @@ async function incomingCall(port: number, input: {
       CallSid: input.callSid ?? 'CA-voice-routing',
     }),
   });
+}
+
+async function connectAuthenticatedChessDisplay(port: number, roomCode: string) {
+  const display = new WebSocket(`ws://127.0.0.1:${port}/chess?display=1`, {
+    headers: { Origin: 'http://localhost' },
+  });
+  const states: Array<Record<string, any>> = [];
+  display.on('message', data => {
+    const frame = JSON.parse(data.toString()) as Record<string, any>;
+    if (frame.type === 'chess_state' && frame.roomCode === roomCode) states.push(frame);
+  });
+  await new Promise<void>((resolve, reject) => {
+    display.once('open', resolve);
+    display.once('error', reject);
+  });
+  display.send(JSON.stringify({ type: 'display_auth', roomCode, token: DISPLAY_TOKEN }));
+  display.send(JSON.stringify({ type: 'spectate', roomCode }));
+  await vi.waitFor(() => expect(states.length).toBeGreaterThan(0), { timeout: 2_000 });
+  return { display, states };
+}
+
+async function connectChessVoice(port: number, callSid: string, customParameters: Record<string, string | number>) {
+  const voice = new WebSocket(`ws://127.0.0.1:${port}/voice`);
+  const spoken: string[] = [];
+  voice.on('message', data => {
+    const message = JSON.parse(data.toString()) as { type: string; token?: string };
+    if (message.type !== 'text') return;
+    spoken.push(message.token ?? '');
+    if (voice.readyState === WebSocket.OPEN) {
+      voice.send(JSON.stringify({ type: 'info', name: 'tokensPlayed', value: message.token }));
+    }
+  });
+  await new Promise<void>((resolve, reject) => {
+    voice.once('open', resolve);
+    voice.once('error', reject);
+  });
+  voice.send(JSON.stringify({ type: 'setup', callSid, customParameters }));
+  return { voice, spoken };
+}
+
+async function connectStationChessVoice(port: number, roomCode: string, callSid: string) {
+  expect(await (await incomingCall(port, { callSid })).text()).toContain('<Parameter name="game" value="chess"');
+  return connectChessVoice(port, callSid, { game: 'chess', roomCode, readyEntryId: 'ready-chess',
+    matchId: 'match-chess', launchGeneration: 2, locale: 'en-US' });
+}
+
+async function connectStationChessCall(port: number, roomCode: string, callSid: string) {
+  const { display, states } = await connectAuthenticatedChessDisplay(port, roomCode);
+  const { voice, spoken } = await connectStationChessVoice(port, roomCode, callSid);
+  return { display, states, voice, spoken };
+}
+
+async function persistedChessSessions(): Promise<{ sessions: number; completed: number; abandoned: number }> {
+  if (!directory) throw new Error('test directory was not created');
+  const persisted = JSON.parse(await readFile(path.join(directory, 'analytics.json'), 'utf8')) as {
+    days: Record<string, { games: { chess: { sessions: number; completed: number; abandoned: number } } }>;
+  };
+  return Object.values(persisted.days).reduce((total, day) => ({
+    sessions: total.sessions + day.games.chess.sessions,
+    completed: total.completed + day.games.chess.completed,
+    abandoned: total.abandoned + day.games.chess.abandoned,
+  }), { sessions: 0, completed: 0, abandoned: 0 });
+}
+
+function stationChessRoute(roomCode: string): NonNullable<StationVoiceRoute> {
+  return {
+    game: 'chess', roomCode, matchId: 'match-chess', launchGeneration: 2,
+    admitted: true, readyEntryId: 'ready-chess', participantIndex: 0, participantCount: 1,
+  };
 }
 
 describe('Arcade Voice routing', () => {
@@ -242,6 +340,231 @@ describe('Arcade Voice routing', () => {
     expect(xml).toContain('<Parameter name="game" value="karaoke"');
     spectator.close();
     display.close();
+  });
+
+  it('routes a standalone call to the active Voice Chess display', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const display = new WebSocket(`ws://127.0.0.1:${port}/chess?display=1`, {
+      headers: { Origin: 'http://localhost' },
+    });
+    await new Promise<void>((resolve, reject) => {
+      display.once('open', resolve);
+      display.once('error', reject);
+    });
+    display.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    const xml = await (await incomingCall(port)).text();
+    expect(xml).toContain('<Parameter name="game" value="chess"');
+    display.close();
+  });
+
+  it('binds a validated station Chess caller before its display connects', async () => {
+    const roomCode = 'STATION-CHESS-EARLY';
+    const callSid = 'CA-station-chess-early';
+    const { port } = await harness({
+      active: true, stationRoomCode: roomCode, stationPhase: 'LAUNCHING', route: stationChessRoute(roomCode),
+    });
+    const { voice, spoken } = await connectStationChessVoice(port, roomCode, callSid);
+    await vi.waitFor(() => expect(spoken.join(' ')).toContain('Welcome to Voice Chess'), { timeout: 2_000 });
+
+    const { display, states } = await connectAuthenticatedChessDisplay(port, roomCode);
+    expect(states.at(-1)?.playerConnected).toBe(true);
+    voice.close();
+    display.close();
+  });
+
+  it('still requires an authenticated display for a nonstation Chess caller in a nondefault room', async () => {
+    const roomCode = 'NONSTATION-CHESS';
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const { voice, spoken } = await connectChessVoice(port, 'CA-nonstation-chess', {
+      game: 'chess', roomCode, locale: 'en-US',
+    });
+    await vi.waitFor(() => expect(spoken.join(' ')).toContain('Another caller already commands this chess board'),
+      { timeout: 2_000 });
+
+    const { display, states } = await connectAuthenticatedChessDisplay(port, roomCode);
+    expect(states.at(-1)?.playerConnected).toBe(false);
+    const admitted = await connectChessVoice(port, 'CA-nonstation-chess-admitted', {
+      game: 'chess', roomCode, locale: 'en-US',
+    });
+    await vi.waitFor(() => expect(admitted.spoken.join(' ')).toContain('Welcome to Voice Chess'),
+      { timeout: 2_000 });
+    await vi.waitFor(() => expect(states.at(-1)?.playerConnected).toBe(true), { timeout: 2_000 });
+    voice.close();
+    admitted.voice.close();
+    display.close();
+  });
+
+  it('plays Voice Chess from final phone prompts and resumes the same call without restarting', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const display = new WebSocket(`ws://127.0.0.1:${port}/chess?display=1`, {
+      headers: { Origin: 'http://localhost' },
+    });
+    const boardFrames: Array<Record<string, any>> = [];
+    display.on('message', data => boardFrames.push(JSON.parse(data.toString())));
+    await new Promise<void>((resolve, reject) => {
+      display.once('open', resolve);
+      display.once('error', reject);
+    });
+    display.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+
+    const connectVoice = async () => {
+      const voice = new WebSocket(`ws://127.0.0.1:${port}/voice`);
+      const spoken: string[] = [];
+      voice.on('message', data => {
+        const message = JSON.parse(data.toString()) as { type: string; token?: string; text?: string };
+        if (message.type !== 'text') return;
+        spoken.push(message.token ?? '');
+        voice.send(JSON.stringify({ type: 'info', name: 'tokensPlayed', value: message.token }));
+      });
+      await new Promise<void>((resolve, reject) => {
+        voice.once('open', resolve);
+        voice.once('error', reject);
+      });
+      voice.send(JSON.stringify({ type: 'setup', callSid: 'CA-chess-integration',
+        customParameters: { game: 'chess', roomCode: '4821', locale: 'en-US' } }));
+      return { voice, spoken };
+    };
+    const waitForBoard = async (predicate: (frame: Record<string, any>) => boolean) => {
+      await vi.waitFor(() => expect(boardFrames.some(predicate)).toBe(true), { timeout: 4_000 });
+      return boardFrames.find(predicate)!;
+    };
+    try {
+      const first = await connectVoice();
+      await vi.waitFor(() => expect(first.spoken.join(' ')).toMatch(/Welcome to Voice Chess/), { timeout: 2_000 });
+      const start = await waitForBoard(frame => frame.type === 'chess_state' && frame.playerConnected === true);
+      const originalPly = start.ply as number;
+      const move = start.humanColor === 'w' ? 'pawn from E two to E four' : 'pawn from E seven to E five';
+
+      first.voice.send(JSON.stringify({ type: 'prompt', voicePrompt: move, last: false }));
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(boardFrames.some(frame => frame.type === 'chess_state' && frame.phase === 'pending')).toBe(false);
+      first.voice.send(JSON.stringify({ type: 'prompt', voicePrompt: move, last: true }));
+      await waitForBoard(frame => frame.type === 'chess_state' && frame.phase === 'pending');
+      expect(boardFrames.some(frame => frame.type === 'chess_events'
+        && frame.events.some((event: { type: string; move?: { actor: string } }) => event.type === 'move'
+          && event.move?.actor === 'human'))).toBe(false);
+
+      first.voice.send(JSON.stringify({ type: 'prompt', voicePrompt: 'confirm', last: true }));
+      await waitForBoard(frame => frame.type === 'chess_state'
+        && frame.lastMove?.actor === 'human' && frame.ply === originalPly + 1);
+      await waitForBoard(frame => frame.type === 'chess_events'
+        && frame.events.some((event: { type: string; move?: { actor: string } }) => event.type === 'move'
+          && event.move?.actor === 'computer'));
+      await vi.waitFor(() => expect(first.spoken.join(' ')).toMatch(/rival|captures|moves/i), { timeout: 2_000 });
+
+      first.voice.close();
+      await new Promise<void>(resolve => first.voice.once('close', () => resolve()));
+      const plyAfterFirstCall = (await waitForBoard(frame => frame.type === 'chess_state'
+        && frame.playerConnected === false)).ply;
+      const resumed = await connectVoice();
+      await vi.waitFor(() => expect(resumed.spoken.join(' ')).toMatch(/Welcome back to Voice Chess/), { timeout: 2_000 });
+      const resumedState = await waitForBoard(frame => frame.type === 'chess_state'
+        && frame.playerConnected === true && frame.ply === plyAfterFirstCall);
+      expect(resumedState.ply).toBe(plyAfterFirstCall);
+      resumed.voice.close();
+    } finally {
+      display.close();
+    }
+  });
+
+  it('abandons an unfinished station Chess match when its call ends', async () => {
+    const roomCode = 'STATION-CHESS';
+    const callSid = 'CA-station-chess';
+    const { port, stationEngineStarted, stationEngineAbandoned } = await harness({
+      active: true, stationRoomCode: roomCode, stationPhase: 'PLAYING', route: stationChessRoute(roomCode),
+    });
+    const { display, voice } = await connectStationChessCall(port, roomCode, callSid);
+    await vi.waitFor(() => expect(stationEngineStarted).toHaveBeenCalledWith('chess', roomCode), { timeout: 2_000 });
+
+    const ended = await fetch(`http://127.0.0.1:${port}/voice/session-ended`, {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ CallSid: callSid, SessionStatus: 'completed', CallStatus: 'completed' }),
+    });
+    expect(ended.status).toBe(200);
+    await vi.waitFor(() => expect(stationEngineAbandoned).toHaveBeenCalledWith('chess', roomCode), { timeout: 2_000 });
+    expect(stationEngineAbandoned).toHaveBeenCalledTimes(1);
+    voice.close();
+    display.close();
+  });
+
+  it('keeps a launching station Chess match available for a replacement caller', async () => {
+    const roomCode = 'STATION-CHESS-REPLACE';
+    const callSid = 'CA-station-chess-original';
+    const { port, stationEngineStarted, stationEngineCompleted, stationEngineAbandoned } = await harness({
+      active: true, stationRoomCode: roomCode, stationPhase: 'LAUNCHING', route: stationChessRoute(roomCode),
+    });
+    const { display, states, voice } = await connectStationChessCall(port, roomCode, callSid);
+    await vi.waitFor(() => expect(stationEngineStarted).toHaveBeenCalledWith('chess', roomCode), { timeout: 2_000 });
+
+    const ended = await fetch(`http://127.0.0.1:${port}/voice/session-ended`, {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ CallSid: callSid, SessionStatus: 'completed', CallStatus: 'completed' }),
+    });
+    expect(ended.status).toBe(200);
+    await vi.waitFor(() => expect(states.at(-1)?.playerConnected).toBe(false), { timeout: 2_000 });
+    expect(stationEngineAbandoned).not.toHaveBeenCalled();
+    expect(stationEngineCompleted).not.toHaveBeenCalled();
+
+    const replacement = await connectStationChessVoice(port, roomCode, 'CA-station-chess-replacement');
+    await vi.waitFor(() => expect(replacement.spoken.join(' ')).toContain('Welcome to Voice Chess'),
+      { timeout: 2_000 });
+    await vi.waitFor(() => expect(states.at(-1)?.playerConnected).toBe(true), { timeout: 2_000 });
+    expect(stationEngineAbandoned).not.toHaveBeenCalled();
+    expect(stationEngineCompleted).not.toHaveBeenCalled();
+    voice.close();
+    replacement.voice.close();
+    display.close();
+  });
+
+  it('records one abandoned Chess session when station reconciliation removes its caller', async () => {
+    const roomCode = 'STATION-CHESS-ROSTER';
+    const callSid = 'CA-station-chess-roster';
+    const analyticsAuth = new GoogleAnalyticsAuth({
+      redirectUri: 'http://localhost/auth/google/callback', adminPin: 'Chess!Roster#2026',
+    });
+    const cookie = analyticsAuth.issueSession('reporter@twilio.com').split(';')[0]!;
+    const { port, stationEngineStarted, stationEngineCompleted, stationEngineAbandoned,
+      reconcileStationParticipants } = await harness({
+      active: true, stationRoomCode: roomCode, stationPhase: 'LAUNCHING',
+      route: stationChessRoute(roomCode), analyticsAuth,
+    });
+    await connectStationChessCall(port, roomCode, callSid);
+    await vi.waitFor(() => expect(stationEngineStarted).toHaveBeenCalledWith('chess', roomCode), { timeout: 2_000 });
+
+    reconcileStationParticipants('chess', roomCode, 0, [], []);
+    reconcileStationParticipants('chess', roomCode, 0, [], []);
+    expect(stationEngineCompleted).not.toHaveBeenCalled();
+    expect(stationEngineAbandoned).not.toHaveBeenCalled();
+    const report = await fetch(`http://127.0.0.1:${port}/api/analytics?game=chess`, {
+      headers: { cookie },
+    });
+    expect(report.status).toBe(200);
+    expect((await report.json()).summary).toMatchObject({ sessions: 1, completed: 0, abandoned: 1 });
+
+    const ended = await fetch(`http://127.0.0.1:${port}/voice/session-ended`, {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ CallSid: callSid, SessionStatus: 'completed', CallStatus: 'completed' }),
+    });
+    expect(ended.status).toBe(200);
+    await server!.stop(); server = undefined;
+    expect(await persistedChessSessions()).toEqual({ sessions: 1, completed: 0, abandoned: 1 });
+    expect(stationEngineCompleted).not.toHaveBeenCalled();
+    expect(stationEngineAbandoned).not.toHaveBeenCalled();
+  });
+
+  it('persists an active Chess session as abandoned when the server stops', async () => {
+    const roomCode = 'STATION-CHESS-SHUTDOWN';
+    const callSid = 'CA-station-chess-shutdown';
+    const { port, stationEngineStarted } = await harness({
+      active: true, stationRoomCode: roomCode, route: stationChessRoute(roomCode),
+    });
+    await connectStationChessCall(port, roomCode, callSid);
+    await vi.waitFor(() => expect(stationEngineStarted).toHaveBeenCalledWith('chess', roomCode), { timeout: 2_000 });
+
+    await server!.stop(); server = undefined;
+    expect(await persistedChessSessions()).toEqual({ sessions: 1, completed: 0, abandoned: 1 });
   });
 
   it('never promotes an authenticated station Trivia display to standalone recency after pause', async () => {

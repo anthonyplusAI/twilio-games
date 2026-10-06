@@ -16,13 +16,13 @@
 > Phone CTA when configured. Those games reported factual authoritative results, and staff could reset
 > the Racer leaderboard for one selected map.
 >
-> **Current implementation delta (2026-08-29):** The canonical registry contains five playable games.
+> **Current implementation delta (2026-10-06):** The canonical registry contains six playable games.
 > Racer, Monsters, and Fighter each admit up to two humans; Karaoke admits one; Trivia admits one to
-> four. Karaoke and Trivia have no AI fallback. All five participate in station voting, automatic
+> four; Chess admits one against the computer. All six participate in station voting, automatic
 > selection, launch routing, one-coin-per-human validation, localized factual results, and analytics.
 > Voice Trivia runs localized eight-question rounds from a protected 200-question `en-US`/`pt-BR`
-> bank and persists normalized all-time/category leaderboards. Authenticated staff can reset Racer map,
-> Karaoke song, and Trivia board records.
+> bank and persists normalized all-time/category leaderboards. Chess has no leaderboard. Authenticated
+> staff can reset Racer map, Karaoke song, and Trivia board records.
 
 **Original plan date:** 2026-07-20
 **Status:** Product-direction roadmap and decision history; implementation checkpoints below are historical and incomplete
@@ -886,10 +886,10 @@ Post-game wallet: 0
 
 ## 13. Post-Game Delivery
 
-The implemented station completion notification uses normalized authoritative results from all five
+The implemented station completion notification uses normalized authoritative results from all six
 playable games. It sends factual per-player outcomes over configured SMS and/or WhatsApp, including
 Racer place and time, Monsters/Fighter win or loss, Karaoke score, and Trivia rank plus normalized
-score when supplied by the engine.
+score when supplied by the engine, and Chess win, loss, or draw.
 `includeCoinBalance` optionally adds the authoritative available wallet balance. Enabled delivery
 requires at least one selected channel, and every selected channel must also be enabled globally.
 

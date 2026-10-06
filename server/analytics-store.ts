@@ -192,6 +192,6 @@ function insights(summary: AnalyticsGameMetrics, games: Record<AnalyticsGame, An
 }
 const GAME_LABELS: Readonly<Record<AnalyticsGame, string>> = {
   racer: 'Voice Racer', monsters: 'Voice Monsters', fighter: 'Voice Fighter', karaoke: 'Voice Karaoke',
-  trivia: 'Voice Trivia',
+  trivia: 'Voice Trivia', chess: 'Voice Chess',
 };
 function label(game: AnalyticsGame): string { return GAME_LABELS[game]; }

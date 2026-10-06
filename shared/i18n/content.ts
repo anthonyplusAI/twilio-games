@@ -9,6 +9,7 @@ const GAME_TITLES: Record<GameId, Record<SupportedLocale, string>> = {
   fighter: { 'en-US': 'Voice Fighter', 'pt-BR': 'Luta por Voz' },
   trivia: { 'en-US': 'Voice Trivia', 'pt-BR': 'Quiz por Voz' },
   karaoke: { 'en-US': 'Voice Karaoke', 'pt-BR': 'Karaokê por Voz' },
+  chess: { 'en-US': 'Voice Chess', 'pt-BR': 'Xadrez por Voz' },
 };
 
 const CAR_NAMES: Record<string, string> = {

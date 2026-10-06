@@ -1,6 +1,6 @@
 # Deployment
 
-Twilio Games deploys five playable titles, Voice Racer, Voice Monsters, Voice Fighter, Voice Karaoke, and Voice Trivia, to one Azure Container App. The Node process serves the built browser clients, APIs, static assets, Twilio webhooks, game WebSockets, and Karaoke Media Streams.
+Twilio Games deploys six playable titles, Voice Racer, Voice Monsters, Voice Fighter, Voice Karaoke, Voice Trivia, and Voice Chess, to one Azure Container App. The Node process serves the built browser clients, APIs, static assets, Twilio webhooks, game WebSockets, and Karaoke Media Streams.
 
 For project setup and local development, see the [README](../README.md). For the one-time Azure and GitHub setup, see [Infrastructure setup](./INFRA_SETUP.md).
 
@@ -33,7 +33,7 @@ flowchart LR
 8. The workflow renders `.github/containerapp.yaml` with a unique `sha-<short-sha>-r<run-id>-a<attempt>` revision suffix. An existing app may be in `Single` or `Multiple` mode, but it must have exactly one active revision. The workflow switches to `Multiple` when needed, pins traffic to the old revision, deactivates it, and waits for zero replicas before updating. It also accepts a stopped, zero-running-replica first-deployment retry; every other topology fails closed.
 9. A first deployment creates the minimal Azure-resource-tagged app required by tenant policy with external ingress and `minReplicas=0`, records its temporary revision, immediately switches to Multiple mode, deactivates it, and waits for zero replicas before setting secrets or applying the full specification. Because external ingress exists before deactivation, do not treat the temporary shell as a traffic-isolation boundary.
 10. Before committing the rollout, the workflow requires the exact uniquely named revision to use `twilio-games:<commit-sha>`, be active with one replica, be `Provisioned` and `Healthy`, equal `latestReadyRevisionName`, include the `appdata` Azure Files mount, and include all three health probes. It also asserts that no other revision has a running replica.
-11. Before public cutover, the candidate revision FQDN must return HTTP 200 for `/livez`, `/healthz`, `/`, `/instructions`, `/join`, `/player`, `/karaoke.html`, `/trivia.html`, and `/analytics`, plus the expected HTTP 302 authentication redirect for `/operator`. The route set is retried for up to five minutes. The workflow then assigns 100% public traffic and requires exact `Single` mode around the verified revision.
+11. Before public cutover, the candidate revision FQDN must return HTTP 200 for `/livez`, `/healthz`, `/`, `/instructions`, `/join`, `/player`, `/karaoke.html`, `/trivia.html`, `/chess.html`, and `/analytics`, plus the expected HTTP 302 authentication redirect for `/operator`. The route set is retried for up to five minutes. The workflow then assigns 100% public traffic and requires exact `Single` mode around the verified revision.
 12. Before the candidate can produce external or public durable side effects, a failed rollout may stop it, restore the byte-verified pre-rollout Azure Files snapshot, reactivate the prior revision, pin 100% traffic to it, and deliberately leave recovery in `Multiple` mode. If outbound delivery is enabled, restore becomes unsafe before the candidate update because its worker may call Twilio immediately. Once restore is unsafe, automatic rollback is disabled and the workflow leaves data and revision state intact for manual recovery rather than erasing accepted registrations/webhooks or duplicating messages. A failed first deployment has no prior revision to restore and remains stopped.
 
 The Container App specification uses process-only `/livez` for Azure startup, readiness, and liveness probes. The workflow separately calls dependency-aware `/healthz` on the candidate revision before public cutover.
@@ -89,7 +89,7 @@ These default paths persist:
 |---|---|---|
 | `data/leaderboard.json` | Racer leaderboard | Created on the first completed race |
 | `data/karaoke-leaderboard.json` | Per-song Voice Karaoke leaderboard | Created on the first completed Karaoke performance |
-| `data/analytics.json` | Anonymous daily activation rollups for all five games | Created when the first match or accepted voice command is recorded; the 730-day age cutoff can retain 731 inclusive UTC date buckets |
+| `data/analytics.json` | Anonymous daily activation rollups for all six games | Created when the first match or accepted voice command is recorded; the 730-day age cutoff can retain 731 inclusive UTC date buckets |
 | `data/maps.json` | Live Racer level catalog | Seeded from `assets/maps/maps.json` when missing, blank, or corrupt; a valid live file is not overwritten |
 | `data/arena.json` | Live Voice Monsters arena configuration | Read from the bundled `assets/arena/arena.json` fallback until the editor first saves a live copy |
 | `data/fighter-maps.json` | Live Fighter map catalog | Seeded from `assets/fighters/maps/maps.json` when the live catalog cannot be parsed |
@@ -174,6 +174,7 @@ Replace `<base>` with `https://<app-fqdn>`.
 | Standalone Voice Fighter shared display | `<base>/fighter.html?display=1&room=4821` |
 | Standalone Voice Karaoke shared display | `<base>/karaoke.html?display=1&room=4821` with the event paused and Karaoke enabled; no display pairing is required |
 | Standalone Voice Trivia shared display | `<base>/trivia.html?display=1&room=4821` with the event paused and Trivia enabled; callers only, with no browser-player admission or display pairing |
+| Standalone Voice Chess shared display | `<base>/chess.html?display=1&room=4821` with the event paused and Chess enabled; one caller against the computer, with no browser moves or display pairing |
 | Voice Karaoke local keyboard acceptance | Open `http://localhost:5173/karaoke.html`, press hidden `P`, then use mouse/keyboard controls; public and production origins reject browser singers |
 | Standalone Voice Racer browser player | `<base>/play.html?room=4821&name=Ada` |
 | Challenge portal | `<base>/challenge/` with the signed 15-minute token in the URL fragment; messaging supplies the complete link |
@@ -195,9 +196,9 @@ Replace `<base>` with `https://<app-fqdn>`.
 
 Room `4821` belongs only to standalone play. Station launches use the selected game's route with a generated 12-character room code, match ID, and launch generation from the authenticated display projection; operators should not construct station launch URLs manually.
 
-The Fighter browser page is `/fighter.html`; `/fighter` is the Fighter WebSocket upgrade endpoint and is not an HTTP page. Voice Karaoke and Voice Trivia follow the same split with `/karaoke.html` plus `/karaoke`, and `/trivia.html` plus `/trivia`. Browser URLs do not accept `hostToken` or display credentials. Only station-managed launches inherit the booth access installed from `/operator`; standalone displays do not pair. `FIGHTER_DISPLAY_TOKEN` remains only a server-side override for custom standalone integrations.
+The Fighter browser page is `/fighter.html`; `/fighter` is the Fighter WebSocket upgrade endpoint and is not an HTTP page. Voice Karaoke, Voice Trivia, and Voice Chess follow the same split with `/karaoke.html` plus `/karaoke`, `/trivia.html` plus `/trivia`, and `/chess.html` plus `/chess`. Browser URLs do not accept `hostToken` or display credentials. Only station-managed launches inherit the booth access installed from `/operator`; standalone displays do not pair. `FIGHTER_DISPLAY_TOKEN` remains only a server-side override for custom standalone integrations.
 
-WebSocket endpoints are `/game`, `/battle`, `/fighter`, `/karaoke`, `/trivia`, `/karaoke-media`, and `/voice`. `/trivia` accepts same-origin display upgrades and is not an HTTP smoke target. `/karaoke-media` accepts only signed, query-free Twilio upgrades and one-use call-bound attempt tokens. The same Node server also serves `/api/*`, `/assets/*`, `/fighter-previews/*`, `/brand/*`, and `/fonts/*`.
+WebSocket endpoints are `/game`, `/battle`, `/fighter`, `/karaoke`, `/trivia`, `/chess`, `/karaoke-media`, and `/voice`. `/trivia` and `/chess` accept same-origin display upgrades and are not HTTP smoke targets. `/karaoke-media` accepts only signed, query-free Twilio upgrades and one-use call-bound attempt tokens. The same Node server also serves `/api/*`, `/assets/*`, `/fighter-previews/*`, `/audio/*`, `/video/*`, `/brand/*`, and `/fonts/*`. The six home-card gameplay previews, including Chess, are bundled with the built client.
 
 ### Trivia content and leaderboard security
 
@@ -229,13 +230,13 @@ The operator console distinguishes inbound SMS/WhatsApp onboarding from proactiv
 
 Inactive anonymous messaging players and incomplete drafts become cleanup candidates after 30 days. Each inbound transaction prunes at most 100 oldest candidates. Cleanup is fail-closed: it retains completed lead profiles, CRM/conversation profiles, marketing consent, any wallet balance or economic history, queue or station history, ready/match state, non-messaging idempotency dependencies, and outbound notifications. Inbound receipts tied only to a deleted anonymous identity are deleted with it. Effective outbound delivery requires the literal kill switch, valid REST credentials, an enabled runtime channel, and its configured sender; mode `off` or a false kill switch enqueue and send nothing. An operator can explicitly retry a still-current `FAILED`/undelivered notice only while it is unexpired and has an attempt remaining. Retry requests require same-origin POST, a reason, and an idempotency key; the transition and actor/reason are committed atomically to the bounded messaging audit introduced in schema v10. Provider-terminal failures never auto-retry, and ambiguous provider acceptance is never eligible for operator retry.
 
-### Arcade Configuration V7 and State V11
+### Arcade Configuration V8 and State V11
 
-Configuration schema v7 promotes Trivia into the five-game station enablement, automatic-selection order, and one-coin game-cost maps while retaining `station.comingSoon.trivia.enabled=false` as a compatibility tombstone. Fresh configuration enables Trivia; a migrated v6 configuration adds it disabled so deployment does not silently change an existing event. Valid schema-v1 through v6 files and audit records are promoted in memory without rewriting historical bytes; the next authenticated configuration update appends a v7 record.
+Configuration schema v8 adds Chess to the six-game station enablement, automatic-selection order, and one-coin game-cost maps. Fresh and migrated settings enable Chess. A strict v7 configuration keeps its existing game settings and order, then appends Chess; persisted bytes and audit hashes stay intact until the next authenticated update writes a v8 record. Earlier migrations still apply, including the v6-to-v7 Trivia migration that adds Trivia disabled and retains `station.comingSoon.trivia.enabled=false` as a compatibility tombstone.
 
-State schema v11 permits Trivia identities in persisted station votes, assignments, four-caller matches, and results. Valid schema-v1 through v10 state is promoted in memory and written as v11 on the next transaction. A file labeled v10 but already containing Trivia station identity fails closed rather than being misinterpreted as pre-promotion data.
+State schema v11 permits Trivia and Chess identities in persisted station votes, assignments, matches, and results. Valid schema-v1 through v10 state is promoted in memory and written as v11 on the next transaction. A file labeled v10 but already containing Trivia station identity fails closed rather than being misinterpreted as pre-promotion data.
 
-Older application revisions reject the new schemas. Activate v7 configuration/v11 state writers only after the rollback release can read them, or retain the pre-rollout Azure Files snapshot for a stop-the-writer rollback. Never edit a schema version by hand or restore a snapshot after the candidate may have accepted public interactions or produced Twilio side effects.
+Older application revisions can reject v8 configuration or Chess-bearing state. Activate the new writer only after the rollback release can read its data, or retain the pre-rollout Azure Files snapshot for a stop-the-writer rollback. Never edit a schema version by hand or restore a snapshot after the candidate may have accepted public interactions or produced Twilio side effects.
 
 ## Editor writes
 
@@ -342,8 +343,8 @@ Use the same zero-overlap invariants as the workflow:
 2. Verify schema and secret compatibility. Container App secrets are application-scoped, so reactivating an old revision does not restore its former Twilio, Google, Relay, editor, signing, display, OpenAI, Deepgram, or Dub values.
 3. Switch to `Multiple`, explicitly pin 100% traffic to the current revision, deactivate it, and wait until it is inactive with zero replicas. This creates a planned outage and preserves the single-writer guarantee.
 4. Take and retain an Azure Files share snapshot after the current writer stops.
-5. Activate only the target revision. Wait for `Provisioned`, `Healthy`, and one replica, then use its revision-specific FQDN for read-only `/livez`, `/healthz`, `/`, `/instructions`, `/join`, `/player`, `/karaoke.html`, `/trivia.html`, and `/analytics` checks plus the `/operator` authentication redirect check.
+5. Activate only the target revision. Wait for `Provisioned`, `Healthy`, and one replica, then use its revision-specific FQDN for read-only `/livez`, `/healthz`, `/`, `/instructions`, `/join`, `/player`, `/karaoke.html`, `/trivia.html`, `/chess.html`, and `/analytics` checks plus the `/operator` authentication redirect check.
 6. Pin 100% public traffic to the verified target and keep `Multiple` mode. Do not switch to `Single`, because Azure can select the newer revision that the rollback is replacing.
 7. If target validation fails, stop it and wait for zero replicas before considering the previous writer. Restore the snapshot only when no public request, webhook, worker, or external Twilio side effect could have occurred. Otherwise retain current data and perform a compatibility-aware forward recovery.
 
-Never run `az containerapp update --image` while a writer is active, start schema-older code against configuration v7 or state v11, overlap revisions on the mounted JSON stores, or restore a snapshot after accepted external activity.
+Never run `az containerapp update --image` while a writer is active, start schema-older code against configuration v8 or Chess-bearing state v11, overlap revisions on the mounted JSON stores, or restore a snapshot after accepted external activity.

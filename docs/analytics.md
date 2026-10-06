@@ -1,6 +1,6 @@
 # Activation Analytics
 
-The private `/analytics` dashboard reports engagement for all five playable titles: Voice Racer, Voice Monsters, Voice Fighter, Voice Karaoke, and Voice Trivia. It provides summary metrics, UTC daily trends, per-game performance, popular selections, generated takeaways, and downloadable PDF reports.
+The private `/analytics` dashboard reports engagement for all six playable titles: Voice Racer, Voice Monsters, Voice Fighter, Voice Karaoke, Voice Trivia, and Voice Chess. It provides summary metrics, UTC daily trends, per-game performance, popular selections, generated takeaways, and downloadable PDF reports.
 
 ## Authentication Setup
 
@@ -63,13 +63,13 @@ Collection occurs at authoritative game-state transitions. Spectator connections
 
 | Metric | Definition |
 |---|---|
-| Engaged participants | Distinct pseudonymous participant-slot keys in the selected UTC buckets and games; this is not identity resolution across people or devices |
-| Sessions | Active races, battles, fights, Karaoke performances, or Trivia generations that were later recorded as completed or abandoned |
-| Completed | Racer result with at least one finisher, Monsters result, Fighter victory/results transition, finalized Karaoke result, or Voice Trivia results for the tracked generation |
+| Engaged participants | Distinct pseudonymous participant keys in the selected UTC buckets and games; this is not identity resolution across people or devices |
+| Sessions | Active races, battles, fights, Karaoke performances, Trivia generations, or Chess matches that were later recorded as completed or abandoned |
+| Completed | Racer result with at least one finisher, Monsters result, Fighter victory/results transition, finalized Karaoke result, Voice Trivia results for the tracked generation, or a finished Chess match |
 | Abandoned | A tracked active match that left gameplay without its completed terminal transition |
 | Active play time | Rounded elapsed seconds from the tracked gameplay start until completion or abandonment |
 | Voice commands | Accepted semantic commands; for Karaoke these are setup actions only, never sung words, raw speech, or transcripts |
-| Selections | Aggregate map, song, Trivia category, monster/fighter, and Racer vehicle values stored with recorded sessions |
+| Selections | Aggregate map, song, Trivia category, monster/fighter, and Racer vehicle values stored with recorded sessions; Chess has no selection dimension |
 
 For every recorded match, `sessions` increases once and exactly one of `completed` or `abandoned` increases. Completion rate is `completed / sessions`; average session time is `playSeconds / sessions`. A session is assigned to the UTC date on which it is recorded, usually its completion or abandonment date. Voice commands use the UTC date on which the command is accepted.
 
@@ -85,11 +85,19 @@ The store hashes participant-slot keys with SHA-256 and a server-side salt befor
 
 A Trivia session starts when a positive loading generation has a selected category and first reaches `loading`, `countdown`, `question`, or `reveal`. Its active play time therefore begins at the first observed qualifying phase, normally `loading`, not at the first answer. Results for that same generation record one completed session. Replacing a live generation or observing it leave those phases without matching results records one abandoned session; explicit station/room abort follows the same rule. A loading retry abandons the prior generation and starts the replacement generation. A temporary caller disconnect does not itself finish the session, and repeated state or abort notifications remain idempotent. Legacy prompt/cue phase values remain recognized for compatibility but normal room flow does not emit them.
 
-Each tracked generation increments `selections.categories` once, including abandoned generations and each side of a loading retry. Concrete and `mixed` category IDs are retained as aggregate counts. The `game=trivia` dashboard/API/PDF filter applies to summary, trend, selection, and insight calculations, while the report's `games` object still contains all five titles for the requested dates.
+Each tracked generation increments `selections.categories` once, including abandoned generations and each side of a loading retry. Concrete and `mixed` category IDs are retained as aggregate counts. The `game=trivia` dashboard/API/PDF filter applies to summary, trend, selection, and insight calculations, while the report's `games` object still contains all six titles for the requested dates.
 
 Trivia `voiceCommands` counts only accepted semantic mutations: a required name confirmation, each accepted category vote or revision, each accepted final answer, and explicit play-again from results. Help, rejected or interim recognition, question prompts, browser/display messages, and automatic phase changes do not count. Question text, choices, submitted answers, correctness events, scores, transcripts, and recognition payloads are not passed to `AnalyticsStore` or persisted.
 
 Trivia participant keys use game, room, and stable caller-slot order before SHA-256 hashing. The raw room and slot values exist only in that pre-hash key and are not persisted. The rollup therefore supports pseudonymous per-room activation counts, not cross-room identity resolution. Display names and the separate `data/trivia-leaderboard.json` rows are not copied into `data/analytics.json`.
+
+### Voice Chess collection
+
+A Chess session starts when a connected caller's room first reaches `playing` or `pending`. A finished result records one completed session whether the caller wins, loses, or draws. A terminal call end or room retirement records one abandoned session if play began without a result. A temporary disconnect during the reconnect grace does not end the session. An accepted standalone `play again` creates a new game ID and therefore a new session when play resumes.
+
+Chess `voiceCommands` counts accepted piece or square selection, legal move proposals, confirmation, cancellation, help, and standalone restart. Rejected speech, interim recognition, computer moves, display messages, and animations do not count. Analytics records no move list, captured piece, check, result score, transcript, phone number, or leaderboard row. The authoritative station result retains the caller's win, loss, or draw for the active event.
+
+The active session's in-memory participant key uses the caller's call SID. `AnalyticsStore` hashes that key with its server-side salt before persistence, so two callers who play successive matches in the same room count separately without storing their call SIDs or display names. The `game=chess` dashboard/API/PDF filter applies to summary, trends, and per-game metrics; Chess contributes no selections.
 
 ## Retention
 
@@ -115,4 +123,4 @@ Dates use strict `YYYY-MM-DD` UTC labels and include both endpoints. Omitting `f
 
 The range validator limits the elapsed gap between `from` and `to` to 366 days. Because the endpoints are inclusive, the largest accepted request contains 367 UTC date buckets. A reversed range or a gap greater than 366 days returns `400`.
 
-Valid game filters are `all`, `racer`, `monsters`, `fighter`, `karaoke`, and `trivia`. The filter controls summary metrics, trends, selections, and insights. The `games` object still reports each game's metrics for the requested date range so the dashboard can show the full five-title comparison.
+Valid game filters are `all`, `racer`, `monsters`, `fighter`, `karaoke`, `trivia`, and `chess`. The filter controls summary metrics, trends, selections, and insights. The `games` object still reports each game's metrics for the requested date range so the dashboard can show the full six-title comparison.

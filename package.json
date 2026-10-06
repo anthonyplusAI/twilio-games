@@ -43,6 +43,7 @@
     "@gltf-transform/core": "4.4.1",
     "@gltf-transform/extensions": "4.4.1",
     "camera-controls": "3.1.2",
+    "chess.js": "1.4.0",
     "qrcode": "1.5.4",
     "three": "^0.164.0",
     "twilio": "6.0.2",

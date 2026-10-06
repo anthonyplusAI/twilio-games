@@ -2,7 +2,7 @@ import type { AnalyticsGame, AnalyticsReport } from '../shared/analytics';
 
 const GAME_LABELS: Readonly<Record<AnalyticsGame, string>> = {
   racer: 'Voice Racer', monsters: 'Voice Monsters', fighter: 'Voice Fighter', karaoke: 'Voice Karaoke',
-  trivia: 'Voice Trivia',
+  trivia: 'Voice Trivia', chess: 'Voice Chess',
 };
 
 export function analyticsPdf(report: AnalyticsReport): Buffer {

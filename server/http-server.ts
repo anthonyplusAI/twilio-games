@@ -11,6 +11,8 @@ import { BattleServer } from './battle-server';
 import { FighterServer } from './fighter-server';
 import { KaraokeServer } from './karaoke-server';
 import { TriviaServer, type TriviaServerOptions } from './trivia-server';
+import { ChessServer } from './chess-server';
+import { ChessVoiceSession } from './chess-voice';
 import { TriviaVoiceSession, type TriviaVoiceSnapshot } from './trivia-voice';
 import { TriviaContentStore } from './trivia-content-store';
 import {
@@ -115,6 +117,7 @@ const FIGHTER_VOICE_RECONNECT_GRACE_MS = 30_000;
 const RACER_VOICE_RECONNECT_GRACE_MS = 30_000;
 const KARAOKE_VOICE_RECONNECT_GRACE_MS = 30_000;
 const TRIVIA_VOICE_RECONNECT_GRACE_MS = 30_000;
+const CHESS_VOICE_RECONNECT_GRACE_MS = 30_000;
 export const TRIVIA_PUBLIC_DISPLAY_LIMIT = 8;
 export const TRIVIA_PENDING_CONNECTION_LIMIT = 8;
 export const TRIVIA_IDENTIFICATION_TIMEOUT_MS = 5_000;
@@ -215,7 +218,15 @@ interface TriviaVoiceCallBinding {
   activeSession: TriviaVoiceSession | null;
   leaveTimer: ReturnType<typeof setTimeout> | null;
 }
-type MountedVoiceGame = 'racer' | 'battle' | 'fighter' | 'karaoke' | 'trivia';
+interface ChessVoiceCallBinding {
+  code: string;
+  playerId: string;
+  locale: SupportedLocale;
+  stationManaged: boolean;
+  activeSession: ChessVoiceSession | null;
+  leaveTimer: ReturnType<typeof setTimeout> | null;
+}
+type MountedVoiceGame = 'racer' | 'battle' | 'fighter' | 'karaoke' | 'trivia' | 'chess';
 
 export class HttpServer {
   private server: http.Server;
@@ -224,6 +235,7 @@ export class HttpServer {
   private fighter: FighterServer;
   private karaoke: KaraokeServer;
   private trivia: TriviaServer;
+  private chess: ChessServer;
   private readonly triviaContent: TriviaContentStore;
   private readonly triviaLeaderboard: TriviaLeaderboardStore;
   private karaokeMedia: KaraokeMediaRuntime;
@@ -309,6 +321,8 @@ export class HttpServer {
   private karaokeVoiceCallBindings = new Map<string, KaraokeVoiceCallBinding>();
   private triviaVoice = new Map<string, Set<TriviaVoiceSession>>();
   private triviaVoiceCallBindings = new Map<string, TriviaVoiceCallBinding>();
+  private chessVoice = new Map<string, Set<ChessVoiceSession>>();
+  private chessVoiceCallBindings = new Map<string, ChessVoiceCallBinding>();
   private readonly triviaResultPersistence = new Map<string, Promise<void>>();
   private karaokeFailureLocales = new Map<string, { locale: SupportedLocale; timer: ReturnType<typeof setTimeout> }>();
   private karaokeHandoffResponses = new Map<string, { xml: string; expiresAtMs: number }>();
@@ -320,6 +334,7 @@ export class HttpServer {
   private voiceReconnectAttempts = new Map<string, number>();
   private standaloneDisplays = new Map<MountedVoiceGame,Map<WebSocket,number>>();
   private readonly standaloneTriviaDisplayCandidates = new WeakSet<WebSocket>();
+  private readonly standaloneChessDisplayCandidates = new WeakSet<WebSocket>();
   private readonly authenticatedTriviaDisplays = new WeakSet<WebSocket>();
   private readonly publicTriviaDisplays = new Set<WebSocket>();
   private readonly pendingTriviaDisplays = new Map<WebSocket, ReturnType<typeof setTimeout>>();
@@ -366,6 +381,7 @@ export class HttpServer {
     fighterDisplayToken?: string;
     karaokeDisplayToken?: string;
     triviaDisplayToken?: string;
+    chessDisplayToken?: string;
     triviaIdentificationTimeoutMs?: number;
     triviaServerOptions?: Omit<TriviaServerOptions, 'bank' | 'contentRevision' | 'displayToken' | 'server'>;
     analyticsPath?: string;
@@ -481,6 +497,9 @@ export class HttpServer {
       ...opts.triviaServerOptions,
       displayToken: opts.triviaDisplayToken ?? opts.fighterDisplayToken,
     });
+    this.chess = new ChessServer({
+      displayToken: opts.chessDisplayToken ?? opts.fighterDisplayToken,
+    });
     this.karaokeMediaWss = new WebSocketServer({
       noServer: true,
       maxPayload: 16 * 1024,
@@ -583,6 +602,22 @@ export class HttpServer {
           this.stationVoiceReconnectRoutes.delete(callSid);
           this.voiceReconnectAttempts.delete(callSid);
         }
+      } else if (game === 'chess') {
+        const retained = new Set(activeEnginePlayerIds);
+        for (const [callSid, binding] of this.chessVoiceCallBindings) {
+          if (binding.code !== roomCode || retained.has(binding.playerId)) continue;
+          if (binding.leaveTimer) clearTimeout(binding.leaveTimer);
+          if (binding.activeSession) {
+            this.unregisterChessVoiceSession(binding.activeSession);
+            binding.activeSession.handleReplaced();
+          }
+          this.chessVoiceCallBindings.delete(callSid);
+          this.analyticsObserver.chessAborted(roomCode);
+          this.chess.voiceLeave(roomCode, callSid);
+          this.abandonUnfinishedChessStationRoom(roomCode);
+          this.stationVoiceReconnectRoutes.delete(callSid);
+          this.voiceReconnectAttempts.delete(callSid);
+        }
       } else assertNever(game);
     });
     this.arcadeApi?.setPlayerResetCleanupHandler?.(context => this.cleanupResetPlayerHistory(context));
@@ -606,6 +641,9 @@ export class HttpServer {
     this.trivia.setDisplayAuthenticationRequirement(roomCode => (
       roomCode.trim().toUpperCase() !== DEFAULT_ROOM || !allowBrowserPlayer(roomCode)
     ));
+    this.chess.setDisplayAuthenticationRequirement(roomCode => (
+      roomCode.trim().toUpperCase() !== DEFAULT_ROOM || !allowBrowserPlayer(roomCode)
+    ));
     this.game.setOnDisplayAuthenticated(ws => this.registerStandaloneDisplay('racer', ws));
     this.battle.setOnDisplayAuthenticated(ws => this.registerStandaloneDisplay('battle', ws));
     this.fighter.setOnDisplayAuthenticated(ws => this.registerStandaloneDisplay('fighter', ws));
@@ -627,6 +665,11 @@ export class HttpServer {
       }
       this.clearPendingTriviaDisplay(ws);
       if (this.standaloneTriviaDisplayCandidates.has(ws)) this.registerStandaloneDisplay('trivia', ws);
+    });
+    this.chess.setOnDisplayRegistered((ws, roomCode) => {
+      if (this.standaloneChessDisplayCandidates.has(ws) && roomCode === DEFAULT_ROOM) {
+        this.registerStandaloneDisplay('chess', ws);
+      }
     });
     // Feed newly-created rooms the selectable cars (manifest) + maps (maps.json). Reads are async
     // and the provider is sync, so keep a cache refreshed at startup + on an interval; rooms read
@@ -761,6 +804,30 @@ export class HttpServer {
       );
       for (const session of this.triviaVoice.get(roomCode) ?? []) session.onStateChanged();
     });
+    this.chess.setOnRoomState(roomCode => {
+      const room = this.chess.findRoom(roomCode);
+      if (room) this.analyticsObserver.chessState(room);
+      const state = room?.state();
+      if (!state) return;
+      if (!this.arcadeApi?.isStationEngineRoom?.(roomCode)) return;
+      const result = state.result;
+      this.updateStationEngineLifecycle(
+        'chess', roomCode, state.phase,
+        ['playing', 'pending'], ['finished'],
+        result ? [{
+          enginePlayerId: 'c1',
+          rank: result.winner === state.humanColor ? 1 : result.winner === null ? 1 : 2,
+          completed: true,
+          won: result.winner === null ? null : result.winner === state.humanColor,
+          score: null,
+          durationSeconds: null,
+        }] : [],
+        ['waiting'],
+      );
+    });
+    this.chess.setOnRoomEvents((roomCode, events) => {
+      for (const session of this.chessVoice.get(roomCode) ?? []) session.onRoomEvents(events);
+    });
     // SMS concierge: resolves a room code to a live Room wrapped as a ConciergeRoom (adds car names).
     this.concierge = new SmsConcierge({ findRoom: (code) => this.conciergeRoom(code) });
     this.voiceWss = new WebSocketServer({ noServer: true });
@@ -771,13 +838,14 @@ export class HttpServer {
       const standaloneDisplay = this.standaloneVoiceEnabled
         && displayValues.length === 1 && displayValues[0] === '1'
         && !(this.arcadeApi?.requiresStationVoiceAssignment() ?? false);
-      if ((path === '/karaoke' || path === '/trivia')
+      if ((path === '/karaoke' || path === '/trivia' || path === '/chess')
         && req.headers.origin !== new URL(this.publicBaseUrl).origin) {
         socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
         socket.destroy();
         return;
       }
-      if (path === '/trivia' && (displayValues.length !== 1 || displayValues[0] !== '1')) {
+      if ((path === '/trivia' || path === '/chess')
+        && (displayValues.length !== 1 || displayValues[0] !== '1')) {
         socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
         socket.destroy();
         return;
@@ -828,6 +896,10 @@ export class HttpServer {
         this.trivia.handleUpgrade(req, socket, head, ws => {
           if (standaloneDisplay) this.standaloneTriviaDisplayCandidates.add(ws);
           this.trackPendingTriviaDisplay(ws);
+        });
+      } else if (path === '/chess') {
+        this.chess.handleUpgrade(req, socket, head, ws => {
+          if (standaloneDisplay) this.standaloneChessDisplayCandidates.add(ws);
         });
       } else if (path === '/karaoke-media') {
         this.karaokeMedia.handleUpgrade(req, socket, head);
@@ -918,6 +990,16 @@ export class HttpServer {
       }
       this.analyticsObserver.triviaAborted(roomCode);
       this.trivia.abortRoom(roomCode);
+    } else if (game === 'chess') {
+      for (const session of [...(this.chessVoice.get(roomCode) ?? [])]) session.handleReplaced();
+      this.chessVoice.delete(roomCode);
+      for (const [callSid, binding] of this.chessVoiceCallBindings) {
+        if (binding.code !== roomCode) continue;
+        if (binding.leaveTimer) clearTimeout(binding.leaveTimer);
+        this.chessVoiceCallBindings.delete(callSid);
+      }
+      this.analyticsObserver.chessAborted(roomCode);
+      this.chess.abortRoom(roomCode);
     } else assertNever(game);
     for(const [callSid,route] of this.stationVoiceReconnectRoutes){
       if(route.game!==game||route.roomCode!==roomCode)continue;
@@ -1006,6 +1088,21 @@ export class HttpServer {
         }
         this.analyticsObserver.triviaAborted(roomCode);
         this.trivia.abortRoom(roomCode);
+      } else if (game === 'chess') {
+        for (const session of [...(this.chessVoice.get(roomCode) ?? [])]) session.handleReplaced();
+        this.chessVoice.delete(roomCode);
+        for (const [callSid, binding] of this.chessVoiceCallBindings) {
+          if (binding.code !== roomCode) continue;
+          if (binding.leaveTimer) clearTimeout(binding.leaveTimer);
+          this.chessVoiceCallBindings.delete(callSid);
+        }
+        for (const [callSid, route] of this.stationVoiceReconnectRoutes) {
+          if (route.game !== 'chess' || route.roomCode !== roomCode) continue;
+          this.stationVoiceReconnectRoutes.delete(callSid);
+          this.voiceReconnectAttempts.delete(callSid);
+        }
+        this.analyticsObserver.chessAborted(roomCode);
+        this.chess.abortRoom(roomCode);
       } else assertNever(game);
       this.activeStationEngines.delete(`${game}:${roomCode}`);
     };
@@ -1019,6 +1116,10 @@ export class HttpServer {
       void Promise.race([settled, sleep(RELAY_SPEECH_SETTLE_TIMEOUT_MS)]).then(finalize);
     } else if (game === 'trivia') {
       const settled = Promise.all([...this.triviaVoice.get(roomCode) ?? []]
+        .map(session => session.whenSpeechSettled()));
+      void Promise.race([settled, sleep(RELAY_SPEECH_SETTLE_TIMEOUT_MS)]).then(finalize);
+    } else if (game === 'chess') {
+      const settled = Promise.all([...this.chessVoice.get(roomCode) ?? []]
         .map(session => session.whenSpeechSettled()));
       void Promise.race([settled, sleep(RELAY_SPEECH_SETTLE_TIMEOUT_MS)]).then(finalize);
     } else if (game === 'fighter' || game === 'karaoke') {
@@ -1291,6 +1392,7 @@ export class HttpServer {
       else if (racer.game === 'fighter') this.fighter.anonymizePlayer(racer.roomCode,racer.enginePlayerId);
       else if (racer.game === 'karaoke') this.karaoke.anonymizePlayer(racer.roomCode,racer.enginePlayerId);
       else if (racer.game === 'trivia') this.trivia.anonymizePlayer(racer.roomCode,racer.enginePlayerId);
+      else if (racer.game === 'chess') continue;
       else assertNever(racer.game);
     }
     if (!targets.size && !enginePlayerIds.size && !karaokeEnginePlayerIds.size && !context.racers.some(racer => racer.game === 'trivia')) return Promise.resolve();
@@ -1442,6 +1544,7 @@ export class HttpServer {
     let fighter: FighterVoiceSession | null = null;
     let karaoke: KaraokeVoiceSession | null = null;
     let trivia: TriviaVoiceSession | null = null;
+    let chess: ChessVoiceSession | null = null;
     let relayCallSid = '';
     let stationCallSid = '';
     let stationReadyEntryId = '';
@@ -1457,11 +1560,12 @@ export class HttpServer {
       if (route === 'fighter') return fighter?.boundRoomCode ? { game: 'fighter', roomCode: fighter.boundRoomCode } : null;
       if (route === 'karaoke') return karaoke?.boundRoomCode ? { game: 'karaoke', roomCode: karaoke.boundRoomCode } : null;
       if (route === 'trivia') return trivia?.boundRoomCode ? { game: 'trivia', roomCode: trivia.boundRoomCode } : null;
+      if (route === 'chess') return chess?.boundRoomCode ? { game: 'chess', roomCode: chess.boundRoomCode } : null;
       if (route === 'racer') return adapter.boundRoomCode ? { game: 'racer', roomCode: adapter.boundRoomCode } : null;
       return assertNever(route);
     });
     const say = (text: string, isCurrent?: () => boolean) => sendRelayText(
-      ws, text, relayLocale, isCurrent, route === 'battle' || route === 'trivia',
+      ws, text, relayLocale, isCurrent, route === 'battle' || route === 'trivia' || route === 'chess',
     );
     const processFrame = (raw: string) => {
       if (route === null) {
@@ -1530,6 +1634,11 @@ export class HttpServer {
         trivia.setExpectedPlayers(stationManaged ? stationParticipantCount : 1);
         if (stationManaged) trivia.setStationAssignment(stationParticipantIndex);
         trivia.handleMessage(raw);
+      } else if (route === 'chess') {
+        if (!chess) chess = this.makeChessSession(say, () => stationManaged);
+        chess.setAuthoritativeName(stationFirstName);
+        chess.setStationManaged(stationManaged);
+        chess.handleMessage(raw);
       } else if (route === 'racer') {
         adapter.setAuthoritativeName(stationFirstName);
         adapter.setStationManaged(stationManaged);
@@ -1545,6 +1654,7 @@ export class HttpServer {
             : route === 'fighter' ? fighter?.boundPlayerId
               : route === 'karaoke' ? karaoke?.boundPlayerId
                 : route === 'trivia' ? trivia?.boundPlayerId
+                : route === 'chess' ? chess?.boundPlayerId
                 : route === 'racer' ? adapter.boundPlayerId : null;
           if (bound && readyEntryId) {
             this.arcadeApi?.stationVoiceParticipantConnected(String(setup.callSid ?? ''), readyEntryId, bound, stationConnectionId);
@@ -1610,6 +1720,8 @@ export class HttpServer {
                 ? this.hasResumableKaraokeVoiceCall(stationCallSid, assignedRoom)
                 : assignedGame === 'trivia'
                   ? this.hasResumableTriviaVoiceCall(stationCallSid, assignedRoom)
+                : assignedGame === 'chess'
+                  ? this.hasResumableChessVoiceCall(stationCallSid, assignedRoom)
                 : this.hasResumableRacerVoiceCall(stationCallSid, assignedRoom);
           if ((identity.terminal || racerPhase === 'finished' || racerPhase === 'results') && !resumable) {
             ws.close(1008, 'finished station assignment');
@@ -1623,7 +1735,10 @@ export class HttpServer {
           }catch{/* Session parser handles malformed frames. */}
         }
         processFrame(raw);
-      }).catch(() => ws.close(1011, 'voice setup failed'));
+      }).catch(error => {
+        console.error('[CR] voice setup failed:', error instanceof Error ? error.message : 'unknown error');
+        ws.close(1011, 'voice setup failed');
+      });
     });
     ws.on('close', (code, reason) => {
       socketClosed = true;
@@ -1645,6 +1760,10 @@ export class HttpServer {
       else if (trivia) {
         this.unregisterTriviaVoiceSession(trivia);
         trivia.handleClose();
+      }
+      else if (chess) {
+        this.unregisterChessVoiceSession(chess);
+        chess.handleClose();
       }
       else if (karaoke) {
         const binding = relayCallSid ? this.karaokeVoiceCallBindings.get(relayCallSid) : undefined;
@@ -1686,6 +1805,7 @@ export class HttpServer {
       if (g === 'fighter' || g === 'fight') return 'fighter';
       if (g === 'karaoke' || g === 'sing') return 'karaoke';
       if (g === 'trivia' || g === 'quiz') return 'trivia';
+      if (g === 'chess') return 'chess';
       if (g === 'racer' || g === 'race') return 'racer';
     } catch { /* fall through to auto-detect */ }
     // Auto-detect: route to the game whose screen most recently opened. This avoids a stale tab for one
@@ -1743,6 +1863,7 @@ export class HttpServer {
     if (game === 'racer' && this.game.connectionCount > 0) return this.game.preferredLocale(roomCode, this.defaultLocale);
     if (game === 'karaoke' && this.karaoke.connectionCount > 0) return this.karaoke.preferredLocale(roomCode, this.defaultLocale);
     if (game === 'trivia' && this.trivia.connectionCount > 0) return this.trivia.preferredLocale(roomCode, this.defaultLocale);
+    if (game === 'chess' && this.chess.connectionCount > 0) return this.chess.preferredLocale(roomCode, this.defaultLocale);
     return this.defaultLocale;
   }
 
@@ -1792,12 +1913,155 @@ export class HttpServer {
         : ['general knowledge', 'science', 'geography', 'history', 'entertainment', 'sports', 'technology', 'Twilio'];
       return voiceHintList(commands, numbers, letters, categories);
     }
+    if (game === 'chess') {
+      const commands = locale === 'pt-BR'
+        ? ['xadrez', 'peão', 'cavalo', 'bispo', 'torre', 'rainha', 'rei', 'para', 'de', 'capturar',
+          'roque', 'promover', 'confirmar', 'sim', 'cancelar', 'não', 'ajuda', 'jogar novamente']
+        : ['chess', 'pawn', 'knight', 'bishop', 'rook', 'queen', 'king', 'to', 'from', 'takes',
+          'castle', 'promote', 'confirm', 'yes', 'cancel', 'no', 'help', 'play again'];
+      const squares = 'abcdefgh'.split('').flatMap(file => Array.from({ length: 8 }, (_, index) => `${file}${index + 1}`));
+      return voiceHintList(commands, squares);
+    }
     const commands = locale === 'pt-BR'
       ? ['esquerda', 'direita', 'acelerar', 'acelere', 'acelera', 'vai', 'frear', 'freie', 'freia', 'devagar', 'reduzir', 'reduza', 'desacelerar', 'desacelere', 'parar', 'nitro', 'turbo', 'poder', 'começar', 'iniciar', 'próximo', 'próxima', 'corrida', 'correr', 'revanche', 'sim']
       : ['left', 'right', 'boost', 'go', 'brake', 'slow', 'stop', 'nitro', 'power', 'start', 'next', 'race', 'rematch'];
     const cars = this.roomConfigCache.carNames.flatMap(localizedCarAliases);
     const tracks = this.roomConfigCache.maps.flatMap(localizedTrackAliases);
     return voiceHintList(commands, numbers, cars, tracks);
+  }
+
+  private makeChessSession(
+    say: (text: string, isCurrent?: () => boolean) => void | Promise<boolean>,
+    stationManaged: () => boolean,
+  ): ChessVoiceSession {
+    let session: ChessVoiceSession;
+    session = new ChessVoiceSession({
+      bind: (rawCode, name, callSid, locale) => {
+        const code = rawCode.trim().toUpperCase();
+        const previous = this.chessVoiceCallBindings.get(callSid.trim());
+        if (previous && previous.code !== code) this.endChessVoiceCall(callSid);
+        const joined = this.chess.voiceJoin(code, name, callSid, locale, stationManaged());
+        if (!joined) return null;
+        this.analyticsObserver.chessBound(code, callSid);
+        this.rememberChessVoiceCall(callSid, code, joined.playerId, locale, stationManaged(), session);
+        this.registerChessVoiceSession(code, session);
+        return joined;
+      },
+      leave: (code, playerId, callSid) => {
+        this.unregisterChessVoiceSession(session);
+        this.scheduleChessVoiceLeave(code, playerId, callSid, session);
+      },
+      command: (code, callSid, spoken, locale) => {
+        const result = this.chess.voiceCommand(code, callSid, spoken, locale);
+        if (result && ['selected', 'proposed', 'confirmed', 'cancelled', 'help'].includes(result.code)) {
+          this.analyticsObserver.voiceCommand('chess');
+        }
+        return result;
+      },
+      restart: (code, callSid) => {
+        const restarted = this.chess.voiceRestart(code, callSid);
+        if (restarted) this.analyticsObserver.voiceCommand('chess');
+        return restarted;
+      },
+      snapshot: code => this.chess.findRoom(code)?.state() ?? null,
+      say,
+    });
+    return session;
+  }
+
+  private registerChessVoiceSession(code: string, session: ChessVoiceSession): void {
+    let sessions = this.chessVoice.get(code);
+    if (!sessions) {
+      sessions = new Set();
+      this.chessVoice.set(code, sessions);
+    }
+    sessions.add(session);
+  }
+
+  private unregisterChessVoiceSession(session: ChessVoiceSession): void {
+    for (const [code, sessions] of this.chessVoice) {
+      if (sessions.delete(session) && sessions.size === 0) this.chessVoice.delete(code);
+    }
+  }
+
+  private rememberChessVoiceCall(
+    callSid: string,
+    code: string,
+    playerId: string,
+    locale: SupportedLocale,
+    stationManaged: boolean,
+    session: ChessVoiceSession,
+  ): void {
+    const sid = callSid.trim();
+    const previous = this.chessVoiceCallBindings.get(sid);
+    if (previous?.leaveTimer) clearTimeout(previous.leaveTimer);
+    if (previous?.activeSession && previous.activeSession !== session) {
+      this.unregisterChessVoiceSession(previous.activeSession);
+      previous.activeSession.handleReplaced();
+    }
+    this.chessVoiceCallBindings.set(sid, {
+      code, playerId, locale, stationManaged, activeSession: session, leaveTimer: null,
+    });
+  }
+
+  private hasResumableChessVoiceCall(callSid: string, code: string): boolean {
+    const binding = this.chessVoiceCallBindings.get(callSid.trim());
+    return Boolean(binding && binding.code === code && this.chess.hasVoiceBinding(code, callSid));
+  }
+
+  private scheduleChessVoiceLeave(
+    code: string,
+    playerId: string,
+    callSid: string,
+    session: ChessVoiceSession,
+  ): void {
+    const sid = callSid.trim();
+    const binding = this.chessVoiceCallBindings.get(sid);
+    if (binding?.activeSession && binding.activeSession !== session) return;
+    this.chess.voiceSetConnected(code, sid, false);
+    if (!sid) {
+      this.analyticsObserver.chessAborted(code);
+      this.chess.voiceLeave(code, sid);
+      return;
+    }
+    if (binding?.leaveTimer) clearTimeout(binding.leaveTimer);
+    const leaveTimer = setTimeout(() => {
+      const current = this.chessVoiceCallBindings.get(sid);
+      if (!current || current.code !== code || current.playerId !== playerId) return;
+      if (current.stationManaged) this.arcadeApi?.stationVoiceCallEnded(sid);
+      this.chessVoiceCallBindings.delete(sid);
+      this.analyticsObserver.chessAborted(code);
+      this.chess.voiceLeave(code, sid);
+      if (current.stationManaged) this.abandonUnfinishedChessStationRoom(code);
+    }, CHESS_VOICE_RECONNECT_GRACE_MS);
+    leaveTimer.unref?.();
+    this.chessVoiceCallBindings.set(sid, {
+      code, playerId, locale: binding?.locale ?? session.locale,
+      stationManaged: binding?.stationManaged ?? false, activeSession: null, leaveTimer,
+    });
+  }
+
+  private endChessVoiceCall(callSid: string): void {
+    const sid = callSid.trim();
+    const binding = this.chessVoiceCallBindings.get(sid);
+    if (!binding) return;
+    if (binding.leaveTimer) clearTimeout(binding.leaveTimer);
+    if (binding.activeSession) {
+      this.unregisterChessVoiceSession(binding.activeSession);
+      binding.activeSession.handleReplaced();
+    }
+    this.chessVoiceCallBindings.delete(sid);
+    this.analyticsObserver.chessAborted(binding.code);
+    this.chess.voiceLeave(binding.code, sid);
+    if (binding.stationManaged) this.abandonUnfinishedChessStationRoom(binding.code);
+  }
+
+  private abandonUnfinishedChessStationRoom(code: string): void {
+    if (this.chess.findRoom(code)?.state().phase === 'finished') return;
+    // A launch-time no-show may still be replaced from the station queue. Only a
+    // caller lost during active play should end the match immediately.
+    if (this.arcadeApi?.stationEnginePhase('chess', code) !== 'PLAYING') return;
+    this.updateStationEngineLifecycle('chess', code, undefined, ['playing', 'pending'], ['finished']);
   }
 
   private makeTriviaSession(
@@ -3259,6 +3523,7 @@ export class HttpServer {
         rooms: this.game.roomCount,
         karaokeRooms: this.karaoke.roomCount,
         triviaRooms: this.trivia.roomCount,
+        chessRooms: this.chess.roomCount,
         triviaContent,
         triviaLeaderboard,
         karaokeMediaSessions: this.karaokeMedia.activeSessionCount,
@@ -3609,6 +3874,8 @@ export class HttpServer {
                   ?this.hasResumableFighterVoiceCall(callSid,station.roomCode)
                     :station.game==='karaoke'
                       ?this.hasResumableKaraokeVoiceCall(callSid,station.roomCode)
+                      :station.game==='chess'
+                        ?this.hasResumableChessVoiceCall(callSid,station.roomCode)
                       :this.hasResumableTriviaVoiceCall(callSid,station.roomCode);
               if(!terminalBinding){this.stationVoiceReconnectRoutes.delete(callSid);station=undefined;}
             }
@@ -3619,9 +3886,10 @@ export class HttpServer {
         const fighter = this.fighterVoiceCallBindings.get(callSid);
         const karaoke = this.karaokeVoiceCallBindings.get(callSid);
         const trivia = this.triviaVoiceCallBindings.get(callSid);
-        const game = station?.game ?? (battle ? 'monsters' : fighter ? 'fighter' : karaoke ? 'karaoke' : trivia ? 'trivia' : racer ? 'racer' : null);
-        const roomCode = station?.roomCode ?? battle?.code ?? fighter?.code ?? karaoke?.code ?? trivia?.code ?? racer?.code;
-        const locale = station?.locale ?? battle?.locale ?? fighter?.locale ?? karaoke?.locale ?? trivia?.locale ?? racer?.locale ?? this.defaultLocale;
+        const chess = this.chessVoiceCallBindings.get(callSid);
+        const game = station?.game ?? (battle ? 'monsters' : fighter ? 'fighter' : karaoke ? 'karaoke' : trivia ? 'trivia' : chess ? 'chess' : racer ? 'racer' : null);
+        const roomCode = station?.roomCode ?? battle?.code ?? fighter?.code ?? karaoke?.code ?? trivia?.code ?? chess?.code ?? racer?.code;
+        const locale = station?.locale ?? battle?.locale ?? fighter?.locale ?? karaoke?.locale ?? trivia?.locale ?? chess?.locale ?? racer?.locale ?? this.defaultLocale;
         if (game && roomCode) {
           this.voiceReconnectAttempts.set(callSid, attempts + 1);
           const xml = twimlConnectRelay({
@@ -3644,6 +3912,7 @@ export class HttpServer {
       this.arcadeApi?.stationVoiceCallEnded(callSid);
       this.endRacerVoiceCall(callSid); this.endBattleVoiceCall(callSid); this.endFighterVoiceCall(callSid);
       this.endTriviaVoiceCall(callSid);
+      this.endChessVoiceCall(callSid);
       const karaokeBinding = this.karaokeVoiceCallBindings.get(callSid);
       if (karaokeBinding && this.karaoke.findRoom(karaokeBinding.code)?.state().phase !== 'results') {
         this.failKaraokeCall(callSid);
@@ -4434,6 +4703,12 @@ export class HttpServer {
         binding.activeSession?.handleReplaced();
       }
       this.triviaVoiceCallBindings.clear(); this.triviaVoice.clear();
+      for (const binding of this.chessVoiceCallBindings.values()) {
+        if (binding.leaveTimer) clearTimeout(binding.leaveTimer);
+        this.analyticsObserver.chessAborted(binding.code);
+        binding.activeSession?.handleReplaced();
+      }
+      this.chessVoiceCallBindings.clear(); this.chessVoice.clear();
       this.karaokeHandoffResponses.clear();
       for (const failure of this.karaokeFailureLocales.values()) clearTimeout(failure.timer);
       this.karaokeFailureLocales.clear();
@@ -4448,6 +4723,7 @@ export class HttpServer {
       this.karaokeMedia.close();
       this.karaoke.stopLoopOnly();
       this.trivia.stopLoopOnly();
+      this.chess.stopLoopOnly();
       for (const socket of this.voiceSockets.keys()) {
         disposeRelayQueue(socket);
         socket.terminate();

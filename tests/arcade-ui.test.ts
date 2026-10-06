@@ -69,7 +69,7 @@ describe('Arcade browser UI', () => {
 
   it('renders selection as a stable video-backed vote display with automatic fallback copy', () => {
     expect(stationClient).toContain('choices: number');
-    expect(homeScript).toContain('racer: 1, monsters: 2, fighter: 3, karaoke: 4, trivia: 5');
+    expect(homeScript).toContain('racer: 1, monsters: 2, fighter: 3, karaoke: 4, trivia: 5, chess: 6');
     expect(homeScript).toContain('impact.choices');
     expect(homeScript).toContain('Ready players: text the number shown or the game name.');
     expect(homeScript).not.toContain('In a browser, choose on your player page.');
@@ -329,6 +329,18 @@ describe('Arcade browser UI', () => {
     expect(html).toContain('id="admin-console"');
     expect(homeScript).toContain('isPlayableArcadeGame(entry[0]) && entry[1].enabled');
     expect(homeScript).toContain('.filter(impact => enabledGames.has(impact.id))');
+  });
+
+  it('offers Voice Chess as choice 6 and an operator game without a leaderboard', () => {
+    expect(html).toMatch(/data-game-choice="chess"><span>6<\/span><b>Voice Chess<\/b>/);
+    expect(stationGameSelect).toContain('<option value="chess">Voice Chess · 1 player</option>');
+    expect(html).toContain('id="admin-game-chess"');
+    const prioritySelects = [...html.matchAll(/<select id="admin-game-priority-[1-6]"[^>]*>[\s\S]*?<\/select>/g)]
+      .map(match => match[0]);
+    expect(prioritySelects).toHaveLength(6);
+    for (const select of prioritySelects) expect(select).toContain('<option value="chess">Voice Chess</option>');
+    const leaderboardSelect = /<select id="leaderboard-reset-game">[\s\S]*?<\/select>/.exec(html)?.[0] ?? '';
+    expect(leaderboardSelect).not.toContain('value="chess"');
   });
 
   it('renders aggregate vote counts and allows a capacity-one no-show replacement', () => {
@@ -640,9 +652,9 @@ describe('Arcade browser UI', () => {
     expect(script).toContain('payload.games.find(item=>item.game===game)??{game,resettable:false,maps:[]}');
   });
 
-  it('renders all five priority positions and score-based station fallback results', () => {
-    const prioritySelects = [...html.matchAll(/<select id="admin-game-priority-[1-5]"[^>]*>[\s\S]*?<\/select>/g)].map(match => match[0]);
-    expect(prioritySelects).toHaveLength(5);
+  it('renders all six priority positions and score-based station fallback results', () => {
+    const prioritySelects = [...html.matchAll(/<select id="admin-game-priority-[1-6]"[^>]*>[\s\S]*?<\/select>/g)].map(match => match[0]);
+    expect(prioritySelects).toHaveLength(6);
     for (const select of prioritySelects) expect(select).toContain('<option value="trivia">Voice Trivia</option>');
     expect(stationDisplay).toContain('result.score!==null');
     expect(stationDisplay).toContain('result.score.toLocaleString(locale)');
@@ -650,12 +662,14 @@ describe('Arcade browser UI', () => {
     expect(stationDisplayCss).toContain('.station-result-metric{font-family:');
   });
 
-  it('exposes the persisted game order as the standalone display order', () => {
+  it('shows and saves the six-game display order under every selection policy', () => {
     expect(html).toContain('id="selection-policy-field"');
     expect(html).toContain('id="game-order-label"');
     expect(html).toContain('id="game-order-help"');
-    expect(script).toContain("standalone?'Standalone display order':'Priority order'");
-    expect(script).toContain("selectedMode==='off'||selectionPolicy==='fixed_priority'");
+    expect(html).toContain('id="priority-order-field" class="priority-order-field"><span');
+    expect(script).toContain("el('priority-order-field').hidden=false");
+    expect(script).toContain("standalone?'Standalone display order':fixedPriority?'Priority order':'Display order'");
+    expect(script).toContain("if(!validOrder){setNotice('Choose each game once in the display order.','error');return;}");
     expect(script).toContain('swapPriorityOrder');
   });
 

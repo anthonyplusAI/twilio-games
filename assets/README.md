@@ -38,15 +38,15 @@ The browser also consumes these asset trees outside this directory:
 | Path | Current contents | Public URL root |
 |---|---:|---|
 | `client/public/assets/monsters/` | 16 GIFs | `/assets/monsters/` |
-| `client/public/audio/` | 25 MP3/M4A files | `/audio/` |
+| `client/public/audio/` | 28 MP3/M4A files | `/audio/` |
 | `client/public/fonts/` | 5 OTF files | `/fonts/` |
-| `client/public/video/` | 5 MP4 files | `/video/` |
+| `client/public/video/` | 6 MP4 files | `/video/` |
 | `client/public/brand/` | 2 SVG logos and 3 PNG QR images | `/brand/` |
 | `client/public/draco/` | JavaScript and WASM decoders | `/draco/` |
 
 The font inventory is `TwilioSansDisplay-Regular.otf`, `TwilioSansDisplay-Extrabold.otf`, `TwilioSansText-Regular.otf`, `TwilioSansText-Bold.otf`, and `TwilioSansMono-Regular.otf`. CSS loads them directly with `@font-face`; the production server maps `.otf` to `font/otf`.
 
-The home-page previews use `vr-demo.mp4`, `vm-demo.mp4`, `vf-demo.mp4`, `vk-demo.mp4`, and `vt-demo.mp4` for Voice Racer, Voice Monsters, Voice Fighter, Voice Karaoke, and Voice Trivia. The generated Trivia preview is a silent H.264 1280x692 24fps 12-second MP4 with no audio stream. The Karaoke preview is a silent H.264 1280x692 24fps runtime derivative; its raw source stays in ignored `client/public/video/_raw/`. Voice Karaoke serves exactly two licensed 45-second English excerpts from `client/public/audio/karaoke/`: `classic-instrumental-45s.mp3` (*Never Gonna Give You Up* by Rick Astley) and `thousand-miles-45s.mp3` (*A Thousand Miles* by Vanessa Carlton). Their confirmed rights and detailed provenance are in [CREDITS.md](CREDITS.md). The brand inventory is `twilio_logo_1color_white.svg`, `Twilio_Logo_Bug_White.svg`, the standalone fallback `join-qr.png`, and the locale-specific station QR images `arcade-en.png` and `arcade-pt.png`.
+The home-page previews use `vr-demo.mp4`, `vm-demo.mp4`, `vf-demo.mp4`, `vk-demo.mp4`, `vt-demo.mp4`, and `vc-demo.mp4` for Voice Racer, Voice Monsters, Voice Fighter, Voice Karaoke, Voice Trivia, and Voice Chess. The generated Trivia preview is a silent H.264 1280x692 24fps 12-second MP4 with no audio stream. The Karaoke preview is a silent H.264 1280x692 24fps runtime derivative; its raw source stays in ignored `client/public/video/_raw/`. The Chess preview is a silent, fast-start H.264 1280x692 24fps six-second MP4 captured from the rendered 3D board. Voice Karaoke serves exactly two licensed 45-second English excerpts from `client/public/audio/karaoke/`: `classic-instrumental-45s.mp3` (*Never Gonna Give You Up* by Rick Astley) and `thousand-miles-45s.mp3` (*A Thousand Miles* by Vanessa Carlton). Their confirmed rights and detailed provenance are in [CREDITS.md](CREDITS.md). The brand inventory is `twilio_logo_1color_white.svg`, `Twilio_Logo_Bug_White.svg`, the standalone fallback `join-qr.png`, and the locale-specific station QR images `arcade-en.png` and `arcade-pt.png`.
 
 Vite serves the public tree directly. In development it proxies other `/assets/*` requests to the Node server; in production the Node server resolves built client assets first and then repository-root `assets/` files.
 
@@ -95,13 +95,14 @@ Voice Monsters tries `<id>_<view>.gif`, then `<id>_<view>.png`, and uses its han
 
 Music and effects are not stored under `assets/`. They are served from `client/public/audio/`:
 contextual music is grouped under `lobby/`, `racer/`, `monsters/`, `fighter/music/`, `leaderboard/`,
-and `karaoke/`; shared effects use `sfx/`, with Fighter effects in `fighter/sfx/`. A missing general
+and `chess/`; Karaoke backing excerpts are under `karaoke/`. Shared effects use `sfx/`, with Fighter effects in `fighter/sfx/`. A missing general
 music or effect file logs a browser error and produces silence; it does not substitute another file.
 A missing Voice Karaoke backing instead fails audio preflight and keeps the performance in sound
 check for retry or timeout.
 
-Voice Trivia has no dedicated audio files. Its current client does not select a `MusicManager`
-context, so it does not reuse the global lobby or leaderboard tracks.
+Voice Trivia has no dedicated audio files and reuses the `lobby` music context. Voice Chess uses the
+user-supplied `chess/the-marble-gambit.mp3` and builds its 3D pieces procedurally in the browser,
+so it does not need a separate model bundle.
 
 The Monsters arena loads `assets/arena/arena.glb` using `arena.json`. If that GLB fails, the battle keeps its rendered green-void backdrop.
 

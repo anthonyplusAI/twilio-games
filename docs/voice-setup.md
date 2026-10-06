@@ -1,6 +1,6 @@
 # Voice Setup
 
-This guide configures the locale-specific Twilio numbers used by Voice Racer, Voice Monsters, Voice Fighter, Voice Karaoke, and Voice Trivia. For the project overview and general development setup, see the [README](../README.md).
+This guide configures the locale-specific Twilio numbers used by Voice Racer, Voice Monsters, Voice Fighter, Voice Karaoke, Voice Trivia, and Voice Chess. For the project overview and general development setup, see the [README](../README.md).
 
 ## How Calls Are Routed
 
@@ -23,6 +23,7 @@ In station mode, the server resolves the caller to one persisted admitted player
 | Voice Fighter | `http://localhost:5173/fighter.html?display=1&room=4821` | `/fighter` |
 | Voice Karaoke | `http://localhost:5173/karaoke.html?display=1&room=4821` | `/karaoke` and `/karaoke-media` |
 | Voice Trivia | `http://localhost:5173/trivia.html?display=1&room=4821` | `/trivia` |
+| Voice Chess | `http://localhost:5173/chess.html?display=1&room=4821` | `/chess` |
 
 Room `4821` is the standalone room only. Active station matches use generated 12-character engine room codes.
 
@@ -30,7 +31,7 @@ For standalone testing, pause the event, open the intended shared display before
 
 The selected game is passed to `/voice` as a Conversation Relay custom parameter and remains fixed for that call. `POST /voice/join` is a legacy alias: it uses a posted `Digits` value when present and otherwise uses `4821`. Do not configure new numbers to use `/voice/join`.
 
-When Conversation Relay ends a session, Twilio calls `POST /voice/session-ended`. The server uses the call SID to recover or clean up all five games.
+When Conversation Relay ends a session, Twilio calls `POST /voice/session-ended`. The server uses the call SID to recover or clean up all six games.
 
 ## Requirements
 
@@ -146,9 +147,9 @@ Speech barge-in stops Relay TTS. Voice Racer and Voice Monsters also invalidate 
 
 ## Station Launch And Personal Setup
 
-The persisted match roster supplies a stable slot for every caller: one for Karaoke, up to two for Racer, Monsters, or Fighter, and up to four for Trivia. The server reuses each registered first name instead of asking for it again; only a station identity without a stored completed name falls back to voice name capture.
+The persisted match roster supplies a stable slot for every caller: one for Karaoke or Chess, up to two for Racer, Monsters, or Fighter, and up to four for Trivia. The server reuses each registered first name instead of asking for it again; only a station identity without a stored completed name falls back to voice name capture in games that require a name.
 
-Each caller controls only their personal setup choices. Racer, Monsters, and Fighter keep explicit shared phase gates; Racer and Fighter add a voting gate before gameplay. Trivia automatically opens category voting after all expected names are confirmed and begins loading when every caller has voted. A one-caller Monsters or Fighter match creates an AI opponent after setup; Karaoke and Trivia have no AI players.
+Each caller controls only their personal setup choices. Racer, Monsters, and Fighter keep explicit shared phase gates; Racer and Fighter add a voting gate before gameplay. Trivia automatically opens category voting after all expected names are confirmed and begins loading when every caller has voted. Chess starts the duel without a setup phase. A one-caller Monsters or Fighter match creates an AI opponent after setup, and Chess always has a computer opponent; Karaoke and Trivia have no AI players.
 
 A station match starts only when the display has acknowledged the current launch generation, the selected engine has started, and every expected caller is connected and bound. The launch timeout is also the setup inactivity window. After all expected callers connect, each final speech prompt or DTMF input from either caller moves that deadline forward by the configured launch timeout; partial transcripts do not. Activity extends setup but does not mark gameplay started or redeem a coin.
 
@@ -156,7 +157,7 @@ At the deadline, a disconnected admitted caller is replaced by the first FIFO ov
 
 ## Connection Recovery
 
-Racer, Monsters, Fighter, and Trivia retain the call SID-to-player binding for 30 seconds after a Relay WebSocket disconnect. A replacement WebSocket for the same call SID and room resumes that player and preserves completed choices, Trivia prompt readiness, and a locked Trivia answer; a normal session-ended callback removes the binding immediately, subject to retaining completed station result state.
+Racer, Monsters, Fighter, Trivia, and Chess retain the call SID-to-player binding for 30 seconds after a Relay WebSocket disconnect. A replacement WebSocket for the same call SID and room resumes that player and preserves completed choices, Trivia prompt readiness, a locked Trivia answer, or the current Chess position; a normal session-ended callback removes the binding immediately, subject to retaining completed station result state.
 
 This 30-second binding grace is separate from Relay session recovery. When `SessionStatus=failed`, the call remains `in-progress`, and the error is absent or recoverable (`39001`, `64103`, `64105`, `64111`, or `64112`), `/voice/session-ended` can return new Conversation Relay TwiML up to two times. Station recovery refreshes the route when possible and still revalidates the setup against current state. A permanent error, a completed call, or an exhausted recovery count hangs up and clears the bindings.
 
@@ -279,6 +280,14 @@ Completed rounds append normalized results to `TRIVIA_LEADERBOARD_PATH`. `GET /a
 
 The display reconnects with exponential delays from 500 ms to 8 seconds, then reauthenticates, re-registers its spectator identity, and resumes server-clock sync. Losing the active display during `loading` invalidates that loading generation, so the replacement must send a fresh readiness signal. Caller Relay replacement with the same call SID and room resumes the same slot for 30 seconds; recoverable Relay failures can receive new TwiML up to two times under the common recovery rules above.
 
+## Voice Chess
+
+Voice Chess starts a one-caller match against the computer when selected; there is no setup menu. It is enabled by default, is stable station or Messaging option `6`, and randomly assigns the caller White or Black. Standalone play opens `/chess.html?display=1&room=4821`; station play launches `/chess.html` with its generated room and paired display capability. The board is read-only and uses `/chess?display=1`, while the caller stays on `/voice`.
+
+Say a complete move such as `pawn from E two to E four`, or select a piece first and then name its destination. The phone repeats a legal proposed move; say `confirm` to play it or `cancel` to discard it. Keypad `1`, `0`, and `9` mean confirm, cancel, and help. Ambiguous and illegal moves require a clearer choice. The phone describes the computer's reply, captured pieces, checks, and the result. A standalone caller can say `play again` after the result; station play returns to the next round.
+
+The server validates moves and chooses computer replies. Its default search settings aim for an approachable 800–1200 Elo feel, which has not been measured as a formal rating. The shared display animates moves and captures, plays the supplied *The Marble Gambit* track with a gesture retry for blocked autoplay, and never submits a move. Voice Chess has private activation metrics and station results, but no leaderboard.
+
 ## Voice Karaoke
 
 Voice Karaoke admits one singer. Conversation Relay owns setup and results, while the same call transitions to a signed, one-use Twilio Media Stream during the 45-second performance.
@@ -335,6 +344,12 @@ Start `npm run dev:client` before the browser smoke; it injects public server pr
 npm run smoke:trivia
 ```
 
+Run the Chess rules, voice, room, and transport tests without a phone:
+
+```bash
+npm test -- chess
+```
+
 The integration tests open fake Conversation Relay and Media Stream WebSockets and verify room binding, setup, handoff security, and deterministic scoring. They do not replace live handset tests for carrier latency, pitch quality, acoustic backing-track bleed, or Twilio callback ordering.
 
 ## Troubleshooting
@@ -375,7 +390,7 @@ Confirm `KARAOKE_TIMINGS_PATH` resolves through `/app/data` to Azure Files and t
 
 ### The caller hears the right game but cannot join
 
-Voice Racer may already have two players. Voice Monsters may have two occupied slots. Voice Fighter may have two players or may already be past fighter selection. Voice Karaoke may already have its one microphone slot occupied. Voice Trivia may already have four callers or may be past `lobby`. End stale calls or reset the shared display before retrying.
+Voice Racer may already have two players. Voice Monsters may have two occupied slots. Voice Fighter may have two players or may already be past fighter selection. Voice Karaoke may already have its one microphone slot occupied. Voice Trivia may already have four callers or may be past `lobby`. Voice Chess admits one controlling caller. End stale calls or reset the shared display before retrying.
 
 ### Speech works only after the caller finishes talking
 
@@ -387,7 +402,7 @@ Inspect the returned TwiML for `interruptible="any"` and `reportInputDuringAgent
 
 ### Menus are quiet without an OpenAI key
 
-Voice Racer and Voice Monsters keep deterministic name, number, advance, help, and gameplay paths without OpenAI. English open-ended questions and recommendations require `OPENAI_API_KEY`. Portuguese sessions never send free-form prompts or replies to OpenAI. Voice Fighter and Voice Trivia do not use the OpenAI host; Trivia reads only its validated question bank at runtime.
+Voice Racer and Voice Monsters keep deterministic name, number, advance, help, and gameplay paths without OpenAI. English open-ended questions and recommendations require `OPENAI_API_KEY`. Portuguese sessions never send free-form prompts or replies to OpenAI. Voice Fighter, Voice Trivia, and Voice Chess do not use the OpenAI host; Trivia reads only its validated question bank at runtime, and Chess uses its local rules and computer search.
 
 ### The displayed phone number is missing
 

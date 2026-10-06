@@ -931,7 +931,7 @@ jobs:
           SMOKE_OK=false
           for attempt in $(seq 1 30); do
             FAILED_ROUTES=()
-            for route in /livez /healthz / /instructions /join /player /karaoke.html /trivia.html /analytics /operator; do
+            for route in /livez /healthz / /instructions /join /player /karaoke.html /trivia.html /chess.html /analytics /operator; do
               RESULT=$(curl --silent --show-error --output /dev/null --write-out '%{http_code} %{redirect_url}' \
                 --connect-timeout 5 --max-time 20 "https://${REVISION_FQDN}${route}" || true)
               CODE=${RESULT%% *}
@@ -1021,6 +1021,7 @@ jobs:
           echo "  Racer display:  https://${FQDN}/play.html?display=1&room=4821"
           echo "  Voice Karaoke:  https://${FQDN}/karaoke.html"
           echo "  Voice Trivia:   https://${FQDN}/trivia.html"
+          echo "  Voice Chess:    https://${FQDN}/chess.html"
           echo "  Editor:         https://${FQDN}/editor"
           echo "  Garage:         https://${FQDN}/garage"
           echo "  Voice webhook:  https://${FQDN}/voice/incoming"

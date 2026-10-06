@@ -171,6 +171,7 @@ const srv = new HttpServer({
   fighterDisplayToken: process.env.ARCADE_DISPLAY_TOKEN ?? process.env.FIGHTER_DISPLAY_TOKEN,
   karaokeDisplayToken: process.env.ARCADE_DISPLAY_TOKEN ?? process.env.FIGHTER_DISPLAY_TOKEN,
   triviaDisplayToken: process.env.ARCADE_DISPLAY_TOKEN ?? process.env.FIGHTER_DISPLAY_TOKEN,
+  chessDisplayToken: process.env.ARCADE_DISPLAY_TOKEN ?? process.env.FIGHTER_DISPLAY_TOKEN,
   // The number players call to join (shown + QR-encoded on the lobby screen). Unset → placeholder.
   gamePhoneNumber: process.env.GAME_PHONE_NUMBER,
   smsNumber: smsNumber ?? undefined,
@@ -183,6 +184,7 @@ srv.start().then((p) => {
   console.log(`  game WS: ws://localhost:${p}/game   voice WS: ws://localhost:${p}/voice`);
   console.log(`  karaoke WS: ws://localhost:${p}/karaoke   media WS: wss://${new URL(publicBaseUrl).host}/karaoke-media`);
   console.log(`  trivia WS: ws://localhost:${p}/trivia   questions: ${process.env.TRIVIA_QUESTIONS_PATH ?? 'data/trivia-questions.json'}`);
+  console.log(`  chess WS: ws://localhost:${p}/chess`);
   console.log(`  webhooks: POST ${publicBaseUrl}/voice/incoming , /voice/join`);
   console.log(`  twilio signature validation: ${validateSignatures ? 'ON' : 'OFF'}`);
 });

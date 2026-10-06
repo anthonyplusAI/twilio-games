@@ -823,6 +823,19 @@ export class ArcadeApi {
       || this.stationRoomCodes.has(roomCode.trim());
   }
 
+  stationEnginePhase(game: RoutedStationGame, roomCode: string): 'LAUNCHING' | 'PLAYING' | null {
+    const resources = this.playerRuntime?.getInitializedResources();
+    if (!resources) return null;
+    const state = resources.store.snapshot();
+    const code = roomCode.trim().toUpperCase();
+    for (const station of Object.values(state.stations)) {
+      if (station.phase !== 'LAUNCHING' && station.phase !== 'PLAYING') continue;
+      const match = station.activeMatchId ? state.stationMatches[station.activeMatchId] : undefined;
+      if (match?.game === game && match.engineRoomCode.toUpperCase() === code) return station.phase;
+    }
+    return null;
+  }
+
   stationEngineStarted(game: RoutedStationGame, roomCode: string): void {
     void this.playerRuntime?.getForCleanup().then(resources => {
       resources.station.markEngineStarted(game, roomCode);

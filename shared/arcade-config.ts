@@ -1,9 +1,9 @@
-// Activate v7 writes only after every rollback target can read v7. Promotion is intentionally one-way;
+// Activate v8 writes only after every rollback target can read v8. Promotion is intentionally one-way;
 // deployment must provide the staged compatibility gate rather than relying on a lossy downmigration.
-export const ARCADE_CONFIG_SCHEMA_VERSION = 7 as const;
+export const ARCADE_CONFIG_SCHEMA_VERSION = 8 as const;
 
 export type ArcadeMode = 'off' | 'coin_only' | 'lead_capture';
-export type ArcadeGame = 'racer' | 'monsters' | 'fighter' | 'karaoke' | 'trivia';
+export type ArcadeGame = 'racer' | 'monsters' | 'fighter' | 'karaoke' | 'trivia' | 'chess';
 export type RegistrationFieldKey =
   | 'firstName'
   | 'lastName'
@@ -49,7 +49,7 @@ export type ArcadeSettings = {
 };
 
 export type StationGame = ArcadeGame;
-/** @deprecated Compatibility tombstone retained for schema v7 only. */
+/** @deprecated Compatibility tombstone retained for persisted Trivia configs. */
 export type HomeConcept = 'trivia';
 export type AutomaticSelectionPolicy = 'best_fit_rotation' | 'round_robin' | 'fixed_priority';
 export type StationQrRail = 'auto' | 'always' | 'hidden';
@@ -219,7 +219,7 @@ const CONFIG_KEYS = [
 const SETTINGS_KEYS = [
   'arcade', 'station', 'registration', 'coins', 'earning', 'queue', 'channels', 'postGame', 'intelligence',
 ] as const;
-export const STATION_GAMES: readonly StationGame[] = Object.freeze(['racer', 'monsters', 'fighter', 'karaoke', 'trivia']);
+export const STATION_GAMES: readonly StationGame[] = Object.freeze(['racer', 'monsters', 'fighter', 'karaoke', 'trivia', 'chess']);
 const HOME_CONCEPTS: readonly HomeConcept[] = ['trivia'];
 const REGISTRATION_FIELD_KEYS: readonly RegistrationFieldKey[] = [
   'firstName', 'lastName', 'workEmail', 'companyName', 'phoneNumber', 'countryCode',
@@ -498,6 +498,7 @@ function parseStation(value: unknown, mode: ArcadeMode): StationSettings {
     fighter: parseStationGame(gameInput.fighter, '$.station.games.fighter'),
     karaoke: parseStationGame(gameInput.karaoke, '$.station.games.karaoke'),
     trivia: parseStationGame(gameInput.trivia, '$.station.games.trivia'),
+    chess: parseStationGame(gameInput.chess, '$.station.games.chess'),
   };
   if (mode !== 'off' && !STATION_GAMES.some(game => games[game].enabled)) {
     invalid('$.station.games', 'at least one game must be enabled when arcade mode is not off');
@@ -616,7 +617,7 @@ function parseCoins(value: unknown): CoinSettings {
     'startingBalance', 'defaultGameCost', 'gameCosts', 'chargePolicy', 'consumeWhen',
     'expiresAfterHours', 'refundOnLobbyTimeout', 'disconnectGraceSeconds',
   ], '$.coins');
-  const costs = exactObject(object.gameCosts, ['racer', 'monsters', 'fighter', 'karaoke', 'trivia'], '$.coins.gameCosts');
+  const costs = exactObject(object.gameCosts, STATION_GAMES, '$.coins.gameCosts');
   const expiresAfterHours = object.expiresAfterHours === null
     ? null
     : integerAt(object.expiresAfterHours, 1, 87_600, '$.coins.expiresAfterHours');
@@ -638,6 +639,7 @@ function parseCoins(value: unknown): CoinSettings {
       fighter: stationGameCostAt(costs.fighter, '$.coins.gameCosts.fighter'),
       karaoke: stationGameCostAt(costs.karaoke, '$.coins.gameCosts.karaoke'),
       trivia: stationGameCostAt(costs.trivia, '$.coins.gameCosts.trivia'),
+      chess: stationGameCostAt(costs.chess, '$.coins.gameCosts.chess'),
     },
     chargePolicy,
     consumeWhen: enumAt(object.consumeWhen, ['match_start'], '$.coins.consumeWhen'),
@@ -1033,13 +1035,14 @@ const DEFAULT_CONFIG_INPUT = {
       fighter: { enabled: true },
       karaoke: { enabled: true },
       trivia: { enabled: true },
+      chess: { enabled: true },
     },
     comingSoon: {
       trivia: { enabled: false },
     },
     automaticSelection: {
       policy: 'best_fit_rotation',
-      order: ['racer', 'monsters', 'fighter', 'karaoke', 'trivia'],
+      order: ['racer', 'monsters', 'fighter', 'karaoke', 'trivia', 'chess'],
     },
     qrRail: 'auto',
   },
@@ -1059,7 +1062,7 @@ const DEFAULT_CONFIG_INPUT = {
   coins: {
     startingBalance: 1,
     defaultGameCost: 1,
-    gameCosts: { racer: 1, monsters: 1, fighter: 1, karaoke: 1, trivia: 1 },
+    gameCosts: { racer: 1, monsters: 1, fighter: 1, karaoke: 1, trivia: 1, chess: 1 },
     chargePolicy: 'per_player',
     consumeWhen: 'match_start',
     expiresAfterHours: null,

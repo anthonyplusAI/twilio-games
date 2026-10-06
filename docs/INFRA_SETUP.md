@@ -126,6 +126,8 @@ The workflow validates webhook authentication, TAC credentials, the dedicated Re
 
 Voice Trivia requires no new provider account, GitHub Actions secret, or Container App secret. It uses the existing Twilio and Conversation Relay credentials for calls, `ARCADE_DISPLAY_TOKEN` for station displays, `EDITOR_TOKEN` for the complete question bank, and `ARCADE_SIGNING_SECRET` to derive keyed leaderboard identities. Do not create a `TRIVIA_*` provider secret; the workflow and Container App specification do not consume one.
 
+Voice Chess also needs no new provider secret. It uses the same Twilio and Conversation Relay credentials and station display capability; its supplied music is included in the built client. Chess has no leaderboard store.
+
 An empty primary or Portuguese Auth Token makes the corresponding production webhooks fail closed. Production also rejects an empty `EDITOR_TOKEN`, preventing editor and garage writes from failing open. Production deployment requires at least one complete Google OAuth configuration or `ANALYTICS_ADMIN_PIN`; either method protects analytics and operator access.
 
 ## Configure GitHub Actions variables
@@ -214,14 +216,14 @@ Each deployment run performs these operations:
 6. Reads the ACR admin username/password and stores the password as the Container App secret `acr-password`. The workflow enables the admin account only when it creates ACR; an existing registry must already have `adminUserEnabled=true` or the credential step fails.
 7. Accepts an existing app in `Single` or `Multiple` mode only when exactly one revision is active, switches to `Multiple` when needed, pins traffic to that revision, deactivates it, and waits for zero replicas. It also accepts a stopped, zero-running-replica first-deployment retry. Any other revision topology fails closed. On first create, it creates an Azure-resource-tagged zero-replica shell, then stops its temporary revision.
 8. Applies `.github/containerapp.yaml` as a uniquely named full-spec revision, including the Azure Files mount, one-replica limit, 2 vCPU, 4 GiB memory, health probes, secrets, and complete runtime environment.
-9. Requires the exact SHA image revision to be `Provisioned`, `Healthy`, and latest-ready with the expected mount and `/livez` probes; asserts it is the only running revision; then checks `/livez`, dependency-aware `/healthz`, `/`, `/instructions`, `/join`, `/player`, `/karaoke.html`, `/trivia.html`, and `/analytics` plus the `/operator` authentication redirect through the candidate revision FQDN before public cutover.
+9. Requires the exact SHA image revision to be `Provisioned`, `Healthy`, and latest-ready with the expected mount and `/livez` probes; asserts it is the only running revision; then checks `/livez`, dependency-aware `/healthz`, `/`, `/instructions`, `/join`, `/player`, `/karaoke.html`, `/trivia.html`, `/chess.html`, and `/analytics` plus the `/operator` authentication redirect through the candidate revision FQDN before public cutover.
 10. Assigns public traffic, then requires exact `Single` revision mode around the verified revision. Automatic snapshot restore is allowed only before the candidate can produce external or public durable side effects. If outbound delivery is enabled, restore becomes unsafe before the candidate update because its worker can call Twilio as soon as the revision starts. Once restore is unsafe, a failure leaves current data and revision state intact for manual recovery rather than erasing accepted interactions.
 
 The workflow is create-if-missing for supporting infrastructure, not a full declarative reconciliation system. For example, it does not change an existing storage SKU, share quota, region, resource tags, ACR admin setting, or Log Analytics configuration to match the checked-in defaults.
 
 ## Configure Twilio, Orchestrator, and Memory
 
-After deployment, use the App URL printed by the workflow. The same output prints the Voice Trivia display as the App URL plus `/trivia.html`.
+After deployment, use the App URL printed by the workflow. The same output prints the Voice Trivia and Voice Chess displays at `/trivia.html` and `/chess.html`.
 
 Configure both accounts' incoming Voice webhooks:
 
@@ -306,7 +308,7 @@ curl --fail "https://${FQDN}/livez"
 curl --fail "https://${FQDN}/healthz" | jq -e \
   '.status == "ok" and .triviaContent.state == "ready" and .triviaContent.questionCount == 200 and .triviaLeaderboard.state == "ready"'
 
-for route in / /instructions /join /player /karaoke.html /trivia.html /analytics; do
+for route in / /instructions /join /player /karaoke.html /trivia.html /chess.html /analytics; do
   curl --fail --silent --show-error --output /dev/null "https://${FQDN}${route}"
 done
 
@@ -315,11 +317,11 @@ test "$(curl --silent --show-error --output /dev/null \
   = "302 https://${FQDN}/analytics?returnTo=%2Foperator"
 ```
 
-`/healthz` is dependency-aware and returns 503 for repairable station/TAC/configuration degradation or a non-ready Trivia content/leaderboard store. Trivia loads before the HTTP listener: invalid bundled or live questions, a failed first seed write, or corrupt leaderboard storage prevents `/livez` from becoming reachable. ACA startup, readiness, and liveness probes call process-only `/livez`, so a later Twilio outage does not restart the process. The workflow verifies `/trivia.html`, not `/trivia`; the latter is the same-origin WebSocket upgrade and requires a protocol-aware client. The deployment workflow does not perform live Twilio, Memory, Azure Files write, or WebSocket gameplay tests.
+`/healthz` is dependency-aware and returns 503 for repairable station/TAC/configuration degradation or a non-ready Trivia content/leaderboard store. Trivia loads before the HTTP listener: invalid bundled or live questions, a failed first seed write, or corrupt leaderboard storage prevents `/livez` from becoming reachable. ACA startup, readiness, and liveness probes call process-only `/livez`, so a later Twilio outage does not restart the process. The workflow verifies `/trivia.html` and `/chess.html`, not their `/trivia` and `/chess` WebSocket upgrades; those require protocol-aware clients. The deployment workflow does not perform live Twilio, Memory, Azure Files write, or WebSocket gameplay tests.
 
 There is no safe existing persistent-store write probe. Every public write endpoint changes real editor, Arcade, or messaging state, so the workflow intentionally does not call one. Do not substitute an unauthenticated or production-data mutation. A future persistent write smoke should use an authenticated, idempotent endpoint designed to create and remove a disposable probe record.
 
-For an event readiness check, also load `/play.html`, `/monsters.html`, `/fighter.html`, `/trivia.html`, and `/editor`; verify representative GLB and FBX-backed scenes; save and reload a disposable editor change; and complete real Twilio calls.
+For an event readiness check, also load `/play.html`, `/monsters.html`, `/fighter.html`, `/trivia.html`, `/chess.html`, and `/editor`; verify representative 3D scenes; save and reload a disposable editor change; and complete real Twilio calls.
 
 ### Live acceptance checklist
 
@@ -330,17 +332,18 @@ Keep runtime mode `off` during provisioning. After item 1 passes, open the event
 3. In the primary account, send `JOIN` by SMS and confirm exactly one reply, one Conversation, and one Memory profile. Send `ENTRAR` by SMS and confirm it is durably rejected with guidance to use WhatsApp or the lead-capture browser fallback; legacy `LANG` commands remain supported.
 4. Send `ENTRAR` through WhatsApp and confirm it resolves to the same profile for the same phone identity.
 5. In lead-capture mode, register through `/player` once in English and once in Portuguese. Confirm both players can join immediately without an OTP and that `/join` presents browser registration below the preferred Messaging actions.
-6. Run a paid two-player game. During selection, confirm the display offers all five enabled games; vote by SMS with `1` or `RACER`, change the vote with `5` or `TRIVIA`, and confirm the browser player can vote from `/player`. Confirm the shared display shows looping previews and live totals. When gameplay starts, confirm one coin is redeemed from each admitted player and an overflow player's coin remains reserved.
+6. Run a paid two-player game. Confirm all six games are enabled in operator settings. Move Chess to the first display position, save, and confirm its home card moves while its vote remains option `6`; restore the desired event order afterward. Check that selection shows Chess alongside the other games; vote by SMS with `1` or `RACER`, change the vote with `5` or `TRIVIA`, and confirm the browser player can vote from `/player`. Confirm the shared display shows looping gameplay previews, including Chess, and live totals. When gameplay starts, confirm one coin is redeemed from each admitted player and an overflow player's coin remains reserved.
 7. Switch the event to free play and confirm no wallet grants, reservations, or redemptions are created.
 8. Call the English number and confirm either configured Voice Auth Token can validate the request, the English `To` number selects English recognition/TTS, and the call reaches its assigned generated room.
 9. Call the Portuguese number and confirm either configured Voice Auth Token can validate the request, the Portuguese `To` number selects `pt-BR`, and free-form OpenAI help remains disabled.
-10. In the authenticated station display tab, select **Enable concert audio** before the first Karaoke call and confirm the preflight does not return for later performances in that loaded tab. Complete each non-Trivia game once and confirm the operator sees authoritative results; item 14 covers Voice Trivia. For Karaoke, verify the countdown waits for both display audio and the authenticated inbound Media Stream, then confirm the result reaches the all-time song leaderboard. Use the operator score controls to reset one test track and one test song.
+10. In the authenticated station display tab, select **Enable concert audio** before the first Karaoke call and confirm the preflight does not return for later performances in that loaded tab. Complete Racer, Monsters, Fighter, and Karaoke once and confirm the operator sees authoritative results; items 14 and 15 cover Trivia and Chess. For Karaoke, verify the countdown waits for both display audio and the authenticated inbound Media Stream, then confirm the result reaches the all-time song leaderboard. Use the operator score controls to reset one test track and one test song.
 11. Reset an inactive test player from `/operator`. The reset must delete the linked Conversation Memory profile before local identity, wallet, messaging, and roster retirement commits; it fails closed if Memory deletion is unavailable or fails. Confirm the next `JOIN` creates a fresh profile and wallet. Never reset a connected caller or a player with an active game, coin hold, or pending outbound notice.
 12. If proactive messaging is enabled, confirm SMS delivery callbacks, all three WhatsApp call-now states where practical, and one approved out-of-session template.
-13. For station-managed play, authenticate at `/operator` in the intended booth tab and select **Pair this tab as the big screen**. Confirm the same tab returns to `/`, display access is held only in `sessionStorage`, and no credential appears in the URL. During a station launch, verify an absent or rejected display session links to the authenticated operator flow instead of showing a secret field or a stuck countdown. Separately pause the event, open standalone Karaoke and Trivia displays for room `4821`, and confirm neither requires display pairing. Karaoke still requires audio preflight; Trivia rejects browser-player admission.
+13. For station-managed play, authenticate at `/operator` in the intended booth tab and select **Pair this tab as the big screen**. Confirm the same tab returns to `/`, display access is held only in `sessionStorage`, and no credential appears in the URL. During a station launch, verify an absent or rejected display session links to the authenticated operator flow instead of showing a secret field or a stuck countdown. Separately pause the event, open standalone Karaoke, Trivia, and Chess displays for room `4821`, and confirm none requires display pairing. Karaoke still requires audio preflight; Trivia and Chess reject browser-player admission.
 14. Admit four players, select Voice Trivia, and confirm the station launches `/trivia.html` with all four calls bound to the generated room. Have callers cast and revise votes so one concrete category wins, complete all eight questions by voice, and confirm answers are absent before reveal. Verify one completed result in the operator console and the four redacted test rows on the all-time and selected-category leaderboards, then reset that test category through the operator score controls.
-15. Open `/editor?game=trivia`, authenticate with `EDITOR_TOKEN`, and confirm the protected 200-question bank loads. Make and save one factually harmless prompt change, reload it, restore the original prompt using the new ETag, and reload again. A stale second tab must receive `412` rather than overwrite the newer bank. Do not run this test without a current Azure Files snapshot.
-16. Restart the Container App, sign in again because sessions are process-local, and confirm the Trivia question edit/revert, Trivia leaderboard, event recovery, wallet balances, and Memory-linked messaging persist.
+15. Select Voice Chess and confirm option `6` launches `/chess.html` for one caller against the computer. Confirm the caller is assigned White or Black, a spoken move waits for `confirm`, and the phone announces the computer's reply and any capture. Check the animated board, music control, and operator result. In private `/analytics`, filter to Chess and verify one completed match, its accepted voice actions, and the PDF report; confirm there is no Chess leaderboard.
+16. Open `/editor?game=trivia`, authenticate with `EDITOR_TOKEN`, and confirm the protected 200-question bank loads. Make and save one factually harmless prompt change, reload it, restore the original prompt using the new ETag, and reload again. A stale second tab must receive `412` rather than overwrite the newer bank. Do not run this test without a current Azure Files snapshot.
+17. Restart the Container App, sign in again because sessions are process-local, and confirm the Trivia question edit/revert, Trivia leaderboard, event recovery, wallet balances, and Memory-linked messaging persist.
 
 ## Persistent storage operations
 
@@ -348,7 +351,7 @@ Azure Files is mounted at `/app/appdata`; `scripts/start.sh` links `/app/data` t
 
 Back up the share before destructive editor work or rollback across a data-format change. The workflow creates a temporary pre-rollout share snapshot after the old writer stops. It deletes the snapshot after success and restores it automatically only while no external or public side effects can have occurred. Azure retention policies and long-lived backups remain an operator responsibility.
 
-Create and verify a retained manual snapshot before Trivia question editing or activating configuration v7/state v11 writers:
+Create and verify a retained manual snapshot before Trivia question editing or activating configuration v8 or Chess-bearing state v11 writers:
 
 ```bash
 STORAGE_KEY=$(az storage account keys list \
@@ -360,7 +363,7 @@ SNAPSHOT=$(az storage share snapshot \
   --name twiliogamesdata \
   --account-name twiliogamesdata \
   --account-key "$STORAGE_KEY" \
-  --metadata purpose=manual-pre-trivia-v11 \
+  --metadata purpose=manual-pre-chess-v8 \
   --query snapshot \
   --output tsv)
 test -n "$SNAPSHOT"
@@ -376,7 +379,7 @@ Do not place image-owned assets or `assets/manifest.json` on the share without c
 
 ## Configuration gaps and security notes
 
-`FIGHTER_DISPLAY_TOKEN` remains available as a server-side standalone override for custom integrations, but browser URLs no longer accept display credentials. The deployed server passes `ARCADE_DISPLAY_TOKEN` to Fighter, Racer, Monsters, Karaoke, and Trivia, so station engine rooms share the kiosk capability installed through `/operator`. That capability is required only for station-managed engine rooms; standalone room `4821` deliberately registers without pairing while the event is paused.
+`FIGHTER_DISPLAY_TOKEN` remains available as a server-side standalone override for custom integrations, but browser URLs no longer accept display credentials. The deployed server passes `ARCADE_DISPLAY_TOKEN` to Fighter, Racer, Monsters, Karaoke, Trivia, and Chess, so station engine rooms share the kiosk capability installed through `/operator`. That capability is required only for station-managed engine rooms; standalone room `4821` deliberately registers without pairing while the event is paused.
 
 `VOICE_RELAY_TOKEN` is wired as its own Container App secret and is mandatory in the deployment workflow. Rotate it independently from `TWILIO_AUTH_TOKEN`; the server places the current value in newly generated Conversation Relay setup parameters.
 
