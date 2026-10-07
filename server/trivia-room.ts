@@ -36,6 +36,8 @@ export const TRIVIA_FINAL_ANSWER_GRACE_MS = 1_500;
 /** A received spoken final can hold only its own question while semantic intent resolves. */
 export const TRIVIA_SEMANTIC_ANSWER_MAX_MS = 3_000;
 export const TRIVIA_REVEAL_MS = 4_000;
+/** Reveal audio may outlast the visual minimum, but must never stall a round indefinitely. */
+export const TRIVIA_REVEAL_MAX_MS = 18_000;
 export const TRIVIA_AUDIO_RECOVERY_MS = 120_000;
 
 export interface TriviaRoomOptions {
@@ -117,9 +119,12 @@ export class TriviaRoom {
     questionId: string;
     questionAttemptId: number;
     expiresAtMs: number;
-    lateOnset?: { choiceId: string; atMs: number };
+    lateOnset?: { choiceId?: string; atMs: number };
   }>();
   private revealEndsAt: number | null = null;
+  private revealHardEndsAt: number | null = null;
+  private readonly revealDeliveries = new Map<string, number>();
+  private readonly revealReadyPlayerIds = new Set<string>();
   private readonly promptReadyPlayerIds = new Set<string>();
   private readonly answerCueReadyPlayerIds = new Set<string>();
   private nextDeliveryGeneration = 1;
@@ -213,6 +218,8 @@ export class TriviaRoom {
     this.answerCueReadyPlayerIds.delete(playerId);
     this.promptDeliveries.delete(playerId);
     this.cueDeliveries.delete(playerId);
+    this.revealDeliveries.delete(playerId);
+    this.revealReadyPlayerIds.delete(playerId);
     this.events.push({ type: 'player_left', playerId, atMs: this.now() });
     if (!this.players.length) {
       const stationPregame = this.stationFixedValue
@@ -278,10 +285,13 @@ export class TriviaRoom {
     this.questionEndsAt = null;
     this.finalAnswerDeadlineAt = null;
     this.revealEndsAt = null;
+    this.revealHardEndsAt = null;
     this.promptReadyPlayerIds.clear();
     this.answerCueReadyPlayerIds.clear();
     this.promptDeliveries.clear();
     this.cueDeliveries.clear();
+    this.revealDeliveries.clear();
+    this.revealReadyPlayerIds.clear();
     this.resultValue = null;
     this.resetPlayersForRound();
     return true;
@@ -463,6 +473,29 @@ export class TriviaRoom {
     return true;
   }
 
+  /** Each voice transport gets a fresh generation, so a replaced or retried cue cannot acknowledge its successor. */
+  beginRevealDelivery(playerId: string, questionId: string, questionAttemptId: number): number | null {
+    const player = this.players.find(candidate => candidate.playerId === playerId);
+    if (this.phase !== 'reveal' || this.currentQuestion()?.question.id !== questionId
+      || this.questionAttemptIdValue !== questionAttemptId || !player?.connected
+      || this.revealReadyPlayerIds.has(playerId)) return null;
+    const generation = this.nextDeliveryGeneration++;
+    this.revealDeliveries.set(playerId, generation);
+    return generation;
+  }
+
+  /** Relay-confirmed, estimated, or caller-interrupted playback releases this caller's reveal barrier. */
+  questionRevealReady(playerId: string, questionId: string, questionAttemptId: number,
+    deliveryGeneration: number): boolean {
+    const player = this.players.find(candidate => candidate.playerId === playerId);
+    if (this.phase !== 'reveal' || this.currentQuestion()?.question.id !== questionId
+      || this.questionAttemptIdValue !== questionAttemptId || !player?.connected
+      || this.revealDeliveries.get(playerId) !== deliveryGeneration) return false;
+    this.revealDeliveries.delete(playerId);
+    this.revealReadyPlayerIds.add(playerId);
+    return true;
+  }
+
   /** Holds a final early choice for the shared start; it never exposes the answer key. */
   queueEarlyAnswer(playerId: string, questionId: string, questionAttemptId: number,
     spokenOrChoiceId: string): boolean {
@@ -520,7 +553,7 @@ export class TriviaRoom {
 
   /** Reserve bounded interpretation time only for a final heard during this attempt's ten-second clock. */
   beginSemanticAnswerResolution(playerId: string, questionId: string, questionAttemptId: number,
-    onset?: { choiceId: string; atMs: number }): number | null {
+    onset?: { choiceId?: string; atMs: number }): number | null {
     const receivedAtMs = this.now();
     const current = this.currentQuestion();
     const player = this.players.find(candidate => candidate.playerId === playerId);
@@ -534,7 +567,8 @@ export class TriviaRoom {
     if (receivedAtMs > this.questionEndsAt && (!lateOnset
       || !Number.isSafeInteger(lateOnset.atMs) || lateOnset.atMs < this.answeringStartsAt
       || lateOnset.atMs > this.questionEndsAt || lateOnset.atMs > receivedAtMs
-      || !current.question.locales[this.locale].choices.some(choice => choice.id === lateOnset.choiceId))) return null;
+      || (lateOnset.choiceId !== undefined
+        && !current.question.locales[this.locale].choices.some(choice => choice.id === lateOnset.choiceId)))) return null;
     const id = this.nextSemanticResolutionId++;
     this.semanticAnswerResolutions.set(playerId, {
       id, questionId, questionAttemptId,
@@ -582,8 +616,9 @@ export class TriviaRoom {
     if (!player?.connected || player.submittedChoiceId !== null || !current) return false;
     const choiceId = this.resolveChoice(current, spokenOrChoiceId);
     if (!choiceId) return false;
-    if (reservation?.lateOnset && (choiceId !== reservation.lateOnset.choiceId
-      || answeredAtMs !== reservation.lateOnset.atMs)) return false;
+    if (reservation?.lateOnset && (answeredAtMs !== reservation.lateOnset.atMs
+      || (reservation.lateOnset.choiceId !== undefined
+        && choiceId !== reservation.lateOnset.choiceId))) return false;
 
     const elapsedMs = answeredAtMs - this.answeringStartsAt;
     const scored = scoreTriviaAnswer(choiceId === current.question.correctChoiceId, elapsedMs, player.currentStreak);
@@ -668,10 +703,12 @@ export class TriviaRoom {
         changed = true;
         continue;
       }
-      if (this.phase === 'reveal' && this.revealEndsAt !== null && now >= this.revealEndsAt) {
+      if (this.phase === 'reveal' && this.revealEndsAt !== null && now >= this.revealEndsAt
+        && (this.revealHardEndsAt !== null && now >= this.revealHardEndsAt
+          || !this.players.some(player => player.connected && this.revealDeliveries.has(player.playerId)))) {
         const nextIndex = (this.questionIndexValue ?? -1) + 1;
         if (nextIndex < this.round.length) this.startQuestion(nextIndex, now);
-        else this.finishRound(this.revealEndsAt);
+        else this.finishRound(now);
         changed = true;
         continue;
       }
@@ -770,6 +807,9 @@ export class TriviaRoom {
     this.questionEndsAt = null;
     this.finalAnswerDeadlineAt = null;
     this.revealEndsAt = null;
+    this.revealHardEndsAt = null;
+    this.revealDeliveries.clear();
+    this.revealReadyPlayerIds.clear();
     this.promptDeliveries.clear();
     this.cueDeliveries.clear();
     this.resultValue = null;
@@ -814,6 +854,9 @@ export class TriviaRoom {
     this.finalAnswerDeadlineAt = null;
     this.semanticAnswerResolutions.clear();
     this.revealEndsAt = null;
+    this.revealHardEndsAt = null;
+    this.revealDeliveries.clear();
+    this.revealReadyPlayerIds.clear();
     this.audioProblemValue = null;
     this.promptReadyPlayerIds.clear();
     this.answerCueReadyPlayerIds.clear();
@@ -897,6 +940,9 @@ export class TriviaRoom {
     this.finalAnswerDeadlineAt = null;
     this.semanticAnswerResolutions.clear();
     this.revealEndsAt = revealedAtMs + this.revealMs;
+    this.revealHardEndsAt = revealedAtMs + Math.max(this.revealMs, TRIVIA_REVEAL_MAX_MS);
+    this.revealDeliveries.clear();
+    this.revealReadyPlayerIds.clear();
     this.events.push({ type: 'question_revealed', questionId: current.question.id,
       questionAttemptId: this.questionAttemptIdValue, atMs: revealedAtMs });
     for (const player of this.players) {
@@ -964,6 +1010,9 @@ export class TriviaRoom {
     this.promptReadyPlayerIds.clear();
     this.answerCueReadyPlayerIds.clear();
     this.revealEndsAt = null;
+    this.revealHardEndsAt = null;
+    this.revealDeliveries.clear();
+    this.revealReadyPlayerIds.clear();
     const standings = this.state().standings as readonly TriviaPublicStanding[];
     this.events.push({ type: 'round_finished', standings, result: this.resultValue, atMs: completedAtMs });
   }
@@ -1050,6 +1099,9 @@ export class TriviaRoom {
     this.finalAnswerDeadlineAt = null;
     this.semanticAnswerResolutions.clear();
     this.revealEndsAt = null;
+    this.revealHardEndsAt = null;
+    this.revealDeliveries.clear();
+    this.revealReadyPlayerIds.clear();
     this.promptReadyPlayerIds.clear();
     this.answerCueReadyPlayerIds.clear();
     this.promptDeliveries.clear();

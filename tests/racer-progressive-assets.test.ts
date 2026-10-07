@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AssetLoader } from '../client/asset-loader';
+import { AssetLoader as RacerAssetLoader } from '../client/asset-loader';
 import { renderBoostThumbnailAsync, renderCarThumbnailsAsync } from '../client/thumbnails';
+import * as THREE from 'three';
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -80,5 +82,61 @@ describe('Racer progressive asset portraits', () => {
     boost.resolve(false);
 
     await expect(complete).resolves.toBe('');
+  });
+});
+
+describe('Racer slow-network asset loading', () => {
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  it('aborts stalled downloads and starts the next queued asset without exceeding four requests', async () => {
+    vi.useFakeTimers();
+    const signals: AbortSignal[] = [];
+    vi.stubGlobal('fetch', vi.fn((_url: string, options: { signal: AbortSignal }) => {
+      signals.push(options.signal);
+      return new Promise<Response>((_resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      });
+    }));
+    const loader = new RacerAssetLoader() as unknown as {
+      loadRef(ref: { file: string }, target: number): Promise<THREE.Group | null>;
+    };
+    const loads = Array.from({ length: 5 }, (_, index) => loader.loadRef({ file: `car-${index}.glb` }, 5));
+    await Promise.resolve();
+    expect(signals).toHaveLength(4);
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(signals.slice(0, 4).every(signal => signal.aborted)).toBe(true);
+    expect(signals).toHaveLength(5);
+    await vi.advanceTimersByTimeAsync(45_000);
+    await expect(Promise.all(loads)).resolves.toEqual([null, null, null, null, null]);
+  });
+
+  it('holds a decode slot until a timed-out parse settles', async () => {
+    vi.useFakeTimers();
+    const parses: Array<ReturnType<typeof deferred<{ scene: THREE.Group; animations: [] }>>> = [];
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      arrayBuffer: async () => new ArrayBuffer(4),
+    })));
+    const loader = new RacerAssetLoader() as unknown as {
+      loader: { parseAsync(bytes: ArrayBuffer, path: string): Promise<{ scene: THREE.Group; animations: [] }> };
+      loadRef(ref: { file: string }, target: number): Promise<THREE.Group | null>;
+    };
+    loader.loader.parseAsync = () => {
+      const parse = deferred<{ scene: THREE.Group; animations: [] }>();
+      parses.push(parse);
+      return parse.promise;
+    };
+    const loads = Array.from({ length: 5 }, (_, index) => loader.loadRef({ file: `car-${index}.glb` }, 5));
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    expect(parses).toHaveLength(4);
+
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(parses).toHaveLength(4);
+    parses[0]!.resolve({ scene: new THREE.Group(), animations: [] });
+    for (let turn = 0; turn < 12 && parses.length < 5; turn++) await Promise.resolve();
+    expect(parses).toHaveLength(5);
+    for (const parse of parses.slice(1)) parse.resolve({ scene: new THREE.Group(), animations: [] });
+    await expect(Promise.all(loads)).resolves.toEqual([null, null, null, null, null]);
   });
 });

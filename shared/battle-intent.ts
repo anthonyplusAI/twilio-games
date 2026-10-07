@@ -63,9 +63,9 @@ export function matchMove(spoken: string, names: string[], locale: SupportedLoca
 }
 
 // ── the two-level command menu, by voice ───────────────────────────────────────────────────────────
-// ROOT keyword → action synonyms. A word-boundary match anywhere in the utterance fires it, so
-// "let me attack", "brace for it", "use a potion" all work. Ordered most-specific first isn't needed —
-// each set is disjoint. ATTACK opens the moves unless the same utterance also names a move.
+// ROOT keyword → action synonyms. A clear command such as "let me attack", "brace for it", or
+// "use a potion" is fast; questions and status statements stay on the conversational path.
+// ATTACK opens the moves unless the same utterance also names a move.
 const COMMAND_WORDS: Record<SupportedLocale, {
   guard: string[]; item: string[]; taunt: string[]; fight: string[]; back: string[];
 }> = {
@@ -169,10 +169,12 @@ export function matchBattleAction(spoken: string, ctx: BattleMenuCtx, locale: Su
 function unsafeActionUtterance(spoken: string, locale: SupportedLocale): boolean {
   const q = normalizeForMatching(spoken, locale);
   if (q === 'never mind' || q === 'nevermind') return false;
-  if (spoken.includes('?')) return true;
+  if (/[?？¿]/u.test(spoken)) return true;
   return locale === 'pt-BR'
-    ? /\b(nao|nunca|nem|talvez|devo|posso|qual|como|porque|por que|ou)\b/.test(q)
-    : /\b(don't|dont|do not|not|never|no|maybe|should|could|would|can i|what|which|how|why|instead|actually|or)\b/.test(q);
+    ? /\b(nao|nunca|nem|talvez|devo|posso|podemos|qual|quais|como|porque|por que|ou)\b/.test(q)
+      || /^(?:eu tenho|nos temos|eu consigo|me fale|me conte|explique|descreva|diga me)\b/.test(q)
+    : /\b(don't|dont|do not|not|never|no|maybe|should|could|would|can i|can't|cant|cannot|what|which|how|why|who|when|where|instead|actually|or)\b/.test(q)
+      || /^(?:i have|we have|i can|we can|there is|there are|tell me|explain|describe|what about|show me)\b/.test(q);
 }
 
 /** A bare menu number is actionable; an incidental count in a question or status remark is not. */

@@ -94,7 +94,7 @@ For a deployed environment, configure the same `POST /voice/incoming` webhook ag
 | `GAME_PHONE_NUMBER` | Optional | Legacy lobby fallback until locale-specific voice numbers are saved in Arcade runtime settings. |
 | `TWILIO_SMS_NUMBER` | Required by production deployment | SMS-capable sender/receiver registered with TAC and used by the join chooser and outbound notices. |
 | `PORT` | No | HTTP and WebSocket port. Defaults to `8080`. |
-| `CR_TTS_VOICE` | No | English ElevenLabs voice ID for every game's Conversation Relay talk-back. Defaults to `xp3gDg85YgFcWpnNVlIu`; deployment pins that value. |
+| `CR_TTS_VOICE` | No | English ElevenLabs voice ID for every game's Conversation Relay talk-back. Defaults to `SA7eD52NRr8WAehitVt1`; deployment pins that value. |
 | `CR_TTS_VOICE_PT_BR` | No | Optional Brazilian Portuguese ElevenLabs voice ID. Empty uses Relay's `pt-BR` default. |
 | `DEFAULT_LOCALE` | No | Fallback when the dialed `To` number does not identify one locale and the selected display does not provide one. Defaults to `en-US`. |
 | `ARCADE_STANDALONE_VOICE_ENABLED` | No | Set to `true` to permit standalone routing to an eligible open shared display. It does not make a game callable without a display. Production sets this to `true`. |
@@ -289,7 +289,7 @@ Voice Chess starts a one-caller match against the computer when selected; there 
 
 While the standalone board waits for a caller, it shows the configured locale's call QR and linked number. The card hides once the caller connects. Station launches use the station `/join` QR rail instead.
 
-Say a complete move such as `pawn from E two to E four`, or select a piece first and then name its destination. The phone repeats a legal proposed move; say `confirm` to play it or `cancel` to discard it. Keypad `1`, `0`, and `9` mean confirm, cancel, and help. Ambiguous and illegal moves require a clearer choice. The phone describes the computer's reply, captured pieces, checks, and the result. A standalone caller can say `play again` after the result; station play returns to the next round.
+Say a complete move such as `pawn from E two to E four`, or select a piece first and take as long as needed before naming its destination. Say `castle` for the available castling move; if both sides are legal, the host asks which side. The phone repeats a legal proposed move; say `confirm` to play it or `cancel` to discard it. Keypad `1`, `0`, and `9` mean confirm, cancel, and help. Ambiguous and illegal moves require a clearer choice. The phone describes the computer's reply, captured pieces, checks, and the result. A standalone caller can say `play again` after the result; station play returns to the next round.
 
 The server validates moves and chooses computer replies. Its default search settings aim for an approachable 800–1200 Elo feel, which has not been measured as a formal rating. The shared display animates moves and captures, plays the supplied *The Marble Gambit* track with a gesture retry for blocked autoplay, and never submits a move. Drag the board to rotate the camera, right-drag or use two fingers to pan, scroll or pinch to zoom, and double-click to reset the view. Voice Chess has private activation metrics and station results, but no leaderboard.
 
@@ -300,7 +300,7 @@ Voice Karaoke admits one singer. Conversation Relay owns setup and results, whil
 1. The caller gives or confirms their name.
 2. The host explains the falling-word highway and display-supplied backing music.
 3. The caller chooses a localized song by number or title.
-4. The caller hears the third-party speech-recognition disclosure, then explicitly says `start` to consent. `#` repeats the disclosure.
+4. The host begins the third-party speech-recognition disclosure. The caller may interrupt it at any point and explicitly say `start` or press `#` to consent and begin. Silence does not count as consent; `*` repeats the song list.
 5. The display preloads the selected instrumental and reports ready only when its Web Audio context is running and unmuted.
 6. The server sends Conversation Relay an `end` envelope with call-bound `HandoffData`. Twilio posts it to `/voice/session-ended`; the server validates the live account, call, room, singer, song, locale, and generation before issuing one-use attempt credentials.
 7. The returned TwiML starts `inbound_track` at the signed, query-free `/karaoke-media` WebSocket, pauses for the 3-second countdown, 45-second song, and a 5-second stop grace, then stops the named stream and redirects to `/voice/karaoke/complete`. `/voice/karaoke/stream-status` receives signed lifecycle callbacks.
@@ -370,7 +370,7 @@ Use the actual booth phone numbers and shared display, with the production OpenA
 | Chess | Speak a legal move in more than one natural form, clarify an ambiguous move, hear an illegal-move correction, finish, and use the finished-screen replay selector. |
 | Karaoke | Choose a song by voice and tap; hear and see the scoring disclosure; explicitly consent by phone before media starts; sing, score, and reconnect for the result. |
 
-Confirm Twilio accepts `xp3gDg85YgFcWpnNVlIu` for English calls on the deployed account and that Portuguese calls retain their own voice. Check Conversation Relay error events and handset audio as well as the on-screen state; fake Relay tests cannot establish voice entitlement or real acoustic recognition quality.
+Confirm Twilio accepts `SA7eD52NRr8WAehitVt1` for English calls on the deployed account and that Portuguese calls retain their own voice. Check Conversation Relay error events and handset audio as well as the on-screen state; fake Relay tests cannot establish voice entitlement or real acoustic recognition quality.
 
 ## Troubleshooting
 

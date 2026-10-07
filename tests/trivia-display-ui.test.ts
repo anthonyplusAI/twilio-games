@@ -145,13 +145,28 @@ describe('Voice Trivia display DOM projection', () => {
     expect(cue.html).toContain('Get ready to answer');
     expect(cue.html).toContain('Phones are synchronizing the answer cue.');
     expect(cue.html).not.toContain('id="question-seconds"');
-    expect(cue.announcement).toBe('Get ready to answer. Phones are synchronizing the answer cue.');
+    expect(cue.announcement).toBe('Get ready to answer. Phones are synchronizing the answer cue. The ten-second clock starts after all phones are ready.');
 
     const portuguese = renderTriviaView(state({
       phase: 'answer_cue', questionIndex: 0, question,
     }), { ...context, locale: 'pt-BR' });
     expect(portuguese.html).toContain('Preparem-se para responder');
     expect(portuguese.html).toContain('Os telefones estão sincronizando o aviso de resposta.');
+  });
+
+  it('places the authoritative answer clock above the choices and explains the pre-clock wait', () => {
+    const active = renderTriviaView(state({
+      phase: 'question', questionIndex: 0, questionAttemptId: 1, question,
+      answeringStartsAtMs: 20_000, questionEndsAtMs: 30_000,
+    }), context);
+    expect(active.html).toContain('id="question-seconds">10</strong>');
+    expect(active.html.indexOf('id="question-seconds"')).toBeLessThan(active.html.indexOf('class="choice-grid"'));
+
+    const reading = renderTriviaView(state({
+      phase: 'question_prompt', questionIndex: 0, questionAttemptId: 1, question,
+    }), context);
+    expect(reading.html).toMatch(/ten.second.*clock.*starts.*after.*phones/i);
+    expect(reading.html).not.toContain('id="question-seconds"');
   });
 
   it('shows answering immediately without the obsolete pre-start wait UI', () => {

@@ -100,6 +100,14 @@ describe('clearSelectionIndex (deterministic pre-LLM pick)', () => {
     expect(clearSelectionIndex('não quero o carro um', cars, 'pt-BR')).toBeNull();
     expect(clearSelectionIndex('one, actually two', cars)).toBe(1);
   });
+  it('routes comparisons and remarks with numbers or names to the conversational interpreter', () => {
+    expect(clearSelectionIndex('Compare car 2 with car 3', cars)).toBeNull();
+    expect(clearSelectionIndex('I have two favorite cars', cars)).toBeNull();
+    expect(clearSelectionIndex('I am thinking about the Bronco', cars)).toBeNull();
+    expect(clearSelectionIndex('The McLaren looks fast', cars)).toBeNull();
+    expect(clearSelectionIndex('Estou pensando no carro dois', cars, 'pt-BR')).toBeNull();
+    expect(clearSelectionIndex('car 2', cars)).toBe(1);
+  });
 });
 
 describe('buildSystemPrompt', () => {

@@ -244,6 +244,7 @@ export class BattleRenderer {
   // ── draw loop ────────────────────────────────────────────────────────────────────────────────
   private loop = (): void => {
     this.raf = requestAnimationFrame(this.loop);
+    if (document.hidden || this.host.style.display === 'none') return;
     // ease the transient anims toward 0
     for (const s of ['a', 'b'] as const) {
       this.lunge[s] = Math.max(0, this.lunge[s] - 0.06);
@@ -353,8 +354,15 @@ export class BattleRenderer {
     const lg = this.lunge[side];                       // attack lunge toward the opponent
     const dx = (side === 'a' ? 1 : -1) * lg * 6;
     const dy = (side === 'a' ? -1 : 1) * lg * 4;
+    const idleBob = spr.img ? 0 : Math.round(Math.sin(this.tick * .075 + (side === 'a' ? 0 : 1.7)) * 1.2);
     // shadow platform (drawn first, under the sprite) so the creature reads as standing on the arena.
     ctx.save();
+    if (!spr.img) {
+      ctx.globalAlpha = .18 + Math.sin(this.tick * .055) * .035;
+      ctx.fillStyle = typeColor(st.type);
+      ctx.beginPath(); ctx.ellipse(cx + dx, groundY + 1, size * .34, size * .085, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
     ctx.fillStyle = 'rgba(15,30,15,0.4)';
     ctx.beginPath(); ctx.ellipse(cx + dx, groundY + 2, size * 0.38, size * 0.12, 0, 0, Math.PI * 2); ctx.fill();
     ctx.restore();
@@ -367,7 +375,7 @@ export class BattleRenderer {
     } else {
       // Placeholder → canvas draw (feet anchored on groundY, centered on cx).
       this.hideSpriteImg(side);            // ensure no stale <img> lingers
-      if (!blink) ctx.drawImage(spr.canvas, cx - size / 2 + dx, groundY - size + dy, size, size);
+      if (!blink) ctx.drawImage(spr.canvas, cx - size / 2 + dx, groundY - size + dy + idleBob, size, size);
     }
   }
 

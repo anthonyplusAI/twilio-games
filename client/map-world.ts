@@ -59,9 +59,9 @@ export const TRACK_CENTER: [number, number, number] = [0, 0, RACE_LEN / 2];
 const d2r = (d: number) => (d * Math.PI) / 180;
 
 /** Fetch all map configs (server reads assets/maps/maps.json). Returns {} on any failure. */
-export async function fetchMaps(): Promise<Record<string, MapConfig>> {
+export async function fetchMaps(signal?: AbortSignal): Promise<Record<string, MapConfig>> {
   try {
-    const res = await fetch('/api/maps');
+    const res = await fetch('/api/maps', { signal });
     if (!res.ok) return {};
     return (await res.json()) as Record<string, MapConfig>;
   } catch { return {}; }
@@ -157,26 +157,72 @@ export function wrapMapScene(scene: THREE.Object3D): THREE.Group {
   return wrap;
 }
 
+/** Release a map that finished decoding after its race or preview was cancelled. */
+export function disposeMapWorld(root: THREE.Object3D): void {
+  const geometries = new Set<THREE.BufferGeometry>();
+  const materials = new Set<THREE.Material>();
+  const textures = new Set<THREE.Texture>();
+  const bitmaps = new Set<ImageBitmap>();
+  const skeletons = new Set<THREE.Skeleton>();
+  const instances = new Set<THREE.InstancedMesh>();
+  root.traverse(object => {
+    const mesh = object as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    if ((mesh as THREE.InstancedMesh).isInstancedMesh) instances.add(mesh as THREE.InstancedMesh);
+    if ((mesh as THREE.SkinnedMesh).isSkinnedMesh) skeletons.add((mesh as THREE.SkinnedMesh).skeleton);
+    if (mesh.geometry) geometries.add(mesh.geometry);
+    const assigned = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const material of assigned) if (material) materials.add(material);
+  });
+  for (const instance of instances) instance.dispose();
+  for (const skeleton of skeletons) skeleton.dispose();
+  for (const geometry of geometries) geometry.dispose();
+  for (const material of materials) {
+    for (const value of Object.values(material)) if (value instanceof THREE.Texture) textures.add(value);
+    material.dispose();
+  }
+  for (const texture of textures) {
+    if (typeof ImageBitmap !== 'undefined' && texture.image instanceof ImageBitmap) bitmaps.add(texture.image);
+    texture.dispose();
+  }
+  for (const bitmap of bitmaps) bitmap.close();
+}
+
 /**
  * Load the scenery GLB for `cfg` into a recentered group placed in game space per cfg.model.
  * (The TRACK transform is applied separately by the game to its own race group.)
+ * A race deadline can abort the download. Decoding cannot be interrupted, so a scene decoded
+ * after cancellation is disposed before it can replace the generated race presentation.
  * Resolves null on failure (game falls back to its own generated track + sky).
  */
-export function loadMapWorld(cfg: MapConfig): Promise<THREE.Group | null> {
+export async function loadMapWorld(cfg: MapConfig, signal?: AbortSignal): Promise<THREE.Group | null> {
+  if (signal?.aborted) return null;
   const loader = new GLTFLoader();
   const draco = new DRACOLoader();
-    draco.setDecoderPath('/draco/');
+  draco.setDecoderPath('/draco/');
   loader.setDRACOLoader(draco);
-
-  return new Promise((resolve) => {
-    loader.load(`/assets/maps/${cfg.file}`, (gltf) => {
-      try {
-        const wrap = wrapMapScene(gltf.scene);
-        applyTrackTransform(wrap, cfg.model ?? IDENTITY_TRANSFORM);
-        // Map terrain both casts AND receives shadows so the raking sun models its hills/buildings.
-        wrap.traverse(o => { const m = o as THREE.Mesh; if (m.isMesh) { m.castShadow = true; m.receiveShadow = true; } });
-        resolve(wrap);
-      } catch { resolve(null); }
-    }, undefined, () => resolve(null));
-  });
+  let ownedScene: THREE.Object3D | null = null;
+  try {
+    const response = await fetch(`/assets/maps/${cfg.file}`, { signal });
+    if (!response.ok || signal?.aborted) return null;
+    const bytes = await response.arrayBuffer();
+    if (signal?.aborted) return null;
+    // Relative resources in authored GLBs resolve against the same map directory as load().
+    const gltf = await loader.parseAsync(bytes, '/assets/maps/');
+    ownedScene = gltf.scene;
+    if (signal?.aborted) return null;
+    const wrap = wrapMapScene(ownedScene);
+    ownedScene = wrap;
+    applyTrackTransform(wrap, cfg.model ?? IDENTITY_TRANSFORM);
+    // Map terrain both casts AND receives shadows so the raking sun models its hills/buildings.
+    wrap.traverse(o => { const m = o as THREE.Mesh; if (m.isMesh) { m.castShadow = true; m.receiveShadow = true; } });
+    if (signal?.aborted) return null;
+    ownedScene = null; // ownership passes to the caller/renderer
+    return wrap;
+  } catch {
+    return null;
+  } finally {
+    if (ownedScene) disposeMapWorld(ownedScene);
+    draco.dispose();
+  }
 }

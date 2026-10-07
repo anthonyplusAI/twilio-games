@@ -167,8 +167,11 @@ export class ChessBoardScene {
   private onAvailability?: (available: boolean) => void;
 
   constructor(private readonly container: HTMLElement) {
+    const lowPowerDisplay = (navigator as Navigator & { deviceMemory?: number }).deviceMemory !== undefined
+      ? (navigator as Navigator & { deviceMemory?: number }).deviceMemory! <= 4
+      : matchMedia('(pointer: coarse) and (max-width: 900px)').matches;
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-    this.renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 1.7));
+    this.renderer.setPixelRatio(Math.min(devicePixelRatio || 1, lowPowerDisplay ? 1.3 : 1.7));
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -209,7 +212,7 @@ export class ChessBoardScene {
     const keyLight = new THREE.DirectionalLight(0xfff1dc, 3.0);
     keyLight.position.set(-4, 12, 7);
     keyLight.castShadow = true;
-    keyLight.shadow.mapSize.set(2048, 2048);
+    keyLight.shadow.mapSize.set(lowPowerDisplay ? 1024 : 2048, lowPowerDisplay ? 1024 : 2048);
     keyLight.shadow.camera.left = -12;
     keyLight.shadow.camera.right = 12;
     keyLight.shadow.camera.top = 12;
@@ -416,9 +419,8 @@ export class ChessBoardScene {
   private readonly tick = (now: number): void => {
     const dt = Math.min(0.05, (now - (this.lastFrameAt || now)) / 1000);
     this.lastFrameAt = now;
-    if (this.ready) {
-      this.orbit.update();
-      this.constrainCameraFraming();
+    if (this.ready && !document.hidden) {
+      if (this.orbit.update()) this.constrainCameraFraming();
       this.updateAnimation(now);
       this.updateParticles(now, dt);
       if (!this.reducedMotion) {

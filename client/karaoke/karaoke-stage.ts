@@ -25,17 +25,21 @@ import {
   KARAOKE_WORD_TEXTURE_WIDTH,
   KARAOKE_SUSTAIN_TAIL_DEPTH,
   KARAOKE_WORD_TILE_DEPTH,
+  karaokeAdaptiveRenderMode,
   karaokeAnimatedTransform,
+  karaokeCanInstallOptionalAssets,
   karaokeCameraShot,
   karaokeDrumAnchorTransform,
   karaokeFallbackWordProjection,
   karaokeHighwayPose,
+  karaokeInitialRenderMode,
   karaokeRenderPixelRatio,
   karaokeResponsiveHighwayTransform,
   karaokeStageIntensity,
   karaokeStaticCameraShot,
   karaokeSustainTailPose,
   type KaraokeCameraTargets,
+  type KaraokeRenderMode,
 } from './karaoke-client-utils';
 
 type JudgmentEvent = Extract<KaraokeEvent, { type: 'word_judgment' }>;
@@ -233,6 +237,52 @@ export function createKaraokeCrowdMeshes(
   return { root, heads, hairs, torsos, arms };
 }
 
+/** Network-free Twilio mark for the procedural venue. */
+export function createKaraokeProceduralLogo(): THREE.Group {
+  const logo = new THREE.Group();
+  logo.name = 'procedural-twilio-mark';
+  const white = new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide });
+  logo.add(new THREE.Mesh(new THREE.RingGeometry(.77, .95, 48), white));
+  const dots = new THREE.InstancedMesh(new THREE.CircleGeometry(.135, 18), white, 4);
+  const positions = [[-.32, .32], [.32, .32], [-.32, -.32], [.32, -.32]] as const;
+  positions.forEach(([x, y], index) => dots.setMatrixAt(index,
+    new THREE.Matrix4().makeTranslation(x, y, .01)));
+  dots.instanceMatrix.needsUpdate = true;
+  logo.add(dots);
+  return logo;
+}
+
+/** A single instanced LED wall adds texture to the fallback stage without per-light draw calls. */
+export function createKaraokeProceduralLedWall(): THREE.InstancedMesh {
+  const cells: Array<{ x: number; y: number; color: number }> = [];
+  for (const side of [-1, 1]) {
+    for (let column = 0; column < 11; column++) {
+      const height = 2 + Math.round(5 * Math.abs(Math.sin(column * .64 + side * .9)));
+      for (let row = 0; row < height; row++) cells.push({
+        x: side * (3.42 + column * .29),
+        y: 1.05 + row * .42,
+        color: row > 4 ? 0xfd7685 : column % 3 === 0 ? 0x3acefa : 0x2188ef,
+      });
+    }
+  }
+  const wall = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(.13, .19, .045),
+    new THREE.MeshBasicMaterial({ color: 0xffffff }),
+    cells.length,
+  );
+  wall.name = 'procedural-led-wall';
+  const dummy = new THREE.Object3D();
+  cells.forEach((cell, index) => {
+    dummy.position.set(cell.x, cell.y, -5.94);
+    dummy.updateMatrix();
+    wall.setMatrixAt(index, dummy.matrix);
+    wall.setColorAt(index, new THREE.Color(cell.color));
+  });
+  wall.instanceMatrix.needsUpdate = true;
+  if (wall.instanceColor) wall.instanceColor.needsUpdate = true;
+  return wall;
+}
+
 export class KaraokeStage {
   private renderer: THREE.WebGLRenderer | null = null;
   private composer: EffectComposer | null = null;
@@ -284,6 +334,12 @@ export class KaraokeStage {
   private reducedMotion = false;
   private disposed = false;
   private lastAnimationSeconds = 0;
+  private renderMode: KaraokeRenderMode = 'full';
+  private lastFrameAtMs = 0;
+  private frameMsTotal = 0;
+  private frameSamples = 0;
+  private renderModeChangedAtMs = 0;
+  private lastDecorationAtMs = -Infinity;
   private drumAnchor = new THREE.Vector3(...KARAOKE_DRUMMER_FALLBACK_POSITION);
   private venueConfig = cloneKaraokeVenueConfig(DEFAULT_KARAOKE_VENUE);
 
@@ -322,6 +378,7 @@ export class KaraokeStage {
     this.mount.dataset.karaokeCrowd = `${this.crowdBase.length}/${this.crowd.root.children.length}`;
     this.buildHighway();
     this.applyVenueConfig();
+    this.mount.dataset.karaokeRenderMode = this.renderMode;
     try { this.createRenderer(); }
     catch (error) { this.failWebGl(error); }
   }
@@ -399,7 +456,8 @@ export class KaraokeStage {
     if (!this.renderer) return;
     const width = Math.max(1, this.mount.clientWidth || innerWidth);
     const height = Math.max(1, this.mount.clientHeight || innerHeight);
-    const pixelRatio = karaokeRenderPixelRatio(width, height, devicePixelRatio);
+    const pixelRatio = karaokeRenderPixelRatio(width, height, devicePixelRatio)
+      * (this.renderMode === 'light' ? .8 : 1);
     this.camera.aspect = width / height;
     this.highwayCamera.aspect = width / height;
     this.applyHighwayTransform();
@@ -417,6 +475,8 @@ export class KaraokeStage {
       this.updateFallbackHighway(frame);
       return;
     }
+    const frameAtMs = performance.now();
+    this.sampleFrameTime(frameAtMs, frame.phase);
     const activeTimeMs = frame.phase === 'countdown' || frame.phase === 'performing'
       ? frame.songTimeMs
       : frame.serverNowMs;
@@ -430,8 +490,11 @@ export class KaraokeStage {
     const motionIntensity = this.reducedMotion ? 0 : intensity;
     this.animatePerformers(motionSeconds, frame.song?.bpm ?? 100, motionIntensity);
     this.animateInstalledPerformers(this.reducedMotion ? 0 : animationSeconds);
-    this.animateCrowd(motionSeconds, motionIntensity);
-    this.animateLighting(motionSeconds, motionIntensity);
+    if (frameAtMs - this.lastDecorationAtMs >= 30 || frameAtMs < this.lastDecorationAtMs) {
+      this.animateCrowd(motionSeconds, motionIntensity);
+      this.animateLighting(motionSeconds, motionIntensity);
+      this.lastDecorationAtMs = frameAtMs;
+    }
     this.updateHighway(frame);
     this.updateBursts(frame.serverNowMs);
     const shot = this.reducedMotion
@@ -450,13 +513,6 @@ export class KaraokeStage {
     this.camera.lookAt(...shot.lookAt);
     try { this.renderLayers(); }
     catch (error) { this.failWebGl(error); }
-  }
-
-  warm(): void {
-    if (!this.renderer) return;
-    this.renderer.compile(this.scene, this.camera);
-    this.renderer.compile(this.highwayScene, this.highwayCamera);
-    this.renderLayers();
   }
 
   dispose(): void {
@@ -485,10 +541,17 @@ export class KaraokeStage {
 
   private createRenderer(): void {
     const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    const context = renderer.getContext();
+    const debugRenderer = context.getExtension('WEBGL_debug_renderer_info');
+    const rendererName = debugRenderer
+      ? String(context.getParameter(debugRenderer.UNMASKED_RENDERER_WEBGL) ?? '') : '';
+    this.renderMode = karaokeInitialRenderMode(rendererName, navigator.hardwareConcurrency);
+    this.renderModeChangedAtMs = performance.now();
+    this.mount.dataset.karaokeRenderMode = this.renderMode;
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.08;
-    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.enabled = this.renderMode === 'full';
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.domElement.setAttribute('aria-label', 'Procedural Voice Karaoke concert stage');
     renderer.domElement.addEventListener('webglcontextlost', event => {
@@ -497,12 +560,16 @@ export class KaraokeStage {
     });
     this.mount.append(renderer.domElement);
     this.renderer = renderer;
-    const composer = new EffectComposer(renderer);
-    composer.addPass(new RenderPass(this.scene, this.camera));
-    const bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), .58, .38, .72);
-    composer.addPass(bloom);
-    this.composer = composer;
+    if (this.renderMode === 'full') this.createComposer();
     this.resize();
+  }
+
+  private createComposer(): void {
+    if (!this.renderer || this.composer) return;
+    const composer = new EffectComposer(this.renderer);
+    composer.addPass(new RenderPass(this.scene, this.camera));
+    composer.addPass(new UnrealBloomPass(new THREE.Vector2(1, 1), .58, .38, .72));
+    this.composer = composer;
   }
 
   private failWebGl(error: unknown): void {
@@ -583,13 +650,45 @@ export class KaraokeStage {
 
   private renderLayers(): void {
     if (!this.renderer) return;
-    if (this.composer) this.composer.render();
+    if (this.composer && this.renderMode === 'full') this.composer.render();
     else this.renderer.render(this.scene, this.camera);
     const autoClear = this.renderer.autoClear;
     this.renderer.autoClear = false;
     this.renderer.clearDepth();
     this.renderer.render(this.highwayScene, this.highwayCamera);
     this.renderer.autoClear = autoClear;
+  }
+
+  private sampleFrameTime(nowMs: number, phase: KaraokePhase): void {
+    const deltaMs = nowMs - this.lastFrameAtMs;
+    this.lastFrameAtMs = nowMs;
+    // Ignore a suspended tab or one large decoder stall; respond to sustained frame cost.
+    if (deltaMs < 4 || deltaMs > 120) return;
+    this.frameMsTotal += deltaMs;
+    if (++this.frameSamples < 90) return;
+    const next = karaokeAdaptiveRenderMode(
+      this.renderMode, this.frameMsTotal / this.frameSamples, nowMs - this.renderModeChangedAtMs,
+    );
+    this.frameSamples = 0;
+    this.frameMsTotal = 0;
+    if (next === this.renderMode || !this.renderer) return;
+    if (next === 'full' && !karaokeCanInstallOptionalAssets(phase)) return;
+    if (next === 'full') {
+      try { this.createComposer(); }
+      catch (error) {
+        console.warn('Karaoke bloom unavailable; keeping the lightweight renderer.', error);
+        return;
+      }
+    } else {
+      this.composer?.dispose();
+      this.composer = null;
+    }
+    this.renderMode = next;
+    this.renderModeChangedAtMs = nowMs;
+    this.renderer.shadowMap.enabled = next === 'full';
+    this.renderer.shadowMap.needsUpdate = true;
+    this.mount.dataset.karaokeRenderMode = next;
+    this.resize();
   }
 
   private buildVenue(): void {
@@ -624,16 +723,20 @@ export class KaraokeStage {
     bug.position.set(0, 3.65, -6.16);
     bug.scale.setScalar(1.15);
     fallbackStage.add(bug);
+    fallbackStage.add(createKaraokeProceduralLedWall());
 
     const steel = new THREE.MeshStandardMaterial({ color: 0x38425e, metalness: .92, roughness: .24 });
     const beamGeometry = new THREE.CylinderGeometry(.075, .075, 1, 8);
+    const beamPieces: THREE.BufferGeometry[] = [];
     const addBeam = (from: THREE.Vector3, to: THREE.Vector3): void => {
       const midpoint = from.clone().add(to).multiplyScalar(.5);
-      const beam = new THREE.Mesh(beamGeometry, steel);
-      beam.position.copy(midpoint);
-      beam.scale.y = from.distanceTo(to);
-      beam.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), to.clone().sub(from).normalize());
-      fallbackStage.add(beam);
+      const rotation = new THREE.Quaternion().setFromUnitVectors(
+        new THREE.Vector3(0, 1, 0), to.clone().sub(from).normalize(),
+      );
+      const matrix = new THREE.Matrix4().compose(
+        midpoint, rotation, new THREE.Vector3(1, from.distanceTo(to), 1),
+      );
+      beamPieces.push(beamGeometry.clone().applyMatrix4(matrix));
     };
     for (const side of [-1, 1]) {
       const x = side * 7.15;
@@ -648,6 +751,14 @@ export class KaraokeStage {
       addBeam(new THREE.Vector3(x, 7.2, -4), new THREE.Vector3(x + .45, 6.78, -4));
       addBeam(new THREE.Vector3(x + .45, 6.78, -4), new THREE.Vector3(x + .9, 7.2, -4));
     }
+    beamGeometry.dispose();
+    const truss = mergeGeometries(beamPieces, false);
+    if (truss) {
+      for (const piece of beamPieces) piece.dispose();
+      const mesh = new THREE.Mesh(truss, steel);
+      mesh.name = 'procedural-stage-truss';
+      fallbackStage.add(mesh);
+    } else for (const piece of beamPieces) fallbackStage.add(new THREE.Mesh(piece, steel));
     for (const side of [-1, 1]) {
       const stack = new THREE.Group();
       for (let y = .65; y < 3; y += .72) {
@@ -665,15 +776,8 @@ export class KaraokeStage {
     }
   }
 
-  private buildBugMark(): THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial> {
-    const material = new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false });
-    new THREE.TextureLoader().load('/brand/Twilio_Logo_Bug_White.svg', texture => {
-      if (this.disposed) { texture.dispose(); return; }
-      texture.colorSpace = THREE.SRGBColorSpace;
-      material.map = texture;
-      material.needsUpdate = true;
-    });
-    return new THREE.Mesh(new THREE.PlaneGeometry(2.84, 2.84), material);
+  private buildBugMark(): THREE.Group {
+    return createKaraokeProceduralLogo();
   }
 
   private buildCharacter(primary: number, secondary: number): PerformerRig {
@@ -687,6 +791,24 @@ export class KaraokeStage {
     const head = new THREE.Mesh(new THREE.SphereGeometry(.27, 20, 14), skin);
     head.position.y = 2.08;
     head.castShadow = true;
+    const facePieces: THREE.BufferGeometry[] = [
+      new THREE.SphereGeometry(.027, 8, 6).translate(-.09, 2.12, .257),
+      new THREE.SphereGeometry(.027, 8, 6).translate(.09, 2.12, .257),
+      new THREE.BoxGeometry(.11, .019, .013).translate(0, 1.984, .252),
+    ];
+    const face = mergeGeometries(facePieces, false);
+    for (const piece of facePieces) piece.dispose();
+    if (face) root.add(new THREE.Mesh(face,
+      new THREE.MeshStandardMaterial({ color: 0x191f36, roughness: .8 })));
+    const lapelGeometry = new THREE.BufferGeometry();
+    lapelGeometry.setAttribute('position', new THREE.Float32BufferAttribute([
+      -.27, 1.59, .285, -.055, 1.53, .357, -.10, 1.27, .347,
+      .27, 1.59, .285, .10, 1.27, .347, .055, 1.53, .357,
+    ], 3));
+    lapelGeometry.computeVertexNormals();
+    root.add(new THREE.Mesh(lapelGeometry, new THREE.MeshStandardMaterial({
+      color: 0xdde0e6, metalness: .18, roughness: .5, side: THREE.DoubleSide,
+    })));
     const hips = new THREE.Mesh(new THREE.SphereGeometry(.31, 16, 10), accent);
     hips.scale.y = .68;
     hips.position.y = .72;
@@ -735,6 +857,12 @@ export class KaraokeStage {
 
   private buildDrummer(): PerformerRig {
     const rig = this.buildCharacter(0x2188ef, 0x232b45);
+    const hair = new THREE.Mesh(
+      new THREE.SphereGeometry(.281, 16, 10, 0, Math.PI * 2, 0, Math.PI * .43),
+      new THREE.MeshStandardMaterial({ color: 0x181224, roughness: .85 }),
+    );
+    hair.position.y = 2.19;
+    rig.root.add(hair);
     this.drumAnchorRoot.add(rig.root);
     this.proceduralByRole.set('drummer', rig.root);
     return rig;
@@ -746,14 +874,35 @@ export class KaraokeStage {
     kit.position.set(0, 0, .72);
     const drumMaterial = new THREE.MeshStandardMaterial({ color: 0xef223a, metalness: .48, roughness: .35 });
     const bass = new THREE.Mesh(new THREE.CylinderGeometry(.6, .6, .48, 24), drumMaterial);
-    bass.rotation.z = Math.PI / 2;
+    bass.rotation.x = Math.PI / 2;
     bass.position.set(0, .62, 0);
+    const bassHead = new THREE.Mesh(new THREE.CircleGeometry(.54, 32),
+      new THREE.MeshStandardMaterial({ color: 0xf2f1ed, roughness: .64, side: THREE.DoubleSide }));
+    bassHead.position.set(0, .62, .248);
+    const bassBadge = new THREE.Mesh(new THREE.RingGeometry(.13, .18, 24),
+      new THREE.MeshBasicMaterial({ color: 0xef223a, side: THREE.DoubleSide }));
+    bassBadge.position.set(0, .62, .255);
     const snare = new THREE.Mesh(new THREE.CylinderGeometry(.34, .34, .25, 20), new THREE.MeshStandardMaterial({ color: 0xdde0e6, metalness: .65 }));
     snare.position.set(.7, 1.05, -.37);
-    const cymbal = new THREE.Mesh(new THREE.CylinderGeometry(.48, .48, .035, 28), new THREE.MeshStandardMaterial({ color: 0x9aa0b4, metalness: .9, roughness: .18 }));
-    cymbal.position.set(-.85, 1.62, -.6);
-    cymbal.rotation.z = .08;
-    kit.add(bass, snare, cymbal);
+    const toms = new THREE.InstancedMesh(new THREE.CylinderGeometry(.26, .23, .32, 18), drumMaterial, 2);
+    toms.setMatrixAt(0, new THREE.Matrix4().makeTranslation(-.32, 1.28, -.28));
+    toms.setMatrixAt(1, new THREE.Matrix4().makeTranslation(.30, 1.28, -.28));
+    toms.instanceMatrix.needsUpdate = true;
+    const cymbals = new THREE.InstancedMesh(
+      new THREE.CylinderGeometry(.48, .48, .035, 28),
+      new THREE.MeshStandardMaterial({ color: 0xc8a963, metalness: .82, roughness: .2 }),
+      2,
+    );
+    cymbals.setMatrixAt(0, new THREE.Matrix4().compose(
+      new THREE.Vector3(-.85, 1.62, -.6), new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, .08)),
+      new THREE.Vector3(1, 1, 1),
+    ));
+    cymbals.setMatrixAt(1, new THREE.Matrix4().compose(
+      new THREE.Vector3(.96, 1.56, -.64), new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, -.08)),
+      new THREE.Vector3(.84, 1, .84),
+    ));
+    cymbals.instanceMatrix.needsUpdate = true;
+    kit.add(bass, bassHead, bassBadge, snare, toms, cymbals);
     this.drumAnchorRoot.add(kit);
     return kit;
   }
@@ -762,12 +911,30 @@ export class KaraokeStage {
     const rig = this.buildCharacter(0x0b2a60, 0x38425e);
     rig.root.position.set(3.45, .58, -1.2);
     rig.root.rotation.y = -.12;
+    const hair = new THREE.Mesh(
+      new THREE.SphereGeometry(.287, 18, 10, 0, Math.PI * 2, 0, Math.PI * .52),
+      new THREE.MeshStandardMaterial({ color: 0x512922, roughness: .9 }),
+    );
+    hair.position.y = 2.16;
+    rig.root.add(hair);
     const guitar = new THREE.Group();
     const body = new THREE.Mesh(new THREE.SphereGeometry(.38, 20, 14), new THREE.MeshStandardMaterial({ color: 0xef223a, metalness: .55, roughness: .27 }));
     body.scale.set(1, 1.28, .28);
     const neck = new THREE.Mesh(new THREE.BoxGeometry(.12, 1.28, .08), new THREE.MeshStandardMaterial({ color: 0x9aa0b4, roughness: .4 }));
     neck.position.y = .87;
-    guitar.add(body, neck);
+    const bridge = new THREE.Mesh(new THREE.BoxGeometry(.26, .06, .04),
+      new THREE.MeshStandardMaterial({ color: 0x191f36, metalness: .3 }));
+    bridge.position.set(0, -.19, .12);
+    const strings = new THREE.LineSegments(
+      new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(-.06, -.19, .148), new THREE.Vector3(-.06, 1.43, .068),
+        new THREE.Vector3(-.02, -.19, .148), new THREE.Vector3(-.02, 1.43, .068),
+        new THREE.Vector3(.02, -.19, .148), new THREE.Vector3(.02, 1.43, .068),
+        new THREE.Vector3(.06, -.19, .148), new THREE.Vector3(.06, 1.43, .068),
+      ]),
+      new THREE.LineBasicMaterial({ color: 0xf6e7c1 }),
+    );
+    guitar.add(body, neck, bridge, strings);
     guitar.position.set(.08, 1.1, .35);
     guitar.rotation.z = -.43;
     rig.root.add(guitar);

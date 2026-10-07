@@ -23,6 +23,10 @@ export const FIGHTER_ASSET_VERSION = '4';
 const FIGHTER_ANIMATION_TIMEOUT_MS = 30_000;
 export const fighterAssetUrl = (file: string) => `${FIGHTER_ASSET_ROOT}${file}?v=${FIGHTER_ASSET_VERSION}`;
 
+export function preferProceduralFighterAssets(connection?: { saveData?: boolean; effectiveType?: string }): boolean {
+  return Boolean(connection?.saveData || /^(?:slow-2g|2g|3g)$/.test(connection?.effectiveType ?? ''));
+}
+
 export const FIGHTERS: FighterSpec[] = FIGHTER_ROSTER.map(entry => ({ id: entry.id, label: entry.name, file: entry.file, embeddedIdle: entry.embeddedIdle }));
 
 export const FIGHTER_ANIMATIONS: FighterAnimationSpec[] = [
@@ -60,15 +64,23 @@ export const ANIMATION_POOLS: Record<string, string[]> = {
   celebration: ['celebration-01', 'celebration-02', 'celebration-03', 'celebration-04', 'celebration-05', 'celebration-06'],
 };
 
-export function loadFbx(file: string, onProgress?: (fraction: number) => void): Promise<THREE.Group> {
-  return new Promise((resolve, reject) => {
-    new FBXLoader().load(
-      fighterAssetUrl(file),
-      resolve,
-      (event) => onProgress?.(event.total ? event.loaded / event.total : 0),
-      reject,
-    );
-  });
+/** One readable clip per combat verb is enough for the first match. Optional alternate takes
+ *  should never compete with the selected fighters and arena on a slow connection. */
+export const STARTUP_ANIMATION_IDS = [
+  'idle', 'walk', 'walk-back', 'jump-01', 'block-01', 'punch-01', 'kick-01',
+  'reaction-01', 'fall-01', 'celebration-01',
+] as const;
+
+export async function loadFbx(file: string, onProgress?: (fraction: number) => void, signal?: AbortSignal): Promise<THREE.Group> {
+  // FBXLoader.load uses FileLoader, whose request cannot be cancelled by callers.
+  // Fetch the bytes ourselves so a timeout, changed selection, or active bout
+  // actually releases network bandwidth before optional models are parsed.
+  const response = await fetch(fighterAssetUrl(file), { signal });
+  if (!response.ok) throw new Error(`fighter asset ${file} failed with HTTP ${response.status}`);
+  const buffer = await response.arrayBuffer();
+  if (signal?.aborted) throw signal.reason ?? new DOMException('Fighter asset request aborted', 'AbortError');
+  onProgress?.(1);
+  return new FBXLoader().parse(buffer, FIGHTER_ASSET_ROOT);
 }
 
 /** Keep animation pose and vertical body motion, but remove Mixamo's baked X/Z travel. */
@@ -151,22 +163,32 @@ export function prepareFighterModel(model: THREE.Group, targetHeight = 2.25): vo
 
 export async function loadAnimationSources(
   onLoaded?: (loaded: number, total: number, label: string) => void,
+  signal?: AbortSignal,
 ): Promise<Map<string, THREE.AnimationClip>> {
-  const specs = FIGHTER_ANIMATIONS.filter((spec) => spec.id !== 'pose');
+  const specs = FIGHTER_ANIMATIONS.filter(spec => STARTUP_ANIMATION_IDS.some(id => id === spec.id));
   const sources = new Map<string, THREE.AnimationClip>();
   let loaded = 0;
-  await Promise.all(specs.map(async (spec) => {
-    try {
-      const source = await Promise.race([
-        loadFbx(spec.file),
-        new Promise<never>((_, reject) => setTimeout(
-          () => reject(new Error(`animation ${spec.id} timed out`)), FIGHTER_ANIMATION_TIMEOUT_MS,
-        )),
-      ]), clip = source.animations[0];
-      if (clip && clip.duration > 0 && clip.tracks.length > 0) sources.set(spec.id, clip);
-    } catch { /* Optional variants may fail; required pools are checked below. */ }
-    finally { loaded += 1; onLoaded?.(loaded, specs.length, spec.label); }
-  }));
+  let nextIndex = 0;
+  const loadNext = async () => {
+    while (!signal?.aborted && nextIndex < specs.length) {
+      const spec = specs[nextIndex++]!;
+      const controller = new AbortController();
+      const onAbort = () => controller.abort(signal?.reason);
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener('abort', onAbort, { once: true });
+      const timeout = setTimeout(() => controller.abort(new Error(`animation ${spec.id} timed out`)), FIGHTER_ANIMATION_TIMEOUT_MS);
+      try {
+        const source = await loadFbx(spec.file, undefined, controller.signal), clip = source.animations[0];
+        if (clip && clip.duration > 0 && clip.tracks.length > 0) sources.set(spec.id, clip);
+      } catch { /* The procedural fighter remains playable if any clip fails. */ }
+      finally {
+        clearTimeout(timeout);
+        signal?.removeEventListener('abort', onAbort);
+        loaded += 1; onLoaded?.(loaded, specs.length, spec.label);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(3, specs.length) }, () => loadNext()));
   for (const pool of ['idle', 'walk', 'walk-back', 'jump', 'block', 'punch', 'kick', 'reaction', 'fall']) {
     if (!(ANIMATION_POOLS[pool] ?? []).some(id => sources.has(id))) throw new Error(`Required animation pool failed: ${pool}`);
   }

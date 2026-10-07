@@ -1,10 +1,21 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { existsSync } from 'node:fs';
 import * as THREE from 'three';
+import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { FIGHTER_ROSTER } from '../shared/fighter-roster';
-import { ANIMATION_POOLS, FIGHTER_ANIMATIONS, clipsForFighter, fighterAssetUrl, prepareFighterModel } from '../client/fighter/fighter-assets';
+import { ANIMATION_POOLS, FIGHTER_ANIMATIONS, STARTUP_ANIMATION_IDS, clipsForFighter, fighterAssetUrl, loadFbx, preferProceduralFighterAssets, prepareFighterModel } from '../client/fighter/fighter-assets';
+
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('fighter assets', () => {
+  it('boots with one essential clip per action instead of fetching every optional variant', () => {
+    expect(STARTUP_ANIMATION_IDS.length).toBeLessThan(FIGHTER_ANIMATIONS.length);
+    const startupIds = new Set<string>(STARTUP_ANIMATION_IDS);
+    for (const pool of ['idle', 'walk', 'walk-back', 'jump', 'block', 'punch', 'kick', 'reaction', 'fall']) {
+      expect((ANIMATION_POOLS[pool] ?? []).some(id => startupIds.has(id))).toBe(true);
+    }
+    expect(STARTUP_ANIMATION_IDS).not.toContain('celebration-05');
+  });
   it('has unique roster IDs with models and previews', () => {
     expect(new Set(FIGHTER_ROSTER.map(fighter => fighter.id)).size).toBe(FIGHTER_ROSTER.length);
     expect(FIGHTER_ROSTER).toHaveLength(12);
@@ -33,6 +44,39 @@ describe('fighter assets', () => {
 
   it('cache-busts Fighter runtime assets after binary replacements', () => {
     expect(fighterAssetUrl('fighting-idle.fbx')).toMatch(/^\/assets\/fighters\/source\/fighting-idle\.fbx\?v=\d+$/);
+  });
+
+  it('keeps optional high-resolution fighters local on data-saving and slow links', () => {
+    expect(preferProceduralFighterAssets({ saveData: true })).toBe(true);
+    expect(preferProceduralFighterAssets({ effectiveType: '3g' })).toBe(true);
+    expect(preferProceduralFighterAssets({ effectiveType: '4g' })).toBe(false);
+  });
+
+  it('aborts an optional FBX download before decoding when its selection expires', async () => {
+    const parse = vi.spyOn(FBXLoader.prototype, 'parse');
+    let requestSignal: AbortSignal | undefined;
+    vi.stubGlobal('fetch', vi.fn((_url: string, init: RequestInit) => {
+      requestSignal = init.signal as AbortSignal;
+      return new Promise<Response>((_resolve, reject) => {
+        requestSignal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+      });
+    }));
+    const controller = new AbortController();
+    const loading = loadFbx('wraith.fbx', undefined, controller.signal);
+    expect(requestSignal).toBe(controller.signal);
+    controller.abort();
+    await expect(loading).rejects.toMatchObject({ name: 'AbortError' });
+    expect(parse).not.toHaveBeenCalled();
+  });
+
+  it('parses a downloaded FBX with the correct asset directory', async () => {
+    const model = new THREE.Group();
+    const parse = vi.spyOn(FBXLoader.prototype, 'parse').mockReturnValue(model);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), { status: 200 })));
+    const progress = vi.fn();
+    expect(await loadFbx('fighting-idle.fbx', progress)).toBe(model);
+    expect(parse).toHaveBeenCalledWith(expect.any(ArrayBuffer), '/assets/fighters/source/');
+    expect(progress).toHaveBeenCalledWith(1);
   });
 
   it('rejects empty fighter models instead of treating them as ready', () => {

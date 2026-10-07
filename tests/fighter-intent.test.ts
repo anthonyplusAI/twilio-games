@@ -32,6 +32,25 @@ describe('fighter voice intent', () => {
     expect(matchFighterCommands('can I punch now')).toEqual([]);
   });
 
+  it('acts immediately on unambiguous conversational requests', () => {
+    expect(matchFighterCommands('Could you throw a quick punch at him?')).toEqual(['punch']);
+    expect(matchFighterCommands('I want to get closer to my opponent')).toEqual(['forward']);
+    expect(matchFighterCommands("Let's block and then kick")).toEqual(['block', 'kick']);
+    expect(matchFighterCommands('Please back away from them')).toEqual(['back']);
+    expect(matchFighterCommands('Can you give him a roundhouse kick?')).toEqual(['kick']);
+    expect(matchFighterCommands('Pode dar um soco nele?', 'pt-BR')).toEqual(['punch']);
+    expect(matchFighterCommands('Quero me aproximar do rival', 'pt-BR')).toEqual(['forward']);
+  });
+
+  it('leaves advice, hypotheticals, negations, and ambiguous choices to conversation', () => {
+    expect(matchFighterCommands('How do I throw a punch?')).toEqual([]);
+    expect(matchFighterCommands('Could you tell me whether to kick?')).toEqual([]);
+    expect(matchFighterCommands("I don't want to punch him")).toEqual([]);
+    expect(matchFighterCommands('Maybe block or kick')).toEqual([]);
+    expect(matchFighterCommands('If I move closer, would I get hit?')).toEqual([]);
+    expect(matchFighterCommands('Como posso dar um chute?', 'pt-BR')).toEqual([]);
+  });
+
   it.each([
     ['frente', 'forward'], ['avançar', 'forward'], ['aproximar', 'forward'],
     ['trás', 'back'], ['recuar', 'back'], ['afastar', 'back'],

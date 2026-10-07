@@ -59,6 +59,17 @@ function findPiece(text: string): ChessPieceType | undefined {
   return earliest?.piece;
 }
 
+const PIECE_SPOKEN_FORM = '(?:pawn|peao|knight|night|horse|cavalo|bishop|bispo|rook|castle piece|torre|queen|rainha|dama|king|rei)';
+const PIECE_DETERMINER = '(?:(?:the|my|this|that|our|a|o|a|minha|meu|essa|esse)\\s+)?';
+const PIECE_ONLY = new RegExp(`^${PIECE_DETERMINER}${PIECE_SPOKEN_FORM}(?:\\s+(?:please|por favor))?$`);
+const PIECE_COMMAND = new RegExp(
+  `^(?:(?:use|move|play|pick|choose|vamos mover|mova|mover|joga|jogar|use o|use a)\\s+)${PIECE_DETERMINER}${PIECE_SPOKEN_FORM}(?:\\s+(?:please|por favor))?$`,
+);
+
+function isPieceSelection(spoken: string): boolean {
+  return PIECE_ONLY.test(spoken) || PIECE_COMMAND.test(spoken);
+}
+
 function spokenSquares(text: string): ChessSquare[] {
   const tokens = text.split(/\s+/).filter(Boolean);
   const squares: ChessSquare[] = [];
@@ -119,7 +130,9 @@ export function parseChessIntent(spoken: string, locale: SupportedLocale = 'en-U
     || /\b(?:wonder if|whether|quero saber se)\b/.test(text)
     || /\b(?:do not|don t|dont|not|never|nao|sem)\b/.test(text)) return { kind: 'unknown' };
 
-  if (/\b(?:castle|castling|roque)\b/.test(text) || /^o o(?: o)?$/.test(text)) {
+  const castleCommand = /^(?:(?:please|por favor)\s+)?(?:castle|castling|roque)(?:\s+(?:kingside|king side|queenside|queen side|short|long|pequeno|grande|lado da dama|lado do rei))?(?:\s+(?:please|por favor))?$/.test(text)
+    || /^o o(?: o)?$/.test(text);
+  if (castleCommand && !/\bcastle piece\b/.test(text)) {
     const side: ChessCastleSide | null = /\b(?:queenside|queen side|long|grande|lado da dama)\b|^o o o$/.test(text)
       ? 'queen'
       : /\b(?:kingside|king side|short|pequeno|lado do rei)\b|^o o$/.test(text)
@@ -134,6 +147,7 @@ export function parseChessIntent(spoken: string, locale: SupportedLocale = 'en-U
   const promotion = findPiece(promotionText);
   const piece = findPiece(moveText);
   const squares = spokenSquares(moveText);
+  const captureOnly = /\b(?:capture|captures|capturing|take|takes|taking|captura|capturar|capturei|toma|tomar|come|comer)\b/.test(moveText);
   const selecting = /^(?:select|choose|pick|selecionar|selecione|seleciona|escolher|escolha|escolhe)\b/.test(moveText);
 
   if (selecting) {
@@ -141,14 +155,21 @@ export function parseChessIntent(spoken: string, locale: SupportedLocale = 'en-U
     if (piece) return { kind: 'select', piece };
     return { kind: 'unknown' };
   }
-  if (squares.length === 0 && piece) return { kind: 'select', piece };
-  if (squares.length === 1 && /\b(?:from|de|da casa|do quadrado)\b/.test(moveText)
-    && !/\b(?:to|para|pra|em|on)\b/.test(moveText)) {
+  if (squares.length === 0 && piece && isPieceSelection(moveText)) return { kind: 'select', piece };
+  // Relay can finalize a sentence while the caller is still thinking about the
+  // destination. A source-only utterance must select the piece; the room keeps
+  // that selection until the caller eventually names a destination or cancels.
+  const explicitSource = /\b(?:from|starting at|starting on|de|da casa|do quadrado)\b/.test(moveText);
+  const positionedPiece = locale === 'pt-BR'
+    ? /\b(?:na casa|no quadrado|em)\b/.test(moveText)
+      && !captureOnly && !/\b(?:mova|mover|joga|jogar|coloque|ponha|avance|vai|para|pra)\b/.test(moveText)
+    : /\b(?:on|at)\b/.test(moveText)
+      && !captureOnly && !/\b(?:move|put|place|send|push|play|to|toward|towards|into|onto)\b/.test(moveText);
+  if (squares.length === 1 && (explicitSource || positionedPiece)) {
     return { kind: 'select', from: squares[0], ...(piece ? { piece } : {}) };
   }
   if (squares.length === 0 || squares.length > 2) return { kind: 'unknown' };
 
-  const captureOnly = /\b(?:capture|captures|capturing|take|takes|taking|captura|capturar|capturei|toma|tomar|come|comer)\b/.test(moveText);
   const query: ChessMoveQuery = {
     ...(piece ? { piece } : {}),
     ...(squares.length === 2 ? { from: squares[0] } : {}),

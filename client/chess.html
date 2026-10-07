@@ -9,7 +9,7 @@
   <link rel="stylesheet" href="./chess/chess.css" />
   <title>Voice Chess · Twilio Games</title>
 </head>
-<body data-renderer="three">
+<body data-renderer="fallback">
   <div id="app" class="chess-app">
     <div id="board-stage" class="board-stage" aria-hidden="true"></div>
     <div class="scene-vignette" aria-hidden="true"></div>
@@ -30,6 +30,7 @@
         </button>
         <a id="game-home" class="icon-button game-home" href="/" aria-label="Return to Twilio Games" title="Return to Twilio Games">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11.5 12 4l9 7.5M5.5 10v10h13V10M9.5 20v-6h5v6" /></svg>
+          <span id="game-home-label">Back</span>
         </a>
       </div>
     </header>
@@ -78,8 +79,8 @@
       </div>
     </div>
 
-    <div id="fallback-board" class="fallback-board" hidden>
-      <div id="fallback-explanation" class="fallback-explanation">3D graphics are unavailable. The live chess position is shown below.</div>
+    <div id="fallback-board" class="fallback-board">
+      <div id="fallback-explanation" class="fallback-explanation">Live board · 2D mode</div>
     </div>
     <table id="accessible-board" class="accessible-board" aria-label="Live chess board"><tbody></tbody></table>
     <div id="live-announcer" class="visually-hidden" role="status" aria-live="polite" aria-atomic="true"></div>

@@ -3,7 +3,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { FighterActor } from './fighter-actor';
 import { FighterActorLoadCoordinator, fighterActorLoadContext, type FighterActorLoadContext } from './fighter-actor-loading';
-import { FIGHTERS, FIGHTER_ASSET_VERSION, loadAnimationSources } from './fighter-assets';
+import { FIGHTERS, FIGHTER_ASSET_VERSION, loadAnimationSources, preferProceduralFighterAssets } from './fighter-assets';
 import { FighterAtmosphere, fighterAtmosphereSpec, type FighterAtmosphereSpec } from './fighter-atmosphere';
 import { FighterConnection, type FighterConnectionState } from './fighter-net';
 import { isInteractiveShortcutTarget, resolveNumericSelection } from './fighter-client-utils';
@@ -88,7 +88,7 @@ connection.setDisplayAuth(roomCode, isDisplay ? stationDisplay.displayToken : nu
 const arenaSize = () => ({ width: Math.max(1, arena.clientWidth || innerWidth), height: Math.max(1, arena.clientHeight || innerHeight) });
 const initialArenaSize = arenaSize();
 const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); renderer.setSize(initialArenaSize.width, initialArenaSize.height);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5)); renderer.setSize(initialArenaSize.width, initialArenaSize.height);
 renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.outputColorSpace = THREE.SRGBColorSpace; renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.12;
 arena.appendChild(renderer.domElement);
@@ -111,9 +111,9 @@ let touchTargetPlayerId: string | null = null;
 let roster: FighterRosterEntry[] = [];
 let maps: FighterMapEntry[] = [];
 let phoneNumber = t('phone.fallback');
-const FIGHTER_ACTOR_TIMEOUT_MS = 105_000;
-const FIGHTER_ACTOR_FALLBACK_MS = 12_000;
-const FIGHTER_MAP_TIMEOUT_MS = 15_000;
+const FIGHTER_ACTOR_TIMEOUT_MS = 30_000;
+const FIGHTER_ACTOR_FALLBACK_MS = 5_000;
+const FIGHTER_MAP_TIMEOUT_MS = 7_000;
 let phoneQr = '/brand/join-qr.png?v=2';
 let movement: Partial<Record<FighterId, { from: number; to: number; elapsed: number; jump: boolean; duration: number }>> = {};
 const actionDurations: Record<FighterId, number> = { p1: FIGHTER_RUN_FORWARD_DURATION, p2: FIGHTER_RUN_FORWARD_DURATION };
@@ -130,6 +130,7 @@ let mapModel: THREE.Object3D | null = null;
 let mapBackdrop: THREE.WebGLRenderTarget | null = null;
 let mapAtmosphere: FighterAtmosphere | null = null;
 let mapLoadAttempt = 0;
+let mapLoadController: AbortController | null = null;
 let customMapStatic = false;
 let usingProceduralFallback = false;
 let mapPlane = { origin: [0, 0, 0] as [number, number, number], rotationY: 0 };
@@ -140,7 +141,9 @@ let cameraBase = { pos: [0, 2.15, 10.5] as [number, number, number], lookAt: [0,
 const cameraAxis = new THREE.Vector3(), cameraTarget = new THREE.Vector3(), cameraView = new THREE.Vector3(), cameraDesired = new THREE.Vector3();
 let flowMessage = '';
 let animationSources: Awaited<ReturnType<typeof loadAnimationSources>> | null = null;
+let animationLoadController: AbortController | null = null;
 const actorLoads = new Map<string, Promise<FighterActor>>();
+const actorLoadControllers = new Map<string, AbortController>();
 const fallbackActorIds = new Set<string>();
 const deferredRealActors = new Map<string, FighterActor>();
 let preparedFightKey = '';
@@ -225,6 +228,10 @@ connection.onState(next => {
     if (['lobby', 'fighter_select', 'map_select', 'loading'].includes(next.phase)) getMusicManager().switchContext('lobby');
   }
   state = next;
+  if (selectionChanged && (next.phase === 'fighter_select' || next.phase === 'map_select')) {
+    cancelActorLoads(new Set(next.players.map(player => player.fighterId).filter((id): id is string => Boolean(id))));
+  }
+  if (phaseChanged && next.phase === 'fight') cancelOptionalFightDownloads();
   if (!fighterActorLoadContext(next)) actorLoadCoordinator.clear();
   if (next.phase === 'countdown') {
     const count = Math.ceil(next.countdown ?? 0);
@@ -238,7 +245,7 @@ connection.onState(next => {
     syncAuthoritativePositions(next.world);
   }
   updateNames(next);
-  if (next.phase === 'map_select') for (const player of next.players) if (!player.isAi && player.fighterId) preloadFighterActor(player.fighterId);
+  if (next.phase === 'map_select') for (const player of next.players) if (player.fighterId) preloadFighterActor(player.fighterId);
   if (next.selectedMap && ['loading', 'intro', 'countdown', 'fight', 'victory', 'results'].includes(next.phase)) applyMapTheme(next.selectedMap);
   if (fighterActorLoadContext(next) && (phaseChanged || selectionChanged || !actors)) prepareFight(next);
   if (phaseChanged && next.phase === 'intro') beginIntro(next);
@@ -281,7 +288,11 @@ function setLoading(progress: number, label: string): void {
 
 async function initialize(): Promise<void> {
   const attempt = ++initializationAttempt;
+  animationLoadController?.abort();
+  animationLoadController = null;
   initializationFailed = false;
+  // Rendering and server readiness must never wait for optional FBX downloads.
+  animationSources = new Map();
   loading.classList.remove('done'); loading.setAttribute('aria-busy', 'true'); hideAssetError();
   setLoading(.05, t('loading.openingLobby'));
   setTimeout(() => {
@@ -289,23 +300,25 @@ async function initialize(): Promise<void> {
     loading.classList.add('done'); loading.setAttribute('aria-busy', 'false'); renderFlow();
     scheduleFightReceipt();scheduleResultReceipt();
   }, 250);
-  try {
-    animationSources = await loadAnimationSources((loaded, total) => setLoading(loaded / total, t('loading.preparingAssets')));
+  setLoading(1, t('loading.ready'));
+  if (state?.phase === 'loading' || state?.phase === 'intro' || state?.phase === 'countdown' || state?.phase === 'fight') prepareFight(state);
+  maybeSignalReady(); renderFlow();
+  if (preferProceduralFighterAssets(browserConnection()) || state?.phase === 'fight') return;
+  const controller = new AbortController();
+  animationLoadController = controller;
+  void loadAnimationSources(undefined, controller.signal).then(realSources => {
+    if (controller.signal.aborted) return;
     if (attempt !== initializationAttempt) return;
-    setLoading(1, t('loading.ready'));
-    if (state?.phase === 'loading' || state?.phase === 'intro' || state?.phase === 'countdown' || state?.phase === 'fight') prepareFight(state);
-    maybeSignalReady(); renderFlow();
-  } catch (error) {
-    if (attempt !== initializationAttempt) return;
-    loading.classList.add('done'); loading.setAttribute('aria-busy', 'false');
-    initializationFailed = true;
-    showAssetError(t('error.animations'), error, stationDisplay.active
-      ? [{ label: t('action.retry'), action: reloadForAssetRetry }]
-      : [
-        { label: t('action.retry'), action: () => void initialize() },
-        { label: t('action.cancel'), secondary: true, action: () => { hideAssetError(); connection.back(); } },
-      ]);
-  }
+    animationSources = realSources;
+    // Warm only the chosen pair while players are in setup. Starting a large FBX during
+    // an active bout would compete with voice, map, and rendering traffic.
+    if (state?.phase === 'map_select') for (const player of state.players)
+      if (player.fighterId) preloadFighterActor(player.fighterId);
+  }, error => {
+    if (!controller.signal.aborted) console.warn('Fighter animations failed to load; procedural actors stay active.', error);
+  }).finally(() => {
+    if (animationLoadController === controller) animationLoadController = null;
+  });
 }
 
 function renderFlow(): void {
@@ -552,9 +565,10 @@ function prepareFight(next: FighterState): void {
 
 function ensureFightActors(context: FighterActorLoadContext): void {
   if (!animationSources) return;
+  if (!animationSources.size) { installFallbackActors(context); return; }
   const { p1Id, p2Id } = context;
   const load = (id: string) => {
-    const existing = loadedActors.get(id); if (existing) return Promise.resolve(existing);
+    const existing = loadedActors.get(id); if (existing && !fallbackActorIds.has(id)) return Promise.resolve(existing);
     let pending = actorLoads.get(id);
     if (!pending) {
       const spec = FIGHTERS.find(fighter => fighter.id === id); if (!spec) return Promise.reject(new Error(t('error.unknownFighter', { id })));
@@ -565,6 +579,7 @@ function ensureFightActors(context: FighterActorLoadContext): void {
     }
     return pending;
   };
+  installFallbackActors(context);
   actorLoadCoordinator.start(
     context.key,
     async () => {
@@ -591,7 +606,7 @@ function installFallbackActors(context: FighterActorLoadContext): void {
   for (const id of [context.p1Id, context.p2Id]) {
     if (loadedActors.has(id)) continue;
     const color = roster.find(fighter => fighter.id === id)?.color ?? '#ef223a';
-    loadedActors.set(id, FighterActor.fallback(color));
+    loadedActors.set(id, FighterActor.fallback(color, id));
     fallbackActorIds.add(id);
   }
   finishActorPreparation(context);
@@ -601,8 +616,12 @@ function storeLoadedActor(id: string, actor: FighterActor, keep: Set<string>): v
   const existing = loadedActors.get(id);
   if (!existing) loadedActors.set(id, actor);
   else if (fallbackActorIds.has(id)) {
-    deferredRealActors.get(id)?.dispose();
-    deferredRealActors.set(id, actor);
+    if (actors && (actors.p1 === existing || actors.p2 === existing)) {
+      deferredRealActors.get(id)?.dispose();
+      deferredRealActors.set(id, actor);
+    } else {
+      loadedActors.set(id, actor); fallbackActorIds.delete(id); existing.dispose();
+    }
   } else actor.dispose();
   trimActorCache(keep);
 }
@@ -613,34 +632,69 @@ function resetFallbackActors(): void {
   for (const id of fallbackActorIds) {
     const fallback = loadedActors.get(id);
     const replacement = deferredRealActors.get(id);
-    if (replacement) { loadedActors.set(id, replacement); deferredRealActors.delete(id); }
-    else loadedActors.delete(id);
-    fallback?.dispose();
+    if (!replacement) continue;
+    loadedActors.set(id, replacement); deferredRealActors.delete(id);
+    fallback?.dispose(); fallbackActorIds.delete(id);
   }
-  fallbackActorIds.clear();
 }
 
 function preloadFighterActor(id: string): void {
-  if (!animationSources || loadedActors.has(id) || actorLoads.has(id)) return;
+  if (!animationSources?.size || loadedActors.has(id) && !fallbackActorIds.has(id) || actorLoads.has(id)) return;
   const spec = FIGHTERS.find(fighter => fighter.id === id); if (!spec) return;
   const pending = loadFighterActor(spec); actorLoads.set(id, pending);
   void pending.then(actor => storeLoadedActor(id, actor, new Set([id])))
     .finally(() => { if (actorLoads.get(id) === pending) actorLoads.delete(id); }).catch(() => {});
 }
 
+function browserConnection(): { saveData?: boolean; effectiveType?: string } | undefined {
+  return (navigator as Navigator & { connection?: { saveData?: boolean; effectiveType?: string } }).connection;
+}
+
+function cancelActorLoads(keep?: ReadonlySet<string>): void {
+  for (const [id, controller] of actorLoadControllers) {
+    if (keep?.has(id)) continue;
+    actorLoads.delete(id);
+    controller.abort(new Error(`fighter ${id} is no longer needed`));
+    actorLoadControllers.delete(id);
+  }
+}
+
+function cancelOptionalFightDownloads(): void {
+  animationLoadController?.abort(new Error('fight started'));
+  animationLoadController = null;
+  cancelActorLoads();
+  if (mapLoadController) {
+    mapLoadController.abort(new Error('fight started'));
+    mapLoadController = null;
+    mapLoadAttempt++;
+    if (state?.selectedMap) failedMapKey = `${state.loadingGeneration}:${state.selectedMap}`;
+  }
+}
+
 function loadFighterActor(spec: (typeof FIGHTERS)[number]): Promise<FighterActor> {
   return new Promise((resolve, reject) => {
+    const controller = new AbortController();
+    actorLoadControllers.set(spec.id, controller);
     let settled = false;
-    const timer = setTimeout(() => {
+    const clear = () => {
+      clearTimeout(timer);
+      if (actorLoadControllers.get(spec.id) === controller) actorLoadControllers.delete(spec.id);
+    };
+    controller.signal.addEventListener('abort', () => {
+      if (settled) return;
       settled = true;
-      reject(new Error(`fighter model timed out after ${FIGHTER_ACTOR_TIMEOUT_MS / 1000} seconds`));
+      clear();
+      reject(controller.signal.reason ?? new DOMException('Fighter asset request aborted', 'AbortError'));
+    }, { once: true });
+    const timer = setTimeout(() => {
+      controller.abort(new Error(`fighter model timed out after ${FIGHTER_ACTOR_TIMEOUT_MS / 1000} seconds`));
     }, FIGHTER_ACTOR_TIMEOUT_MS);
-    void FighterActor.load(spec, animationSources!).then(actor => {
+    void FighterActor.load(spec, animationSources!, undefined, controller.signal).then(actor => {
       if (settled) { actor.dispose(); return; }
-      settled = true; clearTimeout(timer); resolve(actor);
+      settled = true; clear(); resolve(actor);
     }, error => {
       if (settled) return;
-      settled = true; clearTimeout(timer); reject(error);
+      settled = true; clear(); reject(error);
     });
   });
 }
@@ -806,6 +860,8 @@ function applyMapTheme(mapId: string): void {
     if (!failedMapKey) { maybeSignalReady(); return; }
   }
   const config = maps.find(map => map.id === mapId); if (!config) return;
+  mapLoadController?.abort(new Error('arena selection changed'));
+  mapLoadController = null;
   const attempt = ++mapLoadAttempt;
   if (readyTimer) { clearTimeout(readyTimer); readyTimer = null; }
   loadedMapId = mapId;
@@ -816,77 +872,114 @@ function applyMapTheme(mapId: string): void {
   disposeCurrentMap();
   theme.ring.material.color.set(config.color); theme.red.color.set(config.color);
   theme.foundry.visible = mapId === 'foundry'; theme.voidStage.visible = mapId === 'void';
+  for (const child of theme.procedural.children)
+    if (child.name.startsWith('fallback:')) child.visible = child.name === `fallback:${mapId}`;
   theme.floor.material.color.set(mapId === 'void' ? 0x080d1c : 0x21171a);
   scene.background = new THREE.Color(mapId === 'void' ? 0x02040d : 0x0d080b);
   scene.fog = new THREE.FogExp2(mapId === 'void' ? 0x040817 : 0x16090c, .035);
-  mapPlane = config.fightPlane ?? { origin: [0, config.floorY ?? 0, 0], rotationY: 0 };
   mapBoundsCenter = (config.bounds[0] + config.bounds[1]) / 2;
   const livePortraitMap = shouldUseLivePortraitArena(mapId, camera.aspect);
   const atmosphereSpec = fighterAtmosphereSpec(mapId);
-  applyAtmosphereLighting(atmosphereSpec);
-  applyActorTransforms();
-  applyCameraFraming(config);
-  if (atmosphereSpec) mapAtmosphere = new FighterAtmosphere(atmosphereSpec, scene, new THREE.Vector3(...cameraBase.lookAt), new THREE.Vector3(...mapPlane.origin), THREE.MathUtils.degToRad(mapPlane.rotationY));
   customMapStatic = false;
   renderer.shadowMap.enabled = true;
-  theme.procedural.visible = !config.file;
-  if (!config.file) { mapReadyId = mapId; maybeSignalReady(); return; }
+  const arenaFile = config.file;
+  if (!arenaFile) {
+    mapPlane = config.fightPlane ?? { origin: [0, config.floorY ?? 0, 0], rotationY: 0 };
+    applyAtmosphereLighting(atmosphereSpec); applyActorTransforms(); applyCameraFraming(config);
+    if (atmosphereSpec) mapAtmosphere = new FighterAtmosphere(atmosphereSpec, scene,
+      new THREE.Vector3(...cameraBase.lookAt), new THREE.Vector3(...mapPlane.origin), THREE.MathUtils.degToRad(mapPlane.rotationY));
+    theme.procedural.visible = true;
+    mapReadyId = mapId; maybeSignalReady(); return;
+  }
+  // A selected 3D arena may be tens of megabytes. Its themed local stage is ready for
+  // play now; downloading the optional scene cannot hold the first playable frame.
+  showProceduralMap(config, atmosphereSpec);
+  mapReadyId = mapId; maybeSignalReady();
+  if (preferProceduralFighterAssets(browserConnection())
+    || state?.phase === 'fight' || state?.phase === 'victory' || state?.phase === 'results') {
+    failedMapKey = loadKey;
+    return;
+  }
+  const controller = new AbortController();
+  mapLoadController = controller;
   const draco = new DRACOLoader(); draco.setDecoderPath('/draco/');
   const loader = new GLTFLoader(); loader.setDRACOLoader(draco);
   const fallbackTimer = setTimeout(() => {
-    if (loadedMapId === mapId && attempt === mapLoadAttempt && mapReadyId !== mapId) {
-      draco.dispose();
+    if (loadedMapId === mapId && attempt === mapLoadAttempt && !mapModel) {
+      controller.abort(new Error(`arena timed out after ${FIGHTER_MAP_TIMEOUT_MS / 1000} seconds`));
+      if (mapLoadController === controller) mapLoadController = null;
       handleMapLoadFailure(mapId, loadKey, new Error(`arena timed out after ${FIGHTER_MAP_TIMEOUT_MS / 1000} seconds`));
     }
   }, FIGHTER_MAP_TIMEOUT_MS);
-  loader.load(`/assets/fighters/maps/${encodeURIComponent(config.file)}?v=${FIGHTER_ASSET_VERSION}`, gltf => {
-    clearTimeout(fallbackTimer);
-    draco.dispose();
-    if (loadedMapId !== mapId || attempt !== mapLoadAttempt) { disposeObjectResources(gltf.scene); return; }
-    if (!hasRenderableTriangle(gltf.scene)) {
-      disposeObjectResources(gltf.scene);
-      handleMapLoadFailure(mapId, loadKey, new Error('arena model has no renderable geometry'));
-      return;
+  void (async () => {
+    try {
+      const response = await fetch(`/assets/fighters/maps/${encodeURIComponent(arenaFile)}?v=${FIGHTER_ASSET_VERSION}`,
+        { signal: controller.signal });
+      if (!response.ok) throw new Error(`arena request failed with HTTP ${response.status}`);
+      const buffer = await response.arrayBuffer();
+      if (controller.signal.aborted) return;
+      const gltf = await loader.parseAsync(buffer, '/assets/fighters/maps/');
+      if (controller.signal.aborted || loadedMapId !== mapId || attempt !== mapLoadAttempt) {
+        disposeObjectResources(gltf.scene); return;
+      }
+      if (!hasRenderableTriangle(gltf.scene)) {
+        disposeObjectResources(gltf.scene);
+        handleMapLoadFailure(mapId, loadKey, new Error('arena model has no renderable geometry'));
+        return;
+      }
+      // Swapping a large decoded scene in the middle of combat causes an FPS spike and
+      // moves the camera under the player's controls. Keep the local stage for this bout.
+      if (state?.phase === 'fight' || state?.phase === 'victory' || state?.phase === 'results') {
+        disposeObjectResources(gltf.scene); failedMapKey = loadKey; return;
+      }
+      usingProceduralFallback = false;
+      theme.procedural.visible = false;
+      mapPlane = config.fightPlane ?? { origin: [0, config.floorY ?? 0, 0], rotationY: 0 };
+      applyAtmosphereLighting(atmosphereSpec); applyActorTransforms(); applyCameraFraming(config);
+      if (mapAtmosphere) { mapAtmosphere.dispose(scene); mapAtmosphere = null; }
+      if (atmosphereSpec) mapAtmosphere = new FighterAtmosphere(atmosphereSpec, scene,
+        new THREE.Vector3(...cameraBase.lookAt), new THREE.Vector3(...mapPlane.origin), THREE.MathUtils.degToRad(mapPlane.rotationY));
+      mapModel = gltf.scene;
+      mapModel.position.set(...(config.pos ?? [0, 0, 0]));
+      const rotation = config.rotDeg ?? [0, 0, 0]; mapModel.rotation.set(...rotation.map(value => THREE.MathUtils.degToRad(value)) as [number, number, number]);
+      mapModel.scale.setScalar(config.scale ?? 1);
+      // Environment geometry is static and often contains millions of triangles. It can receive fighter
+      // shadows, but must not render into the shadow map itself every frame.
+      mapModel.traverse(object => { if ((object as THREE.Mesh).isMesh) { (object as THREE.Mesh).receiveShadow = true; (object as THREE.Mesh).castShadow = false; } });
+      scene.add(mapModel);
+      if (livePortraitMap) { customMapStatic = false; renderer.shadowMap.enabled = true; }
+      else try { captureMapBackdrop(); }
+      catch (error) { console.warn('Unable to cache arena backdrop; using live rendering.', error); customMapStatic = false; renderer.shadowMap.enabled = true; }
+      mapReadyId = mapId;
+      failedMapKey = '';
+      maybeSignalReady();
+    } catch (error) {
+      if (!controller.signal.aborted && loadedMapId === mapId && attempt === mapLoadAttempt)
+        handleMapLoadFailure(mapId, loadKey, error);
+    } finally {
+      clearTimeout(fallbackTimer);
+      draco.dispose();
+      if (mapLoadController === controller) mapLoadController = null;
     }
-    mapModel = gltf.scene;
-    mapModel.position.set(...(config.pos ?? [0, 0, 0]));
-    const rotation = config.rotDeg ?? [0, 0, 0]; mapModel.rotation.set(...rotation.map(value => THREE.MathUtils.degToRad(value)) as [number, number, number]);
-    mapModel.scale.setScalar(config.scale ?? 1);
-    // Environment geometry is static and often contains millions of triangles. It can receive fighter
-    // shadows, but must not render into the shadow map itself every frame.
-    mapModel.traverse(object => { if ((object as THREE.Mesh).isMesh) { (object as THREE.Mesh).receiveShadow = true; (object as THREE.Mesh).castShadow = false; } });
-    scene.add(mapModel);
-    if (livePortraitMap) { customMapStatic = false; renderer.shadowMap.enabled = true; }
-    else try { captureMapBackdrop(); }
-    catch (error) { console.warn('Unable to cache arena backdrop; using live rendering.', error); customMapStatic = false; renderer.shadowMap.enabled = true; }
-    mapReadyId = mapId;
-    failedMapKey = '';
-    maybeSignalReady();
-  }, undefined, error => {
-    clearTimeout(fallbackTimer);
-    draco.dispose();
-    if (loadedMapId !== mapId || attempt !== mapLoadAttempt) return;
-    handleMapLoadFailure(mapId, loadKey, error);
-  });
+  })();
 }
 
 function handleMapLoadFailure(mapId: string, _loadKey: string, error: unknown): void {
   console.warn(`Arena ${mapId} failed to load; using the procedural stage.`, error);
-  useProceduralFallback(mapId);
+  mapLoadAttempt++;
+  failedMapKey = _loadKey;
+  mapReadyId = mapId; maybeSignalReady();
 }
 
-function useProceduralFallback(mapId: string): void {
-  mapLoadAttempt++; disposeCurrentMap(); hideAssetError();
-  failedMapKey = '';
+function showProceduralMap(config: FighterMapEntry, atmosphereSpec: FighterAtmosphereSpec | null): void {
   usingProceduralFallback = true;
   theme.procedural.visible = true; renderer.shadowMap.enabled = true; customMapStatic = false;
   mapPlane = { origin: [0, 0, 0], rotationY: 0 };
-  applyAtmosphereLighting(null);
-  const config = maps.find(map => map.id === mapId);
   applyProceduralFallbackFraming(config);
   applyActorTransforms();
-  scene.background = new THREE.Color(0x05060a); scene.fog = new THREE.FogExp2(0x08090e, .06);
-  mapReadyId = mapId; maybeSignalReady();
+  applyAtmosphereLighting(atmosphereSpec);
+  if (atmosphereSpec) mapAtmosphere = new FighterAtmosphere(atmosphereSpec, scene,
+    new THREE.Vector3(...cameraBase.lookAt), new THREE.Vector3(0, 0, 0), 0);
 }
 
 function disposeCurrentMap(): void {
@@ -1107,6 +1200,55 @@ function buildArena(): { ring: THREE.Mesh<THREE.RingGeometry, THREE.MeshBasicMat
   for (let i = 0; i < starPositions.length; i += 3) { starPositions[i] = (Math.random() - .5) * 35; starPositions[i + 1] = Math.random() * 14 + 2; starPositions[i + 2] = -4 - Math.random() * 12; }
   starGeometry.setAttribute('position', new THREE.BufferAttribute(starPositions, 3));
   voidStage.add(new THREE.Points(starGeometry, new THREE.PointsMaterial({ color: 0xbcecff, size: .055, transparent: true, opacity: .85 })));
+  // Small themed stages are bundled as geometry so a slow or missing GLB never leaves a
+  // generic empty ring. Shared shapes/materials keep the fallback cheap to draw.
+  const cube = new THREE.BoxGeometry(1, 1, 1);
+  const city = new THREE.Group(); city.name = 'fallback:cyberpunk-city'; city.visible = false; procedural.add(city);
+  const concrete = new THREE.MeshStandardMaterial({ color: 0x101025, roughness: .8 });
+  const cityNeon = new THREE.MeshBasicMaterial({ color: 0xff35d1 });
+  const cityBlue = new THREE.MeshBasicMaterial({ color: 0x40d8ff });
+  for (let index = -5; index <= 5; index++) {
+    const height = 3.3 + Math.abs(index * 7 % 5) * .58;
+    const building = new THREE.Mesh(cube, concrete); building.scale.set(1.45, height, 1.2);
+    building.position.set(index * 2.3, height / 2, -7.5); city.add(building);
+    for (let row = 1; row < 4; row++) {
+      const light = new THREE.Mesh(cube, row % 2 ? cityNeon : cityBlue);
+      light.scale.set(.85, .045, .015); light.position.set(index * 2.3, row * .8 + .55, -6.88);
+      city.add(light);
+    }
+  }
+  const cityLane = new THREE.Mesh(cube, cityBlue); cityLane.scale.set(20, .014, .04); cityLane.position.set(0, .04, 2.8); city.add(cityLane);
+  const restaurant = new THREE.Group(); restaurant.name = 'fallback:inakaya'; restaurant.visible = false; procedural.add(restaurant);
+  const wood = new THREE.MeshStandardMaterial({ color: 0x40271d, roughness: .9 });
+  const paper = new THREE.MeshStandardMaterial({ color: 0xe7cba5, roughness: 1, side: THREE.DoubleSide });
+  const lantern = new THREE.MeshBasicMaterial({ color: 0xffba63 });
+  for (let index = -5; index <= 5; index++) {
+    const mat = new THREE.Mesh(cube, index % 2 ? paper : wood);
+    mat.scale.set(1.8, .025, 3.1); mat.position.set(index * 1.9, .018, -.1); restaurant.add(mat);
+  }
+  for (let index = -4; index <= 4; index++) {
+    const panel = new THREE.Mesh(cube, paper); panel.scale.set(1.5, 2.8, .08);
+    panel.position.set(index * 1.9, 1.7, -5.4); restaurant.add(panel);
+    const post = new THREE.Mesh(cube, wood); post.scale.set(.14, 3.7, .22);
+    post.position.set(index * 1.9 + .9, 1.85, -5.3); restaurant.add(post);
+  }
+  for (const x of [-4.6, 0, 4.6]) {
+    const lamp = new THREE.Mesh(new THREE.SphereGeometry(.28, 8, 6), lantern);
+    lamp.position.set(x, 3.55, -4.5); restaurant.add(lamp);
+  }
+  const rainStage = new THREE.Group(); rainStage.name = 'fallback:rain'; rainStage.visible = false; procedural.add(rainStage);
+  const wetStone = new THREE.MeshStandardMaterial({ color: 0x172b37, metalness: .34, roughness: .36 });
+  const rainBlue = new THREE.MeshBasicMaterial({ color: 0x76d5ff, transparent: true, opacity: .78 });
+  for (let index = -5; index <= 5; index++) {
+    const slab = new THREE.Mesh(cube, wetStone); slab.scale.set(1.8, .06, 4.2);
+    slab.position.set(index * 1.9, .03, 0); rainStage.add(slab);
+  }
+  for (const side of [-1, 1]) for (let index = 0; index < 4; index++) {
+    const pylon = new THREE.Mesh(cube, wetStone); pylon.scale.set(.48, 2.5, .48);
+    pylon.position.set(side * (5 + index * 1.7), 1.25, -3.6); rainStage.add(pylon);
+    const glow = new THREE.Mesh(cube, rainBlue); glow.scale.set(.15, 1.65, .5);
+    glow.position.set(pylon.position.x, 1.4, -3.33); rainStage.add(glow);
+  }
   const key = new THREE.DirectionalLight(0xfff1e6, 4.4); key.position.set(-1, 7, 5); key.castShadow = true; key.shadow.mapSize.set(2048, 2048); key.shadow.camera.left = -6; key.shadow.camera.right = 6; key.shadow.camera.top = 5; key.shadow.camera.bottom = -1;
   const red = new THREE.SpotLight(0xef223a, 70, 14, .62, .8); red.position.set(-5, 5, 1); red.target.position.set(-1, 0, 0);
   const cyan = new THREE.SpotLight(0x2dd4bf, 55, 14, .62, .8); cyan.position.set(5, 4, -1); cyan.target.position.set(1, 0, 0);

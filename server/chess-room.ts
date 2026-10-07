@@ -1,6 +1,7 @@
 import { Chess, type Move } from 'chess.js';
 import { describeChessMove, parseChessIntent, type ChessMoveQuery } from '../shared/chess-intent';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../shared/i18n/locales';
+import { normalizeForMatching } from '../shared/i18n/translate';
 import type {
   ChessColor, ChessCommandResult, ChessEvent, ChessFeedback, ChessFeedbackCode,
   ChessMovePreview, ChessMoveRecord, ChessPendingMove, ChessPieceType,
@@ -155,10 +156,11 @@ export class ChessRoom {
       case 'confirm': return this.confirmMove(undefined, locale);
       case 'cancel': return this.cancelMove(locale);
       case 'select': return this.selectPiece(intent, locale);
-      case 'move': return this.proposeQuery(intent.query, locale);
+      case 'move': return this.selectSpokenSource(text, intent.query, locale)
+        ?? this.proposeQuery(intent.query, locale);
       case 'help': return this.respond('help', inLanguage(locale,
-        'Say a piece and destination square, then say confirm or cancel. If two pieces can reach it, include the starting square.',
-        'Diga a peça e a casa de destino, depois diga confirmar ou cancelar. Se duas peças puderem chegar lá, inclua a casa inicial.'));
+        'Name a piece or its starting square, then take your time and say the destination. Say confirm or cancel after I repeat the move. To castle, say castle; if both sides are open, name kingside or queenside.',
+        'Diga uma peça ou a casa inicial e pense com calma antes de dizer o destino. Depois da minha repetição, diga confirmar ou cancelar. Para fazer roque, diga roque; se ambos os lados estiverem livres, diga pequeno ou grande.'));
       default: return this.respond('unknown', inLanguage(locale,
         'I did not catch a chess move. Say a piece and destination square, or say help.',
         'Não entendi a jogada. Diga a peça e a casa de destino, ou diga ajuda.'));
@@ -249,6 +251,17 @@ export class ChessRoom {
     return this.respond('selected', inLanguage(locale, 'Piece selected. Say the destination square.', 'Peça selecionada. Diga a casa de destino.'));
   }
 
+  /** A bare "pawn E2" names the pawn already on E2, not an impossible move onto itself. */
+  private selectSpokenSource(text: string, query: ChessMoveQuery, locale: SupportedLocale): ChessCommandResult | null {
+    if (!query.to || query.from || query.castle !== undefined || query.captureOnly || query.promotion) return null;
+    const normalized = normalizeForMatching(text, locale);
+    if (/\b(?:to|toward|towards|into|onto|para|pra)\b/.test(normalized)) return null;
+    const occupant = this.chess.get(query.to);
+    if (!occupant || occupant.color !== this.humanColorValue
+      || (query.piece && query.piece !== occupant.type)) return null;
+    return this.selectPiece({ from: query.to, piece: occupant.type }, locale);
+  }
+
   private proposeQuery(query: ChessMoveQuery, locale: SupportedLocale): ChessCommandResult {
     const guard = this.guardHumanAction(locale);
     if (guard) return guard;
@@ -270,12 +283,18 @@ export class ChessRoom {
       candidates = candidates.filter(move => !move.promotion || move.promotion === 'q');
     }
     if (candidates.length === 0) {
+      if (effective.castle !== undefined) return this.respond('illegal', inLanguage(locale,
+        'Castling is not legal in this position. Try another move.',
+        'O roque não é legal nesta posição. Tente outra jogada.'));
       return this.respond('illegal', inLanguage(locale,
         'That move is not legal from this position. Try another square.',
         'Essa jogada não é legal nesta posição. Tente outra casa.'));
     }
     if (candidates.length > 1) {
       const previews = candidates.map(move => this.preview(move));
+      if (effective.castle !== undefined) return this.respond('ambiguous', inLanguage(locale,
+        'Both castling sides are legal. Say castle kingside or castle queenside.',
+        'Os dois lados do roque são possíveis. Diga roque pequeno ou roque grande.'), previews);
       const sources = [...new Set(candidates.map(move => move.from.toUpperCase()))].join(', ');
       return this.respond('ambiguous', inLanguage(locale,
         `More than one piece can move there. Repeat the full move with its starting square: ${sources}.`,

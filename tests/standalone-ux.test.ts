@@ -89,13 +89,15 @@ describe('standalone and station display UX', () => {
     expect(stationDisplay).toContain('role="img" aria-label="${qrLabel}"');
   });
 
-  it('warms the exact Racer scene before releasing a station countdown', () => {
+  it('warms a playable Racer scene before releasing a station countdown, even without optional assets', () => {
     const script = readClient('main.ts');
-    expect(script).toContain('assets.waitForGameplayAssets(first.cars.map(car => car.carIndex))');
+    expect(script).toContain('loadRaceLevelWithinBudget(mapName, generation)');
+    expect(script).toContain('RACER_RACE_SCENE_BUDGET_MS = 1_800');
+    expect(script).toContain('resetToGeneratedRaceScene()');
     expect(script).toContain('renderer.render(first, { splitScreen })');
     expect(script).toContain('if (stationDisplay.active) conn.ready()');
     expect(script).toContain('buffer.clear()');
-    expect(script).toContain('() => !stationDisplay.active || !raceLive');
+    expect(script).toContain('() => !raceLive');
     expect(script).toContain('cancelPendingRaceSnapshot()');
     expect(script).toMatch(/conn\.onLobby[\s\S]*?if \(raceLive\)[\s\S]*?liftVeil\(\)/);
   });

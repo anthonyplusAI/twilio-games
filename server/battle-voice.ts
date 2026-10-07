@@ -80,11 +80,9 @@ export interface BattleVoiceDeps {
   interpret?(request: VoiceInterpretRequest): Promise<VoiceInterpretResult>;
 }
 
-const GREETING_KEYS = [
-  'voice.greetingWelcome', 'voice.greetingRelay', 'voice.askName',
-] as const satisfies readonly MonstersMessageKey[];
 const FINAL_REPEAT_GUARD_MS = 400;
 const SAME_CONTEXT_REPEAT_GUARD_MS = 400;
+const BATTLE_BEAT_SPEECH_MAX_AGE_MS = 5_000;
 
 export class BattleVoiceSession {
   private code: string | null = null;
@@ -103,6 +101,8 @@ export class BattleVoiceSession {
   private stationAssignment: { side: 'a' | 'b'; expectedPlayers: number } | null = null;
   private lastFinalCommand: { text: string; beforeContext: string; afterContext: string; at: number; inputSignal:number } | null = null;
   private inputSignal=0;
+  private introEpoch=0;
+  private introExpired=false;
   private awaitingName = false;
   private applyingSetupChange=false;
   private lastCanAdvanceLobby=false;
@@ -111,6 +111,7 @@ export class BattleVoiceSession {
   private lastStateScope: string | null = null;
   private lastResultsNarratedKey: string | null = null;
   private lastResultsPresentationTimedOut = false;
+  private beatSpeechEpoch = 0;
   private text: (key: MonstersMessageKey, values?: MessageValues) => string = createTranslator(DEFAULT_LOCALE, MONSTERS_MESSAGES);
 
   constructor(private deps: BattleVoiceDeps) {}
@@ -140,6 +141,40 @@ export class BattleVoiceSession {
     });
   }
 
+  /** A painted beat is still true after the next animation frame. Let a short line
+   * finish across adjacent beats, but drop it if it waits too long in Relay's queue. */
+  private sayBattleBeat(text: string): void {
+    const code = this.code, playerId = this.playerId, callSid = this.callSid;
+    const snapshot = code && playerId ? this.deps.snapshot(code, playerId, this.commandLocale) : null;
+    if (!code || !playerId || !snapshot) return;
+    const generation = snapshot.generation, inputEpoch = this.introEpoch, beatEpoch = this.beatSpeechEpoch;
+    const queuedAt = Date.now();
+    this.deps.say(text, () => {
+      if (this.code !== code || this.playerId !== playerId || this.callSid !== callSid
+        || this.introEpoch !== inputEpoch || this.beatSpeechEpoch !== beatEpoch
+        || Date.now() - queuedAt > BATTLE_BEAT_SPEECH_MAX_AGE_MS) return false;
+      const current = this.deps.snapshot(code, playerId, this.commandLocale);
+      return Boolean(current && current.generation === generation
+        && (current.phase === 'battle' || current.phase === 'results'));
+    });
+  }
+
+  /** Retire queued opening speech as soon as the display moves to another screen. */
+  private sayCallIntro(text:string):void{
+    const code=this.code,playerId=this.playerId,callSid=this.callSid,epoch=this.introEpoch;
+    const phase=code&&playerId?this.deps.snapshot(code,playerId,this.commandLocale)?.phase:null;
+    this.deps.say(text,()=>{
+      const current=code&&playerId?this.deps.snapshot(code,playerId,this.commandLocale):null;
+      if(current&&current.phase!==phase)this.introExpired=true;
+      return Boolean(code&&playerId&&current&&this.code===code&&this.playerId===playerId
+        &&this.callSid===callSid&&this.introEpoch===epoch&&!this.introExpired&&current.phase===phase);
+    });
+  }
+
+  private isCallIntroPhase(phase:BattleVoiceSnapshot['phase']):boolean{
+    return phase==='lobby'||phase==='monster_select';
+  }
+
   private applySetupChange<T>(change:()=>T):T{
     this.applyingSetupChange=true;
     try{return change();}finally{this.applyingSetupChange=false;}
@@ -163,12 +198,17 @@ export class BattleVoiceSession {
           this.authoritativeName !== null);
         if (!joined) { this.deps.say(this.text('voice.roomUnavailable')); return; }
         this.code = code; this.playerId = joined.playerId; this.callSid = msg.callSid;
+        this.introExpired=false;
         const current = this.deps.snapshot(code, joined.playerId, this.commandLocale);
         const snap = current&&this.authoritativeName?{...current,myName:this.authoritativeName}:current;
+        if(snap&&!this.isCallIntroPhase(snap.phase))this.introExpired=true;
         this.awaitingName = !this.authoritativeName && !this.nameIsConfirmed(snap);
         this.lastStateScope = snap ? this.semanticScope(snap) : null;
         this.lastMyMonsterId=snap?.myMonsterId??null;
         this.lastResultsPresentationTimedOut=snap?.resultsPresentationTimedOut===true;
+        this.sayCallIntro(snap?.myName
+          ?this.text('voice.welcomeNamed',{name:snap.myName}):this.text('voice.greetingWelcome'));
+        this.sayCallIntro(this.text('voice.greetingRelay'));
         if (joined.resumed) this.speakResumeCue();
         else {
            this.lastPhase = snap?.phase ?? null;
@@ -177,15 +217,12 @@ export class BattleVoiceSession {
            this.lastCanStartBattle=snap?.canStartBattle??false;
           if (snap?.phase === 'battle' && !snap.myMonsterId) {
             this.sayCurrent(this.text('voice.lateBattle'));
-            if(snap.myName){this.sayCurrent(this.text('voice.welcomeNamed',{name:snap.myName}));this.sayCurrent(this.text('voice.greetingActions'));}
+            if(snap.myName){this.sayCurrent(this.text('voice.greetingActions'));}
             else this.sayCurrent(this.text('voice.askName'));
           } else if (snap?.phase === 'results') {
             this.sayCurrent(this.text('voice.lateResults'));
-            this.sayCurrent(snap.myName?(this.stationManaged?this.text('voice.welcomeNamed',{name:snap.myName}):this.text('voice.welcomeRematchNamed',{name:snap.myName})):this.text('voice.askName'));
-            if(snap.myName&&this.stationManaged)this.sayCurrent(this.resultsStatusText(snap));
+            this.sayCurrent(snap.myName?this.resultsStatusText(snap):this.text('voice.askName'));
           } else if(this.authoritativeName&&snap){
-            this.sayCurrent(this.text('voice.welcomeNamed',{name:this.authoritativeName}));
-            this.sayCurrent(this.text('voice.greetingRelay'));
             if(snap.phase==='lobby'){
               this.sayCurrent(this.text('voice.greetingRules'));
               this.sayCurrent(this.text('voice.greetingActions'));
@@ -195,7 +232,7 @@ export class BattleVoiceSession {
               this.sayCurrent(this.text(snap.phase==='monster_select'?'voice.helpSelect':'voice.howTo'));
             }
           } else {
-            for (const key of this.authoritativeName ? GREETING_KEYS.slice(0, -1) : GREETING_KEYS) this.sayCurrent(this.text(key));
+            this.sayCurrent(this.text('voice.askName'));
           }
         }
         break;
@@ -204,6 +241,7 @@ export class BattleVoiceSession {
         if (!this.code || !this.playerId) return;
         this.cancelNarration();
         const text = msg.voicePrompt.trim();
+        this.introEpoch++;
         if (!msg.last) { this.inputSignal++;this.turnEpoch++;this.pendingInterpret?.abort(); return; }
         if (text) {
           const normalized = normalizeForMatching(text, this.commandLocale);
@@ -230,6 +268,7 @@ export class BattleVoiceSession {
       }
       case 'interrupt':
         this.cancelNarration();
+        this.introEpoch++;
         this.inputSignal++;
         this.turnEpoch++;   // caller barged in → drop any in-flight LLM reply
         this.pendingInterpret?.abort();
@@ -237,7 +276,7 @@ export class BattleVoiceSession {
         break;
       case 'dtmf': {
         if (!this.code || !this.playerId) return;
-        this.cancelNarration();this.inputSignal++;
+        this.cancelNarration();this.inputSignal++;this.introEpoch++;
         const digit = msg.digit.trim();
         if (/^[0-9*#]$/.test(digit)) {
           this.handleUtterance(digit === '0' ? this.backCommand() : digit);
@@ -450,6 +489,14 @@ export class BattleVoiceSession {
     if (snap.myMonsterName) facts.push({ id: 'my_monster', text: this.commandLocale === 'pt-BR'
       ? `Seu monstro é ${snap.myMonsterName}.` : `Your monster is ${snap.myMonsterName}.` });
     if (snap.phase === 'battle' && snap.participating) {
+      if (snap.myHp !== null && snap.myMaxHp !== null && snap.foeHp !== null && snap.foeMaxHp !== null) {
+        facts.push({ id: 'health', text: this.commandLocale === 'pt-BR'
+          ? `Você tem ${snap.myHp} de ${snap.myMaxHp} pontos de vida. ${snap.foeMonsterName ?? 'O rival'} tem ${snap.foeHp} de ${snap.foeMaxHp}.`
+          : `You have ${snap.myHp} of ${snap.myMaxHp} health. ${snap.foeMonsterName ?? 'The opponent'} has ${snap.foeHp} of ${snap.foeMaxHp}.` });
+      }
+      facts.push({ id: 'potions', text: this.commandLocale === 'pt-BR'
+        ? `Você tem ${snap.myPotions} ${snap.myPotions === 1 ? 'poção' : 'poções'}.`
+        : `You have ${snap.myPotions} ${snap.myPotions === 1 ? 'potion' : 'potions'}.` });
       facts.push({ id: 'turn', text: this.commandLocale === 'pt-BR'
         ? (snap.whoseTurn === 'me' ? 'É sua vez.' : 'É a vez do outro monstro.')
         : (snap.whoseTurn === 'me' ? 'It is your turn.' : 'It is the other monster’s turn.') });
@@ -661,7 +708,8 @@ export class BattleVoiceSession {
 
   private resultsStatusText(snap:BattleVoiceSnapshot):string{
     if(snap.resultsPresentationTimedOut===true&&snap.resultsPresented!==true)
-      return this.text('voice.resultsDisplayTimeout',{winner:snap.winnerName??this.text('voice.rival')});
+      return this.text(this.stationManaged?'voice.resultsDisplayTimeoutStation':'voice.resultsDisplayTimeout',
+        {winner:snap.winnerName??this.text('voice.rival')});
     if(snap.resultsPresented===false)return this.text('voice.resultsPending');
     return this.text(this.stationManaged?'voice.waitOperator':snap.canRematch?'voice.helpResults':'voice.holdFinal');
   }
@@ -680,6 +728,7 @@ export class BattleVoiceSession {
   onBattleStateChanged(): void {
     if (!this.code || !this.playerId) return;
     const snap = this.deps.snapshot(this.code, this.playerId, this.commandLocale);
+    if(snap&&!this.isCallIntroPhase(snap.phase))this.introExpired=true;
     if (snap && this.nameIsConfirmed(snap)) this.awaitingName = false;
     const scope = snap ? this.semanticScope(snap) : null;
     if (scope !== this.lastStateScope && !this.applyingSetupChange) {
@@ -734,11 +783,11 @@ export class BattleVoiceSession {
     if(!snap||!snap.participating||snap.generation!==undefined&&snap.generation!==presentation.generation)return;
     if(presentation.kind==='event'){
       if(snap.phase!=='battle'&&snap.phase!=='results')return;
-      // The next painted beat replaces a prior beat that may still be queued in Relay.
-      this.turnEpoch++;
+      // A later painted beat can arrive before ElevenLabs finishes this one. Keep
+      // the current short cue intact; its bounded guard drops stale queued lines.
       this.pendingInterpret?.abort();
       if(presentation.event.kind==='battle_over')
-        this.sayCurrent(this.text('battle.eventWin',{winner:presentation.event.winnerName}));
+        this.sayBattleBeat(this.text('battle.eventWin',{winner:presentation.event.winnerName}));
       else this.speakEvent(presentation.event);
       if(!snap.presentationPending&&this.pendingStateCue){
         this.pendingStateCue=false;
@@ -750,6 +799,7 @@ export class BattleVoiceSession {
     const key=`${this.code}:${presentation.generation}`;
     if(this.lastResultsNarratedKey===key)return;
     this.lastResultsNarratedKey=key;
+    this.beatSpeechEpoch++;
     this.turnEpoch++;
     this.pendingInterpret?.abort();
     // The room-state notification follows this paint receipt. Record the same state now,
@@ -820,19 +870,32 @@ export class BattleVoiceSession {
     if (ev.kind === 'turn_start' && !this.introDone && snap) {
       // Dramatic scene-set on turn 1 + a quick how-to-act recap. Then normal commentary flows.
       this.introDone = true; this.menuLevel = 'root';
-      this.sayCurrent(battleIntro(mine, foe, 0, this.commandLocale));
-      this.sayCurrent(this.text('voice.introActions'));
+      this.sayBattleBeat(battleIntro(mine, foe, 0, this.commandLocale));
+      this.sayBattleBeat(this.text('voice.introActions'));
       return;
     }
     if (ev.kind === 'battle_over') {
       this.lineSeq++;
-      if (this.stationManaged && snap?.phase === 'results') this.deps.say(this.battleOverLine(ev, snap, aName, bName));
-      else this.sayCurrent(this.battleOverLine(ev, snap, aName, bName));
+      if (this.stationManaged) {
+        const key = snap?.phase === 'results' ? `${this.code}:${snap.generation}` : null;
+        if (key && this.lastResultsNarratedKey === key) return;
+        if (key && snap?.resultsPresented === true) {
+          this.lastResultsNarratedKey = key;
+          this.deps.say(this.battleOverLine(ev, snap, aName, bName));
+        } else if (key && snap?.resultsPresentationTimedOut === true) {
+          this.lastResultsNarratedKey = key;
+          this.deps.say(this.resultsStatusText(snap));
+        } else {
+          // The battle winner is known now, but the result overlay has not been painted.
+          // Do not claim it is on the display until its paint receipt arrives.
+          this.sayBattleBeat(this.text('battle.eventWin', { winner: ev.winnerName }));
+        }
+      } else this.sayBattleBeat(this.battleOverLine(ev, snap, aName, bName));
       this.introDone = false;
       return;
     }
     const line = commentaryForBattleEvent(ev, { aName, bName }, this.lineSeq, this.commandLocale);
-    if (line) { this.lineSeq++; this.sayCurrent(line); }
+    if (line) { this.lineSeq++; this.sayBattleBeat(line); }
     if (ev.kind === 'turn_start') this.menuLevel = 'root';
   }
 
@@ -856,12 +919,15 @@ export class BattleVoiceSession {
       this.lastTurnCueKey = '';
       const previous = this.lastPhase;
       this.lastPhase = snap?.phase ?? null;
+      if(previous!==null&&snap?.phase!==previous)this.introExpired=true;
       const rematchBecameReady = previous === 'results' && snap?.phase === 'results' && snap.canRematch && !this.lastCanRematch;
       const resultTimedOut=snap?.phase==='results'&&snap.resultsPresentationTimedOut===true
         &&!this.lastResultsPresentationTimedOut;
       this.lastCanRematch = snap?.phase === 'results' ? snap.canRematch : false;
       this.lastResultsPresentationTimedOut=snap?.resultsPresentationTimedOut===true;
-      if(resultTimedOut&&snap){
+      const resultsKey=snap?.phase==='results'?`${this.code}:${snap.generation}`:null;
+      if(resultTimedOut&&snap&&resultsKey!==this.lastResultsNarratedKey){
+        this.lastResultsNarratedKey=resultsKey;
         // A completed station match is retired as soon as recovery is announced.
         if(this.stationManaged)this.deps.say(this.resultsStatusText(snap));
         else this.sayCurrent(this.resultsStatusText(snap));
@@ -973,7 +1039,7 @@ export class BattleVoiceSession {
   }
 
   handleClose(): void {
-    this.turnEpoch++;this.pendingInterpret?.abort();this.cancelNarration();
+    this.turnEpoch++;this.beatSpeechEpoch++;this.pendingInterpret?.abort();this.cancelNarration();
     const preserve=this.stationManaged&&this.code&&this.playerId
       &&this.deps.snapshot(this.code,this.playerId,this.commandLocale)?.phase==='results';
     if (this.code && this.playerId&&!preserve) this.deps.leave(this.code, this.playerId, this.callSid ?? '');
@@ -982,6 +1048,7 @@ export class BattleVoiceSession {
 
   handleReplaced(): void {
     this.turnEpoch++;
+    this.beatSpeechEpoch++;
     this.pendingInterpret?.abort();
     this.cancelNarration();
     this.code = null; this.playerId = null; this.callSid = null;
@@ -994,7 +1061,10 @@ export class BattleVoiceSession {
 export function isAdvanceWord(spoken: string, locale: SupportedLocale = DEFAULT_LOCALE): boolean {
   const q = normalizeForMatching(spoken, locale);
   if (locale === 'en-US' && q === 'run it back') return true;
-  if (spoken.includes('?') || (locale === 'pt-BR'
+  if (/[?？¿]/u.test(spoken) || (locale === 'pt-BR'
+    ? /^(?:como|o que|qual|quais|quem|quando|onde|por que|porque|posso|podemos|poderia|devo|sera|voce pode|me explique|explique)\b/.test(q)
+    : /^(?:how|what|why|when|where|which|who|can|could|would|should|do|does|did|is|are|am|may|will|tell me|explain)\b/.test(q))
+    || (locale === 'pt-BR'
     ? /\b(nao|nunca|talvez|voltar|volte|antes|depois|ou)\b/.test(q)
     : /\b(don't|dont|not|never|no|maybe|back|later|wait|hold|or)\b/.test(q))) return false;
   if (locale === 'pt-BR') {
@@ -1026,8 +1096,15 @@ function isContinueResultsWord(spoken: string, locale: SupportedLocale): boolean
 function matchNameOrNumber(spoken: string, choices: string[], locale: SupportedLocale): number {
   const q = normalizeForMatching(spoken, locale);
   if (spoken.includes('?') || (locale === 'pt-BR'
-    ? /\b(?:nao|nunca|nem|talvez|ou|na verdade|em vez de|melhor|qual|quais|como)\b/.test(q)
-    : /\b(?:not|dont|do not|never|no|maybe|or|actually|instead|rather|which|what|how)\b/.test(q))) return -1;
+    ? /\b(?:nao|nunca|nem|talvez|ou|na verdade|em vez de|melhor|qual|quais|como|quem|onde|quando|por que|me fale|fale me|explique|comparar|compare|estou pensando)\b/.test(q)
+    : /\b(?:not|dont|do not|never|no|maybe|or|actually|instead|rather|which|what|how|who|where|when|why|tell me|explain|compare|thinking about|considering)\b/.test(q))) return -1;
+  // A number can occur in a question or an unrelated statement. Only a standalone
+  // option or a short selection request is safe to execute without interpretation.
+  const selection = locale === 'pt-BR'
+    ? q.replace(/^(?:(?:eu )?(?:quero|escolho|prefiro|seleciono)|escolha|selecione|use|pegue)\s+/, '')
+      .replace(/\s+por favor$/, '')
+    : q.replace(/^(?:i(?:'d|'ll|d|ll| would)? (?:like|take|pick|choose|want)|choose|pick|select|take|use|give me)\s+/, '')
+      .replace(/\s+please$/, '');
   // number words / digits first. Ordinals must beat cardinals so "second one" is 2, not 1.
   const NUM: Record<string, number> = locale === 'pt-BR'
     ? { um: 1, uma: 1, dois: 2, duas: 2, tres: 3, quatro: 4, cinco: 5, seis: 6, sete: 7, oito: 8 }
@@ -1038,27 +1115,24 @@ function matchNameOrNumber(spoken: string, choices: string[], locale: SupportedL
         quinto: 5, quinta: 5, sexto: 6, sexta: 6, setimo: 7, setima: 7, oitavo: 8, oitava: 8,
       }
     : { first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, seventh: 7, eighth: 8 };
-  const digit = q.match(/\b(\d)(?:st|nd|rd|th)?\b/);
+  const digit = selection.match(/^(?:(?:the|o|a)\s+)?(?:(?:monster|monstro|option|opcao|number|numero)\s+){0,2}([1-8])(?:st|nd|rd|th)?(?:\s+(?:one|monster|option|um|monstro|opcao))?$/);
   if (digit) { const n = parseInt(digit[1]!, 10); if (n >= 1 && n <= choices.length) return n - 1; }
   for (const [w, n] of Object.entries(ORD)) {
     const pattern = locale === 'pt-BR'
       ? new RegExp(`^(?:(?:eu )?(?:quero|escolho|prefiro) )?(?:(?:o|a) )?${w}(?: monstro| opcao)?$`)
       : new RegExp(`^(?:i(?:'d| would)? (?:like|take|pick) )?(?:the )?${w}(?: one| monster| option)?$`);
-    if (pattern.test(q) && n <= choices.length) return n - 1;
+    if ((pattern.test(q) || pattern.test(selection)) && n <= choices.length) return n - 1;
   }
   for (const [w, n] of Object.entries(NUM)) {
     const pattern = locale === 'pt-BR'
       ? new RegExp(`^(?:(?:eu )?(?:quero|escolho|prefiro) )?(?:(?:numero|monstro|opcao) )?${w}$`)
       : new RegExp(`^(?:i(?:'d| would)? (?:like|take|pick) )?(?:(?:number|monster|option) )?${w}$`);
-    if (pattern.test(q) && n <= choices.length) return n - 1;
+    if ((pattern.test(q) || pattern.test(selection)) && n <= choices.length) return n - 1;
   }
-  // name: exact, then substring either way
-  const normalizedChoices = choices.map((choice, index) =>
-    localizedMonsterAliases(ROSTER[index]?.id ?? '', choice).map(alias => normalizeForMatching(alias, locale)).join(' '));
-  let i = normalizedChoices.findIndex(choice => choice === q);
-  if (i >= 0) return i;
-  i = normalizedChoices.findIndex(choice => choice.includes(q) || q.includes(choice));
-  return i;
+  // A bare name or a direct request is fast. Remarks *about* a monster go to
+  // the conversational resolver, which has the complete current menu context.
+  return choices.findIndex((choice, index) => localizedMonsterAliases(ROSTER[index]?.id ?? '', choice)
+    .some(alias => normalizeForMatching(alias, locale) === selection));
 }
 
 function playerName(from: string | undefined, locale: SupportedLocale): string {
@@ -1070,8 +1144,8 @@ function playerName(from: string | undefined, locale: SupportedLocale): string {
 function isBattleHelpRequest(spoken: string, locale: SupportedLocale): boolean {
   const text = normalizeForMatching(spoken, locale);
   return locale === 'pt-BR'
-    ? /\b(ajuda|instrucoes|comandos|como jogar|o que posso dizer)\b/.test(text)
-    : /\b(help|instructions|commands|how do i play|what can i say)\b/.test(text);
+    ? /\b(ajuda|instrucoes|comandos|como jogar|como lutar|como batalhar|o que posso dizer|explique a batalha)\b/.test(text)
+    : /\b(help|instructions|commands|how (?:do|can|should) i (?:play|fight|battle)|what can i say|explain (?:the )?battle)\b/.test(text);
 }
 
 function isItemRequest(spoken: string, level: BattleVoiceSnapshot['activeMenu'], locale: SupportedLocale): boolean {

@@ -87,16 +87,38 @@ const ambient = new AmbientFx(appEl);
 const collage = document.createElement('div');
 collage.id = 'vm-collage';
 collage.setAttribute('aria-hidden', 'true');
-appEl.appendChild(collage);   // z-index (1) layers it above the ambient canvas (0), below stage/overlay
+// The ambient canvas shares layer 0 and is already in the DOM, while the menu and battle stage
+// occupy layer 1. This keeps the decorative art behind every readable control.
+collage.style.zIndex = '0';
+appEl.appendChild(collage);
 function buildCollage(): void {
   if (collage.childElementCount || roster.length === 0) return;   // build once, after the roster arrives
   // 5 columns × enough rows to fill; cycle the 8 front sprites so the pattern reads as "all of them".
   const cells = 40;
-  collage.innerHTML = Array.from({ length: cells }, (_, i) => {
+  const portraits = new Map<string, HTMLImageElement[]>();
+  for (let i = 0; i < cells; i++) {
     const m = roster[i % roster.length]!;
-    return `<img src="${spriteCandidateUrls(m.id, 'front')[0]}"
-      onerror="this.onerror=null;this.src='${spriteCandidateUrls(m.id, 'front')[1]}'" alt="">`;
-  }).join('');
+    const img = document.createElement('img');
+    img.src = placeholderPortrait(m.id, m.type);
+    img.alt = '';
+    collage.appendChild(img);
+    const copies = portraits.get(m.id) ?? [];
+    copies.push(img);
+    portraits.set(m.id, copies);
+  }
+  // Keep the local portrait visible while optional art loads. One probe per monster also avoids
+  // issuing the same GIF/PNG request for every repeated tile on a slow connection.
+  for (const [id, copies] of portraits) {
+    const urls = spriteCandidateUrls(id, 'front');
+    const tryNext = (index: number): void => {
+      if (index >= urls.length) return;
+      const probe = new Image();
+      probe.onload = () => { for (const img of copies) img.src = urls[index]!; };
+      probe.onerror = () => tryNext(index + 1);
+      probe.src = urls[index]!;
+    };
+    tryNext(0);
+  }
 }
 
 const conn = new BattleConnection(wsUrl, locale);

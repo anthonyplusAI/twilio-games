@@ -59,6 +59,47 @@ describe('parseCrMessage', () => {
 });
 
 describe('ConversationRelayAdapter', () => {
+  it('keeps the call introduction on its screen, but expires it when a touch advances the menu', () => {
+    const room = fakeRoom();
+    let phase = 'lobby';
+    const cues: Array<{ text: string; isCurrent?: () => boolean }> = [];
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => phase,
+      say: (text, isCurrent) => { cues.push({ text, isCurrent }); },
+    });
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-intro', customParameters: { roomCode: '4821' } }));
+    const introduction = cues.find(cue => /Twilio Voice Racer, powered by Conversation Relay/i.test(cue.text));
+    expect(introduction?.isCurrent?.()).toBe(true);
+    phase = 'car_select';
+    adapter.onGameEvent({ kind: 'enter_car_select' });
+    expect(introduction?.isCurrent?.()).toBe(false);
+    phase = 'map_select';
+    expect(introduction?.isCurrent?.()).toBe(false);
+    phase = 'countdown';
+    adapter.onGameEvent({ kind: 'countdown', n: 3 });
+    expect(introduction?.isCurrent?.()).toBe(false);
+    phase = 'lobby'; // a later round must not revive a queued opening line
+    expect(introduction?.isCurrent?.()).toBe(false);
+  });
+
+  it('allows same-screen touch updates until caller barge-in skips the opening line', () => {
+    const room=fakeRoom();
+    const cues:Array<{text:string;isCurrent?:()=>boolean}>=[];
+    const adapter=new ConversationRelayAdapter({
+      findOrCreateRoom:()=>room,
+      phaseOf:()=> 'car_select',
+      say:(text,isCurrent)=>{cues.push({text,isCurrent});},
+    });
+    adapter.handleMessage(JSON.stringify({type:'setup',callSid:'CA-car-intro',customParameters:{roomCode:'4821'}}));
+    const intro=cues.find(cue=>/Conversation Relay/i.test(cue.text));
+    expect(intro?.isCurrent?.()).toBe(true);
+    adapter.onGameEvent({kind:'car_picked',playerId:'p1',name:'Ada',car:'Roadster'});
+    expect(intro?.isCurrent?.()).toBe(true);
+    adapter.handleMessage(JSON.stringify({type:'interrupt',utteranceUntilInterrupt:'',durationUntilInterruptMs:80}));
+    expect(intro?.isCurrent?.()).toBe(false);
+  });
+
   it('binds to a room on setup and applies a mapped intent on a final prompt', () => {
     const room = fakeRoom();
     const a = new ConversationRelayAdapter({ findOrCreateRoom: () => room });
@@ -303,6 +344,174 @@ describe('ConversationRelayAdapter', () => {
 
     expect(said.join(' ').toLowerCase()).toMatch(/first place|congrat|won/);
     expect(said.join(' ').toLowerCase()).toContain('leaderboard');
+  });
+
+  it('speaks an authoritative station result immediately as one cue', async () => {
+    const room = fakeRoom(); const said: string[] = [];
+    let modelTurns = 0;
+    let phase = 'lobby';
+    const recap = 'You placed 2nd in 42.10 seconds. You rank 5th of 12 on the leaderboard.';
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => phase,
+      say: line => said.push(line),
+      resultRecap: (_roomCode, _playerId, _locale, stationManaged) => {
+        expect(stationManaged).toBe(true);
+        return recap;
+      },
+      converse: async () => { modelTurns++; return 'A slow model recap'; },
+    });
+    adapter.setStationManaged(true);
+    adapter.handleMessage(JSON.stringify({ type:'setup', callSid:'CA-station-result', customParameters:{ roomCode:'4821' } }));
+    said.length = 0;
+    phase = 'results';
+    adapter.onGameEvent({ kind:'race_over' });
+    await adapter.whenSpeechSettled();
+    expect(said).toEqual([recap]);
+    expect(modelTurns).toBe(0);
+  });
+
+  it('answers interrupted station result questions from authoritative standings', () => {
+    const room = {
+      ...fakeRoom(),
+      results: () => [
+        { playerId: 'p2', name: 'Grace', carIndex: 0, place: 1, finishT: 38.4, finished: true },
+        { playerId: 'p1', name: 'Ada', carIndex: 1, place: 2, finishT: 42.1, finished: true },
+      ],
+    };
+    const said: Array<{ text: string; isCurrent?: () => boolean }> = [];
+    const recap = 'You placed 2nd in 42.10 seconds. You rank 5th of 12 on the leaderboard.';
+    let phase = 'lobby';
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => phase,
+      say: (text, isCurrent) => { said.push({ text, isCurrent }); },
+      resultRecap: () => recap,
+    });
+    adapter.setStationManaged(true);
+    adapter.setAuthoritativeName('Ada');
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-result-questions', customParameters: { roomCode: '4821' } }));
+    said.length = 0;
+    phase = 'results';
+    adapter.onGameEvent({ kind: 'race_over' });
+    const firstRecap = said.at(-1);
+    adapter.handleMessage(JSON.stringify({ type: 'interrupt', utteranceUntilInterrupt: '', durationUntilInterruptMs: 100 }));
+    expect(firstRecap?.isCurrent?.()).toBe(false);
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'Who won the race?', last: true }));
+    expect(said.at(-1)?.text).toMatch(/Grace.*first place/i);
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'Who got second place?', last: true }));
+    expect(said.at(-1)?.text).toMatch(/Ada.*2nd/i);
+    expect(said.at(-1)?.text).not.toMatch(/Grace/i);
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'What place did I get?', last: true }));
+    expect(said.at(-1)?.text).toBe(recap);
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'Did I win?', last: true }));
+    expect(said.at(-1)?.text).toMatch(/Grace.*first place/i);
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'Was I second?', last: true }));
+    expect(said.at(-1)?.text).toBe(recap);
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'I like racing', last: true }));
+    expect(said.at(-1)?.text).toMatch(/results are on the display/i);
+  });
+
+  it('does not execute live controls mentioned in questions or status remarks', async () => {
+    const room = fakeRoom();
+    const conversations: Array<{spoken:string;readOnlyInquiry:boolean|undefined}> = [];
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => 'racing',
+      hasPlayerName: () => true,
+      converse: async (_code, _id, spoken, _locale, _isCurrent, readOnlyInquiry) => {
+        conversations.push({spoken,readOnlyInquiry}); return 'Stay focused on the race.';
+      },
+    });
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-racing-questions', customParameters: { roomCode: '4821' } }));
+    for (const spoken of [
+      'Can you tell me what boost does?',
+      'Could you tell me whether to steer left?',
+      'I have two nitro charges.',
+    ]) {
+      adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: spoken, last: true }));
+      await adapter.whenSpeechSettled();
+    }
+    expect(room.applied).toEqual([]);
+    expect(conversations).toHaveLength(3);
+    expect(conversations.every(turn=>turn.readOnlyInquiry===true)).toBe(true);
+    for (const spoken of ['Boost now', 'Steer left', 'Use nitro']) {
+      adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: spoken, last: true }));
+    }
+    expect(room.applied.map(action => action.intent)).toEqual(['BOOST', 'MOVE_LEFT', 'USE_POWER']);
+  });
+
+  it.each([
+    {
+      locale: 'en-US',
+      statuses: ['My nitro is ready', 'Nitro is ready', 'I got two nitro charges', 'If I boost, should I turn left?'],
+      mixed: ['I have two nitro charges. Boost now.', 'Boost now. What does nitro do?'],
+      sequence: 'Boost then left',
+    },
+    {
+      locale: 'pt-BR',
+      statuses: ['Meu nitro está pronto', 'Nitro está pronto', 'Tenho duas cargas de nitro', 'Se eu usar nitro, devo virar à esquerda?'],
+      mixed: ['Tenho duas cargas de nitro. Acelerar agora.', 'Acelerar agora. O que faz o nitro?'],
+      sequence: 'acelerar e depois esquerda',
+    },
+  ])('keeps $locale status clauses read-only while applying only explicit mixed commands', async row => {
+    const room = fakeRoom();
+    const inquiries: boolean[] = [];
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => 'racing',
+      hasPlayerName: () => true,
+      converse: async (_code, _playerId, _spoken, _locale, _isCurrent, readOnlyInquiry) => {
+        inquiries.push(readOnlyInquiry === true);
+        return null;
+      },
+    });
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-mixed-controls',
+      customParameters: { roomCode: '4821', commandLocale: row.locale } }));
+    for (const spoken of row.statuses) {
+      adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: spoken, last: true }));
+      await adapter.whenSpeechSettled();
+    }
+    expect(room.applied).toEqual([]);
+    expect(inquiries).toEqual(row.statuses.map(() => true));
+
+    for (const spoken of row.mixed) {
+      adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: spoken, last: true }));
+    }
+    expect(room.applied.map(action => action.intent)).toEqual(['BOOST', 'BOOST']);
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: row.sequence, last: true }));
+    expect(room.applied.map(action => action.intent)).toEqual(['BOOST', 'BOOST', 'BOOST', 'MOVE_LEFT']);
+  });
+
+  it('keeps a queued station result valid through room retirement and waits for playback', async () => {
+    const room = fakeRoom();
+    const recap = 'You won first place. You rank 1st on the leaderboard.';
+    let finishPlayback!: (played: boolean) => void;
+    const playback = new Promise<boolean>(resolve => { finishPlayback = resolve; });
+    let resultCurrent: (() => boolean) | undefined;
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => 'results',
+      say: (line, isCurrent) => {
+        if (line !== recap) return;
+        resultCurrent = isCurrent;
+        return playback;
+      },
+      resultRecap: () => recap,
+    });
+    adapter.setStationManaged(true);
+    adapter.handleMessage(JSON.stringify({ type:'setup', callSid:'CA-station-drain', customParameters:{ roomCode:'4821' } }));
+    adapter.onGameEvent({ kind:'race_over' });
+
+    let settled = false;
+    const waiting = adapter.whenSpeechSettled().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    adapter.handleClose(true);
+    expect(resultCurrent?.()).toBe(true);
+    finishPlayback(true);
+    await waiting;
+    expect(settled).toBe(true);
   });
 
   it('waits for an in-flight race-over recap before reporting speech settled', async () => {

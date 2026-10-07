@@ -49,8 +49,34 @@ describe('Voice Chess intent', () => {
 
   it('supports two-step spoken piece selection', () => {
     expect(parseChessIntent('select the knight', 'en-US')).toEqual({ kind: 'select', piece: 'n' });
+    expect(parseChessIntent('my knight please', 'en-US')).toEqual({ kind: 'select', piece: 'n' });
+    expect(parseChessIntent('move the queen', 'en-US')).toEqual({ kind: 'select', piece: 'q' });
     expect(parseChessIntent('select E2', 'en-US')).toEqual({ kind: 'select', from: 'e2' });
     expect(parseChessIntent('E4', 'en-US')).toMatchObject({ kind: 'move', query: { to: 'e4' } });
+  });
+
+  it('routes comments about pieces and castling to conversational interpretation', () => {
+    expect(parseChessIntent('My queen is trapped', 'en-US')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('The knight is my favorite piece', 'en-US')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('Castling is a defensive move', 'en-US')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('Meu cavalo está preso', 'pt-BR')).toEqual({ kind: 'unknown' });
+  });
+
+  it('treats a source square without a destination as a lasting selection', () => {
+    expect(parseChessIntent('my pawn on E2', 'en-US')).toEqual({ kind: 'select', from: 'e2', piece: 'p' });
+    expect(parseChessIntent('move the rook from A1', 'en-US')).toEqual({ kind: 'select', from: 'a1', piece: 'r' });
+    expect(parseChessIntent('meu peão na casa E2', 'pt-BR')).toEqual({ kind: 'select', from: 'e2', piece: 'p' });
+    expect(parseChessIntent('move my pawn to E4', 'en-US')).toMatchObject({
+      kind: 'move', query: { piece: 'p', to: 'e4' },
+    });
+  });
+
+  it('keeps a spoken castle piece distinct from the castling command', () => {
+    expect(parseChessIntent('castle', 'en-US')).toEqual({ kind: 'move', query: { castle: null } });
+    expect(parseChessIntent('castle piece from A1 to A3', 'en-US')).toMatchObject({
+      kind: 'move', query: { piece: 'r', from: 'a1', to: 'a3' },
+    });
+    expect(parseChessIntent('the castle piece on A1', 'en-US')).toEqual({ kind: 'select', from: 'a1', piece: 'r' });
   });
 
   it('recovers common spoken-square transcription variants without guessing the piece', () => {

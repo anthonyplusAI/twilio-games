@@ -5,6 +5,7 @@ import {
   TRIVIA_FINAL_ANSWER_GRACE_MS,
   TRIVIA_SEMANTIC_ANSWER_MAX_MS,
   TRIVIA_REVEAL_MS,
+  TRIVIA_REVEAL_MAX_MS,
   TriviaRoom,
 } from '../server/trivia-room';
 import {
@@ -75,6 +76,81 @@ function finishRound(room: TriviaRoom, playerId: string, now: { value: number })
 }
 
 describe('authoritative trivia room', () => {
+  it('holds the next question until two staggered voice reveals finish after the visual minimum', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('REVEAL-VOICES', { bank, now: () => now.value });
+    const first = joined(room, 'Ada');
+    const second = joined(room, 'Grace');
+    startQuestion(room, first, now);
+    const question = room.state().question!;
+    const attemptId = room.state().questionAttemptId!;
+    expect(room.answer(first, correctChoice(room))).toBe(true);
+    expect(room.answer(second, correctChoice(room))).toBe(true);
+    const firstDelivery = room.beginRevealDelivery(first, question.id, attemptId)!;
+    const secondDelivery = room.beginRevealDelivery(second, question.id, attemptId)!;
+    expect(firstDelivery).not.toBe(secondDelivery);
+
+    now.value = room.state().revealEndsAtMs! - 1;
+    expect(room.questionRevealReady(first, question.id, attemptId, firstDelivery)).toBe(true);
+    expect(room.tick()).toBe(false);
+    now.value += 1;
+    expect(room.tick()).toBe(false);
+    expect(room.phase).toBe('reveal');
+    now.value += 5_000;
+    expect(room.questionRevealReady(second, question.id, attemptId, secondDelivery)).toBe(true);
+    expect(room.tick()).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'question_prompt', questionIndex: 1 });
+  });
+
+  it('releases disconnected callers but rejects stale generations and old-question callbacks', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('REVEAL-STALE', { bank, now: () => now.value });
+    const first = joined(room, 'Ada');
+    const second = joined(room, 'Grace');
+    startQuestion(room, first, now);
+    const question = room.state().question!;
+    const attemptId = room.state().questionAttemptId!;
+    room.answer(first, correctChoice(room));
+    room.answer(second, correctChoice(room));
+    const staleGeneration = room.beginRevealDelivery(first, question.id, attemptId)!;
+    const currentGeneration = room.beginRevealDelivery(first, question.id, attemptId)!;
+    const disconnectedGeneration = room.beginRevealDelivery(second, question.id, attemptId)!;
+    expect(room.questionRevealReady(first, question.id, attemptId, staleGeneration)).toBe(false);
+    expect(room.setPlayerConnected(second, false)).toBe(true);
+    now.value = room.state().revealEndsAtMs!;
+    expect(room.tick()).toBe(false);
+    expect(room.questionRevealReady(first, question.id, attemptId, currentGeneration)).toBe(true);
+    expect(room.questionRevealReady(second, question.id, attemptId, disconnectedGeneration)).toBe(false);
+    expect(room.tick()).toBe(true);
+    expect(room.phase).toBe('question_prompt');
+    expect(room.questionRevealReady(first, question.id, attemptId, currentGeneration)).toBe(false);
+  });
+
+  it('unblocks a failed or lost voice reveal at the hard deadline without delaying touch-only rounds', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('REVEAL-DEADLINE', { bank, now: () => now.value });
+    const player = joined(room);
+    startQuestion(room, player, now);
+    const question = room.state().question!;
+    const attemptId = room.state().questionAttemptId!;
+    room.answer(player, correctChoice(room));
+    const generation = room.beginRevealDelivery(player, question.id, attemptId)!;
+    const revealedAt = room.state().revealEndsAtMs! - TRIVIA_REVEAL_MS;
+    now.value = room.state().revealEndsAtMs!;
+    expect(room.tick()).toBe(false);
+    now.value = revealedAt + TRIVIA_REVEAL_MAX_MS - 1;
+    expect(room.tick()).toBe(false);
+    now.value += 1;
+    expect(room.tick()).toBe(true);
+    expect(room.phase).toBe('question_prompt');
+    expect(room.questionRevealReady(player, question.id, attemptId, generation)).toBe(false);
+
+    settlePrompt(room, now);
+    room.answer(player, correctChoice(room));
+    now.value = room.state().revealEndsAtMs!;
+    expect(room.tick()).toBe(true);
+    expect(room.phase).toBe('question_prompt');
+  });
   it('enforces 1-4 confirmed players and freezes a four-player standalone roster', () => {
     const room = new TriviaRoom('FOUR', { bank, seed: 1 });
     const players = [
@@ -832,6 +908,26 @@ describe('authoritative trivia room', () => {
     expect(room.state().phase).toBe('question');
     now.value = receivedAtMs + TRIVIA_SEMANTIC_ANSWER_MAX_MS - 1;
     expect(room.answerAt(player, correctChoice(room), true, receivedAtMs, resolutionId!)).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'reveal', players: [{ answered: true, rawScore: 1_000 }] });
+  });
+
+  it('reserves a paraphrased answer heard before time runs out without awarding an early speed bonus', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('SEMANTIC-PARAPHRASE', { bank, now: () => now.value });
+    const player = joined(room);
+    startQuestion(room, player, now);
+    const state = room.state();
+    const end = state.questionEndsAtMs!;
+    now.value = end + 400;
+    const id = room.beginSemanticAnswerResolution(player, state.question!.id,
+      state.questionAttemptId!, { atMs: end });
+    expect(id).not.toBeNull();
+    expect(room.beginSemanticAnswerResolution(player, state.question!.id,
+      state.questionAttemptId!, { atMs: end + 1 })).toBeNull();
+
+    now.value = end + TRIVIA_FINAL_ANSWER_GRACE_MS + 1;
+    expect(room.tick()).toBe(false);
+    expect(room.answerAt(player, correctChoice(room), true, end, id!)).toBe(true);
     expect(room.state()).toMatchObject({ phase: 'reveal', players: [{ answered: true, rawScore: 1_000 }] });
   });
 

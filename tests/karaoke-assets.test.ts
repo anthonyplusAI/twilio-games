@@ -24,6 +24,8 @@ import {
   KARAOKE_CROWD_MEMBER_COUNT,
   createKaraokeCrowdLayout,
   createKaraokeCrowdMeshes,
+  createKaraokeProceduralLedWall,
+  createKaraokeProceduralLogo,
 } from '../client/karaoke/karaoke-stage';
 import { readGlb } from '../tools/glb-read';
 import { DEFAULT_KARAOKE_VENUE, karaokeVenueModel } from '../shared/karaoke-venue';
@@ -224,6 +226,25 @@ describe('Voice Karaoke human crowd', () => {
     expect(crowd.torsos.count).toBe(KARAOKE_CROWD_MEMBER_COUNT);
     expect(crowd.arms.reduce((total, mesh) => total + mesh.count, 0)).toBe(KARAOKE_CROWD_MEMBER_COUNT);
     disposeKaraokeObjectResources(crowd.root);
+  });
+});
+
+describe('Voice Karaoke procedural stage', () => {
+  it('keeps the Twilio mark visible with no image request or texture dependency', () => {
+    const logo = createKaraokeProceduralLogo();
+    expect(logo.children).toHaveLength(2);
+    expect(hasVisibleKaraokeTriangles(logo)).toBe(true);
+    expect(karaokeMaterialDiagnostics(logo).textureCount).toBe(0);
+    disposeKaraokeObjectResources(logo);
+  });
+
+  it('renders the fallback LED wall in one draw call', () => {
+    const wall = createKaraokeProceduralLedWall();
+    expect(wall.isInstancedMesh).toBe(true);
+    expect(wall.count).toBeGreaterThan(50);
+    expect(wall.count).toBeLessThan(200);
+    expect(wall.instanceColor).not.toBeNull();
+    disposeKaraokeObjectResources(wall);
   });
 });
 

@@ -1,7 +1,7 @@
 import type { SupportedLocale } from '../shared/i18n/locales';
 
 /** Requested English ElevenLabs voice ID for Conversation Relay calls. */
-export const DEFAULT_ENGLISH_RELAY_VOICE = 'xp3gDg85YgFcWpnNVlIu';
+export const DEFAULT_ENGLISH_RELAY_VOICE = 'SA7eD52NRr8WAehitVt1';
 
 /** Keep Brazilian Portuguese on its own voice; an empty value selects Twilio's pt-BR default. */
 export function relayVoiceForLocale(

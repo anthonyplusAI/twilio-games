@@ -64,6 +64,19 @@ const TYPE_COLOR: Record<MonsterType, string> = {
 };
 export function typeColor(type: string): string { return TYPE_COLOR[type as MonsterType] ?? '#c8d4e6'; }
 
+/** Dorsal markings make the offline back view read as the player's creature rather than a
+ *  faceless copy of the front. Coordinates are in each creature's small pixel grid. */
+const BACK_MARKS: Record<string, readonly [number,number][]> = {
+  sparkmouse:[[6,5],[9,5],[7,7],[8,7],[6,9],[9,9]],
+  embertail:[[6,4],[9,4],[7,6],[8,6],[6,9],[9,9],[12,11]],
+  shellback:[[5,4],[8,4],[11,4],[4,7],[8,7],[12,7],[6,9],[10,9]],
+  thornling:[[7,5],[8,5],[6,7],[9,7],[7,9],[8,9]],
+  galecoil:[[5,4],[9,4],[7,6],[11,7],[6,9],[10,10],[4,12]],
+  voltcrest:[[7,3],[8,3],[6,6],[9,6],[7,8],[8,8]],
+  dazeduck:[[6,5],[9,5],[7,7],[8,7],[6,10],[9,10]],
+  psyclone:[[6,4],[9,4],[7,7],[8,7],[6,10],[9,10],[7,12],[8,12]],
+};
+
 /** Draw a creature to a fresh canvas. Uses the hand-authored grid for its id; falls back to a simple
  *  filled blob only for an unknown id (should never happen for the fixed roster). */
 export function drawMonsterSprite(opts: SpriteOpts): HTMLCanvasElement {
@@ -98,6 +111,14 @@ export function drawMonsterSprite(opts: SpriteOpts): HTMLCanvasElement {
       if (!color) continue;
       ctx.fillStyle = color;
       ctx.fillRect(ox + x * cell, oy + y * cell, cell, cell);
+    }
+  }
+  if(back){
+    ctx.fillStyle=accent;
+    for(const [x,y] of BACK_MARKS[opts.id]??[]){
+      const original=grid[y]?.[x]??'.';
+      if(original!=='.'&&original!==' '&&original!=='X')
+        ctx.fillRect(ox+x*cell,oy+y*cell,cell,cell);
     }
   }
   return canvas;

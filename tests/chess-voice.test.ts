@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { ChessVoiceSession } from '../server/chess-voice';
+import { describe, expect, it, vi } from 'vitest';
+import { ChessVoiceSession, type ChessVoiceInterpretContext } from '../server/chess-voice';
 import { ChessRoom } from '../server/chess-room';
 import type { VoiceInterpretResult } from '../server/voice-interpreter';
 import type { ChessCommandResult, ChessEvent, ChessMoveRecord, ChessState } from '../shared/chess-protocol';
@@ -47,6 +47,30 @@ function harness(initial = state(), stationManaged = false, resumed = false, loc
   return { session, spoken, calls, setup, prompt, setState(next: ChessState) { snapshot = next; } };
 }
 
+function liveRoomHarness(room: ChessRoom, locale: 'en-US' | 'pt-BR' = 'en-US',
+  interpret?: (context: ChessVoiceInterpretContext) => Promise<VoiceInterpretResult>) {
+  room.setPlayerConnected(true);
+  const spoken: string[] = [];
+  const commands: string[] = [];
+  const session = new ChessVoiceSession({
+    bind: () => ({ playerId: 'c1', resumed: false }), leave: () => {},
+    command: (_code, _sid, text, commandLocale) => {
+      commands.push(text);
+      return room.handleVoiceCommand(text, commandLocale);
+    },
+    restart: () => false, snapshot: () => room.state(),
+    legalMoves: (_code, _sid, commandLocale) => room.legalVoiceMoves(commandLocale),
+    ...(interpret ? { interpret: async (_spoken: string, _locale: 'en-US' | 'pt-BR', context: ChessVoiceInterpretContext) => interpret(context) } : {}),
+    say: line => { spoken.push(line); },
+  });
+  session.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-chess',
+    customParameters: { roomCode: '4821', locale } }));
+  const prompt = (voicePrompt: string) => session.handleMessage(JSON.stringify({
+    type: 'prompt', voicePrompt, last: true,
+  }));
+  return { room, spoken, commands, session, prompt };
+}
+
 const computerCapture: ChessMoveRecord = {
   actor: 'computer', color: 'b', piece: 'n', from: 'c6', to: 'd4', san: 'Nxd4',
   captured: 'b', capturedSquare: 'd4', promotion: null, castle: null,
@@ -65,6 +89,7 @@ describe('ChessVoiceSession', () => {
 
     expect(game.calls).toEqual(['bind:4821:Ada:CA-chess:en-US']);
     expect(game.spoken.join(' ')).toMatch(/Voice Chess.*Black/i);
+    expect(game.spoken.join(' ')).toMatch(/Twilio Conversation Relay/i);
     expect(game.spoken.join(' ')).toMatch(/confirm/i);
     expect(game.spoken.join(' ')).toMatch(/rival moves a pawn.*E four/i);
     expect(game.spoken.join(' ')).not.toMatch(/choose a (game|piece set|mode)/i);
@@ -87,6 +112,61 @@ describe('ChessVoiceSession', () => {
     const event: ChessEvent = { type: 'move', move: computerCapture };
     game.session.onRoomEvents([event]);
     expect(game.spoken.at(-1)).toMatch(/captures your bishop on D four/i);
+  });
+
+  it('keeps a delayed human-move cue ahead of the 900 ms computer reply until caller barge-in', () => {
+    vi.useFakeTimers();
+    try {
+      let current = state();
+      const queued: Array<{ text: string; guard?: () => boolean }> = [];
+      const humanMove: ChessMoveRecord = { ...computerCapture, actor: 'human', color: 'w', piece: 'p',
+        from: 'e2', to: 'e4', san: 'e4', captured: null, capturedSquare: null, ply: 1, revision: 1 };
+      const computerMove: ChessMoveRecord = { ...computerCapture, piece: 'p', from: 'e7', to: 'e5',
+        san: 'e5', captured: null, capturedSquare: null, ply: 2, revision: 2 };
+      const session = new ChessVoiceSession({
+        bind: () => ({ playerId: 'c1', resumed: false }), leave: () => {}, restart: () => false,
+        snapshot: () => current,
+        command: () => {
+          current = state({ revision: 1, ply: 1, turn: 'b', lastMove: humanMove });
+          return { code: 'confirmed', state: current, message: 'confirmed' };
+        },
+        // A deliberately unresolved Relay playback models slow ElevenLabs audio.
+        say: (text, guard) => { queued.push({ text, guard }); return new Promise<boolean>(() => {}); },
+      });
+      session.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-chess', customParameters: { roomCode: '4821' } }));
+      session.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'confirm', last: true }));
+      const humanCue = queued.at(-1)!;
+      expect(humanCue.text).toMatch(/E four/i);
+      expect(humanCue.guard?.()).toBe(true);
+      setTimeout(() => {
+        current = state({ revision: 2, ply: 2, turn: 'w', lastMove: computerMove });
+        session.onRoomEvents([{ type: 'move', move: computerMove }]);
+      }, 900);
+      vi.advanceTimersByTime(900);
+      expect(humanCue.guard?.()).toBe(true);
+      expect(queued.at(-1)?.text).toMatch(/rival moves/i);
+      session.handleMessage(JSON.stringify({ type: 'interrupt', utteranceUntilInterrupt: '', durationUntilInterruptMs: 100 }));
+      expect(humanCue.guard?.()).toBe(false);
+      expect(queued.at(-1)?.guard?.()).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('does not cut the Black-side introduction when the opening computer move arrives', () => {
+    let current = state({ humanColor: 'b', computerColor: 'w', turn: 'w' });
+    const queued: Array<{ text: string; guard?: () => boolean }> = [];
+    const opening: ChessMoveRecord = { ...computerCapture, actor: 'computer', color: 'w', piece: 'p',
+      from: 'e2', to: 'e4', san: 'e4', captured: null, capturedSquare: null, ply: 1, revision: 1 };
+    const session = new ChessVoiceSession({
+      bind: () => ({ playerId: 'c1', resumed: false }), leave: () => {}, command: () => null,
+      restart: () => false, snapshot: () => current,
+      say: (text, guard) => { queued.push({ text, guard }); return new Promise<boolean>(() => {}); },
+    });
+    session.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-chess', customParameters: { roomCode: '4821' } }));
+    const intro = queued[0]!;
+    current = state({ humanColor: 'b', computerColor: 'w', turn: 'b', revision: 1, ply: 1, lastMove: opening });
+    session.onRoomEvents([{ type: 'move', move: opening }]);
+    expect(intro.guard?.()).toBe(true);
+    expect(queued.at(-1)?.text).toMatch(/rival moves a pawn.*E four/i);
   });
 
   it('reannounces a computer capture after the same call reconnects', () => {
@@ -242,6 +322,134 @@ describe('ChessVoiceSession', () => {
     await session.whenSpeechSettled();
     expect(room.state().pendingMove).toBeNull();
     expect(room.state().ply).toBe(0);
+  });
+
+  it('answers castling availability from the current legal moves without proposing a castle', () => {
+    const castlePosition = new ChessRoom('4821', {
+      humanColor: 'w', initialFen: 'r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1',
+    });
+    const legal = liveRoomHarness(castlePosition);
+    const firstFen = castlePosition.state().fen;
+    legal.prompt('Can I castle?');
+    expect(legal.spoken.at(-1)).toMatch(/both kingside and queenside castling are legal/i);
+    expect(legal.commands).toEqual([]);
+    expect(castlePosition.state().pendingMove).toBeNull();
+    expect(castlePosition.state().fen).toBe(firstFen);
+
+    const blockedPosition = new ChessRoom('4821', { humanColor: 'w' });
+    const blocked = liveRoomHarness(blockedPosition);
+    blocked.prompt('Can I castle?');
+    expect(blocked.spoken.at(-1)).toMatch(/castling is not legal/i);
+    expect(blocked.commands).toEqual([]);
+    expect(blockedPosition.state().pendingMove).toBeNull();
+  });
+
+  it('distinguishes the two castling sides without guessing why a side is blocked', () => {
+    const room = new ChessRoom('4821', {
+      humanColor: 'w', initialFen: 'r3k2r/8/8/8/8/8/8/R2QK2R w KQkq - 0 1',
+    });
+    const game = liveRoomHarness(room);
+    game.prompt('Can I castle kingside?');
+    expect(game.spoken.at(-1)).toMatch(/Yes.*Kingside castling is legal/i);
+    game.prompt('Can I castle queenside?');
+    expect(game.spoken.at(-1)).toMatch(/No.*Queenside castling is not legal/i);
+    expect(game.commands).toEqual([]);
+    expect(room.state().pendingMove).toBeNull();
+    game.prompt('castle');
+    expect(game.commands).toEqual(['castle']);
+    expect(room.state().pendingMove?.castle).toBe('king');
+    expect(room.state().ply).toBe(0);
+  });
+
+  it('answers a named piece’s live destinations without selecting or moving that piece', () => {
+    const room = new ChessRoom('4821', { humanColor: 'w' });
+    const game = liveRoomHarness(room);
+    game.prompt('Where can my knight move?');
+    expect(game.spoken.at(-1)).toMatch(/knight on B one can move to A three and C three/i);
+    expect(game.spoken.at(-1)).toMatch(/knight on G one can move to F three and H three/i);
+    expect(game.commands).toEqual([]);
+    expect(room.state().selection).toBeNull();
+    expect(room.state().pendingMove).toBeNull();
+  });
+
+  it('answers legal and illegal square questions while leaving the board untouched', () => {
+    const room = new ChessRoom('4821', { humanColor: 'w' });
+    const game = liveRoomHarness(room);
+    const firstFen = room.state().fen;
+    game.prompt('Can my knight move from B one to C three?');
+    expect(game.spoken.at(-1)).toMatch(/Yes.*knight.*B one.*C three/i);
+    game.prompt('Is my knight allowed to go from B one to E three?');
+    expect(game.spoken.at(-1)).toMatch(/No.*B one.*E three.*not legal/i);
+    expect(game.commands).toEqual([]);
+    expect(room.state().pendingMove).toBeNull();
+    expect(room.state().fen).toBe(firstFen);
+  });
+
+  it('uses the moving piece when a capture question also names the target piece', () => {
+    const room = new ChessRoom('4821', {
+      humanColor: 'w', initialFen: '4k3/8/2n5/1B6/8/8/8/4K3 w - - 0 1',
+    });
+    const game = liveRoomHarness(room);
+    game.prompt('Can my bishop capture the knight on C six?');
+    expect(game.spoken.at(-1)).toMatch(/Yes.*Your bishop on B five.*C six/i);
+    expect(game.commands).toEqual([]);
+    expect(room.state().pendingMove).toBeNull();
+  });
+
+  it('never turns an open-ended legality question into a model-selected action', async () => {
+    const room = new ChessRoom('4821', { humanColor: 'w' });
+    const game = liveRoomHarness(room, 'en-US', async context => {
+      expect(context.readOnlyInquiry).toBe(true);
+      expect(context.facts.some(fact => fact.id === 'legal_piece_n')).toBe(true);
+      return { kind: 'action', actionId: 'propose_move', targetId: 'e2e4' };
+    });
+    game.prompt('Is that a legal thing for me to try');
+    await game.session.whenSpeechSettled();
+    expect(game.commands).toEqual([]);
+    expect(room.state().pendingMove).toBeNull();
+    expect(game.spoken.at(-1)).toMatch(/which piece or starting square/i);
+  });
+
+  it('drops a delayed legal-move answer after the board changes', async () => {
+    const room = new ChessRoom('4821', { humanColor: 'w' });
+    let resolve!: (result: VoiceInterpretResult) => void;
+    const decision = new Promise<VoiceInterpretResult>(done => { resolve = done; });
+    const game = liveRoomHarness(room, 'en-US', async context => {
+      expect(context.readOnlyInquiry).toBe(true);
+      return decision;
+    });
+    game.prompt('What is that move called');
+    const before = game.spoken.length;
+    room.handleVoiceCommand('pawn from E2 to E4');
+    room.confirmMove();
+    resolve({ kind: 'answer', factId: 'legal_moves' });
+    await game.session.whenSpeechSettled();
+    expect(game.spoken).toHaveLength(before);
+  });
+
+  it('keeps a polite request for a move actionable and still requires confirmation', async () => {
+    const room = new ChessRoom('4821', { humanColor: 'w' });
+    const game = liveRoomHarness(room, 'en-US', async context => {
+      expect(context.readOnlyInquiry).toBe(false);
+      return { kind: 'action', actionId: 'propose_move', targetId: 'g1f3' };
+    });
+    game.prompt('Could you move my knight to F three?');
+    await game.session.whenSpeechSettled();
+    expect(room.state().pendingMove).toMatchObject({ from: 'g1', to: 'f3' });
+    expect(room.state().ply).toBe(0);
+    expect(game.spoken.at(-1)).toMatch(/confirm or cancel/i);
+  });
+
+  it('speaks Portuguese castling and piece facts from the same legal board', () => {
+    const room = new ChessRoom('4821', {
+      humanColor: 'w', initialFen: 'r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1',
+    });
+    const game = liveRoomHarness(room, 'pt-BR');
+    game.prompt('Posso fazer roque pequeno');
+    expect(game.spoken.at(-1)).toMatch(/Sim.*roque pequeno.*legal/i);
+    game.prompt('Onde meu rei pode ir?');
+    expect(game.spoken.at(-1)).toMatch(/Seu rei em E um pode ir para/i);
+    expect(game.commands).toEqual([]);
   });
 
   it('allows spoken replay after a standalone result and blocks it during a station match', () => {

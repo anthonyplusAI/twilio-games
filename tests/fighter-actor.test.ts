@@ -8,7 +8,13 @@ describe('FighterActor playback', () => {
   it('creates a visible procedural actor when an FBX model is unavailable', () => {
     const actor = FighterActor.fallback('#ef223a');
     expect(new THREE.Box3().setFromObject(actor.root).isEmpty()).toBe(false);
-    expect(actor.model.children.length).toBeGreaterThan(0);
+    expect(actor.model.children.length).toBeGreaterThan(5);
+    expect(actor.playRandom('punch')).toBeGreaterThan(0);
+    expect(actor.playRandom('kick')).toBeGreaterThan(0);
+    actor.update(0.1);
+    actor.play('punch-01', { fade: 0 });
+    actor.update(0.2);
+    expect(actor.model.getObjectByName('rightArm')?.rotation.x).toBeLessThan(-0.5);
     actor.dispose();
   });
 

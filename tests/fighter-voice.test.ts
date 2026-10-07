@@ -7,7 +7,7 @@ import type { FighterCommand, FighterEvent } from '../shared/fighter-world';
 import type { VoiceInterpretRequest, VoiceInterpretResult } from '../server/voice-interpreter';
 
 describe('fighter voice session', () => {
-  it('revokes queued greeting when the caller barges in or taps through the menu', () => {
+  it('keeps the Twilio introduction on its screen but expires it when touch advances the menu', () => {
     const game = voiceGame();
     const caller = game.connect('CA-GREETING-BARGE', 'VOICE', undefined, 'Ada');
     const intro = caller.guardedSpeech.find(line => /Conversation Relay/i.test(line.text));
@@ -19,7 +19,19 @@ describe('fighter voice session', () => {
     const menuCaller = next.connect('CA-GREETING-TAP', 'VOICE', undefined, 'Ada');
     const menuIntro = menuCaller.guardedSpeech.find(line => /Conversation Relay/i.test(line.text));
     expect(menuIntro?.isCurrent?.()).toBe(true);
+    next.stateChanged();
+    expect(menuIntro?.isCurrent?.()).toBe(true);
     expect(next.room.advance(menuCaller.playerId)).toBe(true);
+    next.stateChanged();
+    expect(menuIntro?.isCurrent?.()).toBe(false);
+    expect(next.room.selectFighter(menuCaller.playerId, 'nyx')).toBe(true);
+    expect(next.room.advance(menuCaller.playerId)).toBe(true);
+    expect(next.room.selectMap(menuCaller.playerId, 'void')).toBe(true);
+    expect(menuIntro?.isCurrent?.()).toBe(false);
+    expect(next.room.advance(menuCaller.playerId)).toBe(true);
+    expect(next.room.phase).toBe('loading');
+    expect(menuIntro?.isCurrent?.()).toBe(false);
+    expect(next.room.back(menuCaller.playerId)).toBe(true);
     next.stateChanged();
     expect(menuIntro?.isCurrent?.()).toBe(false);
   });
@@ -269,6 +281,56 @@ describe('fighter voice session', () => {
     expect(ada.spoken).toEqual(['You lost. Rival is victorious.']);
   });
 
+  it('keeps the winner cue valid through victory and replaces an unheard cue with winner before rematch', () => {
+    const game = voiceGame(); const ada = game.connect('CA-WINNER-CUE');
+    ada.prompt('Ada');
+    ada.prompt('next'); ada.prompt('Nyx'); ada.prompt('next'); ada.prompt('second'); ada.prompt('start');
+    game.room.ready(game.room.state().loadingGeneration); game.stateChanged(); advanceIntro(game); game.tick(6);
+    const world = game.room.state().world!; world.status = 'finished'; world.winner = 'p1'; game.tick(.1);
+    const victory = [...ada.guardedSpeech].reverse().find(line => /victorious/i.test(line.text));
+    expect(victory?.isCurrent?.()).toBe(true);
+    game.tick(FIGHTER_VICTORY_SECONDS);
+    expect(victory?.isCurrent?.()).toBe(false);
+    expect(ada.spoken.at(-1)).toMatch(/Ada won/i);
+    expect(game.room.acknowledgePresentation('results', game.room.state().loadingGeneration)).toBe(true);
+    game.stateChanged();
+    const replay = ada.spoken.at(-1) ?? '';
+    expect(replay).toMatch(/rematch/i);
+    expect(replay).not.toMatch(/couldn't confirm/i);
+  });
+
+  it('announces the winner before replay if the victory cue was still queued at result paint', () => {
+    const game = voiceGame(); const ada = game.connect('CA-QUEUED-WINNER');
+    ada.prompt('Ada');
+    ada.prompt('next'); ada.prompt('Nyx'); ada.prompt('next'); ada.prompt('second'); ada.prompt('start');
+    game.room.ready(game.room.state().loadingGeneration); game.stateChanged(); advanceIntro(game); game.tick(6);
+    const world = game.room.state().world!; world.status = 'finished'; world.winner = 'p2'; game.tick(.1);
+    const victory = [...ada.guardedSpeech].reverse().find(line => /you lost/i.test(line.text));
+    game.tick(FIGHTER_VICTORY_SECONDS);
+    expect(game.room.acknowledgePresentation('results', game.room.state().loadingGeneration)).toBe(true);
+    game.stateChanged();
+    expect(victory?.isCurrent?.()).toBe(false);
+    const replay = ada.spoken.at(-1) ?? '';
+    expect(replay).toMatch(/Rival won.*you lost.*rematch/i);
+  });
+
+  it('repeats the winner at results even when KO playback was only estimated', async () => {
+    let settleKo!: (playedOrEstimated: boolean) => void;
+    const game = voiceGame(undefined, text => /victorious/i.test(text)
+      ? new Promise<boolean>(resolve => { settleKo = resolve; }) : undefined);
+    const ada = game.connect('CA-ESTIMATED-KO');
+    ada.prompt('Ada'); ada.prompt('next'); ada.prompt('Nyx'); ada.prompt('next');
+    ada.prompt('second'); ada.prompt('start');
+    game.room.ready(game.room.state().loadingGeneration); game.stateChanged(); advanceIntro(game); game.tick(6);
+    const world = game.room.state().world!; world.status = 'finished'; world.winner = 'p1'; game.tick(.1);
+    settleKo(true); // Relay's boolean includes its estimated-playback fallback.
+    await Promise.resolve();
+    game.tick(FIGHTER_VICTORY_SECONDS);
+    expect(game.room.acknowledgePresentation('results', game.room.state().loadingGeneration)).toBe(true);
+    game.stateChanged();
+    expect(ada.spoken.at(-1)).toMatch(/Ada won.*rematch/i);
+  });
+
   it('interprets an open-ended request to reveal the Fighter result early', async () => {
     const game=voiceGame(async request=>{
       expect(request.actions).toEqual(expect.arrayContaining([expect.objectContaining({id:'show_results'})]));
@@ -286,7 +348,7 @@ describe('fighter voice session', () => {
     expect(game.room.resultsPresented).toBe(false);
   });
 
-  it('honestly narrates a result display timeout and permits a free-play rematch',()=>{
+  it('announces the authoritative result and replay option after a delayed result paint',()=>{
     vi.useFakeTimers();
     try{
       vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
@@ -296,13 +358,14 @@ describe('fighter voice session', () => {
       const world=game.room.state().world!;world.status='finished';world.winner='p1';game.tick(.1);game.tick(FIGHTER_VICTORY_SECONDS);
       expect(game.room.phase).toBe('results');expect(game.room.resultsPresented).toBe(false);
       vi.advanceTimersByTime(FIGHTER_RESULTS_PRESENTATION_TIMEOUT_MS+1);game.stateChanged();
-      expect(ada.spoken.at(-1)).toMatch(/couldn't confirm.*display.*won/i);
+      expect(ada.spoken.at(-1)).toMatch(/Ada won.*want another fight.*rematch/i);
+      expect(ada.spoken.at(-1)).not.toMatch(/confirm|display|screen/i);
       ada.prompt('rematch');
       expect(game.room.phase).toBe('fighter_select');
     }finally{vi.useRealTimers();}
   });
 
-  it('does not claim a station result was shown or replay after display timeout',()=>{
+  it('does not claim a station result was shown or offer in-room replay after timeout',()=>{
     vi.useFakeTimers();
     try{
       vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
@@ -311,10 +374,11 @@ describe('fighter voice session', () => {
       game.room.ready(game.room.state().loadingGeneration);game.stateChanged();advanceIntro(game);game.tick(6);
       const world=game.room.state().world!;world.status='finished';world.winner='p1';game.tick(.1);game.tick(FIGHTER_VICTORY_SECONDS);
       vi.advanceTimersByTime(FIGHTER_RESULTS_PRESENTATION_TIMEOUT_MS+1);game.stateChanged();
-      expect(ada.spoken.at(-1)).toMatch(/couldn't confirm.*display.*won/i);
+      expect(ada.spoken.at(-1)).toMatch(/Ada won.*check your messages/i);
+      expect(ada.spoken.at(-1)).not.toMatch(/confirm|result.*display|rematch/i);
       ada.prompt('rematch');
       expect(game.room.phase).toBe('results');
-      expect(ada.spoken.at(-1)).toMatch(/couldn't confirm.*display.*won/i);
+      expect(ada.spoken.at(-1)).toMatch(/Ada won.*check your messages/i);
     }finally{vi.useRealTimers();}
   });
 
@@ -458,6 +522,22 @@ describe('fighter voice session', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it('keeps queued damage commentary valid through a later health tick until caller barge-in', () => {
+    const game=voiceGame(),{ada}=startTwoCallerFight(game);
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(2_000);
+      ada.session.onFighterEvent({type:'hit',attacker:'p1',defender:'p2',damage:9,blocked:false});
+      const cue=[...ada.guardedSpeech].reverse().find(line=>line.text==='Hit for 9.');
+      expect(cue?.isCurrent?.()).toBe(true);
+      game.room.state().world!.p2.health-=5;
+      game.stateChanged();
+      expect(cue?.isCurrent?.()).toBe(true);
+      ada.interrupt();
+      expect(cue?.isCurrent?.()).toBe(false);
+    } finally { vi.useRealTimers(); }
+  });
+
   it('matches screen numbers, ordinals, normalized IDs, and dynamic names', () => {
     const choices = [
       { id: 'neon-foundry', name: 'Neon Foundry' },
@@ -494,6 +574,89 @@ describe('fighter voice session', () => {
     await vi.waitFor(() => expect(game.room.lobbyPlayers()[0]?.fighterId).toBe('nyx'));
     expect(requests.at(-1)).toMatchObject({phase:'fighter_select',game:'fighter'});
     expect(requests.at(-1)?.choices).toContainEqual(expect.objectContaining({id:'nyx'}));
+  });
+
+  it('answers fighter questions without treating mentioned names as selections', async () => {
+    const requests: VoiceInterpretRequest[] = [];
+    const game = voiceGame(async request => {
+      requests.push(request);
+      return { kind: 'answer', factId: request.transcript.startsWith('Tell')
+        ? 'fighter:nyx' : 'fighters' };
+    });
+    const ada = game.connect('CA-FIGHTER-QUESTIONS', 'VOICE', undefined, 'Ada');
+    ada.prompt('next');
+    expect(matchVoiceChoice('Tell me about Nyx', FIGHTER_ROSTER)).toBeNull();
+    expect(matchVoiceChoice('I like Nyx, what are the options?', FIGHTER_ROSTER)).toBeNull();
+    ada.prompt('Tell me about Nyx');
+    await vi.waitFor(() => expect(ada.spoken.at(-1)).toMatch(/Nyx.*Nightblade/i));
+    ada.prompt('I like Nyx, what are the options?');
+    await vi.waitFor(() => expect(ada.spoken.at(-1)).toMatch(/fighters on screen/i));
+    expect(game.room.lobbyPlayers()[0]?.fighterId).toBeNull();
+    expect(requests.every(request => request.actions.length === 0)).toBe(true);
+
+    ada.prompt('Can I choose Nyx?');
+    expect(game.room.lobbyPlayers()[0]?.fighterId).toBe('nyx');
+  });
+
+  it('does not commit comparisons, tentative preferences, or two named fighters', async () => {
+    const requests: VoiceInterpretRequest[] = [];
+    const game = voiceGame(async request => {
+      requests.push(request);
+      return { kind: 'answer', factId: 'fighters' };
+    });
+    const ada = game.connect('CA-FIGHTER-COMPARISONS', 'VOICE', undefined, 'Ada');
+    ada.prompt('next');
+    for (const spoken of ['Compare Nyx with Remy Riot', 'I am thinking about Nyx', 'Nyx and Remy Riot']) {
+      expect(matchVoiceChoice(spoken, FIGHTER_ROSTER)).toBeNull();
+      ada.prompt(spoken);
+      await vi.waitFor(() => expect(requests.at(-1)?.transcript).toBe(spoken));
+      expect(game.room.lobbyPlayers()[0]?.fighterId).toBeNull();
+      expect(requests.at(-1)?.actions).toEqual([]);
+    }
+    ada.prompt('I choose Nyx');
+    expect(game.room.lobbyPlayers()[0]?.fighterId).toBe('nyx');
+  });
+
+  it('answers setup and fight questions from the current screen without advancing', async () => {
+    const requests: VoiceInterpretRequest[] = [];
+    const game = voiceGame(async request => {
+      requests.push(request);
+      return { kind: 'answer', factId: request.transcript.includes('arena') ? 'arena' : 'opponent' };
+    });
+    const ada = game.connect('CA-FIGHTER-FACTS', 'VOICE', undefined, 'Ada');
+    ada.prompt('next'); ada.prompt('Nyx'); ada.prompt('next'); ada.prompt('second');
+    expect(game.room.phase).toBe('map_select');
+    ada.prompt('How do I fight');
+    expect(game.room.phase).toBe('map_select');
+    expect(ada.spoken.at(-1)).toMatch(/forward.*punch.*kick/i);
+    ada.prompt('start');
+    game.room.ready(game.room.state().loadingGeneration); game.stateChanged(); advanceIntro(game); game.tick(6);
+    expect(game.room.phase).toBe('fight');
+    ada.prompt('Who am I fighting?');
+    const foeId = game.room.state().players.find(player => player.isAi)?.fighterId;
+    const foeName = FIGHTER_ROSTER.find(fighter => fighter.id === foeId)?.name;
+    await vi.waitFor(() => expect(ada.spoken.at(-1)).toBe(`You are fighting Rival as ${foeName}.`));
+    ada.prompt('Which arena are we in?');
+    await vi.waitFor(() => expect(ada.spoken.at(-1)).toMatch(/Void Circuit/i));
+    expect(requests.at(-1)?.facts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'opponent' }),
+      expect.objectContaining({ id: 'arena' }),
+    ]));
+  });
+
+  it('answers a winner question at standalone results without starting a rematch', () => {
+    const game = voiceGame();
+    const ada = game.connect('CA-FIGHTER-WINNER-QUESTION', 'VOICE', undefined, 'Ada');
+    ada.prompt('next'); ada.prompt('Nyx'); ada.prompt('next'); ada.prompt('second'); ada.prompt('start');
+    game.room.ready(game.room.state().loadingGeneration); game.stateChanged(); advanceIntro(game); game.tick(6);
+    const world = game.room.state().world!; world.status = 'finished'; world.winner = 'p2'; game.tick(.1);
+    game.tick(FIGHTER_VICTORY_SECONDS);
+    expect(game.room.acknowledgePresentation('results', game.room.state().loadingGeneration)).toBe(true);
+    game.stateChanged();
+    ada.spoken.length = 0;
+    ada.prompt('Who won the fight');
+    expect(game.room.phase).toBe('results');
+    expect(ada.spoken.at(-1)).toMatch(/Rival won.*you lost/i);
   });
 
   it('drops a late semantic selection if the screen phase changed before the answer', async () => {
@@ -601,7 +764,7 @@ describe('fighter voice session', () => {
       maps: FIGHTER_MAPS.map(map => ({ id: map.id, name: map.name })),
     };
     const session = new FighterVoiceSession({
-      say: text => spoken.push(text), join: () => ({ playerId: 'f1', resumed: true }), leave: () => {}, setName: () => {},
+      say: text => { spoken.push(text); }, join: () => ({ playerId: 'f1', resumed: true }), leave: () => {}, setName: () => {},
       selectFighter: () => false, selectMap: () => false, advance: () => false,
       command: (_code, _id, command) => { commands.push(command); return true; }, snapshot: () => snapshot,
     });
@@ -669,7 +832,8 @@ describe('fighter voice session', () => {
   });
 });
 
-function voiceGame(interpret?: (request: VoiceInterpretRequest) => Promise<VoiceInterpretResult>) {
+function voiceGame(interpret?: (request: VoiceInterpretRequest) => Promise<VoiceInterpretResult>,
+  speechDelivery?: (text: string) => void | Promise<boolean>) {
   const room = new FighterRoom('VOICE', 1234);
   const sessions: FighterVoiceSession[] = [];
   const commands: { playerId: string; command: FighterCommand }[] = [];
@@ -731,7 +895,10 @@ function voiceGame(interpret?: (request: VoiceInterpretRequest) => Promise<Voice
     const guardedSpeech: { text: string; isCurrent?: () => boolean }[] = [];
     let playerId = '';
     const session = new FighterVoiceSession({
-      say: (text, isCurrent) => { spoken.push(text); guardedSpeech.push({ text, ...(isCurrent ? { isCurrent } : {}) }); },
+      say: (text, isCurrent) => {
+        spoken.push(text); guardedSpeech.push({ text, ...(isCurrent ? { isCurrent } : {}) });
+        return speechDelivery?.(text);
+      },
       join: (_code,name,_callSid,side,expectedPlayers,nameConfirmed) => {
         if(expectedPlayers!==undefined)room.expectHumanPlayers(expectedPlayers,side!==undefined);
         else if(room.playerCount>=1)room.expectHumanPlayers(2,false);

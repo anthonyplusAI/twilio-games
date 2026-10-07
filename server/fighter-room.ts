@@ -269,15 +269,11 @@ export class FighterRoom {
       return;
     }
     if (this.phase !== 'fight' || !this.world) return;
-    if (this.players.length === 1 && this.world.now >= this.aiNext) {
-      const command = this.aiCommand();
-      this.events.push(...applyFighterCommand(this.world, this.players[0]!.side === 'p1' ? 'p2' : 'p1', command));
-      // Leave room for a spoken command to arrive between rival decisions.
-      this.aiNext = this.world.now + 1.0 + this.random() * 0.55;
-    }
     const resolved = tickFighterWorld(this.world, delta);
     this.events.push(...resolved);
     if (this.world.status === 'fighting') {
+      // A spoken action already waiting for recovery gets the first ready slot. Otherwise the
+      // solo AI can win the same 50 ms tick and make a valid caller command feel ignored.
       for (const [playerId] of this.voiceCommands) {
         const active=this.activeVoiceCommands(playerId),next=active[0];if(!next)continue;
         const events = this.command(playerId, next.command);
@@ -286,6 +282,12 @@ export class FighterRoom {
           this.voiceCommandOutcomes.push({ requestId: next.requestId, command: next.command, status: 'executed' });
         }
         if (!active.length) this.voiceCommands.delete(playerId);
+      }
+      if (this.players.length === 1 && this.world.status === 'fighting' && this.world.now >= this.aiNext) {
+        const command = this.aiCommand();
+        this.events.push(...applyFighterCommand(this.world, this.players[0]!.side === 'p1' ? 'p2' : 'p1', command));
+        // Keep a speech-paced caller's recovery window fair after the human-first tick.
+        this.aiNext = this.world.now + 1.0 + this.random() * 0.60;
       }
     } else this.rejectAllPendingVoiceCommands('match_over');
     if (this.world.status === 'finished') { this.phase = 'victory'; this.victory = FIGHTER_VICTORY_SECONDS; }

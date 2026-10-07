@@ -54,7 +54,7 @@ const copy = locale === 'pt-BR' ? {
   missingDisplayExplanation: 'Somente a tela do estande pode iniciar jogos compartilhados. Abra o console do operador para conectar este navegador.',
   invalidDisplayExplanation: 'O acesso desta tela foi rejeitado. Abra o console do operador para reconectar este navegador.',
   openOperator: 'Abrir console do operador',
-  lightTheme: 'Tema claro', darkTheme: 'Tema escuro', enterFullscreen: 'Entrar em tela cheia', exitFullscreen: 'Sair da tela cheia', operator: 'Console do operador', playerMax: 'máx. {count} jogadores',
+  lightTheme: 'Tema claro', darkTheme: 'Tema escuro', enterFullscreen: 'Entrar em tela cheia', exitFullscreen: 'Sair da tela cheia', operator: 'Console do operador', howMade: 'Como foi feito', playerMax: 'máx. {count} jogadores',
   playNow: 'Jogando nesta rodada: {count}', keepPriority: 'Aguardando o próximo jogo: {count}',
   racerBlurb: 'Uma corrida por uma pista neon controlada por voz.',
   monstersBlurb: 'Comande os golpes em uma batalha tática de criaturas.',
@@ -91,7 +91,7 @@ const copy = locale === 'pt-BR' ? {
   missingDisplayExplanation: 'Only the booth display may launch shared games. Open the operator console to connect this browser.',
   invalidDisplayExplanation: 'This display access was rejected. Open the operator console to reconnect this browser.',
   openOperator: 'Open operator console',
-  lightTheme: 'Light theme', darkTheme: 'Dark theme', enterFullscreen: 'Enter fullscreen', exitFullscreen: 'Exit fullscreen', operator: 'Operator console', playerMax: '{count} player max',
+  lightTheme: 'Light theme', darkTheme: 'Dark theme', enterFullscreen: 'Enter fullscreen', exitFullscreen: 'Exit fullscreen', operator: 'Operator console', howMade: 'How it’s made', playerMax: '{count} player max',
   playNow: 'Playing this round: {count}', keepPriority: 'Waiting for next game: {count}',
   racerBlurb: 'A voice powered race dodging obstacles.',
   monstersBlurb: 'Call the moves in a tactical creature battle.',
@@ -502,6 +502,7 @@ function localizeStaticPage(): void {
   document.getElementById('persistentJoinTitle')!.textContent=locale==='pt-BR'?'Escaneie para entrar':'Scan to join';
   const operator=document.getElementById('operatorLink')!;operator.innerHTML=OPERATOR_ICON;operator.title=copy.operator;operator.setAttribute('aria-label',copy.operator);
   const instructions=document.getElementById('instructionsLink')!;instructions.title=locale==='pt-BR'?'Como jogar':'How to play';instructions.setAttribute('aria-label',instructions.title);
+  const howMade=document.getElementById('howItWorksLink')!;howMade.querySelector('span')!.textContent=copy.howMade;howMade.title=copy.howMade;howMade.setAttribute('aria-label',copy.howMade);
 }
 
 function renderEntryPolicyCopy(): void {

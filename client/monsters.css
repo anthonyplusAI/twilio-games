@@ -36,6 +36,7 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); c
 }
 .game-home svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .game-home:hover { border-color: var(--red); background: rgba(239,34,58,.16); }
+html[data-theme="light"] .game-home:hover { border-color: #B10F23; color: #000D25; background: #FFF1F3; }
 .game-home:active { transform: scale(.97); }
 .game-home:focus-visible { outline: 2px solid var(--red); outline-offset: 3px; }
 #app { position: relative; height: 100vh; display: flex; align-items: center; justify-content: center;
@@ -133,11 +134,12 @@ html[data-theme="light"] :is(.vm-eyebrow,#vm-hud) img { filter:brightness(0) sat
   box-shadow: 0 8px 24px rgba(239,34,58,.35); }
 .vm-btn:hover { filter: brightness(1.08); }
 .vm-btn-secondary { align-self: center; margin-top: 8px; padding: 9px 16px;
-  background: transparent; border: 1px solid var(--glass-brd-2); box-shadow: none; }
-.vm-btn-secondary:hover { border-color: var(--red); }
-.vm-btn-ghost { background: transparent; color: var(--ink); border: 1px solid var(--glass-brd-2);
+  color: var(--ink); background: var(--glass-2); border: 1px solid var(--glass-brd-2); box-shadow: none; }
+.vm-btn-secondary:hover { border-color: var(--red); background: var(--glass); }
+.vm-btn-ghost { background: var(--glass-2); color: var(--ink); border: 1px solid var(--glass-brd-2);
   font-weight: 700; font-size: 14px; padding: 10px 18px; margin-left: 8px; box-shadow: none; }
-.vm-btn-ghost:hover { border-color: var(--red); }
+.vm-btn-ghost:hover { border-color: var(--red); background: var(--glass); }
+.vm-btn-secondary:focus-visible, .vm-btn-ghost:focus-visible { outline: 2px solid var(--red); outline-offset: 3px; }
 
 /* Type color system — one accent var per element, used for the badge + selected border. */
 .t-fire{--tc:#ff6b3d} .t-water{--tc:#3f9be0} .t-grass{--tc:#4fc44a} .t-electric{--tc:#ffd23f}

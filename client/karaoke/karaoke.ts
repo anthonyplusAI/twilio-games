@@ -1,6 +1,7 @@
 import QRCode from 'qrcode';
 import type { KaraokeLane, KaraokeSong } from '../../shared/karaoke';
 import type { KaraokeEvent, KaraokeState } from '../../shared/karaoke-protocol';
+import type { KaraokeVenueConfig } from '../../shared/karaoke-venue';
 import { KARAOKE_MAX_SCORE } from '../../shared/karaoke-protocol';
 import { DEFAULT_ROOM } from '../../shared/constants';
 import { createStationDisplay } from '../station-display';
@@ -11,7 +12,13 @@ import { getMusicManager } from '../music-manager';
 import { getSoundEffectsManager } from '../sound-effects';
 import { commonText, injectLanguagePicker, locale } from '../i18n';
 import { wireThemeToggle } from '../theme';
-import { KaraokeAssetLoader, fetchKaraokeVenueConfig, karaokeAssetManifest } from './karaoke-assets';
+import {
+  KaraokeAssetLoader,
+  disposeKaraokeObjectResources,
+  fetchKaraokeVenueConfig,
+  karaokeAssetManifest,
+  type KaraokeLoadedAsset,
+} from './karaoke-assets';
 import { KaraokeAudioTransport } from './karaoke-audio';
 import {
   KARAOKE_VISUAL_OFFSET_LIMIT_MS,
@@ -21,6 +28,7 @@ import {
   KaraokeServerClock,
   clampKaraokeVisualOffsetMs,
   karaokeAudioPreflightRequired,
+  karaokeCanInstallOptionalAssets,
   karaokeClientAudioUrl,
   karaokeCountdownSongTimeMs,
   karaokeCountdownCount,
@@ -106,6 +114,9 @@ let audioSyncKey = '';
 let stationResultsMarked = false;
 let interactionUnlocked = false;
 let sceneSettled = false;
+let pageDisposed = false;
+let pendingVenue: KaraokeVenueConfig | null = null;
+const pendingAssets: KaraokeLoadedAsset[] = [];
 let leaderboardKey = '';
 let leaderboardLoading = false;
 let leaderboardEntries: KaraokeLeaderboardEntry[] = [];
@@ -192,8 +203,10 @@ for (const home of document.querySelectorAll<HTMLAnchorElement>('.game-home')) {
 }
 
 addEventListener('pagehide', () => {
+  pageDisposed = true;
   stopVoiceNumber();
   audio.dispose();
+  for (const asset of pendingAssets.splice(0)) disposeKaraokeObjectResources(asset.model);
   stage.dispose();
 }, { once: true });
 
@@ -269,36 +282,56 @@ function toggleLocalTester(): void {
 }
 
 async function initializeStage(): Promise<void> {
-  try {
-    stage.warm();
-  } catch (error) {
-    console.warn('Karaoke stage warm-up failed; the DOM stage remains active.', error);
-  }
-  try {
-    const venue = await fetchKaraokeVenueConfig();
-    stage.setVenueConfig(venue);
-    await new KaraokeAssetLoader().loadOptional((loaded, total) => {
-      stageLoadingProgress.style.width = `${loaded / total * 100}%`;
-      stageLoadingProgress.parentElement?.setAttribute('aria-valuenow', String(loaded));
-    }, karaokeAssetManifest(venue), undefined, asset => {
-      stage.installAsset(asset);
-    });
-  } catch (error) {
-    console.warn('Optional Karaoke scene preparation failed; procedural stage remains active.', error);
-  }
-  try { stage.warm(); }
-  catch (error) { console.warn('Karaoke model warm-up failed; loaded roles remain active.', error); }
-  await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+  // The built-in procedural stage is playable immediately. Optional venue data and GLBs
+  // may take many seconds on a weak connection, so they cannot gate display or song readiness.
+  // The regular render loop draws the first frame; a separate warm-up would compile it twice.
+  await new Promise<void>(resolve => {
+    const fallback = setTimeout(resolve, 250);
+    requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(fallback); resolve(); }));
+  });
+  if (pageDisposed) return;
   sceneSettled = true;
   stageLoading.classList.add('done');
   stageLoading.setAttribute('aria-busy', 'false');
   stationDisplay.markEngineReady();
   maybeSignalReady();
+  void loadOptionalStageAssets();
+}
+
+async function loadOptionalStageAssets(): Promise<void> {
+  try {
+    const venue = await fetchKaraokeVenueConfig();
+    if (pageDisposed) return;
+    pendingVenue = venue;
+    installPendingStageAssets();
+    await new KaraokeAssetLoader().loadOptional((loaded, total) => {
+      stageLoadingProgress.style.width = `${loaded / total * 100}%`;
+      stageLoadingProgress.parentElement?.setAttribute('aria-valuenow', String(loaded));
+    }, karaokeAssetManifest(venue), undefined, asset => {
+      if (pageDisposed) disposeKaraokeObjectResources(asset.model);
+      else {
+        pendingAssets.push(asset);
+        installPendingStageAssets();
+      }
+    });
+  } catch (error) {
+    console.warn('Optional Karaoke scene preparation failed; procedural stage remains active.', error);
+  }
+}
+
+function installPendingStageAssets(): void {
+  if (pageDisposed || !karaokeCanInstallOptionalAssets(state?.phase ?? null)) return;
+  if (pendingVenue) {
+    stage.setVenueConfig(pendingVenue);
+    pendingVenue = null;
+  }
+  for (const asset of pendingAssets.splice(0)) stage.installAsset(asset);
 }
 
 function applyState(next: KaraokeState): void {
   const previousPhase = state?.phase;
   state = next;
+  installPendingStageAssets();
   if (guideMode) {
     (window as typeof window & { __karaokeSmokeChart?: KaraokeState['selectedSong'] })
       .__karaokeSmokeChart = next.selectedSong;
@@ -361,7 +394,6 @@ async function preparePerformance(target: KaraokeState): Promise<void> {
     });
     if (!state || state.phase !== 'loading' || state.loadingGeneration !== target.loadingGeneration) return;
     stage.setSong(song);
-    stage.warm();
     preparedGeneration = target.loadingGeneration;
     audioProgress = 1;
     updateLoadingProgress();
@@ -615,14 +647,21 @@ function updateCountdown(serverNow: number): void {
 function updateHud(songTimeMs: number): void {
   const song = state?.selectedSong;
   if (!song) return;
-  element('hud-singer').textContent = state?.singer?.name ?? copy.waiting;
-  element('hud-song').textContent = song.title;
-  element('hud-score').textContent = formatScore(state?.score ?? 0);
-  element('hud-combo').textContent = String(state?.combo ?? 0);
+  setTextIfChanged('hud-singer', state?.singer?.name ?? copy.waiting);
+  setTextIfChanged('hud-song', song.title);
+  setTextIfChanged('hud-score', formatScore(state?.score ?? 0));
+  setTextIfChanged('hud-combo', String(state?.combo ?? 0));
   const progress = Math.min(1, Math.max(0, songTimeMs / song.durationMs));
-  element('song-progress-fill').style.width = `${progress * 100}%`;
+  const progressFill = element('song-progress-fill');
+  const progressWidth = `${(progress * 100).toFixed(1)}%`;
+  if (progressFill.style.width !== progressWidth) progressFill.style.width = progressWidth;
   const remaining = Math.max(0, Math.ceil((song.durationMs - songTimeMs) / 1000));
-  element('song-time').textContent = `0:${String(remaining).padStart(2, '0')}`;
+  setTextIfChanged('song-time', `0:${String(remaining).padStart(2, '0')}`);
+}
+
+function setTextIfChanged(id: string, value: string): void {
+  const node = element(id);
+  if (node.textContent !== value) node.textContent = value;
 }
 
 function updateLoadingProgress(): void {
@@ -747,11 +786,13 @@ function setVisualOffset(value: number): void {
 }
 
 function updateCalibrationReadout(latencyMs: number, latencySource: string): void {
+  if (!guideMode) return;
   const signedOffset = `${visualOffsetMs > 0 ? '+' : ''}${visualOffsetMs} ms`;
   const latency = element<HTMLOutputElement>('output-latency');
-  latency.textContent = `${Math.max(0, Math.round(latencyMs))} ms`;
-  latency.dataset.source = latencySource;
-  element<HTMLOutputElement>('visual-offset').textContent = signedOffset;
+  const latencyText = `${Math.max(0, Math.round(latencyMs))} ms`;
+  if (latency.textContent !== latencyText) latency.textContent = latencyText;
+  if (latency.dataset.source !== latencySource) latency.dataset.source = latencySource;
+  setTextIfChanged('visual-offset', signedOffset);
   element<HTMLButtonElement>('lyrics-earlier').disabled = visualOffsetMs <= -KARAOKE_VISUAL_OFFSET_LIMIT_MS;
   element<HTMLButtonElement>('lyrics-later').disabled = visualOffsetMs >= KARAOKE_VISUAL_OFFSET_LIMIT_MS;
 }

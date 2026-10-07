@@ -253,10 +253,24 @@ export function clearSelectionIndex(spoken: string, choices: string[], locale: S
   const matches = [...normalized.matchAll(correction)];
   const last = matches.at(-1);
   const candidate = last ? normalized.slice(last.index! + last[0].length).trim() : normalized;
-  if (!candidate || /\b(?:don't|dont|don t|do not|can't|cannot|not|never|no|nao|nem|or|ou|either)\b/.test(candidate)) return null;
-  const num = parseSelectionNumber(candidate, locale);
-  if (num !== null) return (num >= 1 && num <= choices.length) ? num - 1 : null;
-  const matching = choices.flatMap((choice, index) => fuzzyMatch(candidate, [choice], locale) >= 0 ? [index] : []);
+  if (!candidate || /\b(?:don't|dont|don t|do not|can't|cannot|not|never|no|nao|nem|or|ou|either|compare|compara|comparar|versus|vs|between|entre|considering|thinking about|pensando em)\b/.test(candidate)) return null;
+  const requested = (locale === 'pt-BR'
+    ? candidate.replace(/^(?:(?:eu )?(?:quero|escolho|prefiro|seleciono|vou escolher)|escolha|selecione|pegue|use|me de)\s+/, '')
+    : candidate.replace(/^(?:i(?:'ll|'d|ll|d| would)? (?:like to |want to )?(?:take|pick|choose|select|use|drive|race with|want)|give me|lets (?:use|pick|choose)|choose|pick|select|take|use|drive)\s+/, ''))
+    .replace(/^(?:please|por favor)\s+/, '').replace(/\s+(?:please|por favor)$/, '');
+  const numberWords = [...Object.keys(NUM_WORDS[locale]), ...Object.keys(ORDINAL_WORDS[locale])].join('|');
+  const numberPhrase = new RegExp(`^(?:(?:the|a|o|a)\\s+)?(?:(?:car|cars|track|map|option|number|carro|pista|mapa|opcao|numero)\\s+){0,2}(?:\\d{1,2}(?:st|nd|rd|th)?|${numberWords})(?:\\s+(?:one|car|track|option|um|carro|pista|opcao))?$`);
+  if (numberPhrase.test(requested)) {
+    const num = parseSelectionNumber(requested, locale);
+    return num !== null && num >= 1 && num <= choices.length ? num - 1 : null;
+  }
+  const name = requested.replace(/^(?:the|a|o|a)\s+/, '').replace(/\s+(?:one|car|track|carro|pista)$/, '');
+  if (!name || name.split(/\s+/).length > 4
+    || /^(?:car|cars|track|tracks|map|maps|carro|carros|pista|pistas|mapa|mapas)$/.test(name)) return null;
+  const matching = choices.flatMap((choice, index) => {
+    const known = normalizeForMatching(choice, locale);
+    return known === name || (name.length >= 3 && known.includes(name)) ? [index] : [];
+  });
   return matching.length === 1 ? matching[0]! : null;
 }
 

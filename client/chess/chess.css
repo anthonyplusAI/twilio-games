@@ -19,7 +19,7 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--chess-ruby);outline
 .game-brand{display:flex;align-items:center;gap:14px;min-width:0;text-shadow:0 2px 16px rgba(0,0,0,.6)}
 .game-brand img{width:40px;height:40px;flex:none;filter:drop-shadow(0 0 13px rgba(239,48,73,.25))}
 .brand-title{display:flex;flex-direction:column;gap:1px}
-.brand-title strong{font:800 clamp(24px,2.3vw,34px)/.97 "Twilio Sans Display",sans-serif;letter-spacing:-.035em;white-space:nowrap}
+.brand-title strong{font:800 clamp(24px,2.3vw,34px)/.97 "Twilio Sans Display",sans-serif;letter-spacing:.02em;white-space:nowrap}
 .brand-title span{color:var(--chess-brass);font:12px/1.2 "Twilio Sans Mono",monospace;letter-spacing:.035em}
 .top-controls{display:flex;align-items:center;gap:8px}
 .connection-status{display:inline-flex;align-items:center;gap:8px;min-height:38px;padding:0 12px;margin-right:4px;border:1px solid rgba(214,226,248,.16);border-radius:3px;background:rgba(5,15,33,.73);color:#b8c8dd;font:11px/1 "Twilio Sans Mono",monospace;white-space:nowrap;backdrop-filter:blur(12px)}
@@ -28,6 +28,8 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--chess-ruby);outline
 .connection-status[data-state="reconnecting"] i{animation:connectionPulse 1s ease-in-out infinite}
 .connection-status[data-state="closed"] i{background:var(--chess-ruby);box-shadow:0 0 10px var(--chess-ruby)}
 .icon-button{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-width:38px;height:38px;padding:0 10px;border:1px solid rgba(214,226,248,.17);border-radius:3px;background:rgba(5,15,33,.76);color:#d7e4f4;text-decoration:none;cursor:pointer;backdrop-filter:blur(12px);transition:border-color .18s,background .18s,color .18s}
+.game-home{min-width:74px;border-color:#91abc8;background:#142440;color:#fff;font-weight:700}
+.game-home span{font:700 11px "Twilio Sans Text",sans-serif}
 .icon-button:hover{border-color:var(--chess-ruby);background:rgba(68,17,37,.9);color:#fff}
 .icon-button svg{display:block;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;flex:none}
 .music-button{min-width:93px;color:var(--chess-brass)}
@@ -42,7 +44,7 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--chess-ruby);outline
 .status-deck{position:absolute;z-index:5;left:max(28px,env(safe-area-inset-left));bottom:max(24px,env(safe-area-inset-bottom));width:min(350px,32vw);padding:19px 21px 17px;border:1px solid rgba(198,212,235,.17);border-left:3px solid var(--chess-ruby);border-radius:2px;background:linear-gradient(112deg,rgba(10,23,47,.94),rgba(6,14,32,.86));box-shadow:0 18px 50px rgba(0,0,0,.33),inset 0 1px rgba(255,255,255,.07);backdrop-filter:blur(18px)}
 .status-heading{display:flex;align-items:center;gap:9px;color:var(--chess-brass);font:11px "Twilio Sans Mono",monospace;letter-spacing:.04em}
 .turn-icon{font-size:17px;line-height:.7;color:var(--chess-ruby);text-shadow:0 0 16px var(--chess-ruby)}
-.status-deck h1{margin:9px 0 6px;font:800 clamp(28px,2.7vw,38px)/1.03 "Twilio Sans Display",sans-serif;letter-spacing:-.03em}
+.status-deck h1{margin:9px 0 6px;font:800 clamp(28px,2.7vw,38px)/1.03 "Twilio Sans Display",sans-serif;letter-spacing:.02em}
 .status-deck p{min-height:38px;margin:0;color:#d6e0ee;font-size:13px;line-height:1.45}
 .move-prompt{margin-top:13px;padding-top:12px;border-top:1px solid rgba(213,226,246,.14);color:#aebbd0;font:11px/1.45 "Twilio Sans Mono",monospace}
 .camera-hint{margin-top:8px;color:#9eaec4;font:10px/1.35 "Twilio Sans Mono",monospace}
@@ -52,7 +54,7 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--chess-ruby);outline
 .call-card{position:absolute;z-index:5;top:clamp(150px,19vh,205px);right:max(28px,env(safe-area-inset-right));display:flex;flex-direction:column;align-items:center;width:234px;padding:17px 17px 18px;border:1px solid rgba(209,170,113,.3);border-top:2px solid var(--chess-ruby);border-radius:3px;background:linear-gradient(145deg,rgba(12,25,48,.96),rgba(6,13,30,.92));box-shadow:0 18px 50px rgba(0,0,0,.42),inset 0 1px rgba(255,255,255,.08);text-align:center;backdrop-filter:blur(18px)}
 .call-card-copy{width:100%}
 .call-card-kicker{display:block;color:var(--chess-brass);font:10px/1.2 "Twilio Sans Mono",monospace;letter-spacing:.12em}
-.call-card h2{margin:5px 0 5px;font:800 25px/1 "Twilio Sans Display",sans-serif;letter-spacing:-.025em}
+.call-card h2{margin:5px 0 5px;font:800 25px/1 "Twilio Sans Display",sans-serif;letter-spacing:.02em}
 .call-card-copy p{margin:0 0 12px;color:#c1cbda;font-size:11px;line-height:1.35}
 .call-card-qr-frame{width:158px;height:158px;padding:7px;border:1px solid rgba(255,255,255,.45);border-radius:3px;background:#fff;box-shadow:0 0 25px rgba(209,170,113,.16)}
 .call-card-qr-frame img{display:block;width:100%;height:100%;object-fit:contain}
@@ -65,13 +67,13 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--chess-ruby);outline
 .move-note-label{color:var(--chess-brass);font:11px "Twilio Sans Mono",monospace}
 .move-note strong{display:block;margin:7px 0 4px;font:800 clamp(19px,1.7vw,25px)/1.1 "Twilio Sans Display",sans-serif}
 .move-note p{margin:0;color:#aebbd0;font-size:12px;line-height:1.4}
-.event-banner{position:absolute;z-index:6;top:24%;left:50%;width:max-content;max-width:90%;transform:translateX(-50%);pointer-events:none;color:#fff;font:800 clamp(26px,4vw,56px)/.92 "Twilio Sans Display",sans-serif;letter-spacing:-.02em;text-align:center;text-shadow:0 0 18px var(--chess-ruby),0 3px 32px rgba(0,0,0,.9);opacity:0}
+.event-banner{position:absolute;z-index:6;top:24%;left:50%;width:max-content;max-width:90%;transform:translateX(-50%);pointer-events:none;color:#fff;font:800 clamp(26px,4vw,56px)/.92 "Twilio Sans Display",sans-serif;letter-spacing:.02em;text-align:center;text-shadow:0 0 18px var(--chess-ruby),0 3px 32px rgba(0,0,0,.9);opacity:0}
 .event-banner.show{animation:eventCall 1.2s ease-out both}
 .result-overlay{position:absolute;z-index:8;inset:0;display:grid;place-items:center;padding:24px;background:radial-gradient(ellipse at center,rgba(6,14,29,.32),rgba(2,7,19,.84));pointer-events:none}
 .result-card{text-align:center;text-shadow:0 3px 24px #000;animation:resultEnter .6s cubic-bezier(.16,.8,.2,1) both}
 .result-mark{display:block;margin-bottom:5px;color:var(--chess-brass);font-size:35px;text-shadow:0 0 25px var(--chess-brass)}
 .result-card>span:not(.result-mark){display:block;color:var(--chess-brass);font:13px "Twilio Sans Mono",monospace;letter-spacing:.06em}
-.result-card strong{display:block;margin:10px 0;font:800 clamp(64px,11vw,150px)/.78 "Twilio Sans Display",sans-serif;letter-spacing:-.06em;text-transform:uppercase}
+.result-card strong{display:block;margin:10px 0;font:800 clamp(64px,11vw,150px)/.78 "Twilio Sans Display",sans-serif;letter-spacing:.02em;text-transform:uppercase}
 .result-card p{margin:18px auto 0;max-width:38ch;color:#e6e1d6;font-size:clamp(14px,1.5vw,19px);line-height:1.4}
 .result-replay{pointer-events:auto;min-height:48px;margin:23px auto 0;padding:11px 26px;border:1px solid var(--chess-brass);border-radius:10px;background:rgba(12,25,48,.9);color:#fff;font:800 17px "Twilio Sans Display",sans-serif;cursor:pointer;touch-action:manipulation;box-shadow:0 0 24px rgba(235,190,106,.24)}
 .result-replay:hover:not(:disabled){background:rgba(34,51,77,.96);box-shadow:0 0 34px rgba(235,190,106,.45)}
@@ -81,15 +83,22 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--chess-ruby);outline
 .result-overlay[data-result="win"] .result-card strong{color:#f7e3b8;text-shadow:0 0 45px rgba(255,201,110,.45),0 3px 24px #000}
 .result-overlay[data-result="draw"] .result-card strong{color:#d4e1f0}
 .fallback-board{position:absolute;z-index:3;top:112px;left:20px;right:20px;text-align:center}
-.fallback-explanation{max-width:42ch;text-align:center;color:#e4e1d6;font-size:13px}
+.fallback-explanation{display:inline-block;max-width:42ch;padding:7px 13px;border:1px solid rgba(209,170,113,.5);border-radius:4px;background:rgba(5,15,33,.88);text-align:center;color:#f9e6c8;font:700 11px "Twilio Sans Mono",monospace;letter-spacing:.06em;text-transform:uppercase}
 .fallback-explanation{margin:0 auto}
 .accessible-board{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
-body[data-renderer="fallback"] .accessible-board{z-index:3;top:46%;left:50%;width:min(70vh,67vw,620px);height:min(70vh,67vw,620px);margin:0;overflow:visible;clip:auto;white-space:normal;transform:translate(-50%,-50%);border:10px solid #3c2934;border-collapse:collapse;table-layout:fixed;box-shadow:0 10px 35px #000}
+body[data-renderer="fallback"] .accessible-board{z-index:3;top:53%;left:calc(50% + 32px);width:min(70vh,67vw,620px);height:min(70vh,67vw,620px);margin:0;overflow:visible;clip:auto;white-space:normal;transform:translate(-50%,-50%);border:10px solid #7c5f4b;border-collapse:separate;border-spacing:0;table-layout:fixed;background:conic-gradient(#33425d 25%,#d1c4ae 0 50%,#33425d 0 75%,#d1c4ae 0) 0 0/25% 25%;box-shadow:0 10px 35px #000,0 0 0 2px #d1aa71,inset 0 0 0 2px #171f30}
 body[data-renderer="fallback"] .camera-hint{display:none}
-.accessible-board td{width:12.5%;height:12.5%;padding:0;text-align:center;vertical-align:middle;font-size:clamp(18px,4.6vw,43px);line-height:1}
-.accessible-board td.light{background:#d1c4ae;color:#18213b}
-.accessible-board td.dark{background:#33425d;color:#f9ead1}
+.accessible-board td{position:relative;width:12.5%;height:12.5%;padding:0;overflow:hidden;text-align:center;vertical-align:middle;font-size:clamp(18px,3.1vw,43px);line-height:1}
+.accessible-board td.light{background:linear-gradient(135deg,#e6d8bf,#c8b89c);color:#18213b}
+.accessible-board td.dark{background:linear-gradient(135deg,#344862,#24334c);color:#f9ead1}
+.accessible-board td::after{content:attr(data-square);position:absolute;right:3px;bottom:3px;color:currentColor;font:700 clamp(7px,.8vw,10px) "Twilio Sans Mono",monospace;opacity:.55}
 .accessible-board td.last{box-shadow:inset 0 0 0 4px #ef3049}
+.accessible-board td.selected{box-shadow:inset 0 0 0 4px #6cc1fa}
+.accessible-board td.pending-from{box-shadow:inset 0 0 0 4px #f7d49b}
+.accessible-board td.pending-to{box-shadow:inset 0 0 0 4px #ffad48}
+.fallback-piece{position:relative;z-index:1;display:grid;place-items:center;width:76%;aspect-ratio:1;margin:auto;border:1px solid;border-radius:50%;font-family:Georgia,"Apple Symbols",serif;text-shadow:0 1px 2px rgba(0,0,0,.5)}
+.fallback-piece.ivory{border-color:#96714e;background:radial-gradient(circle at 35% 28%,#fffaf0,#d8c6a8 72%,#9d8067);color:#283149;box-shadow:0 3px 8px rgba(4,9,22,.34),inset 0 1px 2px #fff}
+.fallback-piece.obsidian{border-color:#81a4d0;background:radial-gradient(circle at 35% 28%,#465574,#121d36 75%);color:#f5e4c7;box-shadow:0 3px 8px rgba(4,9,22,.5),inset 0 1px 3px #7aa2d2}
 body[data-renderer="fallback"] .board-stage{display:none}
 body[data-renderer="fallback"] .scene-vignette{display:none}
 
@@ -97,12 +106,12 @@ body[data-renderer="fallback"] .scene-vignette{display:none}
 @keyframes eventCall{0%{opacity:0;transform:translate(-50%,12px) scale(.88)}18%,62%{opacity:1;transform:translate(-50%,0) scale(1)}100%{opacity:0;transform:translate(-50%,-12px) scale(1.04)}}
 @keyframes resultEnter{from{opacity:0;transform:translateY(26px) scale(.9)}to{opacity:1;transform:translateY(0) scale(1)}}
 
-@media(max-width:1000px){.duel-labels{top:88px;left:30px;right:30px}.status-deck{width:290px}.move-note{width:230px}.call-card{width:210px;padding:14px}.call-card-qr-frame{width:144px;height:144px}}
+@media(max-width:1000px){.duel-labels{top:88px;left:30px;right:30px}.status-deck{width:290px}.move-note{width:230px}.call-card{width:210px;padding:14px}.call-card-qr-frame{width:144px;height:144px}body[data-renderer="fallback"] .accessible-board{top:48.5%;width:min(50vh,34vw);height:min(50vh,34vw)}}
 @media(max-width:720px){
   .topbar{padding:max(15px,env(safe-area-inset-top)) max(14px,env(safe-area-inset-right)) 10px max(14px,env(safe-area-inset-left));gap:8px}
   .game-brand{gap:8px}.game-brand img{width:30px;height:30px}.brand-title strong{font-size:21px}.brand-title span{font-size:9px}
   .top-controls{gap:5px}.icon-button{min-width:32px;width:32px;height:32px;padding:0}.icon-button svg{width:16px;height:16px}
-  .music-button{width:32px;min-width:32px}.music-button span,.connection-status{display:none}
+  .music-button{width:32px;min-width:32px}.music-button span,.connection-status,.game-home span{display:none}
   .duel-labels{top:66px;left:15px;right:15px}.duel-label{font-size:9px;gap:5px}
   .status-deck{left:max(12px,env(safe-area-inset-left));right:max(12px,env(safe-area-inset-right));bottom:max(10px,env(safe-area-inset-bottom));width:auto;padding:12px 14px 10px}
   .status-heading{font-size:9px}.status-deck h1{margin:5px 0 3px;font-size:25px}.status-deck p{min-height:0;font-size:11px;line-height:1.3}
@@ -116,8 +125,9 @@ body[data-renderer="fallback"] .scene-vignette{display:none}
   .call-card-number{grid-area:number;margin:4px 0 0;font-size:14px}
   .call-card-availability{grid-area:availability;margin:2px 0 0;font-size:10px}
   .call-card[data-qr="missing"]{display:block;text-align:center}.call-card[data-qr="missing"] .call-card-copy p{margin-bottom:5px}
-  .move-note{display:none}.event-banner{top:18%}.fallback-board{top:75px;left:12px;right:12px}
-  body[data-renderer="fallback"] .accessible-board{width:min(94vw,calc(100vh - 270px));height:min(94vw,calc(100vh - 270px));border-width:6px}
+  .move-note{display:none}.event-banner{top:18%}.fallback-board{top:94px;left:12px;right:12px}
+  body[data-renderer="fallback"] .accessible-board{top:46%;left:50%;width:min(94vw,calc(100vh - 270px));height:min(94vw,calc(100vh - 270px));border-width:6px}
+  .accessible-board td{font-size:clamp(18px,4.6vw,40px)}
 }
 @media(max-height:640px) and (min-width:721px){.duel-labels{top:73px}.status-deck,.move-note{bottom:12px;padding-top:11px;padding-bottom:10px}.status-deck h1{font-size:26px}.status-deck p{min-height:0}.move-prompt{margin-top:7px;padding-top:7px}.call-card{top:112px}.call-card-qr-frame{width:120px;height:120px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important}}

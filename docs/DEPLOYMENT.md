@@ -140,7 +140,7 @@ The deployed specification currently sets these variables:
 | `TWILIO_MESSAGING_SERVICE_SID` | GitHub repository variable | Messaging Service used for approved WhatsApp Content Templates |
 | `ARCADE_OUTBOUND_MESSAGING_ENABLED` | GitHub repository variable | Explicit outbound station-notification kill switch; only literal `true` enables enqueue and REST delivery |
 | `TWILIO_WHATSAPP_CONTENT_SID_STATION_{ADMITTED,OVERFLOW,CALL_NOW,RESULTS,NEXT_GAME}_{EN_US,PT_BR}` | Ten GitHub repository variables | Approved localized WhatsApp templates; call-now uses a static Phone CTA inside and outside the 24-hour window, while other configured templates are selected outside it |
-| `CR_TTS_VOICE` | Pinned to `xp3gDg85YgFcWpnNVlIu` by deployment | English ElevenLabs Conversation Relay voice for all six games |
+| `CR_TTS_VOICE` | Pinned to `SA7eD52NRr8WAehitVt1` by deployment | English ElevenLabs Conversation Relay voice for all six games |
 | `CR_TTS_VOICE_PT_BR` | GitHub repository variable | Optional Brazilian Portuguese ElevenLabs voice ID; empty uses Relay's `pt-BR` default |
 | `DEFAULT_LOCALE` | GitHub repository variable | Fallback when the dialed number and selected display do not identify a locale; empty defaults to `en-US` |
 | `OPENAI_API_KEY` | Required Container App secret populated from the matching GitHub secret | Enables bounded conversational command interpretation in all six games and both locales; the deployment check rejects an unset key |

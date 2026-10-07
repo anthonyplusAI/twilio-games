@@ -1,9 +1,9 @@
-import type { Intent, GameEvent } from '../shared/types';
+import type { Intent, GameEvent, RaceResult } from '../shared/types';
 import { intentsFromTranscript } from './voice-intent';
-import { greetingLines, lineForEvent, isChattyEvent, raceOverLine } from './voice-lines';
+import { greetingLines, lineForEvent, isChattyEvent, raceOverLine, ordinal } from './voice-lines';
 import { DEFAULT_LOCALE, resolveLocale, type SupportedLocale } from '../shared/i18n/locales';
 import { RACER_MESSAGES } from '../shared/i18n/racer';
-import { createTranslator } from '../shared/i18n/translate';
+import { createTranslator, normalizeForMatching } from '../shared/i18n/translate';
 
 export type CrMessage =
   | { type:'setup'; callSid:string; from?:string; customParameters: Record<string,string> }
@@ -50,6 +50,7 @@ export type RoomLike = {
   hasConfirmedName?(playerId: string): boolean;
   isWaitingForNextRound?(playerId: string): boolean;
   canAdvance?(playerId?: string): boolean;
+  results?(): readonly RaceResult[];
 };
 
 const DTMF_TO_INTENT: Record<string, Intent> = {
@@ -67,7 +68,7 @@ export interface AdapterDeps {
   /** Rebind a reconnecting Conversation Relay transport to its existing Racer player. */
   resumePlayer?: (callSid: string, roomCode: string) => { playerId: string; lane: number; resumed?: boolean; name?:string } | null;
   /** Speak a line to the caller (host wires this to a Relay `{type:'text'}` WS send). */
-  say?: (text: string, isCurrent?: () => boolean) => void;
+  say?: (text: string, isCurrent?: () => boolean) => unknown;
   /** Register/unregister this adapter to receive its room's game events (greeting/countdown/result). */
   register?: (roomCode: string, adapter: ConversationRelayAdapter) => void;
   unregister?: (adapter: ConversationRelayAdapter) => void;
@@ -80,7 +81,11 @@ export interface AdapterDeps {
    *  Wired to the LLM game-host. Absent → no conversational AI (scripted-only, current behavior).
    *  `phase` lets the caller decide command-vs-chat routing. */
   converse?: (roomCode: string, playerId: string, utterance: string, locale: SupportedLocale,
-    isCurrent: () => boolean) => Promise<string | { text: string; phase: string } | null>;
+    isCurrent: () => boolean, readOnlyInquiry?: boolean) => Promise<string | { text: string; phase: string } | null>;
+  /** Snapshot the authoritative finish and current-track leaderboard synchronously at race_over.
+   *  A station can retire this room before an asynchronous host turn finishes. */
+  resultRecap?: (roomCode: string, playerId: string, locale: SupportedLocale,
+    stationManaged: boolean) => string | null;
   /** The room's current phase, so the adapter routes: race → fast commands; else → conversation. */
   phaseOf?: (roomCode: string) => string;
   hasPlayerName?: (roomCode: string, playerId: string) => boolean;
@@ -100,6 +105,12 @@ export class ConversationRelayAdapter {
   // conversational reply captures the epoch it was requested under; if the epoch has since moved
   // (caller interrupted or spoke again), the stale reply is DROPPED instead of spoken over them.
   private turnEpoch = 0;
+  /** A spoken barge-in skips the short call introduction even if it was still queued. */
+  private introEpoch = 0;
+  private introExpired = false;
+  private introPhase: string | null = null;
+  /** Results audio may outlive station room retirement, but never a new caller utterance. */
+  private resultSpeechEpoch = 0;
   private commandLocale: SupportedLocale = DEFAULT_LOCALE;
   private authoritativeName: string | null = null;
   private stationManaged=false;
@@ -135,6 +146,9 @@ export class ConversationRelayAdapter {
   private lineSeq = 0;
   private lastChattyAt = -1e9;
   private recapDone = false;   // one proactive results recap per race (reset on a new countdown/go)
+  private resultRecapText: string | null = null;
+  private resultWinnerName: string | null = null;
+  private resultStandings: readonly RaceResult[] = [];
   private pendingSpeech = new Set<Promise<void>>();
   private lateRacingPromptUntil = 0;
   private lateRacingPromptActive = false;
@@ -142,6 +156,10 @@ export class ConversationRelayAdapter {
   private menuSpeechRevision = 0;
   private lastMenuPrompt: { kind: 'enter_car_select' | 'enter_map_select'; at: number } | null = null;
   onGameEvent(ev: GameEvent): void {
+    const eventPhase = ev.kind === 'enter_car_select' || ev.kind === 'car_picked' ? 'car_select'
+      : ev.kind === 'enter_map_select' || ev.kind === 'map_picked' ? 'map_select' : null;
+    const currentPhase=this.roomCode?this.deps.phaseOf?.(this.roomCode):null;
+    if ((currentPhase&&currentPhase!==this.introPhase) || eventPhase!==this.introPhase) this.introExpired=true;
     const now = Date.now();
     if (ev.kind === 'car_picked' || ev.kind === 'map_picked') {
       // A touch can revise the visible choice without changing the phase. Expire queued menu
@@ -152,6 +170,10 @@ export class ConversationRelayAdapter {
     if ('spokenReplyPlayerId' in ev && ev.spokenReplyPlayerId === this.playerId) return;
     if (ev.kind === 'go' || ev.kind === 'countdown') {
       this.recapDone = false;
+      this.resultRecapText = null;
+      this.resultWinnerName = null;
+      this.resultStandings = [];
+      this.resultSpeechEpoch++;
       this.myFinishPlace = null;
       this.lateRacingPromptUntil = 0;
       this.lateRacingPromptActive = false;
@@ -187,7 +209,10 @@ export class ConversationRelayAdapter {
     }
     if (ev.kind === 'finish' && this.playerId && ev.playerId === this.playerId) {
       this.myFinishPlace = ev.place;
-      if (this.stationManaged) return;
+      // At the final finish, race_over follows in the same event batch. Speak the complete
+      // standings there, without queueing a second place-only line ahead of it.
+      if (this.stationManaged || (this.roomCode
+        && ['results', 'finished'].includes(this.deps.phaseOf?.(this.roomCode) ?? ''))) return;
     }
     // The final recap waits for race_over so the room is on the results screen and hostContext has the
     // actual standings. A finish event can fire earlier while other racers are still driving.
@@ -210,12 +235,23 @@ export class ConversationRelayAdapter {
   }
 
   async whenSpeechSettled(): Promise<void> {
-    await Promise.allSettled([...this.pendingSpeech]);
+    // An in-flight model turn can enqueue actual playback as it resolves. Recheck the set so
+    // station retirement waits for the resulting audio, rather than only for the model response.
+    while (this.pendingSpeech.size) await Promise.allSettled([...this.pendingSpeech]);
   }
 
-  private speakResultRecap(text: string): void {
-    for (const sentence of text.split(/(?<=[.!?])\s+/).map(part => part.trim()).filter(Boolean)) {
-      this.deps.say?.(sentence,this.phaseGuardAny('results','finished'));
+  private trackResultPlayback(delivery: unknown): void {
+    if (!delivery || typeof (delivery as PromiseLike<unknown>).then !== 'function') return;
+    let tracked!: Promise<void>;
+    tracked = Promise.resolve(delivery as PromiseLike<unknown>).then(() => undefined, () => undefined)
+      .finally(() => this.pendingSpeech.delete(tracked));
+    this.pendingSpeech.add(tracked);
+  }
+
+  private speakResultRecap(text: string, asOneCue = false, guard?: () => boolean): void {
+    const lines = asOneCue ? [text] : text.split(/(?<=[.!?])\s+/);
+    for (const line of lines.map(part => part.trim()).filter(Boolean)) {
+      this.trackResultPlayback(this.deps.say?.(line, guard ?? this.phaseGuardAny('results','finished')));
     }
   }
 
@@ -223,21 +259,56 @@ export class ConversationRelayAdapter {
     if (!this.playerId || !this.roomCode || this.recapDone) return;
     if (this.room?.isWaitingForNextRound?.(this.playerId)) return;
     this.recapDone = true;
+    const resultEpoch = ++this.resultSpeechEpoch;
+    const resultCallSid = this.callSid;
+    // The station deliberately tears down its room after the results hold. A committed factual
+    // recap must survive that teardown while Relay drains its audio queue; a new caller utterance
+    // still invalidates it through resultSpeechEpoch and the transport's queue generation.
+    const resultGuard = this.stationManaged
+      ? () => this.recapDone && this.resultSpeechEpoch === resultEpoch && this.callSid === resultCallSid
+      : this.phaseGuardAny('results','finished');
     this.lateRacingPromptUntil = Date.now() + 10_000;
+    // This path is immediate and factual. It can be queued for Relay before the station's
+    // completion transition, unlike a model turn that might resolve after the room retires.
+    const factual = this.deps.resultRecap?.(this.roomCode, this.playerId,
+      this.commandLocale, this.stationManaged);
+    this.resultRecapText = factual ?? null;
+    this.resultStandings = [...(this.room?.results?.() ?? [])];
+    this.resultWinnerName = this.resultStandings.find(result => result.place === 1 && result.finished)?.name ?? null;
+    if (factual) { this.speakResultRecap(factual, true, resultGuard); return; }
     const fallback = () => this.stationManaged
       ? createTranslator(this.commandLocale, RACER_MESSAGES)('voice.waitOperator')
       : raceOverLine(this.myFinishPlace, this.commandLocale);
-    if (!this.deps.converse) { this.speakResultRecap(fallback()); return; }
+    if (!this.deps.converse) { this.speakResultRecap(fallback(), false, resultGuard); return; }
     const epoch = ++this.turnEpoch;
     const prompt = createTranslator(this.commandLocale, RACER_MESSAGES)('voice.raceOverPrompt');
     let speech!: Promise<void>;
-    const resultGuard = this.phaseGuardAny('results','finished');
     const isCurrent = () => epoch === this.turnEpoch && resultGuard();
     speech = this.deps.converse(this.roomCode, this.playerId, prompt, this.commandLocale, isCurrent)
-      .then(reply => { if (isCurrent()) this.speakResultRecap((typeof reply==='string'?reply:reply?.text) || fallback()); })
-      .catch(() => { if (isCurrent()) this.speakResultRecap(fallback()); })
+      .then(reply => { if (isCurrent()) this.speakResultRecap((typeof reply==='string'?reply:reply?.text) || fallback(), false, resultGuard); })
+      .catch(() => { if (isCurrent()) this.speakResultRecap(fallback(), false, resultGuard); })
       .finally(() => this.pendingSpeech.delete(speech));
     this.pendingSpeech.add(speech);
+  }
+
+  private answerResultQuestion(spoken: string): string | null {
+    const rank=racerRequestedRank(spoken,this.commandLocale);
+    if(rank!==null){
+      if(!this.resultStandings.length)return this.resultRecapText;
+      const standing=this.resultStandings.find(result=>result.place===rank);
+      const text=createTranslator(this.commandLocale,RACER_MESSAGES);
+      return standing
+        ?text('voice.resultStanding',{name:standing.name,place:ordinal(rank,this.commandLocale)})
+        :text('voice.resultPlaceUnavailable',{place:ordinal(rank,this.commandLocale)});
+    }
+    const kind = racerResultQuestionKind(spoken, this.commandLocale);
+    if (!kind) return null;
+    if (kind === 'winner' && this.resultWinnerName) return createTranslator(this.commandLocale, RACER_MESSAGES)(
+      'commentary.finishWinner', { name: this.resultWinnerName },
+    );
+    return this.resultRecapText ?? (this.roomCode && this.playerId
+      ? this.deps.resultRecap?.(this.roomCode, this.playerId, this.commandLocale, this.stationManaged) ?? null
+      : null);
   }
 
   ignoreLateRacingPrompt(final: boolean): void {
@@ -265,6 +336,8 @@ export class ConversationRelayAdapter {
         const room = this.deps.findOrCreateRoom(code);
         if (!room) { console.log(`[CR] room ${code} not found → unbound`); return; }
         const beforeJoinPhase=this.deps.phaseOf?.(code)??'lobby';
+        this.introPhase=beforeJoinPhase;
+        if(!this.isCallIntroPhase(beforeJoinPhase))this.introExpired=true;
         this.callSid=msg.callSid;
         if(this.stationManaged)room.expectHumanPlayers?.(this.stationParticipantCount,true);
         else if(this.authoritativeName)room.expectHumanPlayers?.(1,false);
@@ -287,6 +360,18 @@ export class ConversationRelayAdapter {
         // own utterance so Relay TTS pauses naturally between them (one long string read run-on).
         this.deps.register?.(code, this);
         this.deps.onSetupChanged?.(code,beforeJoinPhase);
+        // A queued opening line belongs to this screen. Fast touch navigation expires it before
+        // Relay can speak an obsolete greeting over another menu.
+        if (resumed?.resumed !== true) {
+          const introEpoch = this.introEpoch;
+          this.deps.say?.(greetingLines(this.commandLocale)[0]!,
+            () => {
+              const phase=this.deps.phaseOf?.(code);
+              if(phase&&phase!==this.introPhase)this.introExpired=true;
+              return this.active && this.roomCode === code && this.playerId !== null
+                && this.introEpoch === introEpoch && !this.introExpired;
+            });
+        }
         if(this.waitingForPreviousRacers()) {
           this.deps.say?.(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitNextRound'),
             this.phaseGuard('results'));
@@ -294,12 +379,14 @@ export class ConversationRelayAdapter {
         else if(resumed?.resumed===true){const text=createTranslator(this.commandLocale,RACER_MESSAGES);this.deps.say?.(text('voice.returned'),this.phaseGuard(beforeJoinPhase));if((this.deps.phaseOf?.(code)??'lobby')==='lobby')this.deps.say?.(text('voice.helpLobby'),this.phaseGuard('lobby'));else this.speakPhaseGuidance();}
         else if((this.deps.phaseOf?.(code)??'lobby')==='lobby') {
           const lines=greetingLines(this.commandLocale);
-          for(const line of lines.slice(0,2))this.deps.say?.(line,this.phaseGuard('lobby'));
+          this.deps.say?.(lines[1]!,this.phaseGuard('lobby'));
           this.deps.say?.(lines[2]!,()=>this.phaseGuard('lobby')()&&!this.nameConfirmed());
         } else this.speakPhaseGuidance();
         break;
       }
       case 'prompt': {
+        this.introEpoch++;
+        this.resultSpeechEpoch++;
         const requestEpoch = ++this.turnEpoch;
         const phaseAtFrame=this.roomCode?this.deps.phaseOf?.(this.roomCode)??null:null;
         if(!msg.last&&phaseAtFrame&&['lobby','car_select','map_select'].includes(phaseAtFrame)
@@ -333,7 +420,14 @@ export class ConversationRelayAdapter {
         }
         if(msg.last&&this.stationManaged&&this.roomCode&&['results','finished'].includes(this.deps.phaseOf?.(this.roomCode)??'')){
           if(!this.recapDone)this.requestResultRecap();
-          else this.deps.say?.(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitOperator'));
+          else {
+            const answer=this.answerResultQuestion(msg.voicePrompt);
+            if(answer){
+              const resultEpoch=this.resultSpeechEpoch,resultCallSid=this.callSid;
+              this.speakResultRecap(answer,true,()=>this.recapDone&&this.resultSpeechEpoch===resultEpoch
+                &&this.callSid===resultCallSid);
+            }else this.deps.say?.(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitOperator'));
+          }
           break;
         }
         if (msg.last && isHelpRequest(msg.voicePrompt, this.commandLocale)) {
@@ -382,11 +476,13 @@ export class ConversationRelayAdapter {
             break;
           }
           this.lastFinalCommand={text:normalizedFinal,at:now,source:'race'};
-          const intents = intentsFromTranscript(msg.voicePrompt, this.commandLocale);
+          // The command parser intentionally recognizes short ASR variants, but a word inside a
+          // question or status remark is not permission to move the on-screen car.
+          const { intents, readOnlyInquiry } = racerControlTurn(msg.voicePrompt, this.commandLocale);
           if (!intents.length) {
             const phase = this.roomCode ? this.deps.phaseOf?.(this.roomCode) ?? null : null;
             if (this.deps.converse && this.roomCode && this.playerId) {
-              this.requestConversation(msg.voicePrompt.trim(), requestEpoch, phase);
+              this.requestConversation(msg.voicePrompt.trim(), requestEpoch, phase, readOnlyInquiry);
             } else this.speakPhaseFallback(phase);
             break;
           }
@@ -405,6 +501,8 @@ export class ConversationRelayAdapter {
         break;
       }
       case 'dtmf': {
+        this.introEpoch++;
+        this.resultSpeechEpoch++;
         console.log(`[CR] dtmf digit=${msg.digit}${this.playerId ? '' : ' (NOT BOUND)'}`);
         if (!this.room || !this.playerId) return;
         const phase = this.roomCode ? this.deps.phaseOf?.(this.roomCode) : null;
@@ -426,6 +524,8 @@ export class ConversationRelayAdapter {
         // and clear the current utterance's fired-intents so their next words are read fresh.
         console.log(`[CR] interrupt after ${msg.durationUntilInterruptMs}ms`);
         this.turnEpoch++;
+        this.introEpoch++;
+        this.resultSpeechEpoch++;
         this.setupPromptPhase=null;
         break;
       }
@@ -476,6 +576,10 @@ export class ConversationRelayAdapter {
     this.room = null; this.playerId = null; this.roomCode = null;
   }
 
+  private isCallIntroPhase(phase:string):boolean{
+    return phase==='lobby'||phase==='car_select'||phase==='map_select';
+  }
+
   private phaseGuard(expectedPhase:string):()=>boolean{
     return this.phaseGuardAny(expectedPhase);
   }
@@ -509,14 +613,15 @@ export class ConversationRelayAdapter {
       &&now-previous.at<60;
   }
 
-  private requestConversation(text: string, epoch: number, requestPhase: string | null): void {
+  private requestConversation(text: string, epoch: number, requestPhase: string | null,
+    readOnlyInquiry=false): void {
     if (!text || !this.deps.converse || !this.roomCode || !this.playerId) return;
     const roomCode = this.roomCode, playerId = this.playerId;
     const isActiveTurn = () => epoch === this.turnEpoch && this.active;
     const isCurrent = () => isActiveTurn() && (!requestPhase || !this.deps.phaseOf
       || this.deps.phaseOf(roomCode) === requestPhase);
     let speech!:Promise<void>;
-    speech=this.deps.converse(roomCode, playerId, text, this.commandLocale, isCurrent)
+    speech=this.deps.converse(roomCode, playerId, text, this.commandLocale, isCurrent, readOnlyInquiry)
       .then(result => {
         if (!isActiveTurn()) return;
         if (!result) { if (isCurrent()) this.speakBriefContextCue(requestPhase); return; }
@@ -569,6 +674,77 @@ function playerName(from: string | undefined, locale: SupportedLocale): string {
   const racer = createTranslator(locale, RACER_MESSAGES)('voice.playerName');
   if (from && from.length >= 4) return `${racer} ${from.slice(-4)}`;
   return racer;
+}
+
+function racerResultQuestionKind(spoken: string, locale: SupportedLocale): 'winner' | 'recap' | null {
+  const text=normalizeForMatching(spoken,locale);
+  if(!text)return null;
+  const asking=locale==='pt-BR'
+    ? /^(?:quem|qual|quais|quanto|como|onde|me diga|me fale|repita|leia|pode me dizer|voce pode me dizer|minha|meu|eu (?:ganhei|venci|fiquei|fui)|ganhei|venci|fiquei)\b/.test(text)
+      || /[?？¿]/u.test(spoken)
+    : /^(?:who|what|which|where|how|tell me|remind me|repeat|read|say|can you tell|could you tell|my|did i|did we|was i|were we|am i|are we|have i)\b/.test(text)
+      || /[?？¿]/u.test(spoken);
+  if(!asking)return null;
+  if(locale==='pt-BR'){
+    if(/\b(?:vencedor|vencedora|ganhou|ganhei|venceu|venci|primeiro lugar|primeira colocacao)\b/.test(text))return 'winner';
+    return /\b(?:lugar|posicao|colocacao|classificacao|resultado|pontuacao|tempo|corrida|fui|fiquei|me sai|segundo|segunda|terceiro|terceira)\b/.test(text)
+      ?'recap':null;
+  }
+  if(/\b(?:winner|win|won|first place|came first)\b/.test(text))return 'winner';
+  return /\b(?:place|position|rank|ranking|leaderboard|standing|standings|result|score|time|race|finish|finished|came|come|first|second|third|did i do)\b/.test(text)
+    ?'recap':null;
+}
+
+function racerRequestedRank(spoken:string,locale:SupportedLocale):number|null{
+  const text=normalizeForMatching(spoken,locale);
+  const asksWho=locale==='pt-BR'
+    ? /^(?:quem|qual (?:piloto|jogador))\b/.test(text)
+    : /^(?:who|which (?:racer|player))\b/.test(text);
+  if(!asksWho)return null;
+  const ordinals=locale==='pt-BR'
+    ? ['primeir[oa]|1', 'segund[oa]|2', 'terceir[oa]|3', 'quart[oa]|4', 'quint[oa]|5', 'sext[oa]|6', 'setim[oa]|7', 'oitav[oa]|8', 'non[oa]|9', 'decim[oa]|10']
+    : ['first|1st|1', 'second|2nd|2', 'third|3rd|3', 'fourth|4th|4', 'fifth|5th|5', 'sixth|6th|6', 'seventh|7th|7', 'eighth|8th|8', 'ninth|9th|9', 'tenth|10th|10'];
+  const index=ordinals.findIndex(form=>new RegExp(`\\b(?:${form})\\b`).test(text));
+  return index>=0?index+1:null;
+}
+
+function isRacerInformationalSpeech(spoken:string,locale:SupportedLocale):boolean{
+  const text=normalizeForMatching(spoken,locale);
+  if(!text)return false;
+  const status=locale==='pt-BR'
+    ? /^(?:(?:(?:meu|o meu|o) )?(?:nitro|turbo|poder|impulso|freio) (?:esta|e|tem|acabou|parece|funciona)|(?:eu )?(?:tenho|estou com)|talvez|estou pensando em|penso em|se eu|e se)\b/.test(text)
+    : /^(?:(?:(?:my|the|our|this) )?(?:nitro|power|boost|brakes?) (?:is|are|was|has|had|looks|seems|works|ran)|i(?:'ve| have)? got|i have|we (?:have|got)|i (?:might|may|am thinking about|wonder if)|maybe|perhaps|if|suppose|assuming)\b/.test(text);
+  if(status)return true;
+  const action=locale==='pt-BR'
+    ? '(?:ir|mover|virar|trocar|mudar|acelerar|frear|reduzir|usar|ativar|soltar|nitro|esquerda|direita)'
+    : '(?:go|move|steer|turn|switch|change|accelerate|boost|brake|slow|use|activate|fire|hit|nitro|left|right)';
+  const direct=new RegExp(`^(?:(?:please|por favor) )?(?:(?:can|could|would|will) you (?:(?:please|por favor) )?|(?:voce )?pode (?:(?:please|por favor) )?)?${action}\\b`);
+  if(direct.test(text))return false;
+  const intended=new RegExp(locale==='pt-BR'
+    ? `^(?:eu (?:quero|preciso|gostaria de) |vamos )${action}\\b`
+    : `^(?:i (?:want|need|would like) to |lets |let's )${action}\\b`);
+  if(intended.test(text))return false;
+  return locale==='pt-BR'
+    ? /^(?:o que|qual|quais|como|por que|porque|quem|onde|quando|devo|posso|me diga|me explique|pode me (?:dizer|explicar|falar)|voce pode me (?:dizer|explicar|falar)|eu tenho|meu carro tem|tenho|ha|existe)\b/.test(text)
+      || /\b(?:o que|qual|quais|como|por que)\b/.test(text)
+    : /^(?:what|which|how|why|who|where|when|should i|do i|does|is there|are there|can i|tell me|explain|describe|can you (?:tell|explain|describe)|could you (?:tell|explain|describe)|i have|my car has|there (?:is|are))\b/.test(text)
+      || /\b(?:what|which|how|why|whether)\b/.test(text);
+}
+
+/** A mixed utterance can contain a status fact and a real command. Interpret each
+ * clause separately so a mentioned nitro charge is never consumed by the later boost. */
+function racerControlTurn(spoken:string,locale:SupportedLocale):{intents:Intent[];readOnlyInquiry:boolean}{
+  const clauses=spoken.split(/[.!?;,]|\b(?:and then|then|e depois|entao)\b/iu)
+    .map(part=>part.trim()).filter(Boolean);
+  if(clauses.length>1){
+    const informational=clauses.map(part=>isRacerInformationalSpeech(part,locale));
+    if(informational.some(Boolean)){
+      const intents=clauses.flatMap((part,index)=>informational[index]?[]:intentsFromTranscript(part,locale));
+      return {intents,readOnlyInquiry:intents.length===0};
+    }
+  }
+  const readOnlyInquiry=isRacerInformationalSpeech(spoken,locale);
+  return {intents:readOnlyInquiry?[]:intentsFromTranscript(spoken,locale),readOnlyInquiry};
 }
 
 function isHelpRequest(spoken: string, locale: SupportedLocale): boolean {

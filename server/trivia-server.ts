@@ -862,6 +862,24 @@ export class TriviaServer {
     return accepted;
   }
 
+  voiceBeginRevealDelivery(code: string, playerId: string, questionId: string,
+    questionAttemptId: number): number | null {
+    code = canonicalRoomCode(code);
+    return this.rooms.get(code)?.beginRevealDelivery(playerId, questionId, questionAttemptId) ?? null;
+  }
+
+  voiceQuestionRevealReady(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, deliveryGeneration: number): boolean {
+    code = canonicalRoomCode(code);
+    const room = this.rooms.get(code);
+    if (!room?.questionRevealReady(playerId, questionId, questionAttemptId, deliveryGeneration)) return false;
+    const advanced = room.tick();
+    this.flush(room);
+    if (advanced) this.pushState(code);
+    this.syncTimingLoop();
+    return true;
+  }
+
   voiceQuestionPromptSkipped(code: string, playerId: string, questionId: string,
     questionAttemptId: number): boolean {
     code = canonicalRoomCode(code);
@@ -941,7 +959,7 @@ export class TriviaServer {
   }
 
   voiceBeginAnswerResolution(code: string, playerId: string, questionId: string,
-    questionAttemptId: number, onset?: { choiceId: string; atMs: number }): number | null {
+    questionAttemptId: number, onset?: { choiceId?: string; atMs: number }): number | null {
     code = canonicalRoomCode(code);
     return this.rooms.get(code)?.beginSemanticAnswerResolution(playerId, questionId,
       questionAttemptId, onset) ?? null;

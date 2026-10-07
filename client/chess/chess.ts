@@ -7,7 +7,7 @@ import { createStationDisplay } from '../station-display';
 import { rejectDisplayToken, watchVoiceNumber } from '../station-client';
 import { wireFullscreenToggle } from '../fullscreen-toggle';
 import { getMusicManager } from '../music-manager';
-import { ChessBoardScene } from './chess-board';
+import type { ChessBoardScene } from './chess-board';
 import { ChessConnection, chessWebSocketUrl, type ChessConnectionState } from './chess-net';
 
 const element = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
@@ -66,6 +66,7 @@ let phoneNumber = '';
 let phoneQr = '';
 let phoneQrFailed = false;
 let phoneQrGeneration = 0;
+let pageClosing = false;
 const boardQueue: ChessState[] = [];
 
 document.documentElement.lang = locale;
@@ -117,16 +118,38 @@ wireFullscreenToggle(element<HTMLButtonElement>('fullscreen-button'), {
   exit: isPortuguese ? 'Sair da tela cheia' : 'Exit fullscreen',
 });
 
-try {
-  board = new ChessBoardScene(boardStage);
-  board.setAvailabilityHandler(available => {
-    document.body.dataset.renderer = available ? 'three' : 'fallback';
-    fallback.hidden = available;
-  });
-} catch (error) {
-  console.warn('Voice Chess is showing its accessible board because WebGL is unavailable.', error);
-  document.body.dataset.renderer = 'fallback';
-  fallback.hidden = false;
+// Keep the live 2D board visible while the larger Three.js chunk arrives. A
+// slow asset connection no longer delays room status or the first playable view.
+void loadChessScene();
+
+async function loadChessScene(): Promise<void> {
+  try {
+    const { ChessBoardScene } = await import('./chess-board');
+    if (pageClosing) return;
+    const scene = new ChessBoardScene(boardStage);
+    const current = latestState ?? visualState;
+    if (current) synchronizeScene(scene, current);
+    board = scene;
+    scene.setAvailabilityHandler(available => {
+      document.body.dataset.renderer = available ? 'three' : 'fallback';
+      fallback.hidden = available;
+    });
+  } catch (error) {
+    console.warn('Voice Chess is showing its live 2D board because WebGL is unavailable.', error);
+    document.body.dataset.renderer = 'fallback';
+    fallback.hidden = false;
+  }
+}
+
+function synchronizeScene(scene: ChessBoardScene, current: ChessState): void {
+  scene.setHumanColor(current.humanColor);
+  scene.setPosition(current.pieces);
+  scene.setLastMove(current.lastMove?.from ?? null, current.lastMove?.to ?? null);
+  const checkedKing = current.lastMove?.check
+    ? current.pieces.find(piece => piece.type === 'k' && piece.color === current.turn)?.square ?? null : null;
+  scene.setCheck(checkedKing);
+  scene.setPendingMove(current.pendingMove?.from ?? null, current.pendingMove?.to ?? null);
+  scene.setSelection(current.selection?.from ?? null);
 }
 
 if (stationLaunchRequested && !stationDisplay.displayToken) {
@@ -180,6 +203,7 @@ void (document.fonts?.ready ?? Promise.resolve()).then(() => new Promise<void>(r
 });
 
 addEventListener('pagehide', () => {
+  pageClosing = true;
   if (bannerTimer) clearTimeout(bannerTimer);
   phoneQrGeneration += 1;
   stopVoiceNumberUpdates?.();
@@ -486,8 +510,17 @@ function renderAccessiblePosition(state: ChessState): void {
       const piece = positions.get(square);
       const cell = document.createElement('td');
       cell.className = (('abcdefgh'.indexOf(file) + rank) % 2 ? 'dark' : 'light')
-        + (state.lastMove?.to === square ? ' last' : '');
-      cell.textContent = piece ? symbols[piece.color][piece.type] : '';
+        + (state.lastMove?.to === square ? ' last' : '')
+        + (state.selection?.from === square ? ' selected' : '')
+        + (state.pendingMove?.from === square ? ' pending-from' : '')
+        + (state.pendingMove?.to === square ? ' pending-to' : '');
+      cell.dataset.square = square.toUpperCase();
+      if (piece) {
+        const glyph = document.createElement('span');
+        glyph.className = `fallback-piece ${piece.color === 'w' ? 'ivory' : 'obsidian'}`;
+        glyph.textContent = symbols[piece.color][piece.type];
+        cell.append(glyph);
+      }
       cell.setAttribute('aria-label', piece
         ? isPortuguese
           ? `${capitalize(pieceName(piece.type))} das ${piece.color === 'w' ? 'brancas' : 'pretas'} em ${square.toUpperCase()}`
@@ -515,6 +548,7 @@ function localizeStaticCopy(): void {
   const home = element<HTMLAnchorElement>('game-home');
   home.setAttribute('aria-label', 'Voltar à página de jogos da Twilio');
   home.title = 'Voltar à página de jogos da Twilio';
+  element<HTMLElement>('game-home-label').textContent = 'Voltar';
   humanLabel.textContent = 'Você · Marfim';
   computerLabel.textContent = 'O Arquimago · Obsidiana';
   element<HTMLElement>('mobile-last-label').textContent = 'Último lance';
@@ -530,7 +564,7 @@ function localizeStaticCopy(): void {
   resultKicker.textContent = 'Duelo encerrado';
   resultTitle.textContent = 'Vitória';
   resultReplay.textContent = 'Jogar de novo';
-  element<HTMLElement>('fallback-explanation').textContent = 'Os gráficos 3D não estão disponíveis. A posição atual aparece abaixo.';
+  element<HTMLElement>('fallback-explanation').textContent = 'Tabuleiro ao vivo · modo 2D';
   accessibleBoard.setAttribute('aria-label', 'Tabuleiro de xadrez ao vivo');
 }
 

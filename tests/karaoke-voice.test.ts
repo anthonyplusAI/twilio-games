@@ -19,14 +19,144 @@ const finalHits = (song: KaraokeSong, score: number) => song.chart.words.map((wo
 }));
 
 describe('KaraokeVoiceSession', () => {
-  it('never starts Media Stream scoring when disclosure playback was unverified', () => {
+  it('keeps the technology introduction on its screen but expires it when touch advances the menu', () => {
+    const game = karaokeVoiceGame('en-US', true);
+    const singer = game.connect('CA-INTRO-TOUCH');
+    const introduction = singer.spoken.findIndex(line => /Twilio Conversation Relay/i.test(line));
+    expect(introduction).toBeGreaterThanOrEqual(0);
+    expect(singer.guards[introduction]?.()).toBe(true);
+    expect(game.room.setName(singer.playerId, 'Ada')).toBe(true);
+    game.stateChanged();
+    expect(singer.guards[introduction]?.()).toBe(true);
+    expect(game.room.advance(singer.playerId)).toBe(true);
+    game.stateChanged();
+    expect(singer.guards[introduction]?.()).toBe(false);
+    expect(game.room.selectSong(singer.playerId, KARAOKE_RUNTIME_SONGS[0]!.id)).toBe(true);
+    expect(game.room.advance(singer.playerId)).toBe(true);
+    game.stateChanged();
+    expect(game.room.phase).toBe('loading');
+    expect(singer.guards[introduction]?.()).toBe(false);
+  });
+
+  it('starts the selected song on explicit consent even if disclosure playback is still pending', () => {
     const game = karaokeVoiceGame('en-US', false, true);
     const singer = game.connect('CA-UNVERIFIED');
     singer.prompt('Ada');
     singer.prompt('song one');
     singer.prompt('start');
-    expect(game.room.phase).toBe('song_select');
+    expect(game.room.phase).toBe('loading');
     expect(game.handoffs).toHaveLength(0);
+  });
+
+  it.each(['start now', "let's start", 'please start this song now', 'I want to begin singing'])
+  ('starts promptly on clear conversational English consent: %s', phrase => {
+    const game = karaokeVoiceGame('en-US', false, true);
+    const singer = game.connect(`CA-START-${phrase}`);
+    singer.prompt('Ada');
+    singer.prompt('song one');
+    singer.prompt(phrase);
+    expect(game.room.phase).toBe('loading');
+  });
+
+  it.each(['começar agora', 'vamos começar esta música', 'quero iniciar a música agora'])
+  ('starts promptly on clear conversational Portuguese consent: %s', phrase => {
+    const game = karaokeVoiceGame('pt-BR', false, true);
+    const singer = game.connect(`CA-COMECO-${phrase}`);
+    singer.prompt('Ana');
+    singer.prompt('música um');
+    singer.prompt(phrase);
+    expect(game.room.phase).toBe('loading');
+  });
+
+  it.each(['do not start yet', 'maybe start later', 'can we start?', 'Start?', 'I said start in the song title'])
+  ('does not infer consent from ambiguous or negative English speech: %s', phrase => {
+    const game = karaokeVoiceGame('en-US', false, true);
+    const singer = game.connect(`CA-NO-START-${phrase}`);
+    singer.prompt('Ada');
+    singer.prompt('song one');
+    singer.prompt(phrase);
+    expect(game.room.phase).toBe('song_select');
+  });
+
+  it('does not let a semantic action treat a question as third-party scoring consent', async () => {
+    const game = karaokeVoiceGame('en-US', false, true, async () => ({ kind: 'action', actionId: 'start_with_consent' }));
+    const singer = game.connect('CA-QUESTION-CONSENT');
+    singer.prompt('Ada');
+    singer.prompt('song one');
+    singer.prompt('Start?');
+    await flushMicrotasks();
+    expect(game.room.phase).toBe('song_select');
+  });
+
+  it('answers a request for disclosure details after “start by” without inferring consent', () => {
+    const game = karaokeVoiceGame('en-US', false, true);
+    const singer = game.connect('CA-START-BY-INFO');
+    singer.prompt('Ada');
+    singer.prompt('song one');
+    singer.prompt('Start by telling me where my voice goes');
+    expect(game.room.phase).toBe('song_select');
+    expect(singer.spoken.at(-1)).toMatch(/live voice.*third-party.*Start.*pound key/i);
+    singer.prompt('start');
+    expect(game.room.phase).toBe('loading');
+  });
+
+  it('answers scoring and interruption questions while disclosure is still queued', () => {
+    const game = karaokeVoiceGame('en-US', true);
+    const singer = game.connect('CA-SCORING-QUESTION');
+    singer.prompt('Ada');
+    singer.prompt('song one');
+    singer.prompt('Where does my voice go?');
+    expect(singer.spoken.at(-1)).toMatch(/live voice.*third-party.*do not have to wait.*Start.*pound key/i);
+    singer.prompt('Do I have to wait?');
+    expect(singer.spoken.at(-1)).toMatch(/do not have to wait/i);
+    expect(game.room.phase).toBe('song_select');
+  });
+
+  it('grounds open-ended scoring answers in a consent fact without starting the song', async () => {
+    const game = karaokeVoiceGame('en-US', false, false, async request => {
+      expect(request.facts).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: 'scoring', text: expect.stringMatching(/third-party speech recognition/i) }),
+      ]));
+      return { kind: 'answer', factId: 'scoring' };
+    });
+    const singer = game.connect('CA-SCORING-FACT');
+    singer.prompt('Ada');
+    singer.prompt('song one');
+    singer.prompt('I would like the scoring details');
+    await flushMicrotasks();
+    expect(singer.spoken.at(-1)).toMatch(/live voice.*third-party.*do not have to wait/i);
+    expect(game.room.phase).toBe('song_select');
+  });
+
+  it('keeps broad song-list questions read-only even if the model suggests a selection', async () => {
+    const requests: KaraokeIntentRequest[] = [];
+    const game = karaokeVoiceGame('en-US', false, false, async request => {
+      requests.push(request);
+      return { kind: 'action', actionId: 'select_song', targetId: 'a-thousand-miles' };
+    });
+    const singer = game.connect('CA-SONG-LIST-INQUIRY');
+    singer.prompt('Ada');
+    singer.prompt('What songs do you have?');
+    await flushMicrotasks();
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.actions).toEqual([]);
+    expect(game.selectionCalls).toBe(0);
+    expect(singer.spoken.at(-1)).toMatch(/Available songs/i);
+  });
+
+  it('answers title questions without selecting a song, while a polite play request selects it', () => {
+    const game = karaokeVoiceGame('en-US');
+    const singer = game.connect('CA-SONG-QUESTION');
+    singer.prompt('Ada');
+    singer.prompt('How long is Never Gonna Give You Up?');
+    expect(game.selectionCalls).toBe(0);
+    expect(singer.spoken.at(-1)).toMatch(/Never Gonna Give You Up.*45 seconds/i);
+    singer.prompt('Can you tell me about A Thousand Miles?');
+    expect(game.selectionCalls).toBe(0);
+    expect(singer.spoken.at(-1)).toMatch(/A Thousand Miles.*45 seconds/i);
+    singer.prompt('Can you play A Thousand Miles?');
+    expect(game.selectionCalls).toBe(1);
+    expect(game.room.state().selectedSong?.id).toBe('a-thousand-miles');
   });
 
   it('does not replay optional loading speech when the caller barges in', async () => {
@@ -68,29 +198,56 @@ describe('KaraokeVoiceSession', () => {
     expect(singer.guards[catalogIndex]?.()).toBe(false);
   });
 
-  it('invalidates consent when a shared display reselects the same song', async () => {
+  it('requires a fresh explicit start after a shared display reselects the same song', async () => {
     const game = karaokeVoiceGame('en-US', true);
     const singer = game.connect('CA-SAME-SONG');
     singer.prompt('Ada');
     singer.prompt('song one');
-    game.playAllSpeech();
-    await Promise.resolve();
     expect(game.room.selectSong(singer.playerId, 'never-gonna-give-you-up')).toBe(true);
     game.stateChanged();
-    singer.prompt('start');
     expect(game.room.phase).toBe('song_select');
+    singer.prompt('start');
+    expect(game.room.phase).toBe('loading');
   });
 
-  it('uses a later keypad start after a completed disclosure but repeats an incomplete disclosure', async () => {
+  it('accepts keypad start during disclosure without replaying it', () => {
     const game = karaokeVoiceGame('en-US', true);
     const singer = game.connect('CA-KEYPAD-START');
     singer.prompt('Ada');
     singer.prompt('song one');
+    const disclosures = singer.spoken.filter(line => /third-party speech recognition service/i.test(line)).length;
     singer.dtmf('#');
+    expect(game.room.phase).toBe('loading');
+    expect(singer.spoken.filter(line => /third-party speech recognition service/i.test(line))).toHaveLength(disclosures);
+  });
+
+  it('accepts a spoken start after barge-in without repeating the disclosure', () => {
+    const game = karaokeVoiceGame('en-US', true);
+    const singer = game.connect('CA-INTERRUPT-CONSENT');
+    singer.prompt('Ada');
+    singer.prompt('song one');
+    const disclosures = singer.spoken.filter(line => /third-party speech recognition service/i.test(line)).length;
+    singer.interrupt();
+    singer.prompt('start');
+    expect(game.room.phase).toBe('loading');
+    expect(singer.spoken.filter(line => /third-party speech recognition service/i.test(line))).toHaveLength(disclosures);
+  });
+
+  it('rejects a delayed semantic start after the selected song changes', async () => {
+    let resolve!: (value: KaraokeIntentResult) => void;
+    const pending = new Promise<KaraokeIntentResult>(finish => { resolve = finish; });
+    const game = karaokeVoiceGame('en-US', true, false, () => pending);
+    const singer = game.connect('CA-STALE-CONSENT');
+    singer.prompt('Ada');
+    singer.prompt('song one');
+    singer.prompt('I agree, play this now');
+    expect(game.room.selectSong(singer.playerId, 'a-thousand-miles')).toBe(true);
+    game.stateChanged();
+    resolve({ kind: 'action', actionId: 'start_with_consent' });
+    await flushMicrotasks();
     expect(game.room.phase).toBe('song_select');
-    game.playAllSpeech();
-    await Promise.resolve();
-    singer.dtmf('#');
+    expect(game.room.state().selectedSong?.id).toBe('a-thousand-miles');
+    singer.prompt('start');
     expect(game.room.phase).toBe('loading');
   });
 
@@ -129,9 +286,9 @@ describe('KaraokeVoiceSession', () => {
       title: 'Never Gonna Give You Up',
       start: 'start singing',
       gameplay: /number or title.*say Start.*watch the display.*each word.*target/i,
-      consent: /live voice.*sent to a third-party speech recognition service.*scoring.*Say Start to consent/i,
-      result: /Ada, your score is 1,234, with a best combo of 1/i,
-      station: /results are on the display.*check your messages.*game coin/i,
+      consent: /scoring.*live voice.*third-party speech recognition service.*Say Start anytime to consent/i,
+      result: /Score 1,234, best combo 1/i,
+      station: /Results on screen.*check your messages.*coin instructions to replay/i,
     },
     {
       locale: 'pt-BR' as const,
@@ -140,9 +297,9 @@ describe('KaraokeVoiceSession', () => {
       title: 'Luz no Ritmo',
       start: 'começar a cantar',
       gameplay: /número ou título.*diga Começar.*olhe para a tela.*cada palavra.*alvo/i,
-      consent: /voz ao vivo.*enviada a um serviço terceirizado de reconhecimento de fala.*pontuação.*Diga Começar para consentir/i,
-      result: /Ana, sua pontuação é 1\.234, com melhor combo de 1/i,
-      station: /resultados estão na tela.*mensagens.*moedas do jogo/i,
+      consent: /pontuação.*voz ao vivo.*serviço terceirizado de reconhecimento de fala.*Diga Começar a qualquer momento para consentir/i,
+      result: /Pontuação 1\.234, melhor combo 1/i,
+      station: /Resultados na tela.*mensagens.*conseguir moedas.*jogar novamente/i,
     },
   ])('runs the final-only setup, explicit start, media handoff, and station result in $locale', async row => {
     const game = karaokeVoiceGame(row.locale);
@@ -150,6 +307,7 @@ describe('KaraokeVoiceSession', () => {
 
     expect(singer.spoken).toHaveLength(2);
     expect(singer.spoken.at(-1)).toMatch(row.locale === 'pt-BR' ? /primeiro nome/i : /first name/i);
+    expect(singer.spoken[0]).toMatch(/Twilio Conversation Relay/i);
     singer.prompt(row.name, false);
     expect(game.room.phase).toBe('lobby');
     singer.prompt(row.name);
@@ -224,6 +382,9 @@ describe('KaraokeVoiceSession', () => {
     expect(singer.spoken.join(' ')).toMatch(row.result);
     expect(singer.spoken.join(' ')).toMatch(row.station);
     expect(singer.spoken.filter(line => row.result.test(line))).toHaveLength(1);
+    const resultLine = singer.spoken.find(line => row.result.test(line));
+    expect(resultLine).toMatch(row.station);
+    expect(resultLine!.trim().split(/\s+/).length).toBeLessThanOrEqual(18);
 
     singer.interrupt();
     expect(singer.spoken.filter(line => row.result.test(line))).toHaveLength(1);
@@ -259,16 +420,11 @@ describe('KaraokeVoiceSession', () => {
     expect(game.selectionCalls).toBe(1);
   });
 
-  it('requires completed consent disclosure but never blocks media handoff on preparation TTS', async () => {
+  it('never blocks explicit start or media handoff on consent and preparation TTS', async () => {
     const game = karaokeVoiceGame('en-US', true);
     const singer = game.connect('CA-CONSENT');
     singer.prompt('Ada');
     singer.prompt('Never Gonna Give You Up');
-    singer.prompt('start');
-    expect(game.room.phase).toBe('song_select');
-
-    game.playAllSpeech();
-    await Promise.resolve();
     singer.prompt('start');
     expect(game.room.phase).toBe('loading');
     game.room.ready(game.room.state().loadingGeneration);
@@ -282,14 +438,11 @@ describe('KaraokeVoiceSession', () => {
     expect(game.handoffs).toHaveLength(1);
   });
 
-  it('accepts a conservatively estimated disclosure only before a later explicit final consent', async () => {
+  it('never infers consent from speech playback or a partial prompt', async () => {
     const game = karaokeVoiceGame('en-US', true);
     const singer = game.connect('CA-ESTIMATED-CONSENT');
     singer.prompt('Ada');
     singer.prompt('song one');
-    singer.prompt('start');
-    expect(game.room.phase).toBe('song_select');
-
     game.playAllSpeech('estimated');
     await Promise.resolve();
     expect(game.room.phase).toBe('song_select');
@@ -312,10 +465,6 @@ describe('KaraokeVoiceSession', () => {
     expect(singer.spoken.length).toBe(beforeRepeat + 1);
     singer.dtmf('1');
     expect(game.room.state().selectedSong?.title).toBe('Luz no Ritmo');
-    singer.dtmf('#');
-    expect(game.room.phase).toBe('song_select');
-    expect(singer.spoken.at(-1)).toMatch(/Diga Começar para consentir/i);
-    await Promise.resolve();
     singer.prompt('começar');
 
     expect(game.room.phase).toBe('loading');
@@ -338,7 +487,7 @@ describe('KaraokeVoiceSession', () => {
     expect(resumed.spoken).toEqual([
       'You are back, Ada.',
       'Your song is Never Gonna Give You Up.',
-      'When scoring is enabled, your live voice is sent to a third-party speech recognition service for scoring. Say Start to consent and begin.',
+      'With scoring, your live voice goes to a third-party speech recognition service. Say Start anytime to consent and sing.',
     ]);
     await Promise.resolve();
     resumed.prompt('start');
@@ -375,15 +524,14 @@ describe('KaraokeVoiceSession', () => {
     game.stateChanged();
     game.stateChanged();
 
-    expect(resumed.spoken).toHaveLength(2);
-    expect(resumed.spoken[0]).toContain('score is 900');
-    expect(resumed.spoken[1]).toMatch(/check your messages/i);
+    expect(resumed.spoken).toHaveLength(1);
+    expect(resumed.spoken[0]).toMatch(/Score 900, best combo .*Results on screen.*check your messages/i);
     expect(resumed.guards.every(guard => guard?.())).toBe(true);
     resumed.session.handleClose();
     expect(game.leaveCalls).toBe(0);
   });
 
-  it('waits for result lines and conversational score readbacks to settle', async () => {
+  it('queues one complete station result and waits for score readbacks to settle', async () => {
     const game = karaokeVoiceGame('en-US', true, false,
       async () => ({ kind: 'answer', factId: 'result' }));
     const singer = game.connect('CA-RESULT-DRAIN', true);
@@ -407,16 +555,10 @@ describe('KaraokeVoiceSession', () => {
     expect(game.room.finalizeMediaScore(singer.playerId, 900,
       finalHits(game.room.state().selectedSong!, 900))).toBe(true);
     game.stateChanged();
-    expect(singer.spoken.slice(-2)).toEqual([
-      expect.stringContaining('score is 900'),
-      expect.stringMatching(/check your messages/i),
-    ]);
+    expect(singer.spoken.at(-1)).toMatch(/Score 900, best combo .*Results on screen.*check your messages/i);
 
     let settled = false;
     const drain = singer.session.whenResultSpeechSettled().then(() => { settled = true; });
-    await flushMicrotasks();
-    expect(settled).toBe(false);
-    game.playNextSpeech();
     await flushMicrotasks();
     expect(settled).toBe(false);
     game.playNextSpeech();
@@ -504,6 +646,8 @@ describe('matchKaraokeSong', () => {
     expect(matchKaraokeSong('Song one, no, actually song two', KARAOKE_RUNTIME_SONGS)?.id)
       .toBe('a-thousand-miles');
     expect(matchKaraokeSong("Don't play song one", KARAOKE_RUNTIME_SONGS)).toBeNull();
+    expect(matchKaraokeSong('How long is Never Gonna Give You Up?', KARAOKE_RUNTIME_SONGS)).toBeNull();
+    expect(matchKaraokeSong('Can you tell me about A Thousand Miles?', KARAOKE_RUNTIME_SONGS)).toBeNull();
   });
   it('matches locale numbers and complete normalized titles', () => {
     const songs = KARAOKE_RUNTIME_SONGS;

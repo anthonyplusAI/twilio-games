@@ -3,7 +3,7 @@ import { DEFAULT_ENGLISH_RELAY_VOICE, relayVoiceForLocale } from '../server/rela
 
 describe('Conversation Relay voice selection', () => {
   it('uses the requested voice for every English game call by default', () => {
-    expect(DEFAULT_ENGLISH_RELAY_VOICE).toBe('xp3gDg85YgFcWpnNVlIu');
+    expect(DEFAULT_ENGLISH_RELAY_VOICE).toBe('SA7eD52NRr8WAehitVt1');
     expect(relayVoiceForLocale('en-US', {})).toBe(DEFAULT_ENGLISH_RELAY_VOICE);
   });
 

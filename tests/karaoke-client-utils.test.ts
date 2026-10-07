@@ -15,10 +15,12 @@ import {
   KaraokeServerClock,
   clampKaraokeVisualOffsetMs,
   estimateKaraokeClockOffset,
+  karaokeAdaptiveRenderMode,
   karaokeAnimatedTransform,
   karaokeAudioSchedule,
   karaokeAudioPreflightRequired,
   karaokeCameraShot,
+  karaokeCanInstallOptionalAssets,
   karaokeClientAudioUrl,
   karaokeCountdownCount,
   karaokeCountdownSongTimeMs,
@@ -29,6 +31,7 @@ import {
   karaokeDisplayPairingRequired,
   karaokeLocalTestingAllowed,
   karaokeHighwayPose,
+  karaokeInitialRenderMode,
   karaokeRenderPixelRatio,
   karaokeResponsiveHighwayTransform,
   karaokeStageIntensity,
@@ -41,6 +44,25 @@ import { cloneKaraokeVenueConfig, karaokeVenueModel } from '../shared/karaoke-ve
 import { KARAOKE_COUNTDOWN_MS } from '../shared/karaoke-protocol';
 
 describe('Voice Karaoke client timeline utilities', () => {
+  it('keeps optional scene swaps away from live audio and scoring phases', () => {
+    expect(['lobby', 'song_select', 'results'].every(phase =>
+      karaokeCanInstallOptionalAssets(phase as 'lobby' | 'song_select' | 'results'))).toBe(true);
+    expect(['loading', 'countdown', 'performing', 'finalizing'].every(phase =>
+      !karaokeCanInstallOptionalAssets(phase as 'loading' | 'countdown' | 'performing' | 'finalizing'))).toBe(true);
+    expect(karaokeCanInstallOptionalAssets(null)).toBe(true);
+  });
+
+  it('drops expensive effects after sustained slow frames and restores them only after recovery', () => {
+    expect(karaokeInitialRenderMode('ANGLE (SwiftShader)', 16)).toBe('light');
+    expect(karaokeInitialRenderMode('Apple M3', 4)).toBe('light');
+    expect(karaokeInitialRenderMode('Apple M3', 8)).toBe('full');
+    expect(karaokeAdaptiveRenderMode('full', 26, 0)).toBe('light');
+    expect(karaokeAdaptiveRenderMode('full', 20, 0)).toBe('full');
+    expect(karaokeAdaptiveRenderMode('light', 16, 4_000)).toBe('light');
+    expect(karaokeAdaptiveRenderMode('light', 16, 10_000)).toBe('full');
+    expect(karaokeAdaptiveRenderMode('light', Number.NaN, 20_000)).toBe('light');
+  });
+
   it('maps future, late, and completed server starts onto the Web Audio clock', () => {
     expect(karaokeAudioSchedule(12_000, 10_000, 4, 45_000)).toEqual({
       contextStartTime: 6, offsetSeconds: 0, ended: false,

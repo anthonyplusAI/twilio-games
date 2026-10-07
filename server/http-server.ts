@@ -25,13 +25,14 @@ import type { KaraokeLyricRecognizerFactory } from './karaoke-lyric-recognizer';
 import { KaraokeVoiceSession, type KaraokeSpeechOutcome, type KaraokeVoiceEndHandoff,
   type KaraokeVoiceSnapshot } from './karaoke-voice';
 import { ConversationRelayAdapter } from './conversation-relay';
+import { ordinal } from './voice-lines';
 import { twimlConnectRelay, twimlHangup, twimlKaraokeMedia, twimlMessage, twimlEmpty, twimlSayAndHangup } from './twiml';
 import { validateTwilioSignature } from './twilio-signature';
 import { ManifestStore } from './manifest-store';
 import { parseManifest } from '../shared/asset-manifest';
 import { mergeMapConfig } from '../shared/maps-store';
 import { seedMapsPlan } from './maps-seed';
-import { DEFAULT_ROOM } from '../shared/constants';
+import { DEFAULT_ROOM, LAP_TARGET } from '../shared/constants';
 import { appendResults, MAX_LEADERBOARD_HISTORY, parseLeaderboard, parseLeaderboardStrict, topEntries, type LeaderboardEntry } from '../shared/leaderboard-store';
 import {
   appendKaraokeResult,
@@ -152,9 +153,9 @@ export function isRacerAdvanceWord(spoken: string, locale: SupportedLocale = DEF
   const text = normalizeForMatching(spoken, locale);
   // Questions and explicit negation should be interpreted in context, never treated as a
   // fast-path command just because they contain "start" or "race".
-  if (spoken.trim().endsWith('?')
+  if (/[?？¿]/u.test(spoken)
     || /\b(?:don't|dont|don t|do not|can't|cannot|not|never|no|nao|nem|wait|hold|espere|espera)\b/.test(text)
-    || /^(?:when|why|what|which|how|quando|por que|qual|como)\b/.test(text)) return false;
+    || /^(?:when|why|what|which|who|how|can|could|would|should|do|does|did|is|are|am|may|will|tell me|explain|quando|por que|qual|quais|quem|como|posso|podemos|poderia|devo|sera|voce pode)\b/.test(text)) return false;
   return locale === 'pt-BR'
     ? /\b(comecar|iniciar|proximo|proxima|continuar|pronto|pronta|revanche|correr|corrida|de novo|correr de novo|vamos correr|sim)\b/.test(text)
     : /\b(start|begin|go|next|continue|ready|race|rematch|again|race again|go again|yes)\b/.test(text);
@@ -1545,9 +1546,16 @@ export class HttpServer {
           :phase==='map_select'?(room.canSelectMap(playerId)?'active':'waiting'):'active';
       },
       onIntent: () => this.analyticsObserver.voiceCommand('racer'),
+      resultRecap: (roomCode, playerId, locale, isStationManaged) => {
+        const room = this.game.findRoom(roomCode);
+        if (!room || !['results', 'finished'].includes(room.phase)) return null;
+        const context = this.hostContext(room, playerId, locale, isStationManaged);
+        context.stationManaged = isStationManaged;
+        return this.racerResultsRecap(context, locale);
+      },
       // Interpret only actions and answers available on this caller's current screen. The
       // authoritative room applies them after the model returns; model prose never drives state.
-      converse: async (roomCode, playerId, utterance, locale, isCurrent) => {
+      converse: async (roomCode, playerId, utterance, locale, isCurrent, readOnlyInquiry = false) => {
         const room = this.game.findRoom(roomCode);
         if (!room || !isCurrent()) return null;
         if (utterance.trim().startsWith('(') && ['results', 'finished'].includes(room.phase)) {
@@ -1557,7 +1565,8 @@ export class HttpServer {
         }
         return this.resolveRacerVoiceTurn(room, playerId, utterance, locale, isCurrent,
           stationManaged, stationFirstName !== null,
-          !stationManaged || Boolean(stationReadyEntryId && this.arcadeApi?.stationVoiceSetupReady(stationReadyEntryId)));
+          !stationManaged || Boolean(stationReadyEntryId && this.arcadeApi?.stationVoiceSetupReady(stationReadyEntryId)),
+          readOnlyInquiry);
       },
     });
 
@@ -2023,18 +2032,18 @@ export class HttpServer {
       legalMoves: (code, callSid, locale) => this.chess.voiceLegalMoves(code, callSid, locale),
       interpret: (spoken, locale, context, isCurrent) => {
         if (!isCurrent()) return Promise.resolve({ kind: 'none' as const });
-        const actions: VoiceInterpretAction[] = [
+        const actions: VoiceInterpretAction[] = context.readOnlyInquiry ? [] : [
           { id: 'help', description: 'Explain the current chess controls' },
         ];
-        if (context.legalMoves.length) actions.push({
+        if (!context.readOnlyInquiry && context.legalMoves.length) actions.push({
           id: 'propose_move', description: 'Propose a legal chess move; confirmation is still required',
           targetIds: context.legalMoves.map(move => move.id),
         });
-        if (context.pendingMove) {
+        if (!context.readOnlyInquiry && context.pendingMove) {
           actions.push({ id: 'confirm', description: 'Confirm the pending move' });
           actions.push({ id: 'cancel', description: 'Cancel the pending move' });
         }
-        if (context.phase === 'finished' && !stationManaged()) {
+        if (!context.readOnlyInquiry && context.phase === 'finished' && !stationManaged()) {
           actions.push({ id: 'reset', description: 'Start a new standalone game' });
         }
         return interpretVoiceTurn(this.llm, {
@@ -2200,6 +2209,10 @@ export class HttpServer {
         this.trivia.voiceQuestionAnswerCueReady(code, playerId, questionId, attemptId, deliveryGeneration),
       questionAnswerCueSkipped: (code, playerId, questionId, attemptId) =>
         this.trivia.voiceQuestionAnswerCueSkipped(code, playerId, questionId, attemptId),
+      beginRevealDelivery: (code, playerId, questionId, attemptId) =>
+        this.trivia.voiceBeginRevealDelivery(code, playerId, questionId, attemptId),
+      questionRevealReady: (code, playerId, questionId, attemptId, deliveryGeneration) =>
+        this.trivia.voiceQuestionRevealReady(code, playerId, questionId, attemptId, deliveryGeneration),
       queueEarlyAnswer: (code, playerId, questionId, attemptId, choiceId) =>
         this.trivia.voiceQueueEarlyAnswer(code, playerId, questionId, attemptId, choiceId),
       pauseAudio: (code, questionId, attemptId) => this.trivia.voicePauseAudio(code, questionId, attemptId),
@@ -3089,7 +3102,7 @@ export class HttpServer {
 
   private async resolveRacerVoiceTurn(room: Room, playerId: string, utterance: string,
     locale: SupportedLocale, isCurrent: () => boolean, stationManaged: boolean,
-    nameLocked: boolean, setupReady: boolean): Promise<{ text: string; phase: string } | null> {
+    nameLocked: boolean, setupReady: boolean, readOnlyInquiry = false): Promise<{ text: string; phase: string } | null> {
     const phase = room.phase;
     if (['results', 'finished'].includes(phase)) {
       const direct = this.directSelection(room, playerId, utterance, locale, nameLocked, setupReady);
@@ -3146,6 +3159,7 @@ export class HttpServer {
       ] as const;
       for (const [id, description] of commands) actions.push({ id, description });
       fact('screen', text('voice.help'));
+      facts.push(...this.racerLiveFacts(room, playerId, locale));
     } else if (phase === 'results' || phase === 'finished') {
       const context = this.hostContext(room, playerId, locale, stationManaged, current);
       context.stationManaged = stationManaged;
@@ -3156,13 +3170,20 @@ export class HttpServer {
     }
 
     const resolution = await interpretVoiceTurn(this.llm, {
-      game: 'racer', phase, locale, transcript: utterance, actions, choices, facts,
+      game: 'racer', phase, locale, transcript: utterance,
+      actions: readOnlyInquiry ? [] : actions, choices, facts,
     });
     if (!current()) return null;
     if (resolution.kind === 'answer') {
-      const answer = facts.find(candidate => candidate.id === resolution.factId);
+      // Position and charges change every tick. Refresh those facts after the
+      // interpreter returns so the caller hears the current race, not a stale snapshot.
+      const answer = (phase === 'racing'
+        ? [...facts.filter(candidate => candidate.id === 'screen'),
+          ...this.racerLiveFacts(room, playerId, locale)] : facts)
+        .find(candidate => candidate.id === resolution.factId);
       return answer ? { text: answer.text, phase } : null;
     }
+    if (readOnlyInquiry) return { text: phase === 'racing' ? text('voice.help') : facts[0]?.text ?? text('voice.help'), phase };
     if (resolution.kind === 'clarify') {
       const clarification = phase === 'car_select'
         ? locale === 'pt-BR' ? 'Qual carro na tela você quer?' : 'Which car on screen do you want?'
@@ -3329,19 +3350,53 @@ export class HttpServer {
   }
 
   private racerResultsRecap(context:HostContext,locale:SupportedLocale):string{
-    const rank=context.myCurrentTrackRank,count=context.currentTrackRankedRunCount??0,map=context.selectedMap??(locale==='pt-BR'?'esta pista':'this track');
+    const rank=context.myCurrentTrackRank,count=context.currentTrackRankedRunCount??0;
     const time=(seconds:number)=>locale==='pt-BR'?seconds.toFixed(2).replace('.',','):seconds.toFixed(2);
-    const outro=createTranslator(locale,RACER_MESSAGES)('voice.waitOperator');
     if(locale==='pt-BR'){
-      const race=context.myPlace?(context.myFinishTime?`Você terminou esta corrida na posição ${context.myPlace}, com o tempo de ${time(context.myFinishTime)} segundos.`:`Você não concluiu a corrida e ficou na posição ${context.myPlace}.`):'A corrida terminou.';
-      const leader=context.allTimeBest?`O melhor tempo em ${map} é de ${context.allTimeBest.name}, com ${time(context.allTimeBest.time)} segundos.`:`Veja a classificação da pista na tela.`;
-      const board=rank&&count?`Seu tempo ficou em ${rank}º lugar entre ${count} corridas concluídas nesta pista.`:'';
-      return `${race} ${leader}${board?` ${board}`:''} ${context.stationManaged?outro:'Diga revanche quando quiser correr novamente.'}`;
+      const race=context.myPlace?(context.myFinishTime
+        ?`${context.myPlace===1?'Você venceu em 1º lugar':`Você ficou em ${ordinal(context.myPlace,locale)}`} com ${time(context.myFinishTime)} segundos.`
+        :`Você ficou em ${ordinal(context.myPlace,locale)} sem concluir a corrida.`):'A corrida terminou.';
+      const board=rank&&count?`Você está em ${ordinal(rank,locale)} de ${count} na classificação.`
+        :context.allTimeBest?`${context.allTimeBest.name} lidera a classificação com ${time(context.allTimeBest.time)} segundos.`
+          :'A classificação está na tela.';
+      return `${race} ${board}${context.stationManaged
+        ? ' Para correr novamente, veja nas mensagens as instruções sobre moedas.'
+        : ' Quer correr de novo?'}`;
     }
-    const race=context.myPlace?(context.myFinishTime?`You finished this race in place ${context.myPlace}, with a time of ${time(context.myFinishTime)} seconds.`:`You did not finish the race and placed ${context.myPlace}.`):'The race is complete.';
-    const leader=context.allTimeBest?`${context.allTimeBest.name} leads ${map} with the fastest time of ${time(context.allTimeBest.time)} seconds.`:'Check the track leaderboard on the display.';
-    const board=rank&&count?`Your run ranks number ${rank} out of ${count} completed runs on this track.`:'';
-    return `${race} ${leader}${board?` ${board}`:''} ${context.stationManaged?outro:'Say rematch when you want to race again.'}`;
+    const race=context.myPlace?(context.myFinishTime
+      ?`${context.myPlace===1?'You won first place':`You placed ${ordinal(context.myPlace,locale)}`} in ${time(context.myFinishTime)} seconds.`
+      :`You placed ${ordinal(context.myPlace,locale)} without finishing.`):'The race is complete.';
+    const board=rank&&count?`You rank ${ordinal(rank,locale)} of ${count} on the leaderboard.`
+      :context.allTimeBest?`${context.allTimeBest.name} leads the leaderboard at ${time(context.allTimeBest.time)} seconds.`
+        :'The leaderboard is on the display.';
+    return `${race} ${board}${context.stationManaged
+      ? ' For another race, check your messages for game coin instructions.'
+      : ' Want another race?'}`;
+  }
+
+  private racerLiveFacts(room: Room, playerId: string, locale: SupportedLocale): VoiceInterpretFact[] {
+    const snapshot = room.snapshot();
+    const me = snapshot?.cars.find(car => car.id === playerId);
+    if (!snapshot || !me) return [];
+    const leader = snapshot.cars.find(car => car.place === 1);
+    const lap = Math.min(LAP_TARGET, Math.max(1, me.lap));
+    const count = snapshot.cars.length;
+    if (locale === 'pt-BR') return [
+      { id: 'position', text: `Você está em ${ordinal(me.place, locale)} de ${count} na corrida.` },
+      { id: 'leader', text: leader?.id === playerId ? 'Você está liderando a corrida.'
+        : leader ? `${leader.name} está liderando a corrida.` : 'Ainda não há líder definido.' },
+      { id: 'lap', text: `Você está na volta ${lap} de ${LAP_TARGET}.` },
+      { id: 'nitro', text: me.powerActive > 0 ? 'Seu nitro está ativo agora.'
+        : `Você tem ${me.power} ${me.power === 1 ? 'carga' : 'cargas'} de nitro.` },
+    ];
+    return [
+      { id: 'position', text: `You are ${ordinal(me.place, locale)} of ${count} in the race.` },
+      { id: 'leader', text: leader?.id === playerId ? 'You are leading the race.'
+        : leader ? `${leader.name} is leading the race.` : 'There is no race leader yet.' },
+      { id: 'lap', text: `You are on lap ${lap} of ${LAP_TARGET}.` },
+      { id: 'nitro', text: me.powerActive > 0 ? 'Your nitro is active now.'
+        : `You have ${me.power} nitro ${me.power === 1 ? 'charge' : 'charges'}.` },
+    ];
   }
 
   /** Test seam for verifying voice host context. */

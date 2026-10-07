@@ -10,7 +10,7 @@ import { renderCarThumbnailsAsync, renderMapThumbnail, renderBoostThumbnailAsync
 import { AttractMode } from './attract';
 import { Announcer } from './announcer';
 import QRCode from 'qrcode';
-import { fetchMaps, loadMapWorld, applyTrackTransform, CANONICAL_TRACK } from './map-world';
+import { fetchMaps, loadMapWorld, disposeMapWorld, applyTrackTransform, CANONICAL_TRACK } from './map-world';
 import { CurvedTrack } from './track-path';
 import { surfaceOptsFromPath } from './track-surface';
 import { mergeLevel, resolveCarScale, resolveItemScale, resolveCamera } from '../shared/level';
@@ -151,10 +151,15 @@ function paintGauge(snap: import('../shared/types').WorldSnapshot | null): void 
 lobbyEl.style.display = 'none';   // legacy overlay retired; the Screens overlay handles pre/post-race
 // SSB-style front-end (lobby → car grid → map select → results). Host actions go back to the server.
 const screens = new Screens(document.getElementById('app')!, {
-  onAdvance: (room, phase, playerId) => conn.displayAdvance(room, phase, playerId),
-  onBack: (room, phase) => conn.displayBack(room, phase),
-  onSelectCar: (room, playerId, index) => conn.displaySelectCar(room, playerId, index),
-  onSelectMap: (room, playerId, map) => conn.displaySelectMap(room, playerId, map),
+  // Shared displays may act for the current caller seat; a standalone player connection may only
+  // act for itself. Sending display_* from a player gets rejected as bad_display_auth.
+  onAdvance: (room, phase, playerId) => isDisplay
+    ? conn.displayAdvance(room, phase, playerId) : conn.advance(),
+  onBack: (room, phase) => isDisplay ? conn.displayBack(room, phase) : conn.back(),
+  onSelectCar: (room, playerId, index) => isDisplay
+    ? conn.displaySelectCar(room, playerId, index) : conn.selectCar(index),
+  onSelectMap: (room, playerId, map) => isDisplay
+    ? conn.displaySelectMap(room, playerId, map) : conn.selectMap(map),
 }, locale, stationDisplay.active);
 
 const roomCode = new URLSearchParams(location.search).get('room') ?? DEFAULT_ROOM;
@@ -225,22 +230,22 @@ let flowEpoch = 0;
 // timeout so it can never hang. Once lifted it stays gone.
 const veilEl = document.getElementById('veil')!;
 let veilLifted = false;
-let assetsReady = false;    // manifest (car GLBs) + backdrop map applied (set by loadAssetsInBackground)
+let assetsReady = false;    // optional manifest + backdrop map applied (set by loadAssetsInBackground)
 let stationEngineStateReady = false;
 let raceSceneReady = !stationDisplay.active;
 function maybeMarkStationReady(): void {
   if (raceSceneReady && stationEngineStateReady) stationDisplay.markEngineReady();
 }
-let wantAttract = false;    // a menu screen wants the demo running (gated until assetsReady)
+let wantAttract = false;    // a menu screen wants the demo running
+let attractFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 let attractFrames = 0;
 function liftVeil() { if (veilLifted) return; veilLifted = true; veilEl.classList.add('hide'); }
 setTimeout(liftVeil, 8000);   // safety: never trap the user behind the veil
 
 // Attract mode: live autopilot gameplay behind the glass menu. Runs whenever a menu screen is up
 // and no real race is live; the renderer's spectator/field camera frames the AI pack automatically.
-// Lift the veil only after attract has painted a few settled frames — by which point models + map
-// are loaded (attract doesn't START until assetsReady), so the reveal shows REAL cars on the neon
-// track, never primitive boxes mid-assembly.
+// Lift the veil only after attract has painted a few settled frames. On a slow connection, the
+// procedural cars and track are a complete scene; optional models can arrive later.
 const attract = new AttractMode((snap) => {
   renderer.render(snap);
   paintSplitLabels(null);
@@ -251,10 +256,11 @@ const attract = new AttractMode((snap) => {
 function startAttract() {
   if (stationDisplay.active && raceLive) return;
   wantAttract = true;
-  // Don't show the demo until car MODELS + map are loaded — otherwise ensureCar caches primitive
-  // BOXES for the demo ids and they never upgrade. The boot veil covers this wait. Once assets are
-  // ready, maybeStartAttract() kicks it off.
-  if (assetsReady) reallyStartAttract();
+  if (assetsReady) { reallyStartAttract(); return; }
+  if (!attractFallbackTimer) attractFallbackTimer = setTimeout(() => {
+    attractFallbackTimer = null;
+    if (wantAttract && !raceLive) reallyStartAttract();
+  }, 1_200);
 }
 function reallyStartAttract() {
   if (raceLive || attract.isRunning) return;
@@ -264,12 +270,14 @@ function reallyStartAttract() {
 }
 function stopAttract() {
   wantAttract = false;
+  if (attractFallbackTimer) { clearTimeout(attractFallbackTimer); attractFallbackTimer = null; }
   if (attract.isRunning) { attract.stop(); renderer.clearCars(); }   // remove the demo cars so they
                                                                      // don't sit frozen during the race
   renderer.setSpectator(isDisplay);   // back to the player's chase cam (or stay spectator on a display)
 }
 
 let racePreparationGeneration = 0;
+let raceAssetPrioritized = false;
 let latestRaceSnapshot: import('../shared/types').WorldSnapshot | null = null;
 let resolveRaceSnapshot: ((snapshot: import('../shared/types').WorldSnapshot) => void) | null = null;
 let cancelRaceSnapshot: (() => void) | null = null;
@@ -280,11 +288,14 @@ function cancelPendingRaceSnapshot(): void {
 }
 conn.onItems((items, map) => {
   cancelPendingRaceSnapshot();
+  activeMapPreviewController?.abort();
+  activeMapPreviewController = null;
   const generation = ++racePreparationGeneration;
+  raceAssetPrioritized = false;
   if (!stationDisplay.active) {
     buffer.clear(); raceLive = true; stopAttract();
     renderer.buildItems(items);
-    void applyLevel(map ?? urlMap).then(applied => {
+    void loadRaceLevelWithinBudget(map ?? urlMap, generation).then(applied => {
       if (applied && generation === racePreparationGeneration && raceLive) renderer.buildItems(items);
     });
     return;
@@ -295,6 +306,10 @@ conn.onItems((items, map) => {
 });
 conn.onSnapshot((s) => {
   stationEngineStateReady = true; maybeMarkStationReady();
+  if (!raceAssetPrioritized) {
+    assets.prioritizeCarIndexes(s.cars.map(car => car.carIndex));
+    raceAssetPrioritized = true;
+  }
   latestRaceSnapshot = s;
   if (resolveRaceSnapshot) {
     const resolve = resolveRaceSnapshot;
@@ -316,6 +331,7 @@ conn.onLobby((m) => {
   stationEngineStateReady = true; maybeMarkStationReady();
   if (raceLive) {
     racePreparationGeneration += 1; cancelPendingRaceSnapshot(); latestRaceSnapshot = null; buffer.clear(); raceLive = false;
+    invalidateLevelLoad();
     liftVeil();
   }
   flowPhase = 'lobby'; flowEpoch++; big.textContent = '';
@@ -330,8 +346,10 @@ conn.onLobby((m) => {
 });
 conn.onSelectState((m) => {
   stationEngineStateReady = true; maybeMarkStationReady();
+  assets.prioritizeCarIndexes(m.players.flatMap(player => player.carIndex === null ? [] : [player.carIndex]));
   if (raceLive) {
     racePreparationGeneration += 1; cancelPendingRaceSnapshot(); latestRaceSnapshot = null; buffer.clear();
+    invalidateLevelLoad();
     liftVeil();
   }
   raceLive = false; flowEpoch++; big.textContent = '';
@@ -348,6 +366,7 @@ conn.onSelectState((m) => {
 let lastBoard: { map: string | null; entries: GlobalEntry[] } | null = null;
 conn.onResults((m) => {
   racePreparationGeneration += 1; cancelPendingRaceSnapshot();
+  if (raceLive) invalidateLevelLoad();
   stationDisplay.markEngineResultsReady();
   stationEngineStateReady = true; maybeMarkStationReady();
   raceLive = false; raceSceneReady = !stationDisplay.active; flowPhase = 'results'; const epoch = ++flowEpoch; big.textContent = '';
@@ -402,13 +421,23 @@ const GANTRY_FILES = { start: 'racer/track/starting_line.glb', finish: 'racer/tr
 const RACER_CONFIG_TIMEOUT_MS = 15_000;
 const RACER_MAP_TIMEOUT_MS = 45_000;
 const RACER_STANDALONE_MAP_TIMEOUT_MS = 15_000;
+const RACER_RACE_SCENE_BUDGET_MS = 1_800;
 /** The map currently loaded into the renderer, so applyLevel() can skip redundant reloads. */
 let loadedMap: string | null = null;
 let levelLoadGeneration = 0;
+let levelLoadController: AbortController | null = null;
+let activeMapPreviewController: AbortController | null = null;
 
-function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+function invalidateLevelLoad(): number {
+  levelLoadGeneration += 1;
+  levelLoadController?.abort();
+  levelLoadController = null;
+  return levelLoadGeneration;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string, onTimeout?: () => void): Promise<T> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} timed out`)), timeoutMs);
+    const timer = setTimeout(() => { onTimeout?.(); reject(new Error(`${label} timed out`)); }, timeoutMs);
     void promise.then(value => { clearTimeout(timer); resolve(value); }, error => { clearTimeout(timer); reject(error); });
   });
 }
@@ -419,24 +448,34 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): 
  * lobby chose (the server sends it on the `items` message) — the host display has no ?map= param, so
  * this is the ONLY way its chosen level + per-car scales get applied. Idempotent per map name.
  */
-async function applyLevel(mapName: string | null | undefined): Promise<boolean> {
+async function applyLevel(mapName: string | null | undefined, deadlineSignal?: AbortSignal): Promise<boolean> {
   // No map (or unchanged): just (re)place gantries on whatever track is current and bail.
-  const generation = ++levelLoadGeneration;
-  if (!mapName) { await renderer.setStartFinishLines(GANTRY_FILES, {}); return true; }
+  const generation = invalidateLevelLoad();
+  if (!mapName) { void renderer.setStartFinishLines(GANTRY_FILES, {}); return true; }
   if (mapName === loadedMap) return true;
+  const controller = new AbortController();
+  levelLoadController = controller;
+  const abortForDeadline = () => controller.abort();
+  deadlineSignal?.addEventListener('abort', abortForDeadline, { once: true });
+  if (deadlineSignal?.aborted) controller.abort();
   let gantryOffsets: { start?: GantryOffset; finish?: GantryOffset } = {};
   let applied = false;
   try {
-    const maps = await withTimeout(fetchMaps(), RACER_CONFIG_TIMEOUT_MS, 'map catalog');
+    if (controller.signal.aborted) return false;
+    const maps = await withTimeout(fetchMaps(controller.signal), RACER_CONFIG_TIMEOUT_MS, 'map catalog', () => controller.abort());
+    if (controller.signal.aborted || generation !== levelLoadGeneration) return false;
     const cfg = maps[mapName];
     if (!cfg) throw new Error(`map ${mapName} is unavailable`);
     if (cfg) {
       // Normalize the saved config into a full level (fills defaults; optional lighting/effects/props).
       const level = mergeLevel(cfg);
       const world = stationDisplay.active
-        ? await withTimeout(loadMapWorld(cfg), RACER_MAP_TIMEOUT_MS, `map ${mapName}`)
-        : await withTimeout(loadMapWorld(cfg), RACER_STANDALONE_MAP_TIMEOUT_MS, `map ${mapName}`);
-      if (generation !== levelLoadGeneration) return false;
+        ? await withTimeout(loadMapWorld(cfg, controller.signal), RACER_MAP_TIMEOUT_MS, `map ${mapName}`, () => controller.abort())
+        : await withTimeout(loadMapWorld(cfg, controller.signal), RACER_STANDALONE_MAP_TIMEOUT_MS, `map ${mapName}`, () => controller.abort());
+      if (controller.signal.aborted || generation !== levelLoadGeneration) {
+        if (world) disposeMapWorld(world);
+        return false;
+      }
       if (!world) throw new Error(`map ${mapName} failed to load`);
       renderer.setMapWorld(world);
       // Race stays in canonical sim space; the map's saved transform places the scenery.
@@ -451,27 +490,66 @@ async function applyLevel(mapName: string | null | undefined): Promise<boolean> 
       renderer.setItemScale((kind) => resolveItemScale(level, kind));
       renderer.setCamera(resolveCamera(level));
       gantryOffsets = { start: level.startLine, finish: level.finishLine };
-      if (stationDisplay.active) await propsReady;
-      else void propsReady;
-      if (generation !== levelLoadGeneration) return false;
+      void propsReady;
+      if (controller.signal.aborted || generation !== levelLoadGeneration) return false;
       applied = true;
     }
   } catch (error) {
-    if (stationDisplay.active) throw error;
-    if (generation !== levelLoadGeneration) return false;
+    if (deadlineSignal?.aborted || generation !== levelLoadGeneration) return false;
+    console.warn('Using the generated Voice Racer scene because the selected map is unavailable.', error);
     renderer.setMapWorld(null); renderer.setPath(null); renderer.setCamera(null);
+    applyTrackTransform(renderer.getTrackGroup(), CANONICAL_TRACK);
     renderer.resetLevelPresentation();
     renderer.setCarScale(() => 1); renderer.setItemScale(() => 1); void renderer.setProps([]);
     loadedMap = null;
+  } finally {
+    deadlineSignal?.removeEventListener('abort', abortForDeadline);
+    if (levelLoadController === controller) levelLoadController = null;
   }
-  if (generation !== levelLoadGeneration) return false;
+  if (deadlineSignal?.aborted || generation !== levelLoadGeneration) return false;
   // Bookend the track AFTER setPath so the gantry auto-fits the level's track width.
   const linesReady = renderer.setStartFinishLines(GANTRY_FILES, gantryOffsets);
-  if (stationDisplay.active) await linesReady;
-  else void linesReady;
-  if (generation !== levelLoadGeneration) return false;
+  void linesReady;
+  if (deadlineSignal?.aborted || generation !== levelLoadGeneration) return false;
   if (applied) loadedMap = mapName;
   return true;
+}
+
+function resetToGeneratedRaceScene(): void {
+  invalidateLevelLoad(); // late map requests cannot replace a live fallback race
+  loadedMap = null;
+  renderer.setMapWorld(null);
+  renderer.setPath(null);
+  applyTrackTransform(renderer.getTrackGroup(), CANONICAL_TRACK);
+  renderer.setCamera(null);
+  renderer.resetLevelPresentation();
+  renderer.setCarScale(() => 1);
+  renderer.setItemScale(() => 1);
+  void renderer.setProps([]);
+  // The tiny authored gantries can upgrade the procedural race without waiting for a
+  // map download; the branded primitive gantries remain visible until they arrive.
+  void renderer.setStartFinishLines(GANTRY_FILES, {});
+}
+
+/** Give a cached or quickly loaded map a short window, then play on the complete generated track. */
+async function loadRaceLevelWithinBudget(mapName: string | null | undefined, generation: number): Promise<boolean> {
+  if (generation !== racePreparationGeneration) return false;
+  if (!mapName) { resetToGeneratedRaceScene(); return true; }
+  if (mapName === loadedMap) { invalidateLevelLoad(); return true; }
+  resetToGeneratedRaceScene();
+  const budgetController = new AbortController();
+  try {
+    const applied = await withTimeout(
+      applyLevel(mapName, budgetController.signal), RACER_RACE_SCENE_BUDGET_MS, 'race map',
+      () => budgetController.abort(),
+    );
+    if (!applied && generation === racePreparationGeneration) resetToGeneratedRaceScene();
+  } catch {
+    budgetController.abort();
+    if (generation !== racePreparationGeneration) return false;
+    resetToGeneratedRaceScene();
+  }
+  return generation === racePreparationGeneration;
 }
 
 async function prepareRaceScene(
@@ -485,9 +563,11 @@ async function prepareRaceScene(
       resolveRaceSnapshot = resolve;
       cancelRaceSnapshot = () => reject(new Error('race preparation cancelled'));
     });
-    await assets.waitForGameplayAssets(first.cars.map(car => car.carIndex));
+    // Car and scenery files are optional presentation assets. Waiting for them before ready() can
+    // stall every caller's race for tens of seconds on a weak display connection.
+    void assets.loadManifest().catch(() => { /* procedural cars remain playable */ });
     if (generation !== racePreparationGeneration) return;
-    if (!await applyLevel(mapName) || generation !== racePreparationGeneration) return;
+    if (!await loadRaceLevelWithinBudget(mapName, generation) || generation !== racePreparationGeneration) return;
     renderer.buildItems(items);
     renderer.clearCars();
     const splitScreen = first.cars.length === 2;
@@ -526,7 +606,7 @@ async function loadAssetsInBackground(): Promise<void> {
   // Portrait captures run independently from the backdrop. A slow map or prop must not leave the car
   // grid spinning, and a live station race pauses this cosmetic work instead of cancelling it.
   const capturesMayStart = new Promise<void>(resolve => setTimeout(resolve, 1500));
-  const canCapture = () => !stationDisplay.active || !raceLive;
+  const canCapture = () => !raceLive;
   void (async () => {
     await capturesMayStart;
     await renderCarThumbnailsAsync(assets, (i, url) => screens.setCarThumb(i, url), 256, canCapture);
@@ -557,10 +637,18 @@ async function loadAssetsInBackground(): Promise<void> {
     const maps = await fetchMaps();
     const previews: Record<string, string> = {};
     for (const [name, cfg] of Object.entries(maps)) {
-      while (!canCapture()) await new Promise(resolve => setTimeout(resolve, 250));
-      await whenIdle();
-      while (!canCapture()) await new Promise(resolve => setTimeout(resolve, 250));
-      const url = await renderMapThumbnail(cfg);
+      let url = '';
+      let cancelled = false;
+      do {
+        while (!canCapture()) await new Promise(resolve => setTimeout(resolve, 250));
+        await whenIdle();
+        while (!canCapture()) await new Promise(resolve => setTimeout(resolve, 250));
+        const controller = new AbortController();
+        activeMapPreviewController = controller;
+        try { url = await renderMapThumbnail(cfg, 480, controller.signal); }
+        finally { if (activeMapPreviewController === controller) activeMapPreviewController = null; }
+        cancelled = controller.signal.aborted;
+      } while (cancelled); // a race interrupted this preview; retry after returning to the menu
       if (url) previews[name] = url;
     }
     screens.setMapPreviews(previews);

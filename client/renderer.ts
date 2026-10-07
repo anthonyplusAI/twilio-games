@@ -18,6 +18,11 @@ import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { AssetLoader } from './asset-loader';
 
 const RENDER_ASSET_TIMEOUT_MS = 30_000;
+const MAX_RENDER_PIXELS = 3_200_000;
+// The fallback terrain spans thousands of units. A 0.1 near plane leaves too little depth
+// precision for its almost-coplanar road, especially halfway through a three-lap race.
+const CAMERA_NEAR = 1;
+const FALLBACK_TERRAIN_Y = -0.35;
 import { buildCar,buildPlayerMarker } from './car-factory';
 import { themeAtZ } from '../shared/zones';
 import { shouldCycleZones } from './zone-gate';
@@ -51,11 +56,12 @@ export class Renderer {
   private sun: THREE.DirectionalLight;
   private ambient: THREE.HemisphereLight;
   private ground!: THREE.Mesh;         // surrounding terrain (theme-tinted); set in buildWorld()
+  private fallbackBermMaterial!: THREE.MeshStandardMaterial;
 
   constructor(private readonly mount: HTMLElement, private assets?: AssetLoader) {
     const size = this.viewportSize();
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
-    this.renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    this.renderer.setPixelRatio(this.pixelRatioFor(size));
     this.renderer.setSize(size.width, size.height);
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -72,17 +78,17 @@ export class Renderer {
     const pmrem = new THREE.PMREMGenerator(this.renderer);
     this.scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
 
-    this.camera = new THREE.PerspectiveCamera(46, size.width / size.height, 0.1, 4000);
+    this.camera = new THREE.PerspectiveCamera(46, size.width / size.height, CAMERA_NEAR, 4000);
     this.splitCameras = [
-      new THREE.PerspectiveCamera(46, size.width / Math.max(1, size.height / 2), 0.1, 4000),
-      new THREE.PerspectiveCamera(46, size.width / Math.max(1, size.height / 2), 0.1, 4000),
+      new THREE.PerspectiveCamera(46, size.width / Math.max(1, size.height / 2), CAMERA_NEAR, 4000),
+      new THREE.PerspectiveCamera(46, size.width / Math.max(1, size.height / 2), CAMERA_NEAR, 4000),
     ];
 
     // Key light (sun) with a real shadow frustum covering the play area.
     this.sun = new THREE.DirectionalLight(0xfff4e2, 2.1);
     this.sun.position.set(60, 110, 40);
     this.sun.castShadow = true;
-    this.sun.shadow.mapSize.set(2048, 2048);
+    this.sun.shadow.mapSize.set(1024, 1024);
     const sc = this.sun.shadow.camera as THREE.OrthographicCamera;
     sc.left = -60; sc.right = 60; sc.top = 120; sc.bottom = -120; sc.near = 1; sc.far = 400;
     this.sun.shadow.bias = -0.0004;
@@ -110,6 +116,9 @@ export class Renderer {
     addEventListener('resize', () => {
       const next = this.viewportSize();
       this.camera.aspect = next.width / next.height; this.camera.updateProjectionMatrix();
+      const pixelRatio = this.pixelRatioFor(next);
+      this.renderer.setPixelRatio(pixelRatio);
+      this.composer.setPixelRatio(pixelRatio);
       this.renderer.setSize(next.width, next.height);
       this.setComposerSize(next.width, this.splitScreenActive ? Math.ceil(next.height / 2) : next.height);
     });
@@ -120,6 +129,13 @@ export class Renderer {
       width: Math.max(1, this.mount.clientWidth || innerWidth),
       height: Math.max(1, this.mount.clientHeight || innerHeight),
     };
+  }
+
+  private pixelRatioFor(size: { width: number; height: number }): number {
+    // Large shared displays and high-DPI phones should not silently render millions of extra
+    // bloom and shadow pixels. Keep a bounded GPU workload while retaining crisp 1080p output.
+    return Math.min(devicePixelRatio || 1, 2,
+      Math.sqrt(MAX_RENDER_PIXELS / (size.width * size.height)));
   }
 
   private composer!: EffectComposer;
@@ -172,13 +188,21 @@ export class Renderer {
    * Pass null to revert to the generated track. The sky dome stays (backdrop either way).
    */
   setMapWorld(world: THREE.Object3D | null): void {
-    if (this.mapWorld) { this.scene.remove(this.mapWorld); this.mapWorld = null; }
+    if (this.mapWorld === world) {
+      this.generatedWorld.visible = world === null && this.path === null;
+      return;
+    }
+    if (this.mapWorld) {
+      this.scene.remove(this.mapWorld);
+      this.disposeOwnedTree(this.mapWorld);
+      this.mapWorld = null;
+    }
     if (world) {
       this.mapWorld = world;
       this.scene.add(world);
       this.generatedWorld.visible = false;   // hide our asphalt/curbs/gantry; map is the world
     } else {
-      this.generatedWorld.visible = true;
+      this.generatedWorld.visible = this.path === null;
     }
   }
 
@@ -202,9 +226,16 @@ export class Renderer {
 
   /** (Re)build the curved 3-lane surface from the current path + width + track-glow. */
   private rebuildSurface(): void {
-    if (this.trackSurface) { this.trackContent.remove(this.trackSurface); this.trackSurface = null; }
+    if (this.trackSurface) {
+      this.trackContent.remove(this.trackSurface);
+      this.disposeOwnedTree(this.trackSurface);
+      this.trackSurface = null;
+    }
     this.pulseMats = [];
-    if (!this.path) return;
+    if (!this.path) {
+      this.generatedWorld.visible = this.mapWorld === null;
+      return;
+    }
     this.generatedWorld.visible = false;   // the curved surface replaces our straight asphalt
     this.trackSurface = buildTrackSurface(this.path, { ...this.surfaceOpts, glow: this.trackEmissive });
     this.trackSurface.traverse(o => {
@@ -266,6 +297,7 @@ export class Renderer {
   /** Load + place decoration props (visual-only) in the track content group. */
   async setProps(props: PlacedProp[]): Promise<void> {
     this.trackContent.remove(this.propsGroup);
+    this.disposeOwnedTree(this.propsGroup);
     this.propsGroup = new THREE.Group();
     this.trackContent.add(this.propsGroup);
     const target = this.propsGroup;
@@ -301,7 +333,10 @@ export class Renderer {
    *  demo to a real race so the demo's autopilot cars don't linger frozen on the track, and on the
    *  reverse so a stale race car doesn't haunt the menu backdrop. */
   clearCars(): void {
-    for (const [, wrapper] of this.carMeshes) this.trackContent.remove(wrapper);
+    for (const [, wrapper] of this.carMeshes) {
+      this.disposeCarVisuals(wrapper);
+      this.trackContent.remove(wrapper);
+    }
     this.carMeshes.clear();
     this.carIndex.clear();
     this.nextCarIndex = 0;
@@ -321,6 +356,16 @@ export class Renderer {
   resetLevelPresentation(): void {
     this.lightingLocked = false;
     this.sunDir.set(-180, 70, -120).normalize();
+    this.sun.color.set(0xfff4e2);
+    this.sun.intensity = 2.1;
+    this.ambient.color.set(0xbfd4ff);
+    this.ambient.groundColor.set(0x202840);
+    this.ambient.intensity = 0.7;
+    const shadowCamera = this.sun.shadow.camera as THREE.OrthographicCamera;
+    shadowCamera.left = -60; shadowCamera.right = 60;
+    shadowCamera.top = 120; shadowCamera.bottom = -120;
+    shadowCamera.near = 1; shadowCamera.far = 400;
+    shadowCamera.updateProjectionMatrix();
     this.renderer.toneMappingExposure = 1.15;
     this.bloom.strength = 0.45; this.bloom.radius = 0.7; this.bloom.threshold = 0.85;
     const fog = this.scene.fog as THREE.FogExp2;
@@ -339,8 +384,10 @@ export class Renderer {
 
   /** Build the static world: sky dome, terrain, asphalt track, markings, curbs, start gantry. */
   private buildWorld(): void {
-    const FULL_LEN = TRACK_LEN * 3;          // covers all laps of travel
-    const midZ = TRACK_LEN;
+    const startZ = -TRACK_LEN;
+    const endZ = RACE_LEN + TRACK_LEN;
+    const FULL_LEN = endZ - startZ;          // full race plus approach/runout at both ends
+    const midZ = (startZ + endZ) / 2;
     // The track group rides in the scene; its inner content group is shifted by -TRACK_CENTER so
     // the group's ORIGIN (where the gizmo attaches + rotation pivots) sits at the race center,
     // while cars/items/markings inside keep normal sim coords. Moving trackGroup moves it all.
@@ -358,30 +405,44 @@ export class Renderer {
     this.sky = makeSkyDome();
     this.scene.add(this.sky);
 
-    // Surrounding terrain (wide; theme-tinted each frame via this.ground.material).
+    // Keep the terrain below the road by more than a depth-buffer rounding step. At the
+    // far end of the fallback race a 0.05-unit gap could make sand paint over the asphalt.
+    // The curbs reach down to this level so the elevated road still has a finished edge.
     this.ground = new THREE.Mesh(
       new THREE.PlaneGeometry(4000, FULL_LEN + 4000),
       new THREE.MeshStandardMaterial({ color: 0x3a4a63, roughness: 1 }));
-    this.ground.rotation.x = -Math.PI / 2; this.ground.position.set(0, -0.05, midZ);
+    this.ground.rotation.x = -Math.PI / 2; this.ground.position.set(0, FALLBACK_TERRAIN_Y, midZ);
     this.ground.receiveShadow = true; this.generatedWorld.add(this.ground);
 
     // Asphalt track surface.
     const asphalt = new THREE.Mesh(
       new THREE.PlaneGeometry(TRACK_W, FULL_LEN),
       new THREE.MeshStandardMaterial({ color: 0x23262e, roughness: 0.95, metalness: 0.0 }));
+    asphalt.name = 'generated-asphalt';
     asphalt.rotation.x = -Math.PI / 2; asphalt.position.set(0, 0, midZ);
     asphalt.receiveShadow = true; this.generatedWorld.add(asphalt);
 
-    // Dashed white lane dividers (between the lanes).
+    // One instanced draw call replaces hundreds of separate lane-dash meshes. This is especially
+    // important for the procedural scene on slow connections, when it is the whole game world.
     const dashMat = new THREE.MeshStandardMaterial({ color: 0xeef2ff, roughness: 0.6 });
+    const dashesPerLane = Math.ceil(FULL_LEN / 14);
+    const dashes = new THREE.InstancedMesh(new THREE.PlaneGeometry(0.4, 6), dashMat,
+      (LANES - 1) * dashesPerLane);
+    const transform = new THREE.Object3D();
+    let dashIndex = 0;
     for (let lane = 1; lane < LANES; lane++) {
       const x = TRACK_W / 2 - (TRACK_W / LANES) * lane;   // divider between lane-1 and lane
-      for (let z = -TRACK_LEN; z < FULL_LEN; z += 14) {
-        const dash = new THREE.Mesh(new THREE.PlaneGeometry(0.4, 6), dashMat);
-        dash.rotation.x = -Math.PI / 2; dash.position.set(x, 0.02, z);
-        this.generatedWorld.add(dash);
+      for (let z = startZ; z < endZ; z += 14) {
+        transform.position.set(x, 0.025, z);
+        transform.rotation.set(-Math.PI / 2, 0, 0);
+        transform.updateMatrix();
+        dashes.setMatrixAt(dashIndex++, transform.matrix);
       }
     }
+    dashes.count = dashIndex;
+    dashes.instanceMatrix.needsUpdate = true;
+    dashes.computeBoundingSphere();
+    this.generatedWorld.add(dashes);
 
     // Solid edge lines + raised curbs on both sides.
     const edgeMat = new THREE.MeshStandardMaterial({ color: 0xeef2ff, roughness: 0.6 });
@@ -390,10 +451,79 @@ export class Renderer {
       const ex = side * (TRACK_W / 2 - 0.3);
       const edge = new THREE.Mesh(new THREE.PlaneGeometry(0.5, FULL_LEN), edgeMat);
       edge.rotation.x = -Math.PI / 2; edge.position.set(ex, 0.02, midZ); this.generatedWorld.add(edge);
-      const curb = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.5, FULL_LEN),
+      const curbTop = 0.5;
+      const curb = new THREE.Mesh(new THREE.BoxGeometry(0.8, curbTop - FALLBACK_TERRAIN_Y, FULL_LEN),
         curbMat);
-      curb.position.set(side * (TRACK_W / 2 + 0.4), 0.25, midZ);
+      curb.position.set(side * (TRACK_W / 2 + 0.4), (curbTop + FALLBACK_TERRAIN_Y) / 2, midZ);
       curb.castShadow = true; curb.receiveShadow = true; this.generatedWorld.add(curb);
+      const rail = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.24, FULL_LEN),
+        new THREE.MeshStandardMaterial({ color: 0x8ca1b2, metalness: 0.72, roughness: 0.36 }));
+      rail.position.set(side * (TRACK_W / 2 + 1.16), 0.8, midZ);
+      this.generatedWorld.add(rail);
+    }
+
+    // Reflective roadside beacons give the offline track scale and rhythm. Instancing keeps the
+    // entire repeating set at one draw call instead of adding a mesh for every post.
+    const beaconCountPerSide = Math.ceil(FULL_LEN / 35);
+    const beacons = new THREE.InstancedMesh(new THREE.BoxGeometry(0.24, 1.18, 0.32),
+      new THREE.MeshStandardMaterial({ color: 0x89eaff, emissive: 0x0d718e,
+        emissiveIntensity: 0.55, roughness: 0.35 }), beaconCountPerSide * 2);
+    let beaconIndex = 0;
+    for (const side of [-1, 1]) for (let z = startZ; z < endZ; z += 35) {
+      transform.position.set(side * (TRACK_W / 2 + 1.22), 0.65, z);
+      transform.rotation.set(0, 0, 0);
+      transform.updateMatrix();
+      beacons.setMatrixAt(beaconIndex++, transform.matrix);
+    }
+    beacons.count = beaconIndex;
+    beacons.instanceMatrix.needsUpdate = true;
+    beacons.computeBoundingSphere();
+    this.generatedWorld.add(beacons);
+
+    // A low-poly roadside silhouette gives the complete offline track depth. All berms and
+    // broadcast towers share just three instanced draw calls; no remote texture/model is needed.
+    this.fallbackBermMaterial = new THREE.MeshStandardMaterial({ color: 0x30324b,
+      roughness: 1, flatShading: true });
+    const sceneryStations = Math.ceil(FULL_LEN / 75);
+    const berms = new THREE.InstancedMesh(new THREE.DodecahedronGeometry(1, 0),
+      this.fallbackBermMaterial, sceneryStations * 2);
+    const towerMat = new THREE.MeshStandardMaterial({ color: 0x263650, metalness: 0.25,
+      roughness: 0.72, flatShading: true });
+    const capMat = new THREE.MeshStandardMaterial({ color: 0x60d8f5, emissive: 0x1e9ac6,
+      emissiveIntensity: 0.9, roughness: 0.38 });
+    const towerCount = Math.ceil(FULL_LEN / 120) * 2;
+    const towers = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), towerMat, towerCount);
+    const towerCaps = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), capMat, towerCount);
+    let bermIndex = 0;
+    let towerIndex = 0;
+    for (const side of [-1, 1]) {
+      for (let z = startZ + 22; z < endZ; z += 75) {
+        const rhythm = Math.sin(z * 0.047 + side * 1.7);
+        transform.position.set(side * (38 + 11 * Math.abs(rhythm)), 1.4 + 0.6 * rhythm, z);
+        transform.rotation.set(0, z * 0.003, 0);
+        transform.scale.set(9 + 3 * Math.abs(rhythm), 3.7 + 1.5 * Math.abs(rhythm), 13);
+        transform.updateMatrix();
+        berms.setMatrixAt(bermIndex++, transform.matrix);
+      }
+      for (let z = startZ + 45; z < endZ; z += 120) {
+        const height = 8 + 12 * Math.abs(Math.sin(z * 0.014 + side));
+        const x = side * (73 + 18 * Math.abs(Math.cos(z * 0.019)));
+        transform.position.set(x, FALLBACK_TERRAIN_Y + height / 2, z);
+        transform.rotation.set(0, 0, 0);
+        transform.scale.set(6.2, height, 7.5);
+        transform.updateMatrix();
+        towers.setMatrixAt(towerIndex, transform.matrix);
+        transform.position.y = FALLBACK_TERRAIN_Y + height + 0.45;
+        transform.scale.set(6.6, 0.9, 8);
+        transform.updateMatrix();
+        towerCaps.setMatrixAt(towerIndex++, transform.matrix);
+      }
+    }
+    for (const [instances, count] of [[berms, bermIndex], [towers, towerIndex], [towerCaps, towerIndex]] as const) {
+      instances.count = count;
+      instances.instanceMatrix.needsUpdate = true;
+      instances.computeBoundingSphere();
+      this.generatedWorld.add(instances);
     }
 
     // Start (z=0) and finish (z=RACE_LEN) line MODELS are loaded + placed by
@@ -401,6 +531,7 @@ export class Renderer {
     // BOTH the straight track and a curved map path (and any track transform/hills). A
     // lightweight primitive gantry is drawn here as a fallback until/unless the models load.
     this.trackContent.add(this.lineGroup);
+    this.buildFallbackGantry(0x10141c, 'start');
     this.buildFallbackGantry(0x10141c, 'finish');
   }
 
@@ -428,13 +559,14 @@ export class Renderer {
     this.lineFiles = files;
     this.lineOffsets = offsets;
     // clear any previously-built gantries (models + fallback) and rebuild
+    for (const line of this.lineGroup.children) this.disposeOwnedTree(line);
     this.lineGroup.clear();
-    if (!files.start && !files.finish) { this.buildFallbackGantry(0x10141c, 'finish'); return; }
+    this.buildFallbackGantry(0x10141c, 'start');
+    this.buildFallbackGantry(0x10141c, 'finish');
+    if (!files.start && !files.finish) return;
     const loads: Promise<void>[] = [];
     if (files.start) loads.push(this.loadLine(files.start, 0, offsets.start, generation));
     if (files.finish) loads.push(this.loadLine(files.finish, RACE_LEN, offsets.finish, generation));
-    // keep a fallback finish gantry only if no finish model was supplied
-    if (!files.finish) this.buildFallbackGantry(0x10141c, 'finish');
     await Promise.all(loads);
   }
   private lineOffsets: { start?: GantryOffset; finish?: GantryOffset } = {};
@@ -445,7 +577,11 @@ export class Renderer {
       const finish = () => { if (!settled) { settled = true; clearTimeout(timer); resolve(); } };
       const timer = setTimeout(finish, RENDER_ASSET_TIMEOUT_MS);
       this.lineLoader.load(`/assets/${file}`, (gltf) => {
-      if (settled || generation !== this.lineLoadGeneration) { finish(); return; }
+      if (settled || generation !== this.lineLoadGeneration) {
+        this.disposeOwnedTree(gltf.scene);
+        finish();
+        return;
+      }
       const model = gltf.scene;
       stripDisplayBases(model);
       // Auto-fit so the gantry's longest axis spans a little wider than the full track width.
@@ -463,6 +599,12 @@ export class Renderer {
       wrapper.add(model);
       wrapper.userData.lineZ = z;
       if (offset) wrapper.userData.offset = offset;   // author-pinned transform (overrides auto-place)
+      const fallbackLabel = z === 0 ? 'start' : 'finish';
+      const oldFallback = this.lineGroup.children.find(child => child.userData.fallbackLine === fallbackLabel);
+      if (oldFallback) {
+        this.lineGroup.remove(oldFallback);
+        this.disposeOwnedTree(oldFallback);
+      }
       this.lineGroup.add(wrapper);
       this.placeLine(wrapper, z);
       finish();
@@ -490,22 +632,32 @@ export class Renderer {
     }
   }
 
-  /** Simple primitive gantry (posts + emissive banner) used when no model is supplied/loaded. */
-  private buildFallbackGantry(color: number, _label: string): void {
-    const g = new THREE.Group(); g.userData.lineZ = 0; g.userData.fallback = true;
+  /** Branded, legible gantry that remains in place until an optional model actually arrives. */
+  private buildFallbackGantry(color: number, label: 'start' | 'finish'): void {
+    const z = label === 'start' ? 0 : RACE_LEN;
+    const accent = label === 'start' ? 0x26d7c1 : 0xef3151;
+    const g = new THREE.Group(); g.userData.lineZ = z; g.userData.fallbackLine = label;
     const postMat = new THREE.MeshStandardMaterial({ color, roughness: 0.6, metalness: 0.3 });
+    const lightMat = new THREE.MeshStandardMaterial({ color: accent, emissive: accent,
+      emissiveIntensity: 1.25, roughness: 0.35 });
     for (const side of [-1, 1]) {
       const post = new THREE.Mesh(new THREE.BoxGeometry(1.2, 12, 1.2), postMat);
       post.position.set(side * (TRACK_W / 2 + 1.5), 6, 0); post.castShadow = true; g.add(post);
+      const light = new THREE.Mesh(new THREE.BoxGeometry(0.11, 9.3, 0.08), lightMat);
+      light.position.set(side * (TRACK_W / 2 + 1.5), 6.1, 0.65); g.add(light);
     }
     const beam = new THREE.Mesh(new THREE.BoxGeometry(TRACK_W + 6, 2.4, 1.4), postMat);
     beam.position.set(0, 11, 0); beam.castShadow = true; g.add(beam);
     const banner = new THREE.Mesh(new THREE.PlaneGeometry(TRACK_W + 5, 2),
-      new THREE.MeshStandardMaterial({ color: 0xef223a, emissive: 0xef223a, emissiveIntensity: 0.6,
+      new THREE.MeshStandardMaterial({ color: accent, emissive: accent, emissiveIntensity: 0.68,
         side: THREE.DoubleSide }));
     banner.position.set(0, 11, 0.8); g.add(banner);
+    const stripe = new THREE.Mesh(new THREE.PlaneGeometry(TRACK_W, 0.8), lightMat);
+    stripe.rotation.x = -Math.PI / 2; stripe.position.set(0, 0.035, 0); g.add(stripe);
+    const topLight = new THREE.Mesh(new THREE.BoxGeometry(TRACK_W + 5, 0.12, 0.18), lightMat);
+    topLight.position.set(0, 12.18, 0.78); g.add(topLight);
     this.lineGroup.add(g);
-    this.placeLine(g, 0);
+    this.placeLine(g, z);
   }
 
   private spectator = false;
@@ -515,9 +667,50 @@ export class Renderer {
   myPlayerId(): string | null { return this.spectator ? null : (this.myId || null); }
   setSpectator(on: boolean) { this.spectator = on; }
 
+  private buildFallbackBarrier(): THREE.Group {
+    const group = new THREE.Group();
+    const steel = new THREE.MeshStandardMaterial({ color: 0x253243, metalness: 0.55, roughness: 0.42 });
+    const warning = new THREE.MeshStandardMaterial({ color: 0xffa62e, emissive: 0x8b3105,
+      emissiveIntensity: 0.45, roughness: 0.48 });
+    const body = new THREE.Mesh(new THREE.BoxGeometry(TRACK_W / LANES - 1.5, 1.25, 0.75), steel);
+    group.add(body);
+    for (const x of [-1.7, -0.6, 0.6, 1.7]) {
+      const stripe = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.9, 0.08), warning);
+      stripe.position.set(x, 0.03, 0.42);
+      stripe.rotation.z = -0.35;
+      group.add(stripe);
+    }
+    const top = new THREE.Mesh(new THREE.BoxGeometry(TRACK_W / LANES - 1.35, 0.13, 0.87), warning);
+    top.position.y = 0.69;
+    group.add(top);
+    return group;
+  }
+
+  private buildFallbackBoost(): THREE.Group {
+    const group = new THREE.Group();
+    const glow = new THREE.MeshStandardMaterial({ color: 0x5dffe2, emissive: 0x10c9a1,
+      emissiveIntensity: 1.35, metalness: 0.2, roughness: 0.22 });
+    const shell = new THREE.MeshStandardMaterial({ color: 0x214e63, metalness: 0.65, roughness: 0.26 });
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(0.95, 0.14, 8, 24), glow);
+    ring.rotation.x = -Math.PI / 2;
+    group.add(ring);
+    const core = new THREE.Mesh(new THREE.IcosahedronGeometry(0.57, 1), shell);
+    core.position.y = 0.25;
+    group.add(core);
+    const jewel = new THREE.Mesh(new THREE.IcosahedronGeometry(0.33, 1), glow);
+    jewel.position.y = 0.25;
+    group.add(jewel);
+    return group;
+  }
+
   buildItems(items: Item[]) {
     this.consumedNow.clear();   // fresh race: no orb is mid-pickup
-    for (const { mesh } of this.itemMeshes) this.trackContent.remove(mesh);
+    for (const { mesh } of this.itemMeshes) {
+      this.trackContent.remove(mesh);
+      this.disposeClonedSkeletons(mesh);
+      const procedural = mesh.userData.proceduralModel as THREE.Object3D | undefined;
+      if (procedural) this.disposeOwnedTree(procedural);
+    }
     this.itemMeshes = items.map(item => {
       // NOTE: keep in sync with the editor preview (level-scene.ts) placement: world/lane position
       // goes on an OUTER wrapper group; the inner model keeps its baked grounding (-min.y) + offset
@@ -529,15 +722,13 @@ export class Renderer {
         usingTemplate = !!template;
         model = template
           ? skeletonClone(template)
-          : new THREE.Mesh(new THREE.BoxGeometry(TRACK_W / LANES - 1.5, 1.6, 1.2),
-              new THREE.MeshStandardMaterial({ color: 0xff3b3b, emissive: 0x550000 }));
+          : this.buildFallbackBarrier();
       } else {
         const template = this.assets?.boostTemplate() ?? null;
         usingTemplate = !!template;
         model = template
           ? skeletonClone(template)
-          : new THREE.Mesh(new THREE.CylinderGeometry(1.3, 1.3, 0.25, 20),
-              new THREE.MeshStandardMaterial({ color: 0x36e08a, emissive: 0x0a5a32 }));
+          : this.buildFallbackBoost();
       }
       // Per-level size multiplier on an INNER group (keeps the model's baked grounding/offset),
       // so resizing scales the obstacle in place without lifting/sinking it off the track.
@@ -546,13 +737,14 @@ export class Renderer {
       scaled.scale.setScalar(this.itemScale(item.kind));
       const mesh = new THREE.Group();
       mesh.add(scaled);
+      if (!usingTemplate) mesh.userData.proceduralModel = model;
       // A real boost MODEL hovers above the track (bob + spin animated in render()); the barrier and
       // any primitive fallback stay grounded. Tag the hovering ones + remember their hover height.
-      const hover = item.kind === 'boost' && usingTemplate;
+      const hover = item.kind === 'boost';
       if (hover) { mesh.userData.hover = true; scaled.userData.hoverBaseY = HOVER_HEIGHT; }
       // Real models self-ground via baked -min.y, so wrapper y=0. Primitives have no baked
       // grounding (box centered, pad thin), so keep their original y (0.8 / 0.13).
-      const y = usingTemplate ? 0 : (item.kind === 'barrier' ? 0.8 : 0.13);
+      const y = usingTemplate ? 0 : (item.kind === 'barrier' ? 0.625 : 0.13);
       this.placeItem(mesh, item, y);
       mesh.userData.groundY = y;     // remembered so setPath() can re-place onto the curve
       this.trackContent.add(mesh);   // ride the track transform so items align with the race line
@@ -659,8 +851,68 @@ export class Renderer {
       const marker=buildPlayerMarker(color,playerNumber);
       wrapper.add(marker);wrapper.userData.playerMarker=marker;this.applyCarScale(wrapper,idx);
       this.trackContent.add(wrapper); this.carMeshes.set(id, wrapper);   // cars ride the track transform
+    } else {
+      const current = wrapper.userData.model as THREE.Group | undefined;
+      const index = this.carIndex.get(id);
+      const template = index === undefined ? null : this.assets?.carTemplate(index) ?? null;
+      if (current?.userData.fallbackCar && template) {
+        // A procedural car may have been shown immediately while its GLB streamed in. Upgrade the
+        // existing wrapper in place so slow connections never pin a racer to its fallback forever.
+        const actual = buildCar(template, color, id === this.myId);
+        actual.traverse(o => { const mesh = o as THREE.Mesh; if (mesh.isMesh) mesh.castShadow = true; });
+        const scaledModel = wrapper.userData.scaledModel as THREE.Group;
+        scaledModel.remove(current);
+        this.disposeOwnedTree(current);
+        scaledModel.add(actual);
+        wrapper.userData.model = actual;
+        this.applyCarScale(wrapper, index!);
+      }
     }
     return wrapper;
+  }
+
+  private disposeOwnedTree(root: THREE.Object3D): void {
+    this.disposeClonedSkeletons(root);
+    const geometries = new Set<THREE.BufferGeometry>();
+    const materials = new Set<THREE.Material>();
+    const textures = new Set<THREE.Texture>();
+    const instances = new Set<THREE.InstancedMesh>();
+    root.traverse(object => {
+      const mesh = object as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      if ((mesh as THREE.InstancedMesh).isInstancedMesh) instances.add(mesh as THREE.InstancedMesh);
+      if (mesh.geometry) geometries.add(mesh.geometry);
+      const assigned = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const material of assigned) if (material) materials.add(material);
+    });
+    // GLTF EXT_mesh_gpu_instancing keeps a per-instance matrix GPU buffer. Geometry/material
+    // disposal alone does not release it when a loaded map is replaced after a race.
+    for (const instance of instances) instance.dispose();
+    for (const geometry of geometries) geometry.dispose();
+    for (const material of materials) {
+      for (const value of Object.values(material)) if (value instanceof THREE.Texture) textures.add(value);
+      material.dispose();
+    }
+    for (const texture of textures) texture.dispose();
+  }
+
+  private disposeClonedSkeletons(root: THREE.Object3D): void {
+    const skeletons = new Set<THREE.Skeleton>();
+    root.traverse(object => {
+      const skin = object as THREE.SkinnedMesh;
+      if (skin.isSkinnedMesh && skin.skeleton) skeletons.add(skin.skeleton);
+    });
+    for (const skeleton of skeletons) skeleton.dispose();
+  }
+
+  private disposeCarVisuals(wrapper: THREE.Group): void {
+    const model = wrapper.userData.model as THREE.Object3D | undefined;
+    if (model?.userData.fallbackCar) this.disposeOwnedTree(model);
+    else if (model) this.disposeClonedSkeletons(model);
+    const marker = wrapper.userData.playerMarker as THREE.Object3D | undefined;
+    if (marker) this.disposeOwnedTree(marker);
+    const aura = wrapper.userData.dashAura as THREE.Object3D | undefined;
+    if (aura) this.disposeOwnedTree(aura);
   }
 
   private applyCarScale(wrapper:THREE.Group,index:number):void {
@@ -723,6 +975,7 @@ export class Renderer {
     const liveCarIds = new Set(snap.cars.map(car => car.id));
     for (const [id, wrapper] of this.carMeshes) {
       if (liveCarIds.has(id)) continue;
+      this.disposeCarVisuals(wrapper);
       this.trackContent.remove(wrapper);
       this.carMeshes.delete(id);
       this.carIndex.delete(id);
@@ -869,6 +1122,7 @@ export class Renderer {
       const fog = this.scene.fog as THREE.FogExp2;
       fog.color.set(theme.fog);
       (this.ground.material as THREE.MeshStandardMaterial).color.set(theme.ground);
+      this.fallbackBermMaterial.color.set(theme.ground).multiplyScalar(0.66);
       this.sun.color.set(theme.sun); this.sun.intensity = Math.max(1.4, theme.sunIntensity * 1.6);
       this.ambient.color.set(theme.sky);
       this.ambient.groundColor.set(theme.ground);

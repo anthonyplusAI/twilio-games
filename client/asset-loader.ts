@@ -8,6 +8,7 @@ import type { Manifest, AssetRef } from '../shared/asset-manifest';
 import { applyModelTransform } from './model-transform';
 
 const RACER_ASSET_TIMEOUT_MS = 45_000;
+const MAX_CONCURRENT_ASSET_LOADS = 4;
 type AssetLoadState = 'idle' | 'loading' | 'ready' | 'failed';
 
 /** Count mesh descendants of an object (including itself). */
@@ -29,6 +30,31 @@ function visibleGeometryBounds(root: THREE.Object3D): { count: number; bounds: T
     count += 1;
   });
   return { count, bounds };
+}
+
+function disposeUninstalledScene(root: THREE.Object3D): void {
+  const geometries = new Set<THREE.BufferGeometry>();
+  const materials = new Set<THREE.Material>();
+  const textures = new Set<THREE.Texture>();
+  const skeletons = new Set<THREE.Skeleton>();
+  root.traverse(object => {
+    const mesh = object as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    if ((mesh as THREE.InstancedMesh).isInstancedMesh) (mesh as THREE.InstancedMesh).dispose();
+    if (mesh.geometry) geometries.add(mesh.geometry);
+    for (const material of Array.isArray(mesh.material) ? mesh.material : [mesh.material]) {
+      if (material) materials.add(material);
+    }
+    const skin = mesh as THREE.SkinnedMesh;
+    if (skin.isSkinnedMesh && skin.skeleton) skeletons.add(skin.skeleton);
+  });
+  for (const geometry of geometries) geometry.dispose();
+  for (const material of materials) {
+    for (const value of Object.values(material)) if (value instanceof THREE.Texture) textures.add(value);
+    material.dispose();
+  }
+  for (const texture of textures) texture.dispose();
+  for (const skeleton of skeletons) skeleton.dispose();
 }
 
 /**
@@ -89,6 +115,11 @@ export class AssetLoader {
   private boostLoad: Promise<void> = Promise.resolve();
   private boostLoadState: AssetLoadState = 'idle';
   private boostLoadGeneration = 0;
+  private activeAssetLoads = 0;
+  private pendingAssetLoads: { file: string; order: number; start: () => void }[] = [];
+  private nextAssetOrder = 0;
+  private priorityCarIndexes = new Set<number>();
+  private priorityCarFiles = new Set<string>();
 
   constructor() {
     this.loader = new GLTFLoader();
@@ -124,21 +155,68 @@ export class AssetLoader {
       if (!res.ok) throw new Error(`manifest request failed with HTTP ${res.status}`);
       // Run the body through parseManifest (tolerant; returns EMPTY_MANIFEST on bad input).
       this.manifest = parseManifest(await res.text());
+      this.refreshAssetPriorities();
       // Pre-size the cars array so carTemplate(i) returns null (→ primitive) until GLB i lands.
       this.cars = new Array(this.manifest.cars.length).fill(null);
       // Kick off ALL loads without awaiting the whole batch — each fills its slot as it resolves.
       this.carLoads = new Array(this.manifest.cars.length);
       this.carLoadStates = new Array(this.manifest.cars.length).fill('idle');
       this.carLoadGenerations = new Array(this.manifest.cars.length).fill(0);
-      for (let index = 0; index < this.manifest.cars.length; index++) this.startCarLoad(index);
+      // Selected cars (if the room choice arrived first) and the two gameplay items consume the
+      // first network slots. Optional roster portraits can stream after them without delaying play.
+      const selectedCars: number[] = [];
+      const otherCars: number[] = [];
+      for (let index = 0; index < this.manifest.cars.length; index++) {
+        (this.priorityCarFiles.has(this.manifest.cars[index]!.file) ? selectedCars : otherCars).push(index);
+      }
+      for (const index of selectedCars) this.startCarLoad(index);
       this.barrierLoad = this.manifest.barrier ? this.startBarrierLoad() : Promise.resolve();
       this.boostLoad = this.manifest.boostPad ? this.startBoostLoad() : Promise.resolve();
+      for (const index of otherCars) this.startCarLoad(index);
       this.carsReady = Promise.allSettled([...this.carLoads, this.barrierLoad, this.boostLoad]).then(() => undefined);
     } finally { clearTimeout(timeout); }
   }
 
   /** Resolves once every car/barrier/boost GLB has settled (or immediately if none). */
   carsReady: Promise<void> = Promise.resolve();
+
+  /** Raise cars seen in the live menu or race ahead of optional roster downloads. */
+  prioritizeCarIndexes(indexes: readonly number[]): void {
+    for (const index of indexes) if (Number.isInteger(index) && index >= 0) this.priorityCarIndexes.add(index);
+    this.refreshAssetPriorities();
+  }
+
+  private refreshAssetPriorities(): void {
+    const carCount = this.manifest.cars.length;
+    this.priorityCarFiles = new Set([...this.priorityCarIndexes]
+      .map(index => carCount ? this.manifest.cars[index % carCount]?.file : undefined)
+      .filter((file): file is string => Boolean(file)));
+    this.pendingAssetLoads.sort((a, b) => this.assetPriority(a.file) - this.assetPriority(b.file)
+      || a.order - b.order);
+  }
+
+  private assetPriority(file: string): number {
+    if (this.priorityCarFiles.has(file)) return 0;
+    if (file === this.manifest.barrier?.file || file === this.manifest.boostPad?.file) return 1;
+    return 2;
+  }
+
+  private acquireAssetSlot(file: string): Promise<void> {
+    if (this.activeAssetLoads < MAX_CONCURRENT_ASSET_LOADS) {
+      this.activeAssetLoads++;
+      return Promise.resolve();
+    }
+    return new Promise(resolve => {
+      this.pendingAssetLoads.push({ file, order: this.nextAssetOrder++, start: resolve });
+      this.refreshAssetPriorities();
+    });
+  }
+
+  private releaseAssetSlot(): void {
+    const next = this.pendingAssetLoads.shift();
+    if (next) next.start(); // hand the open slot directly to the next prioritized file
+    else this.activeAssetLoads--;
+  }
 
   async waitForGameplayAssets(carIndexes: readonly number[]): Promise<void> {
     await this.loadManifest();
@@ -175,6 +253,7 @@ export class AssetLoader {
     this.carLoadGenerations[index] = generation;
     this.carLoadStates[index] = 'loading';
     const load = this.loadRef(ref, CAR_TARGET).then(group => {
+      if (this.carLoadGenerations[index] !== generation) return;
       if (group) {
         this.cars[index] = group;
         this.carLoadStates[index] = 'ready';
@@ -195,6 +274,7 @@ export class AssetLoader {
     const generation = ++this.barrierLoadGeneration;
     this.barrierLoadState = 'loading';
     return this.loadRef(ref, BARRIER_TARGET).then(group => {
+      if (this.barrierLoadGeneration !== generation) return;
       if (group) {
         this.barrier = group;
         this.barrierLoadState = 'ready';
@@ -213,6 +293,7 @@ export class AssetLoader {
     const generation = ++this.boostLoadGeneration;
     this.boostLoadState = 'loading';
     return this.loadRef(ref, BOOST_TARGET).then(group => {
+      if (this.boostLoadGeneration !== generation) return;
       if (group) {
         this.boost = group;
         this.boostLoadState = 'ready';
@@ -256,30 +337,51 @@ export class AssetLoader {
     });
   }
 
-  private loadRef(ref: AssetRef, target: number): Promise<THREE.Group | null> {
-    return new Promise((resolve) => {
-      this.loader.load(`/assets/${ref.file}`, (gltf) => {
-        try {
-          const g = this.normalize(gltf.scene, ref, target);
-          const visible = visibleGeometryBounds(g);
-          const bounds = visible.bounds;
-          const size = bounds.getSize(new THREE.Vector3());
-          if (visible.count === 0 || bounds.isEmpty() || ![size.x, size.y, size.z].every(Number.isFinite)
-            || Math.max(size.x, size.y, size.z) <= 1e-6) throw new Error('asset has no renderable geometry');
-          // Baked clips are OFF by default: on free Sketchfab models they're usually SHOWCASE
-          // animations (doors opening, "air out") with an OPEN resting pose that looks broken while
-          // driving. Cars then animate via wheel-spin. Opt IN per-model with ref.animate (Models
-          // Library toggle) for cars whose clip runs cleanly. buildCar reads userData.clips.
-          g.userData.clips = ref.animate ? gltf.animations : [];
-          // Keep ALL baked clips on a side field (not used by the game). The car-select thumbnail
-          // rig samples these to pose SHOWCASE models (McLaren "Air Out", Yuterra "Take 001") whose
-          // resting pose is OPEN/exploded — without it their portraits render as scattered panels.
-          g.userData.allClips = gltf.animations ?? [];
-          resolve(g);
-        }
-        catch { resolve(null); }
-      }, undefined, () => resolve(null));   // load error => null => primitive fallback
-    });
+  private async loadRef(ref: AssetRef, target: number): Promise<THREE.Group | null> {
+    await this.acquireAssetSlot(ref.file);
+    const controller = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, RACER_ASSET_TIMEOUT_MS);
+    try {
+      // GLTFLoader.load has no abort handle in this Three version. Fetch the GLB ourselves so a
+      // weak connection can be cancelled rather than leaving hidden downloads behind the slot cap.
+      const response = await fetch(`/assets/${ref.file}`, { signal: controller.signal });
+      if (!response.ok) return null;
+      const bytes = await response.arrayBuffer();
+      if (timedOut) return null;
+      const slash = ref.file.lastIndexOf('/');
+      const resourcePath = `/assets/${slash >= 0 ? ref.file.slice(0, slash + 1) : ''}`;
+      const gltf = await this.loader.parseAsync(bytes, resourcePath);
+      if (timedOut) {
+        disposeUninstalledScene(gltf.scene);
+        return null;
+      }
+      try {
+        const g = this.normalize(gltf.scene, ref, target);
+        const visible = visibleGeometryBounds(g);
+        const bounds = visible.bounds;
+        const size = bounds.getSize(new THREE.Vector3());
+        if (visible.count === 0 || bounds.isEmpty() || ![size.x, size.y, size.z].every(Number.isFinite)
+          || Math.max(size.x, size.y, size.z) <= 1e-6) throw new Error('asset has no renderable geometry');
+        // Showroom clips often pose the car open. Gameplay only plays clips explicitly opted in.
+        g.userData.clips = ref.animate ? gltf.animations : [];
+        g.userData.allClips = gltf.animations ?? [];
+        return g;
+      } catch {
+        disposeUninstalledScene(gltf.scene);
+        return null;
+      }
+    } catch {
+      return null; // cancelled, unavailable, or invalid model: the procedural asset stays playable
+    } finally {
+      clearTimeout(timer);
+      // A parse already in progress cannot be interrupted safely. Keep its slot until it settles
+      // so a timeout never makes more than MAX_CONCURRENT_ASSET_LOADS decodes run at once.
+      this.releaseAssetSlot();
+    }
   }
 
   private normalize(scene: THREE.Group, ref: AssetRef, target: number): THREE.Group {

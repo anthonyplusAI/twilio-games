@@ -8,6 +8,7 @@ import { resolve } from 'path';
 //
 // Multi-page build, served by clean paths:
 //   /            → index.html        (branded home/lobby)
+//   /how-it-works.html → how-it-works.html (voice architecture explainer)
 //   /play.html   → play.html         (the racer)
 //   /editor      → editor/index.html (the unified Level Editor)
 //   /garage      → garage/index.html (the model viewer + configurator)
@@ -132,6 +133,7 @@ export default defineConfig(({ mode }) => {
       rollupOptions: {
         input: {
           home: resolve(__dirname, 'index.html'),                  // branded landing/lobby
+          howItWorks: resolve(__dirname, 'how-it-works.html'),       // public voice architecture explainer
           play: resolve(__dirname, 'play.html'),                    // the racer
           monsters: resolve(__dirname, 'monsters.html'),           // Voice Monsters (the battler)
           fighter: resolve(__dirname, 'fighter.html'),              // Voice Fighter gameplay prototype

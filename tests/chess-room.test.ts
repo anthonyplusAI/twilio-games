@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ChessRoom } from '../server/chess-room';
 
 function whiteRoom(fen?: string): ChessRoom {
@@ -89,6 +89,20 @@ describe('Voice Chess room', () => {
     expect(room.state().pendingMove).toMatchObject({ from: 'e2', to: 'e4' });
   });
 
+  it('retains a naturally named starting square through a long thinking pause', () => {
+    vi.useFakeTimers();
+    try {
+      const room = whiteRoom();
+      expect(room.handleVoiceCommand('pawn E2').code).toBe('selected');
+      expect(room.state().selection).toEqual({ from: 'e2', piece: 'p' });
+      vi.advanceTimersByTime(120_000);
+      expect(room.handleVoiceCommand('E4').code).toBe('proposed');
+      expect(room.state().pendingMove).toMatchObject({ from: 'e2', to: 'e4' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('offers position-independent voice help without an illegal opening example', () => {
     const room = whiteRoom();
     for (const command of ['help', 'gibberish']) {
@@ -107,6 +121,22 @@ describe('Voice Chess room', () => {
     expect(room.confirmMove().code).toBe('confirmed');
     expect(room.state().lastMove).toMatchObject({ from: 'e1', to: 'g1', castle: 'king', rookFrom: 'h1', rookTo: 'f1' });
     expect(room.state().pieces).toContainEqual({ square: 'f1', color: 'w', type: 'r' });
+  });
+
+  it('clarifies a bare castle when both sides are legal, without selecting a rook move', () => {
+    const room = whiteRoom('4k3/8/8/8/8/8/8/R3K2R w KQ - 0 1');
+    const answer = room.handleVoiceCommand('castle');
+    expect(answer.code).toBe('ambiguous');
+    expect(answer.message).toMatch(/kingside.*queenside/i);
+    expect(room.state().pendingMove).toBeNull();
+  });
+
+  it('lets bare castle propose the only legal side and commits both king and rook after confirmation', () => {
+    const room = whiteRoom('4k3/8/8/8/8/8/8/4K2R w K - 0 1');
+    expect(room.handleVoiceCommand('castle').code).toBe('proposed');
+    expect(room.state().pendingMove).toMatchObject({ castle: 'king', from: 'e1', to: 'g1' });
+    expect(room.confirmMove().code).toBe('confirmed');
+    expect(room.state().lastMove).toMatchObject({ from: 'e1', to: 'g1', rookFrom: 'h1', rookTo: 'f1' });
   });
 
   it('reports the actual captured square for en passant', () => {

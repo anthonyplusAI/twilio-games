@@ -1,5 +1,5 @@
 import { parseCrMessage } from './conversation-relay';
-import type { KaraokeSong } from '../shared/karaoke';
+import { KARAOKE_SONG_DURATION_MS, type KaraokeSong } from '../shared/karaoke';
 import type { KaraokePhase, KaraokeResult } from '../shared/karaoke-protocol';
 import { KARAOKE_MESSAGES, type KaraokeMessageKey } from '../shared/i18n/karaoke';
 import { DEFAULT_LOCALE, resolveLocale, type SupportedLocale } from '../shared/i18n/locales';
@@ -14,7 +14,8 @@ import { parseFirstName } from '../shared/spoken-name';
 import type { KaraokeAnalyticsSetupAction } from './analytics-observer';
 
 const FINAL_DUPLICATE_FRAME_MS = 160;
-type KaraokeVoiceSong = Pick<KaraokeSong, 'id' | 'title' | 'locale'>;
+type KaraokeVoiceSong = Pick<KaraokeSong, 'id' | 'title' | 'locale'>
+  & Partial<Pick<KaraokeSong, 'durationMs'>>;
 type KaraokeVoiceResult = Pick<KaraokeResult, 'generation' | 'score' | 'bestCombo'>;
 export type KaraokeSpeechOutcome = 'played' | 'estimated' | 'interrupted' | 'failed';
 export interface KaraokeIntentRequest {
@@ -79,6 +80,9 @@ export class KaraokeVoiceSession {
   private code: string | null = null;
   private playerId: string | null = null;
   private callSid: string | null = null;
+  private introEpoch = 0;
+  private introExpired = false;
+  private introPhase: KaraokePhase | null = null;
   private commandLocale: SupportedLocale = DEFAULT_LOCALE;
   private authoritativeName: string | null = null;
   private stationManaged = false;
@@ -90,8 +94,6 @@ export class KaraokeVoiceSession {
   private readonly handedOffGenerations = new Set<number>();
   private readonly announcedResultGenerations = new Set<number>();
   private readonly pendingResultSpeech = new Set<Promise<void>>();
-  private consentReadySelection: string | null = null;
-  private consentAttempt: symbol | null = null;
   private readonly preparationAnnouncedGenerations = new Set<number>();
   private semanticController: AbortController | null = null;
   private semanticContext: string | null = null;
@@ -121,11 +123,13 @@ export class KaraokeVoiceSession {
       return;
     }
     if (!this.code || !this.playerId) return;
+    if (message.type === 'interrupt' || message.type === 'dtmf' || message.type === 'prompt') {
+      this.introEpoch++; // caller barge-in may skip the short technology introduction
+    }
 
     if (message.type === 'interrupt') {
       this.cancelSemantic();
       this.lastFinal = null;
-      this.consentAttempt = null;
       return;
     }
     if (message.type === 'dtmf') {
@@ -165,6 +169,7 @@ export class KaraokeVoiceSession {
   onStateChanged(): void {
     const snapshot = this.currentSnapshot();
     if (!snapshot) return;
+    if (snapshot.phase !== this.introPhase) this.introExpired = true;
     if (this.semanticContext !== null && this.semanticContext !== this.finalContext(snapshot)) this.cancelSemantic();
     if (snapshot.phase === 'loading') this.acknowledgeLoading(snapshot);
 
@@ -180,7 +185,6 @@ export class KaraokeVoiceSession {
       && snapshot.selectedSong
       && snapshot.selectionGeneration !== this.lastSelectionGeneration
       && snapshot.selectedByPlayerId === this.playerId) {
-      this.consentReadySelection = null;
       this.deps.say(this.text('voice.songSelected', { title: snapshot.selectedSong.title }),
         this.selectedGuard(selectionKey(snapshot)));
       this.speakStartConsent();
@@ -227,8 +231,11 @@ export class KaraokeVoiceSession {
     this.code = code;
     this.playerId = binding.playerId;
     this.callSid = callSid;
+    this.introExpired = false;
     const snapshot = this.currentSnapshot();
     if (!snapshot) return;
+    this.introPhase = snapshot.phase;
+    if (!this.isCallIntroPhase(snapshot.phase)) this.introExpired = true;
     this.awaitingName = !snapshot.nameConfirmed;
     this.remember(snapshot);
 
@@ -250,7 +257,7 @@ export class KaraokeVoiceSession {
       return;
     }
 
-    this.deps.say(this.text('voice.welcome'), this.setupGuard());
+    this.deps.say(this.text('voice.welcome'), this.callIntroGuard());
     if (!snapshot.nameConfirmed) {
       this.deps.say(this.text('voice.askName'), this.nameGuard());
       return;
@@ -268,6 +275,16 @@ export class KaraokeVoiceSession {
       return;
     }
     if (snapshot.phase === 'song_select') {
+      if (isScoringConsentQuestion(spoken, this.commandLocale)) {
+        this.deps.say(this.text('voice.scoringInfo'), this.songSelectGuard());
+        return;
+      }
+      if (isKaraokeInformationRequest(spoken, this.commandLocale)) {
+        const mentioned = matchKaraokeSongReference(spoken, this.catalogForLocale(snapshot), this.commandLocale);
+        if (mentioned) this.deps.say(this.songInfo(mentioned), this.songSelectGuard());
+        else this.resolveSemantic(spoken, snapshot, true);
+        return;
+      }
       const song = matchKaraokeSong(spoken, this.catalogForLocale(snapshot), this.commandLocale);
       if (song) {
         this.selectSong(song, snapshot);
@@ -352,7 +369,6 @@ export class KaraokeVoiceSession {
     const next = this.currentSnapshot() ?? snapshot;
     this.remember(next);
     if (selected && next.selectedSong?.id === song.id && next.selectedByPlayerId === this.playerId) {
-      this.consentReadySelection = null;
       this.deps.onSetupAction?.('select_song');
       this.deps.say(this.text('voice.songSelected', { title: next.selectedSong.title }),
         this.selectedGuard(selectionKey(next)));
@@ -367,10 +383,6 @@ export class KaraokeVoiceSession {
       this.deps.say(this.text('voice.chooseFirst'), this.menuGuard());
       return;
     }
-    if (this.consentReadySelection !== selectionKey(snapshot)) {
-      this.speakStartConsent();
-      return;
-    }
     this.applyingChange = true;
     const advanced = this.deps.advance(this.code!, this.playerId!);
     this.applyingChange = false;
@@ -381,7 +393,6 @@ export class KaraokeVoiceSession {
       return;
     }
     this.deps.onSetupAction?.('start_song');
-    this.consentReadySelection = null;
     this.acknowledgeLoading(next);
   }
 
@@ -451,24 +462,12 @@ export class KaraokeVoiceSession {
     const snapshot = this.currentSnapshot();
     const selected = selectionKey(snapshot);
     if (!selected || snapshot?.selectedByPlayerId !== this.playerId) return;
-    this.consentReadySelection = null;
-    const attempt = Symbol(selected);
-    this.consentAttempt = attempt;
-    const isCurrent = () => selectionKey(this.currentSnapshot()) === selected
-      && this.consentAttempt === attempt;
-    const complete = (outcome: KaraokeSpeechOutcome) => {
-      if (this.consentAttempt !== attempt) return;
-      this.consentAttempt = null;
-      if (outcome !== 'played' && outcome !== 'estimated') return;
-      const current = this.currentSnapshot();
-      if (current?.phase === 'song_select' && selectionKey(current) === selected
-        && current.selectedByPlayerId === this.playerId) this.consentReadySelection = selected;
-    };
+    // Relay is interruptible; the caller's explicit Start is consent for this selection.
+    // Do not tie the command to TTS completion, which would replay a barged-in disclosure.
     try {
-      const delivery = this.deps.say(this.text('voice.startConsent'), isCurrent);
-      if (delivery && typeof delivery.then === 'function') void delivery.then(complete, () => complete('failed'));
-      else complete('failed');
-    } catch { complete('failed'); }
+      void Promise.resolve(this.deps.say(this.text('voice.startConsent'), this.selectedGuard(selected)))
+        .catch(() => undefined);
+    } catch { /* An optional spoken cue must not block an explicit start. */ }
   }
 
   private acknowledgeLoading(snapshot: KaraokeVoiceSnapshot): void {
@@ -485,13 +484,26 @@ export class KaraokeVoiceSession {
     const result = snapshot.result;
     if (!result || this.announcedResultGenerations.has(result.generation)) return;
     this.announcedResultGenerations.add(result.generation);
-    this.sayResult(this.text('voice.result', {
+    const resultValues = {
       name: snapshot.myName ?? this.text('voice.callerPlaceholder'),
       score: formatNumber(this.commandLocale, result.score),
       combo: formatNumber(this.commandLocale, result.bestCombo),
-    }), result.generation);
-    this.sayResult(this.text(this.stationManaged ? 'voice.stationRequeue' : 'voice.singAgain'),
-      result.generation);
+    };
+    // A station result has a short display deadline. Keep the score and replay step in one
+    // compact Relay cue so both arrive before the call is retired, even with slow playback.
+    if (this.stationManaged) this.sayResult(this.text('voice.stationResult', resultValues), result.generation);
+    else {
+      this.sayResult(this.text('voice.result', resultValues), result.generation);
+      this.sayResult(this.text('voice.singAgain'), result.generation);
+    }
+  }
+
+  private songInfo(song: KaraokeVoiceSong): string {
+    const durationMs = song.durationMs ?? KARAOKE_SONG_DURATION_MS;
+    return this.text('voice.songInfo', {
+      title: song.title,
+      seconds: formatNumber(this.commandLocale, Math.round(durationMs / 1_000)),
+    });
   }
 
   private sayResult(line: string, generation: number, isCurrent = this.resultGuard(generation)): void {
@@ -523,11 +535,14 @@ export class KaraokeVoiceSession {
     return localized.length ? localized : snapshot.catalog;
   }
 
-  private resolveSemantic(spoken: string, snapshot: KaraokeVoiceSnapshot): void {
+  private resolveSemantic(spoken: string, snapshot: KaraokeVoiceSnapshot, informationOnly = false): void {
+    const catalog = snapshot.phase === 'song_select' ? this.catalogForLocale(snapshot) : [];
+    const informationFallback = () => this.text('voice.catalog', { songs: catalog.map(song => song.title).join(', ') });
     const resolve = this.deps.resolveIntent;
     if (!resolve) {
       if (snapshot.phase === 'song_select') {
-        this.deps.say(this.text('voice.unknownSong'), this.contextGuard(this.finalContext(snapshot)));
+        this.deps.say(informationOnly ? informationFallback() : this.text('voice.unknownSong'),
+          this.contextGuard(this.finalContext(snapshot)));
       }
       return;
     }
@@ -536,11 +551,10 @@ export class KaraokeVoiceSession {
     const controller = new AbortController();
     this.semanticController = controller;
     this.semanticContext = context;
-    const catalog = snapshot.phase === 'song_select' ? this.catalogForLocale(snapshot) : [];
-    const actions = snapshot.phase === 'song_select'
+    const actions = informationOnly ? [] : snapshot.phase === 'song_select'
       ? [
           { id: 'select_song', description: 'Choose one song shown on the current screen.', targetIds: catalog.map(song => song.id) },
-          { id: 'start_with_consent', description: 'Start the selected song only after the caller heard the full scoring disclosure and explicitly consented.' },
+          { id: 'start_with_consent', description: 'Start the currently selected song only when the caller explicitly asks to start now, consenting to scoring. An interrupted disclosure does not block this.' },
           { id: 'list_songs', description: 'Read the available songs.' },
         ]
       : snapshot.phase === 'results'
@@ -553,6 +567,8 @@ export class KaraokeVoiceSession {
       ? [
           { id: 'catalog', text: catalog.map(song => song.title).join(', ') },
           { id: 'selected_song', text: snapshot.selectedSong?.title ?? 'No song is selected yet.' },
+          { id: 'scoring', text: this.text('voice.scoringInfo') },
+          ...catalog.map(song => ({ id: `song:${song.id}`, text: this.songInfo(song) })),
         ]
       : snapshot.phase === 'results' && snapshot.result
         ? [{ id: 'result', text: this.text('voice.result', {
@@ -573,11 +589,17 @@ export class KaraokeVoiceSession {
       const current = this.currentSnapshot();
       if (!current || this.finalContext(current) !== context || !current.nameConfirmed) return;
       if (result.kind === 'action') {
+        if(informationOnly){
+          this.deps.say(informationFallback(), this.contextGuard(context));
+          return;
+        }
         if (current.phase === 'song_select') {
           if (result.actionId === 'select_song') {
             const song = this.catalogForLocale(current).find(candidate => candidate.id === result.targetId);
             if (song) this.selectSong(song, current);
-          } else if (result.actionId === 'start_with_consent') this.startSelectedSong(current);
+          } else if (result.actionId === 'start_with_consent' && !isConsentQuestionOrNegation(spoken, this.commandLocale)) {
+            this.startSelectedSong(current);
+          }
           else if (result.actionId === 'list_songs') this.speakSongSelection(current);
         } else if (current.phase === 'results' && current.result) {
           if (result.actionId === 'repeat_result') {
@@ -603,14 +625,16 @@ export class KaraokeVoiceSession {
           this.deps.say(fact.text, () => this.finalContext(this.currentSnapshot()) === context);
         }
       } else if (current.phase === 'song_select') {
-        this.deps.say(this.text('voice.unknownSong'), this.contextGuard(context));
+        this.deps.say(informationOnly ? informationFallback() : this.text('voice.unknownSong'),
+          this.contextGuard(context));
       }
     }).catch(() => {
       if (controller.signal.aborted || this.semanticEpoch !== epoch) return;
       this.semanticController = null;
       this.semanticContext = null;
       if (this.finalContext(this.currentSnapshot()) === context && snapshot.phase === 'song_select') {
-        this.deps.say(this.text('voice.unknownSong'), this.contextGuard(context));
+        this.deps.say(informationOnly ? informationFallback() : this.text('voice.unknownSong'),
+          this.contextGuard(context));
       }
     });
   }
@@ -642,6 +666,21 @@ export class KaraokeVoiceSession {
       return Boolean(snapshot && (snapshot.phase === 'lobby'
         || (snapshot.phase === 'song_select' && !snapshot.selectedSong)));
     };
+  }
+
+  private callIntroGuard(): () => boolean {
+    const code = this.code, playerId = this.playerId, callSid = this.callSid, epoch = this.introEpoch;
+    return () => {
+      const snapshot = this.currentSnapshot();
+      if (snapshot && snapshot.phase !== this.introPhase) this.introExpired = true;
+      return Boolean(code && playerId && callSid && snapshot && this.code === code
+        && this.playerId === playerId && this.callSid === callSid && this.introEpoch === epoch
+        && !this.introExpired);
+    };
+  }
+
+  private isCallIntroPhase(phase: KaraokePhase): boolean {
+    return phase === 'lobby' || phase === 'song_select';
   }
 
   private introGuard(): () => boolean {
@@ -693,6 +732,7 @@ export class KaraokeVoiceSession {
 
   private clearBinding(): void {
     this.cancelSemantic();
+    this.introEpoch++;
     this.code = null;
     this.playerId = null;
     this.callSid = null;
@@ -701,8 +741,6 @@ export class KaraokeVoiceSession {
     this.lastPhase = null;
     this.lastSelectionGeneration = 0;
     this.lastFinal = null;
-    this.consentReadySelection = null;
-    this.consentAttempt = null;
     this.preparationAnnouncedGenerations.clear();
   }
 }
@@ -711,6 +749,15 @@ export function matchKaraokeSong(
   spoken: string,
   songs: readonly KaraokeVoiceSong[],
   locale: SupportedLocale = DEFAULT_LOCALE,
+): KaraokeVoiceSong | null {
+  if (isKaraokeInformationRequest(spoken, locale)) return null;
+  return matchKaraokeSongReference(spoken, songs, locale);
+}
+
+function matchKaraokeSongReference(
+  spoken: string,
+  songs: readonly KaraokeVoiceSong[],
+  locale: SupportedLocale,
 ): KaraokeVoiceSong | null {
   const normalized = normalizeForMatching(spoken, locale);
   const segments = normalized.split(locale === 'pt-BR'
@@ -760,10 +807,49 @@ function parseKaraokeName(spoken: string, locale: SupportedLocale): string | nul
 }
 
 function isExplicitStart(spoken: string, locale: SupportedLocale): boolean {
+  // A clear, affirmative start should not wait for a semantic model while the consent
+  // disclosure is speaking. Ambiguous, negative, or conditional language still goes
+  // through the contextual intent resolver; this fast path grants no inferred consent.
+  if (isConsentQuestionOrNegation(spoken, locale)) return false;
+  const text = normalizeForMatching(spoken, locale).replace(/['’]/g, '');
+  if (!text || text.split(/\s+/).length > 16) return false;
+  if (locale === 'pt-BR') {
+    return /^(?:(?:sim|claro|ok|okay|por favor|vamos|bora|eu quero|quero|estou pront[oa] para|ja estou pront[oa] para)\s+)*(?:comecar|iniciar)(?:\s+(?:(?:a|esta|essa|minha)\s+)?musica)?(?:\s+a\s+cantar)?(?:\s+(?:agora|ja))?(?:\s+por favor)?$/.test(text);
+  }
+  return /^(?:(?:yes|yeah|yep|sure|ok|okay|alright|please|go ahead(?: and)?|lets|let s|let us|i want to|i wanna|id like to|i would like to|im ready to|i am ready to|were ready to|we are ready to|ready to)\s+)*(?:just\s+)?(?:start|begin)(?:\s+(?:(?:the|this|that|my)\s+)?song)?(?:\s+singing)?(?:\s+(?:right\s+)?now)?(?:\s+please)?$/.test(text);
+}
+
+function isKaraokeInformationRequest(spoken: string, locale: SupportedLocale): boolean {
+  const text = normalizeForMatching(spoken, locale);
+  if (!text) return false;
+  if (locale === 'pt-BR'
+    ? /^(?:comecar|iniciar|comece|inicie)\s+(?:por\s+)?(?:me\s+)?(?:dizendo|explicando|falando|contando)\b/.test(text)
+    : /^(?:start|begin)\s+(?:by|with)\s+(?:tell|telling|explain|explaining|say|saying|describe|describing)\b/.test(text)) return true;
+  // A polite request to choose a title is still an action. Questions about a title are not.
+  if (locale === 'pt-BR'
+    ? /^(?:pode|poderia)\s+(?:por favor\s+)?(?:tocar|escolher|selecionar)\b/.test(text)
+    : /^(?:can|could|would)\s+(?:you|we)\s+(?:please\s+)?(?:play|choose|select|pick)\b/.test(text)) return false;
+  return /[?？¿]/u.test(spoken) || (locale === 'pt-BR'
+    ? /^(?:qual|quais|quanto|onde|quem|como|por que|porque|quando|me fale|fale|explique|compare|pode|posso|preciso|devo|quero saber)\b/.test(text)
+    : /^(?:what|which|where|who|how|why|when|tell me|explain|describe|compare|can|could|would|should|do|does|is|are|i wonder|i want to know|i would like to know)\b/.test(text));
+}
+
+function isScoringConsentQuestion(spoken: string, locale: SupportedLocale): boolean {
+  if (!isKaraokeInformationRequest(spoken, locale)) return false;
   const text = normalizeForMatching(spoken, locale);
   return locale === 'pt-BR'
-    ? /^(?:(?:sim|por favor) )?(?:comecar|comecar a cantar|iniciar|iniciar a musica|vamos comecar|pront[oa] para comecar)(?: por favor)?$/.test(text)
-    : /^(?:(?:yes|please) )?(?:start|start singing|begin|begin singing|let s start|i am ready to start|ready to start)(?: please)?$/.test(text);
+    ? /\b(?:pontuacao|consentimento|consentir|voz|audio|gravar|gravacao|servico|terceiro|terceirizado|dados|privacidade|esperar|espera|aguardar|comecar|iniciar)\b/.test(text)
+    : /\b(?:score|scoring|consent|voice|audio|record|recording|service|third.party|data|privacy|wait|waiting|start|begin)\b/.test(text);
+}
+
+function isConsentQuestionOrNegation(spoken: string, locale: SupportedLocale): boolean {
+  // ASR punctuation is imperfect, but an explicit question mark must never become
+  // consent just because normalization strips it from the fast-path transcript.
+  if (/[?？¿]/u.test(spoken)) return true;
+  const text = normalizeForMatching(spoken, locale).replace(/['’]/g, '');
+  return locale === 'pt-BR'
+    ? /\b(?:nao|nunca|talvez|depois|mais tarde|espera|espere|aguarda|aguarde|ainda|se|quando|antes|posso|podemos|devo|como|qual|quais|quem|onde|porque|por que|explicar|explicando|dizendo|falando|amanha)\b/.test(text)
+    : /\b(?:dont|do not|not|never|wait|hold|later|maybe|might|if|when|before|after|could|would|should|can|how|what|why|where|who|which|whether|telling|tell|explaining|explain|describing|describe|wont|tomorrow|minutes?)\b/.test(text);
 }
 
 function isHelpRequest(spoken: string, locale: SupportedLocale): boolean {

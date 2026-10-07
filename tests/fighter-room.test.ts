@@ -321,6 +321,24 @@ describe('fighter room', () => {
       .toEqual(['punch', 'block']);
   });
 
+  it('runs a queued solo caller command before an AI decision on the same ready tick', () => {
+    const room = new FighterRoom('SOLO-PRIORITY', 1);
+    const player = room.addPlayer('Ada'); if ('error' in player) throw new Error(player.error);
+    room.advance(); room.selectFighter(player.playerId, 'nyx'); room.advance();
+    room.selectMap(player.playerId, 'void'); room.advance();
+    room.ready(room.state().loadingGeneration); room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    expect(room.voiceCommand(player.playerId, 'forward', 'opening')).toMatchObject({ status: 'executed' });
+    expect(room.voiceCommand(player.playerId, 'block', 'queued-block')).toMatchObject({ status: 'queued' });
+    room.drainEvents();
+    room.tick(1);
+    const actions = room.drainEvents().flatMap(event => event.type === 'action' ? [`${event.fighter}:${event.command}`] : []);
+    expect(actions[0]).toBe('p1:block');
+    expect(actions[1]).toMatch(/^p2:/);
+    expect(room.drainVoiceCommandOutcomes()).toContainEqual(expect.objectContaining({
+      requestId: 'queued-block', status: 'executed',
+    }));
+  });
+
   it('keeps both commands from one voice sequence in order through recovery', () => {
     const room = readyFightRoom();
     const playerId = room.lobbyPlayers().find(player => player.side === 'p1')!.playerId;

@@ -115,11 +115,15 @@ describe('HTTP-hosted Voice Karaoke', () => {
       'X-Twilio-Signature': voiceSignature,
     });
     const relayMessages: Record<string, unknown>[] = [];
+    let consentStillSpeaking = false;
     voice.on('message', data => {
       const message = JSON.parse(data.toString()) as Record<string, unknown>;
       relayMessages.push(message);
       if (message.type === 'text') {
-        voice.send(JSON.stringify({ type: 'info', name: 'tokensPlayed', value: message.token }));
+        if (/With scoring/i.test(String(message.token ?? ''))) consentStillSpeaking = true;
+        if (!consentStillSpeaking) {
+          voice.send(JSON.stringify({ type: 'info', name: 'tokensPlayed', value: message.token }));
+        }
       }
     });
     voice.send(JSON.stringify({
@@ -135,6 +139,9 @@ describe('HTTP-hosted Voice Karaoke', () => {
     voice.send(JSON.stringify({ type: 'prompt', voicePrompt: 'Never Gonna Give You Up', last: true }));
     await vi.waitFor(() => expect(karaoke.findRoom(ROOM)?.state().selectedSong?.title).toBe('Never Gonna Give You Up'));
     await waitForConsentPlayback(relayMessages);
+    expect(consentStillSpeaking).toBe(true);
+    voice.send(JSON.stringify({ type: 'interrupt', utteranceUntilInterrupt: '', durationUntilInterruptMs: 100 }));
+    consentStillSpeaking = false;
     voice.send(JSON.stringify({ type: 'prompt', voicePrompt: 'start singing', last: true }));
     await vi.waitFor(() => expect(karaoke.findRoom(ROOM)?.state().phase).toBe('loading'));
     expect(relayMessages.filter(message => message.type === 'end')).toHaveLength(0);
@@ -505,7 +512,7 @@ describe('HTTP-hosted Voice Karaoke', () => {
 });
 
 describe('station Karaoke result Relay retirement', () => {
-  it('keeps score and requeue speech alive across station retirement until both lines play', async () => {
+  it('sends score and requeue guidance in one Relay cue before station retirement', async () => {
     server = new HttpServer({ port: 0, publicBaseUrl: 'http://localhost', validateSignatures: false,
       karaokeLeaderboardPath: join(directory, 'karaoke-leaderboard.json') });
     await server.start();
@@ -517,18 +524,13 @@ describe('station Karaoke result Relay retirement', () => {
     expect(karaoke.findRoom(roomCode)).toBeDefined();
 
     const scoreToken = String(messages.find(message => message.type === 'text')?.token ?? '');
-    expect(scoreToken).toContain('score is 900');
+    expect(scoreToken).toContain('Score 900');
+    expect(scoreToken).toContain('best combo');
+    expect(scoreToken).toContain('Results on screen');
+    expect(scoreToken).toContain('Check your messages');
     expect(handleRelayPlaybackEvent(socket, JSON.stringify({
       type: 'info', name: 'tokensPlayed', value: scoreToken,
     }))).toBe(true);
-    await vi.waitFor(() => expect(messages.filter(message => message.type === 'text')).toHaveLength(2));
-    expect(karaoke.findRoom(roomCode)).toBeDefined();
-
-    const requeueToken = String(messages.filter(message => message.type === 'text')[1]?.token ?? '');
-    expect(requeueToken).toContain('check your messages');
-    handleRelayPlaybackEvent(socket, JSON.stringify({
-      type: 'info', name: 'tokensPlayed', value: requeueToken,
-    }));
     await vi.waitFor(() => expect(karaoke.findRoom(roomCode)).toBeUndefined());
     await vi.waitFor(() => expect(messages.filter(message => message.type === 'end')).toHaveLength(1),
       { timeout: 2_000 });
@@ -542,6 +544,8 @@ describe('station Karaoke result Relay retirement', () => {
     const roomCode = 'KARAOKE-RESULT-STALL';
     const { karaoke, socket, messages, retire } = attachStationResultRelay(server, roomCode);
     await flushMicrotasks();
+    expect(String(messages.find(message => message.type === 'text')?.token ?? ''))
+      .toMatch(/Score 900.*Results on screen.*check your messages/i);
     retire();
 
     await vi.advanceTimersByTimeAsync(9_999);

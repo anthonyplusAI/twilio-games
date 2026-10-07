@@ -325,7 +325,7 @@ The application runs locally without Twilio, OpenAI, or Deepgram credentials. Co
 | `TWILIO_VALIDATE_SIGNATURES` | Explicitly enables or disables webhook signature validation | Enabled when an Auth Token is set or `NODE_ENV=production` |
 | `GAME_PHONE_NUMBER` | Legacy Voice fallback used for both locales only while neither operator-configured locale number exists | Placeholder or unavailable state when unset |
 | `VOICE_RELAY_TOKEN` | Dedicated bearer token for Conversation Relay setup frames | Required and separate from `TWILIO_AUTH_TOKEN` in production |
-| `CR_TTS_VOICE` | English ElevenLabs voice ID used by every game's Conversation Relay talk-back | `xp3gDg85YgFcWpnNVlIu` |
+| `CR_TTS_VOICE` | English ElevenLabs voice ID used by every game's Conversation Relay talk-back | `SA7eD52NRr8WAehitVt1` |
 | `CR_TTS_VOICE_PT_BR` | Optional Brazilian Portuguese ElevenLabs voice ID | Relay's `pt-BR` default voice |
 | `DEFAULT_LOCALE` | Call locale when no localized game display is connected | `en-US` |
 | `OPENAI_API_KEY` | Enables phase-bound semantic interpretation of conversational commands in all six games | Required by deployment; local runs without it retain deterministic commands |

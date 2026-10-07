@@ -31,6 +31,10 @@ describe('isAdvanceWord', () => {
     expect(isAdvanceWord('Sparkmouse')).toBe(false);
     expect(isAdvanceWord('what is this?')).toBe(false);
     expect(isAdvanceWord('start or wait')).toBe(false);
+    expect(isAdvanceWord('how do i fight')).toBe(false);
+    expect(isAdvanceWord('can you explain battle')).toBe(false);
+    expect(isAdvanceWord('who won the battle')).toBe(false);
+    expect(isAdvanceWord('como lutar', 'pt-BR')).toBe(false);
   });
 });
 
@@ -110,7 +114,7 @@ const prompt = (text: string, last = true) => JSON.stringify({ type: 'prompt', v
 const dtmf = (digit: string) => JSON.stringify({ type: 'dtmf', digit });
 
 describe('BattleVoiceSession', () => {
-  it('revokes queued setup speech on barge-in and touchscreen phase changes', () => {
+  it('retires the Twilio introduction when the visible menu changes', () => {
     let snap = battleSnap({ phase: 'lobby', myName: null, nameConfirmed: false });
     const lines: { text: string; isCurrent?: () => boolean }[] = [];
     const { deps } = fakeDeps({ snapshot: () => snap, say: (text, isCurrent) => lines.push({ text, isCurrent }) });
@@ -131,6 +135,12 @@ describe('BattleVoiceSession', () => {
     nextSession.onBattleStateChanged();
     expect(menuIntro?.isCurrent?.()).toBe(false);
     expect(lines.some(line => /choose your own monster/i.test(line.text))).toBe(true);
+    snap = activeBattle();
+    nextSession.onBattleStateChanged();
+    expect(menuIntro?.isCurrent?.()).toBe(false);
+    snap = battleSnap({ phase: 'monster_select', myName: 'Ada', nameConfirmed: true });
+    nextSession.onBattleStateChanged();
+    expect(menuIntro?.isCurrent?.()).toBe(false);
   });
 
   it('speaks a replacement cue when a touchscreen chooses the caller’s monster', () => {
@@ -178,21 +188,31 @@ describe('BattleVoiceSession', () => {
     expect(moveLine?.isCurrent?.()).toBe(false);
   });
 
-  it('keeps battle commentary aligned with the most recently painted event', () => {
-    const snap = activeBattle({ generation: 7, turn: 1 });
+  it('lets an audible battle line finish across the next painted beat, then expires stale queued speech', () => {
+    vi.useFakeTimers();
+    let snap = activeBattle({ generation: 7, turn: 1 });
     const lines: { text: string; isCurrent?: () => boolean }[] = [];
     const { deps } = fakeDeps({ snapshot: () => snap, say: (text, isCurrent) => lines.push({ text, isCurrent }) });
-    const session = new BattleVoiceSession(deps);
-    session.handleMessage(setup());
-    lines.length = 0;
-    session.onBattlePresentation({ kind: 'event', generation: 7, eventId: 1,
-      event: { kind: 'move_used', by: 'a', moveId: 'sparkmouse.jolt', moveName: 'Thunder Jolt' } });
-    const earlier = lines.find(line => /Thunder Jolt/.test(line.text));
-    expect(earlier?.isCurrent?.()).toBe(true);
-    session.onBattlePresentation({ kind: 'event', generation: 7, eventId: 2,
-      event: { kind: 'effectiveness', on: 'b', multiplier: 2, label: "It's super effective!" } });
-    expect(earlier?.isCurrent?.()).toBe(false);
-    expect(lines.at(-1)?.isCurrent?.()).toBe(true);
+    try {
+      const session = new BattleVoiceSession(deps);
+      session.handleMessage(setup());
+      lines.length = 0;
+      session.onBattlePresentation({ kind: 'event', generation: 7, eventId: 1,
+        event: { kind: 'move_used', by: 'a', moveId: 'sparkmouse.jolt', moveName: 'Thunder Jolt' } });
+      const earlier = lines.find(line => /Thunder Jolt/.test(line.text));
+      expect(earlier?.isCurrent?.()).toBe(true);
+      vi.advanceTimersByTime(1_800);
+      snap = { ...snap, foeHp: 42 };
+      session.onBattleStateChanged();
+      session.onBattlePresentation({ kind: 'event', generation: 7, eventId: 2,
+        event: { kind: 'effectiveness', on: 'b', multiplier: 2, label: "It's super effective!" } });
+      expect(earlier?.isCurrent?.()).toBe(true);
+      expect(lines.at(-1)?.isCurrent?.()).toBe(true);
+      vi.advanceTimersByTime(3_201);
+      expect(earlier?.isCurrent?.()).toBe(false);
+      session.handleMessage(JSON.stringify({ type: 'interrupt', utteranceUntilInterrupt: '', durationUntilInterruptMs: 100 }));
+      expect(lines.at(-1)?.isCurrent?.()).toBe(false);
+    } finally { vi.useRealTimers(); }
   });
 
   it('revokes a free-play result if a touchscreen begins the next game', () => {
@@ -506,6 +526,14 @@ describe('BattleVoiceSession', () => {
     expect(log).toContain('monster embertail');
   });
 
+  it('keeps a polite monster choice on the fast voice path', () => {
+    const { deps, log } = fakeDeps({ snapshot: () => battleSnap({ myName: 'Ada' }) });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    session.handleMessage(prompt("I'd like Embertail"));
+    expect(log).toContain('monster embertail');
+  });
+
   it('finishes requested name capture before interpreting a matching monster name', () => {
     const { deps, log } = fakeDeps({
       snapshot: () => battleSnap({ myName: null }),
@@ -543,6 +571,34 @@ describe('BattleVoiceSession', () => {
       expect(log.some(entry=>entry.startsWith('monster '))).toBe(false);
       expect(requests).toEqual([spoken]);
     });
+
+  it.each(['Tell me about monster 2', 'I have 2 questions', 'Sparkmouse looks strong',
+    'Compare Sparkmouse with Embertail', 'Me fale do monstro 2'])
+    ('does not lock a monster while the caller is discussing a choice: %s', async spoken => {
+      const requests: string[] = [];
+      const { deps, log } = fakeDeps({ snapshot: () => battleSnap({ myName: 'Ada' }),
+        interpret: async request => { requests.push(request.transcript); return { kind: 'none' }; } });
+      const session = new BattleVoiceSession(deps);
+      session.handleMessage(setup('4821', spoken.startsWith('Me ') ? 'pt-BR' : undefined));
+      session.handleMessage(prompt(spoken));
+      await Promise.resolve();
+      expect(log.some(entry => entry.startsWith('monster '))).toBe(false);
+      expect(requests).toEqual([spoken]);
+    });
+
+  it('offers current health and potions as facts for conversational questions', async () => {
+    const requests: Parameters<NonNullable<BattleVoiceDeps['interpret']>>[0][] = [];
+    const { deps } = fakeDeps({ snapshot: () => activeBattle({ myHp: 38, foeHp: 52, myPotions: 1 }),
+      interpret: async request => { requests.push(request); return { kind: 'none' }; } });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    session.handleMessage(prompt('How much health do I have'));
+    await Promise.resolve();
+    expect(requests[0]?.facts).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'health', text: expect.stringContaining('38 of 70') }),
+      expect.objectContaining({ id: 'potions', text: expect.stringContaining('1 potion') }),
+    ]));
+  });
 
   it.each([
     {locale:undefined,spoken:'Sparkmouse or Embertail',expected:/which monster/i},
@@ -1334,7 +1390,7 @@ describe('BattleVoiceSession', () => {
     expect(log).not.toContain('show results');
   });
 
-  it('announces display-loss recovery truthfully and allows a free-play rematch',()=>{
+  it('announces the authoritative winner and invites replay when result paint is delayed',()=>{
     let timedOut=false;
     let phase:BattleVoiceSnapshot['phase']='results';
     const {deps,log,said}=fakeDeps({
@@ -1344,19 +1400,57 @@ describe('BattleVoiceSession', () => {
     });
     const session=new BattleVoiceSession(deps);session.handleMessage(setup());said.length=0;
     timedOut=true;session.onBattleStateChanged();
-    expect(said.at(-1)).toMatch(/could not confirm.*display.*Ada won/i);
+    expect(said.at(-1)).toMatch(/Ada won.*(want|like).*again.*rematch/i);
+    expect(said.at(-1)).not.toMatch(/confirm|display|screen/i);
     session.handleMessage(prompt('rematch'));
     expect(log).toContain('advance');
   });
 
   it('sends station players back to messaging and the queue without offering a rematch', () => {
     const {deps,said}=fakeDeps({snapshot:()=>battleSnap({
-      phase:'results',myName:'Ada',myMonsterName:'Sparkmouse',foeName:'Bo',foeMonsterName:'Embertail',winnerName:'Ada',
+      phase:'results',generation:2,resultsPresented:true,myName:'Ada',myMonsterName:'Sparkmouse',
+      foeName:'Bo',foeMonsterName:'Embertail',winnerName:'Ada',
     })});
     const session=new BattleVoiceSession(deps);session.setStationManaged(true);session.handleMessage(setup());said.length=0;
     session.onBattleEvent({kind:'battle_over',winner:'a',winnerName:'Ada'});
     expect(said.join(' ')).toMatch(/results.*display.*thanks for playing.*check your messages/i);
     expect(said.join(' ')).not.toMatch(/rematch|automatically/i);
+  });
+
+  it('waits for a station result paint receipt and narrates the terminal line only once', () => {
+    let snap=battleSnap({phase:'results',generation:2,resultsPresented:false,presentationPending:true,
+      myName:'Ada',myMonsterName:'Sparkmouse',foeName:'Bo',foeMonsterName:'Embertail',winnerName:'Ada'});
+    const {deps,said}=fakeDeps({snapshot:()=>snap});
+    const session=new BattleVoiceSession(deps);session.setStationManaged(true);
+    session.handleMessage(setup());said.length=0;
+
+    session.onBattleEvent({kind:'battle_over',winner:'a',winnerName:'Ada'});
+    expect(said.join(' ')).toMatch(/Ada wins/i);
+    expect(said.join(' ')).not.toMatch(/results.*display/i);
+
+    snap={...snap,resultsPresented:true,presentationPending:false};
+    const result={kind:'results' as const,generation:2,result:{winner:'a' as const,winnerName:'Ada'}};
+    session.onBattlePresentation(result);
+    session.onBattlePresentation(result);
+    session.onBattleEvent({kind:'battle_over',winner:'a',winnerName:'Ada'});
+    expect(said.filter(line=>/results.*display/i.test(line))).toHaveLength(1);
+  });
+
+  it('uses one authoritative station recovery line if result paint times out', () => {
+    let snap=battleSnap({phase:'results',generation:3,resultsPresented:false,
+      resultsPresentationTimedOut:false,myName:'Ada',winnerName:'Ada'});
+    const {deps,said}=fakeDeps({snapshot:()=>snap});
+    const session=new BattleVoiceSession(deps);session.setStationManaged(true);
+    session.handleMessage(setup());said.length=0;
+    session.onBattleEvent({kind:'battle_over',winner:'a',winnerName:'Ada'});
+
+    snap={...snap,resultsPresentationTimedOut:true};
+    session.onBattleStateChanged();
+    session.onBattleEvent({kind:'battle_over',winner:'a',winnerName:'Ada'});
+    snap={...snap,resultsPresented:true};
+    session.onBattlePresentation({kind:'results',generation:3,result:{winner:'a',winnerName:'Ada'}});
+    expect(said.filter(line=>/check your messages/i.test(line))).toHaveLength(1);
+    expect(said.join(' ')).not.toMatch(/results.*display/i);
   });
 
   it('names monsters correctly for a side-b caller (event sides are absolute)', () => {

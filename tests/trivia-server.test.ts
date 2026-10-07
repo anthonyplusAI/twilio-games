@@ -357,6 +357,34 @@ describe('TriviaServer authority and lifecycle', () => {
     expect(trivia!.findRoom('LOCAL')!.state().players[0]).toMatchObject({ answered: true, rawScore: 1_300 });
   });
 
+  it('advances a voice question as soon as its reveal finishes after the minimum dwell', async () => {
+    const now = { value: 0 };
+    await start({ now: () => now.value, tickMs: 5,
+      roomFactory: (code, options) => new TriviaRoom(code, { ...options, countdownMs: 20, revealMs: 10 }) });
+    const player = trivia!.voiceJoin('VOICE-REVEAL', 'Ada', 1)!;
+    expect(trivia!.voiceAdvance('VOICE-REVEAL', player)).toBe(true);
+    expect(trivia!.voiceAdvance('VOICE-REVEAL', player)).toBe(true);
+    const room = trivia!.findRoom('VOICE-REVEAL')!;
+    expect(room.ready(room.state().loadingGeneration)).toBe(true);
+    now.value = room.state().countdownEndsAtMs!;
+    room.tick();
+    const question = room.state().question!;
+    const attemptId = room.state().questionAttemptId!;
+    const prompt = trivia!.voiceBeginPromptDelivery(room.code, player, question.id, attemptId)!;
+    expect(trivia!.voiceQuestionPromptReady(room.code, player, question.id, attemptId, prompt)).toBe(true);
+    const cue = trivia!.voiceBeginAnswerCueDelivery(room.code, player, question.id, attemptId)!;
+    expect(trivia!.voiceQuestionAnswerCueReady(room.code, player, question.id, attemptId, cue)).toBe(true);
+    now.value = room.state().answeringStartsAtMs!;
+    const correct = bank.questions.find(item => item.id === question.id)!.correctChoiceId;
+    expect(trivia!.voiceAnswer(room.code, player, correct)).toBe(true);
+    const reveal = trivia!.voiceBeginRevealDelivery(room.code, player, question.id, attemptId)!;
+    now.value = room.state().revealEndsAtMs!;
+    expect(room.tick()).toBe(false);
+    expect(trivia!.voiceQuestionRevealReady(room.code, player, question.id, attemptId, reveal)).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'question_prompt', questionIndex: 1 });
+    expect(trivia!.voiceQuestionRevealReady(room.code, player, question.id, attemptId, reveal)).toBe(false);
+  });
+
   it('holds a mixed local and phone question behind both playback barriers', async () => {
     let now = 0;
     const port = await start({

@@ -12,7 +12,7 @@
 // context per car) is fine: it's ~19 one-off renders at boot, off the critical path.
 import * as THREE from 'three';
 import { clone as skeletonClone } from 'three/examples/jsm/utils/SkeletonUtils.js';
-import { loadMapWorld } from './map-world';
+import { disposeMapWorld, loadMapWorld } from './map-world';
 import type { AssetLoader } from './asset-loader';
 import type { MapConfig } from './map-world';
 
@@ -169,52 +169,54 @@ export function renderCarThumbnails(assets: AssetLoader, size = 256): string[] {
  * an auto-computed elevated 3/4 establishing shot from the scene bbox. Heavy (scenery GLBs are big);
  * runs once per map at boot, paced to idle.
  */
-export async function renderMapThumbnail(cfg: MapConfig, size = 480): Promise<string> {
-  let renderer: THREE.WebGLRenderer;
-  try { renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true }); }
-  catch { return ''; }
-  const w = size, h = Math.round(size * 0.62);       // landscape tile
-  renderer.setSize(w, h);
-  renderer.setPixelRatio(1);
-  renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.15;
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0b1020);
-  const sun = new THREE.DirectionalLight(0xfff4e2, 2.6); sun.position.set(60, 120, -40); scene.add(sun);
-  scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x202840, 1.1));
-
-  let url = '';
+export async function renderMapThumbnail(cfg: MapConfig, size = 480, signal?: AbortSignal): Promise<string> {
+  let renderer: THREE.WebGLRenderer | null = null;
+  let world: THREE.Group | null = null;
   try {
     // Place the map IDENTICALLY to the editor/game so cfg.previewCam (captured in the editor's world
     // space) lines up. loadMapWorld returns null on failure (we then bail to the placeholder).
-    const world = await loadMapWorld(cfg);
-    if (world) {
-      scene.add(world);
-      world.updateMatrixWorld(true);
-      const box = new THREE.Box3().setFromObject(world);
-      if (!box.isEmpty()) {
-        const c = new THREE.Vector3(); box.getCenter(c);
-        const s = new THREE.Vector3(); box.getSize(s);
-        const r = Math.max(s.x, s.z, 1);
-        const aspect = w / h;
-        const cam = new THREE.PerspectiveCamera(50, aspect, 0.1, r * 12 + 5000);
-        const pv = cfg.previewCam;
-        if (pv && pv.pos.length === 3 && pv.lookAt.length === 3) {
-          // CUSTOM shot captured in the editor (world space).
-          cam.fov = pv.fov ?? 50; cam.updateProjectionMatrix();
-          cam.position.set(pv.pos[0]!, pv.pos[1]!, pv.pos[2]!);
-          cam.lookAt(pv.lookAt[0]!, pv.lookAt[1]!, pv.lookAt[2]!);
-        } else {
-          // AUTO: elevated 3/4 establishing shot, looking down at the scene center.
-          cam.position.set(c.x + r * 0.55, c.y + r * 0.55, c.z + r * 0.75);
-          cam.lookAt(c.x, c.y, c.z);
-        }
-        cam.updateProjectionMatrix();
-        renderer.render(scene, cam);
-        url = renderer.domElement.toDataURL('image/png');
+    world = await loadMapWorld(cfg, signal);
+    if (!world || signal?.aborted) return '';
+    // Do not reserve a WebGL context while a cosmetic preview waits on a slow map download.
+    renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    const w = size, h = Math.round(size * 0.62);       // landscape tile
+    renderer.setSize(w, h);
+    renderer.setPixelRatio(1);
+    renderer.toneMapping = THREE.ACESFilmicToneMapping; renderer.toneMappingExposure = 1.15;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b1020);
+    const sun = new THREE.DirectionalLight(0xfff4e2, 2.6); sun.position.set(60, 120, -40); scene.add(sun);
+    scene.add(new THREE.HemisphereLight(0xbfd4ff, 0x202840, 1.1));
+    scene.add(world);
+    world.updateMatrixWorld(true);
+    const box = new THREE.Box3().setFromObject(world);
+    if (!box.isEmpty()) {
+      const c = new THREE.Vector3(); box.getCenter(c);
+      const s = new THREE.Vector3(); box.getSize(s);
+      const r = Math.max(s.x, s.z, 1);
+      const aspect = w / h;
+      const cam = new THREE.PerspectiveCamera(50, aspect, 0.1, r * 12 + 5000);
+      const pv = cfg.previewCam;
+      if (pv && pv.pos.length === 3 && pv.lookAt.length === 3) {
+        // CUSTOM shot captured in the editor (world space).
+        cam.fov = pv.fov ?? 50; cam.updateProjectionMatrix();
+        cam.position.set(pv.pos[0]!, pv.pos[1]!, pv.pos[2]!);
+        cam.lookAt(pv.lookAt[0]!, pv.lookAt[1]!, pv.lookAt[2]!);
+      } else {
+        // AUTO: elevated 3/4 establishing shot, looking down at the scene center.
+        cam.position.set(c.x + r * 0.55, c.y + r * 0.55, c.z + r * 0.75);
+        cam.lookAt(c.x, c.y, c.z);
       }
+      cam.updateProjectionMatrix();
+      if (signal?.aborted) return '';
+      renderer.render(scene, cam);
+      return renderer.domElement.toDataURL('image/png');
     }
-  } catch { url = ''; }
-  renderer.dispose(); renderer.forceContextLoss();
-  return url;
+  } catch { return ''; }
+  finally {
+    if (world) disposeMapWorld(world);
+    renderer?.dispose(); renderer?.forceContextLoss();
+  }
+  return '';
 }

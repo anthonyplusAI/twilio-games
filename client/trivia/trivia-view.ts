@@ -61,8 +61,8 @@ const COPY = {
     categoryTouch: '{name} is voting on this screen', categorySubmitting: "Recording {name}'s vote...", categoryWaiting: 'Waiting for phone votes', vote: 'vote', votes: 'votes',
     loading: 'Building the question deck', loadingBody: 'The display is checking fonts and stage readiness.',
     displayReady: 'Display ready', displayPreparing: 'Preparing display', countdown: 'Round starts in',
-    question: 'Question', of: 'of', getReady: 'Get ready', promptBody: 'Phones are finishing the question prompt.',
-    cueReady: 'Get ready to answer', cueBody: 'Phones are synchronizing the answer cue.',
+    question: 'Question', of: 'of', getReady: 'Get ready', promptBody: 'Phones are finishing the question prompt. The ten-second clock starts after all phones are ready.',
+    cueReady: 'Get ready to answer', cueBody: 'Phones are synchronizing the answer cue. The ten-second clock starts after all phones are ready.',
     audioProblem: 'Question audio needs attention', audioProblemBody: 'The answer clock is paused. Ask the operator to retry this question.',
     audioExpired: 'This round has ended', audioExpiredBody: 'Question audio could not be recovered. Ask the operator about starting a new game.',
     answerNow: 'Answer now', seconds: 'seconds', listening: 'Listening', locked: 'Answer locked',
@@ -92,8 +92,8 @@ const COPY = {
     categoryTouch: '{name} está votando nesta tela', categorySubmitting: 'Registrando o voto de {name}...', categoryWaiting: 'Aguardando votos por telefone', vote: 'voto', votes: 'votos',
     loading: 'Montando as perguntas', loadingBody: 'A tela está verificando fontes e o palco.',
     displayReady: 'Tela pronta', displayPreparing: 'Preparando a tela', countdown: 'A rodada começa em',
-    question: 'Pergunta', of: 'de', getReady: 'Preparem-se', promptBody: 'Os telefones estão terminando a pergunta.',
-    cueReady: 'Preparem-se para responder', cueBody: 'Os telefones estão sincronizando o aviso de resposta.',
+    question: 'Pergunta', of: 'de', getReady: 'Preparem-se', promptBody: 'Os telefones estão terminando a pergunta. O cronômetro de dez segundos começa quando todos os telefones estiverem prontos.',
+    cueReady: 'Preparem-se para responder', cueBody: 'Os telefones estão sincronizando o aviso de resposta. O cronômetro de dez segundos começa quando todos os telefones estiverem prontos.',
     audioProblem: 'Áudio da pergunta precisa de atenção', audioProblemBody: 'O cronômetro está pausado. Peça ao operador para repetir esta pergunta.',
     audioExpired: 'Esta rodada terminou', audioExpiredBody: 'Não foi possível recuperar o áudio da pergunta. Fale com o operador para iniciar um novo jogo.',
     answerNow: 'Respondam agora', seconds: 'segundos', listening: 'Escutando', locked: 'Resposta registrada',
@@ -239,11 +239,11 @@ function renderQuestion(
   const activelyAnswering = answering;
   const mode = activelyAnswering ? copy.answerNow : stage === 'cue' ? copy.cueReady : copy.getReady;
   const timer = timing
-    ? `<div class="question-timer" aria-label="${escapeHtml(copy.answerNow)}"><strong id="question-seconds">${timing.remainingSeconds}</strong><span>${escapeHtml(copy.seconds)}</span><div class="timer-track" role="progressbar" aria-label="${escapeHtml(copy.answerNow)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(timing.progress * 100)}"><i id="timer-fill" style="width:${timing.progress * 100}%"></i></div></div>`
+    ? `<div id="question-timer" class="question-timer${timing.remainingSeconds <= 5 ? ' urgent' : ''}" aria-label="${escapeHtml(copy.answerNow)}"><strong id="question-seconds">${timing.remainingSeconds}</strong><span>${escapeHtml(copy.seconds)}</span><div class="timer-track" role="progressbar" aria-label="${escapeHtml(copy.answerNow)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(timing.progress * 100)}"><i id="timer-fill" style="transform:scaleX(${timing.progress})"></i></div></div>`
     : `<div class="prompt-status"><span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span><strong>${escapeHtml(stage === 'cue' ? copy.cueBody : copy.promptBody)}</strong></div>`;
   const html = `<section class="scene question-scene" data-view="${state.phase}">
-    <header class="question-header"><div><span>${escapeHtml(copy.question)} ${(state.questionIndex ?? 0) + 1} ${escapeHtml(copy.of)} ${TRIVIA_ROUND_QUESTION_COUNT}</span><strong>${escapeHtml(TRIVIA_CATEGORY_LABELS[context.locale][question.category])} · ${escapeHtml(difficultyLabel(question.difficulty, context.locale))}</strong></div><b>${escapeHtml(mode)}</b></header>
-    <div class="question-layout"><article class="question-board"><h1>${escapeHtml(question.prompt)}</h1><ol class="choice-grid">${renderChoices(question.choices)}</ol>${timer}</article><aside class="answer-status" aria-label="${escapeHtml(copy.players)}">${state.players.map(player => playerPill(player, context.locale, activelyAnswering)).join('')}</aside></div>
+    <header class="question-header"><div><span>${escapeHtml(copy.question)} ${(state.questionIndex ?? 0) + 1} ${escapeHtml(copy.of)} ${TRIVIA_ROUND_QUESTION_COUNT}</span><strong>${escapeHtml(TRIVIA_CATEGORY_LABELS[context.locale][question.category])} · ${escapeHtml(difficultyLabel(question.difficulty, context.locale))}</strong></div><div class="question-timer-zone"><b class="question-mode">${escapeHtml(mode)}</b>${timer}</div></header>
+    <div class="question-layout"><article class="question-board"><h1>${escapeHtml(question.prompt)}</h1><ol class="choice-grid">${renderChoices(question.choices)}</ol></article><aside class="answer-status" aria-label="${escapeHtml(copy.players)}">${state.players.map(player => playerPill(player, context.locale, activelyAnswering)).join('')}</aside></div>
   </section>`;
   const announcement = answering
     ? answered > 0 ? `${answered} of ${state.players.length} ${copy.locked}.` : `${copy.answerNow}. ${timing?.remainingSeconds ?? 10} ${copy.seconds}.`

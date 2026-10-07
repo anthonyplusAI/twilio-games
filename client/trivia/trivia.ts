@@ -67,6 +67,7 @@ let stageError = '';
 let lastAnnouncementKey = '';
 let countdownAnnouncement = '';
 let questionTimeAnnouncement = '';
+let lastTimeUiFrame = 0;
 let pendingAnnouncementFrame: number | null = null;
 let lastPaintAckKey = '';
 let pendingPaintAckKey = '';
@@ -345,8 +346,12 @@ function clearPendingCategoryVote(): void {
   pendingCategoryVoteSeat = null;
 }
 
-function updateTimeDrivenUi(): void {
+function updateTimeDrivenUi(frameNow: number): void {
   requestAnimationFrame(updateTimeDrivenUi);
+  // The visible clock is based on server deadlines; 10 Hz is more than enough
+  // for its text and composited bar, without a layout write on every frame.
+  if (document.hidden || frameNow - lastTimeUiFrame < 100) return;
+  lastTimeUiFrame = frameNow;
   const current = state;
   const now = currentServerNow();
   if (current?.phase === 'countdown' && current.countdownEndsAtMs !== null) {
@@ -365,8 +370,9 @@ function updateTimeDrivenUi(): void {
     const seconds = document.getElementById('question-seconds');
     const fill = document.getElementById('timer-fill');
     if (seconds) seconds.textContent = String(timing.remainingSeconds);
-    if (fill) fill.style.width = `${timing.progress * 100}%`;
+    if (fill) fill.style.transform = `scaleX(${timing.progress})`;
     fill?.parentElement?.setAttribute('aria-valuenow', String(Math.round(timing.progress * 100)));
+    document.getElementById('question-timer')?.classList.toggle('urgent', timing.remainingSeconds <= 5);
     if (timing.remainingSeconds === 5 || timing.remainingSeconds === 0) {
       const key = `${current.questionAttemptId}:${current.question.id}:${timing.remainingSeconds}`;
       if (questionTimeAnnouncement !== key) {

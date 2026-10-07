@@ -12,7 +12,7 @@ const packageManifest = JSON.parse(readFileSync(new URL('../package.json', impor
 
 describe('deployment rollback safety', () => {
   it('pins the requested English Relay voice while keeping Portuguese independently localized', () => {
-    expect(workflow).toContain('CR_TTS_VOICE: xp3gDg85YgFcWpnNVlIu');
+    expect(workflow).toContain('CR_TTS_VOICE: SA7eD52NRr8WAehitVt1');
     expect(workflow).toContain('CR_TTS_VOICE_PT_BR: ${{ vars.CR_TTS_VOICE_PT_BR }}');
     expect(containerApp).toContain('value: "${CR_TTS_VOICE}"');
   });

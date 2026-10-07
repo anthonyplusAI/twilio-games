@@ -56,10 +56,10 @@ const ctx = (over: Partial<BattleMenuCtx> = {}): BattleMenuCtx => ({
 
 describe('matchBattleAction — ROOT keywords', () => {
   it('does not turn acknowledgements, negation, or questions into irreversible actions', () => {
-    for (const spoken of ['right', 'five', "don't fight yet", 'do not use a potion', 'should I guard?', 'I have two potions left', 'guard or attack']) {
+    for (const spoken of ['right', 'five', "don't fight yet", 'do not use a potion', 'should I guard?', 'I have two potions left', 'I have a potion', 'Tell me about the potion', 'Tell me about Thunder Jolt', 'I can block', 'guard or attack']) {
       expect(matchBattleAction(spoken, ctx())).toBeNull();
     }
-    for (const spoken of ['não lute ainda', 'não use poção', 'devo defender?']) {
+    for (const spoken of ['não lute ainda', 'não use poção', 'devo defender?', 'eu tenho uma poção', 'me fale sobre Thunder Jolt']) {
       expect(matchBattleAction(spoken, ctx(), 'pt-BR')).toBeNull();
     }
   });

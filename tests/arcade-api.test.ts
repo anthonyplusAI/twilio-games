@@ -192,7 +192,7 @@ async function createPlayerSession(baseUrl: string, key: string): Promise<Respon
 
 function cookieFrom(response: Response): string {
   const cookie = response.headers.get('set-cookie');
-  if (!cookie) throw new Error('response did not issue a cookie');
+  if (!cookie) throw new Error(`response did not issue a cookie (HTTP ${response.status})`);
   return cookie.split(';', 1)[0]!;
 }
 
@@ -1984,7 +1984,9 @@ describe('Arcade API', () => {
 
   it('uses the authenticated player current entry for queue actions without exposing queue IDs', async () => {
     const { baseUrl } = await harness({ playerMode: 'lead_capture' });
-    const cookie = cookieFrom(await createPlayerSession(baseUrl, 'queue-player'));
+    const session = await createPlayerSession(baseUrl, 'queue-player');
+    expect(session.status, await session.clone().text()).toBe(200);
+    const cookie = cookieFrom(session);
     const registered = await fetch(`${baseUrl}/api/arcade/register`, {
       method: 'POST',
       headers: {

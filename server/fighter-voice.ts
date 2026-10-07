@@ -5,6 +5,7 @@ import type { FighterCommand, FighterEvent } from '../shared/fighter-world';
 import { FIGHTER_INTRO_SECONDS, fighterIntroStage, type FighterIntroStage, type FighterPhase } from '../shared/fighter-protocol';
 import { DEFAULT_LOCALE, resolveLocale, type SupportedLocale } from '../shared/i18n/locales';
 import { FIGHTER_MESSAGES, type FighterMessageKey } from '../shared/i18n/fighter';
+import { FIGHTER_ROSTER } from '../shared/fighter-roster';
 import { createTranslator, formatNumber, normalizeForMatching } from '../shared/i18n/translate';
 import { isExplicitSpokenName, parseFirstName } from '../shared/spoken-name';
 import type { FighterVoiceCommandOutcome } from './fighter-room';
@@ -67,7 +68,7 @@ export interface FighterVoiceDeps {
   showResults?(code:string,id:string):boolean;
   interpret?(request: VoiceInterpretRequest): Promise<VoiceInterpretResult>;
   snapshot(code: string, id: string, locale?: SupportedLocale): FighterVoiceSnapshot | null;
-  say(text: string, isCurrent?: () => boolean): void;
+  say(text: string, isCurrent?: () => boolean): void | Promise<boolean>;
 }
 
 export class FighterVoiceSession {
@@ -103,6 +104,12 @@ export class FighterVoiceSession {
   private lastFinalText:{text:string;beforeContext:string;afterContext:string;at:number;boundary:number}|null=null;
   private utteranceBoundary=0;
   private speechEpoch=0;
+  private introEpoch=0;
+  private introExpired=false;
+  private introPhase:FighterPhase|null=null;
+  private terminalWinnerKey:string|null=null;
+  private terminalWinnerQueued=false;
+  private terminalCueEpoch=0;
   private semanticEpoch=0;
   private semanticController:AbortController|null=null;
   private semanticScopeAtRequest:string|null=null;
@@ -137,6 +144,84 @@ export class FighterVoiceSession {
     this.deps.say(text,()=>guard()&&(!extra||extra()));
   }
 
+  /** An opening line belongs to the screen where this call joined. Touch-driven transitions
+   *  expire it even without caller speech, so it cannot play over a later selector or match. */
+  private sayCallIntro(text:string):void{
+    const code=this.code,playerId=this.playerId,callSid=this.callSid,epoch=this.introEpoch;
+    this.deps.say(text,()=>{
+      const current=code&&playerId?this.deps.snapshot(code,playerId,this.commandLocale):null;
+      if(current&&current.phase!==this.introPhase)this.introExpired=true;
+      return Boolean(code&&playerId&&current&&this.code===code&&this.playerId===playerId
+        &&this.callSid===callSid&&this.introEpoch===epoch&&!this.introExpired);
+    });
+  }
+
+  private isCallIntroPhase(phase:FighterPhase):boolean{
+    return phase==='lobby'||phase==='fighter_select'||phase==='map_select';
+  }
+
+  private resultKey(snapshot:FighterVoiceSnapshot):string|null{
+    if(!this.code||!this.playerId||!snapshot.winnerSide||!snapshot.winnerName)return null;
+    return `${this.code}:${this.playerId}:${snapshot.loadingGeneration??0}:${snapshot.winnerSide}:${snapshot.winnerName}`;
+  }
+  private setResultKey(key:string):void{
+    if(this.terminalWinnerKey===key)return;
+    this.terminalWinnerKey=key;this.terminalWinnerQueued=false;
+    this.terminalCueEpoch++;
+  }
+  private resultWinnerText(snapshot:FighterVoiceSnapshot):string{
+    return snapshot.winnerSide===snapshot.mySide
+      ?this.t('voice.resultWin',{name:snapshot.winnerName??this.t('voice.winnerFallback')})
+      :this.t('voice.resultLoss',{name:snapshot.winnerName??this.t('voice.winnerFallback')});
+  }
+  private resultTail(snapshot:FighterVoiceSnapshot):string{
+    if(snapshot.resultsPresentationTimedOut===true&&!snapshot.resultsPresented)
+      return this.t(this.stationManaged?'voice.resultsDisplayTimeoutStation':'voice.resultsDisplayTimeout');
+    if(snapshot.resultsPresented===false)return this.t('voice.waitResultsDisplay');
+    return this.stationManaged?this.t('voice.waitOperator')
+      :this.t(snapshot.isController?'voice.controllerRematch':'voice.playerOneRematch');
+  }
+  /** The winner is authoritative at KO. Let this cue survive the optional victory animation and
+   *  results transition; replace it only when a newer result cue contains the same fact. */
+  private sayVictoryWinner(snapshot:FighterVoiceSnapshot):void{
+    const key=this.resultKey(snapshot);if(!key)return;
+    this.setResultKey(key);
+    if(this.terminalWinnerQueued)return;
+    this.terminalWinnerQueued=true;
+    const code=this.code,playerId=this.playerId,speechEpoch=this.speechEpoch,cueEpoch=this.terminalCueEpoch;
+    const text=snapshot.winnerSide===snapshot.mySide?this.t('voice.youWin')
+      :this.t('voice.winnerWins',{name:snapshot.winnerName!});
+    this.deps.say(text,()=>{
+      const current=code&&playerId?this.deps.snapshot(code,playerId,this.commandLocale):null;
+      const valid=this.code===code&&this.playerId===playerId&&this.speechEpoch===speechEpoch
+        &&this.terminalCueEpoch===cueEpoch&&current!==null&&this.resultKey(current)===key
+        &&(current.phase==='victory'||current.phase==='results');
+      return valid;
+    });
+  }
+  /** Always restate the winner with the result. Relay can conservatively report estimated
+   *  playback for a KO line the caller never heard; the result must stand on its own. */
+  private sayResultCue(snapshot:FighterVoiceSnapshot):void{
+    const key=this.resultKey(snapshot);if(!key){this.sayCurrent(this.resultTail(snapshot));return;}
+    this.setResultKey(key);
+    const text=`${this.resultWinnerText(snapshot)} ${this.resultTail(snapshot)}`;
+    const cueEpoch=++this.terminalCueEpoch;
+    const speechEpoch=this.speechEpoch;
+    if(this.stationManaged&&(snapshot.resultsPresented===true||snapshot.resultsPresentationTimedOut===true)){
+      this.deps.say(text);
+      return;
+    }
+    const code=this.code,playerId=this.playerId;
+    this.deps.say(text,()=>{
+      const current=code&&playerId?this.deps.snapshot(code,playerId,this.commandLocale):null;
+      const valid=this.code===code&&this.playerId===playerId&&this.speechEpoch===speechEpoch
+        &&this.terminalCueEpoch===cueEpoch&&current!==null&&current.phase==='results'
+        &&this.resultKey(current)===key&&current.resultsPresented===snapshot.resultsPresented
+        &&current.resultsPresentationTimedOut===snapshot.resultsPresentationTimedOut;
+      return valid;
+    });
+  }
+
   private speechScope(snapshot:FighterVoiceSnapshot):string{
     return JSON.stringify([
       snapshot.phase,snapshot.loadingGeneration,snapshot.myName,this.isNameConfirmed(snapshot),
@@ -163,6 +248,8 @@ export class FighterVoiceSession {
       if (!joined) { this.deps.say(this.t('voice.arenaFull')); return; }
       this.code = code; this.playerId = joined.playerId; this.callSid = message.callSid;
       const snapshot = this.deps.snapshot(code, joined.playerId, this.commandLocale); this.lastPhase = snapshot?.phase ?? null;
+      this.introPhase=snapshot?.phase??null;
+      if(snapshot&&!this.isCallIntroPhase(snapshot.phase))this.introExpired=true;
       this.awaitingName=!this.authoritativeName&&!(snapshot?.nameConfirmed??!this.isPlaceholderName(snapshot?.myName??null));
       this.lastLobbyReady=snapshot?this.isLobbyReady(snapshot):false;
       this.lastFighterChoicesReady=snapshot?this.areFighterChoicesReady(snapshot):false;
@@ -173,20 +260,19 @@ export class FighterVoiceSession {
       this.lastFoeName = snapshot?.foeName ?? null;
       this.lastMyFighterId=snapshot?.myFighterId??null;
       this.lastMyMapVote=snapshot?.myMapVote??null;
+      this.sayCallIntro(this.authoritativeName&&snapshot
+        ?this.t('voice.welcomeName',{name:this.authoritativeName}):this.t('voice.welcome'));
+      this.sayCallIntro(this.t('voice.greetingRelay'));
       if (joined.resumed && snapshot) {
         this.sayCurrent(!this.isPlaceholderName(snapshot.myName)
           ? this.t('voice.returnedName', { name: snapshot.myName ?? '' }) : this.t('voice.returned'));
         this.speakContext(snapshot);
       } else {
         if(this.authoritativeName&&snapshot){
-          this.sayCurrent(this.t('voice.welcomeName',{name:this.authoritativeName}));
-          this.sayCurrent(this.t('voice.greetingRelay'));
           this.sayCurrent(this.t('voice.controlsIntro'));
           this.sayCurrent(this.t('voice.fightHelp'));
           this.speakContext(snapshot);
         }else{
-          this.sayCurrent(this.t('voice.welcome'));
-          this.sayCurrent(this.t('voice.greetingRelay'));
           this.sayCurrent(this.t('voice.tellName'),this.phaseGuard('lobby',false));
         }
       }
@@ -195,7 +281,7 @@ export class FighterVoiceSession {
     if (message.type === 'dtmf' && this.code && this.playerId) {
       const snapshot = this.deps.snapshot(this.code, this.playerId, this.commandLocale);
       if (!snapshot || !/^[0-9*#]$/.test(message.digit)) return;
-      this.speechEpoch++;
+      this.speechEpoch++;this.introEpoch++;
       const fightCommands = ['forward', 'back', 'jump', 'punch', 'kick', 'block'];
       const spoken = snapshot.phase === 'fight'
         ? fightCommands[Number(message.digit) - 1]
@@ -203,8 +289,9 @@ export class FighterVoiceSession {
       if (spoken) this.handleUtterance(spoken);
       return;
     }
-    if (message.type === 'interrupt') { this.speechEpoch++;this.resetInterim(); this.lastFinalText=null;this.utteranceBoundary++;this.abortSemantic(); return; }
+    if (message.type === 'interrupt') { this.speechEpoch++;this.introEpoch++;this.resetInterim(); this.lastFinalText=null;this.utteranceBoundary++;this.abortSemantic(); return; }
     if (message.type === 'prompt' && this.code && this.playerId) {
+      this.introEpoch++;
       const snapshot = this.deps.snapshot(this.code, this.playerId, this.commandLocale);
       if (!message.last) {
         // Interim hypotheses can be revised. Never mutate fighter state until the final transcript.
@@ -227,10 +314,16 @@ export class FighterVoiceSession {
   private handleUtterance(spoken: string): void {
     const snapshot = this.deps.snapshot(this.code!, this.playerId!, this.commandLocale); if (!snapshot) return;
     const unnamed = !this.isNameConfirmed(snapshot);
+    const phaseChoices = snapshot.phase === 'fighter_select' ? snapshot.fighters : snapshot.phase === 'map_select' ? snapshot.maps : [];
+    const informationRequest = isFighterInformationRequest(spoken, this.commandLocale)
+      || hasMultipleVoiceChoiceMentions(spoken, phaseChoices, this.commandLocale);
+    if (isFighterGameplayHelpRequest(spoken, this.commandLocale)) {
+      this.sayCurrent(this.t('voice.fightHelp')); return;
+    }
     if(!unnamed)this.awaitingName=false;
     if(this.awaitingName&&unnamed){
       const name=parseFighterSpokenName(spoken,this.commandLocale);
-      if(name&&!isFighterAdvanceWord(spoken,this.commandLocale)&&!isFighterStarAlias(spoken,this.commandLocale)){
+      if(name&&!informationRequest&&!isFighterAdvanceWord(spoken,this.commandLocale)&&!isFighterStarAlias(spoken,this.commandLocale)){
         this.awaitingName=false;this.applyingName=true;this.deps.setName(this.code!,this.playerId!,name);this.applyingName=false;
         const next=this.deps.snapshot(this.code!,this.playerId!,this.commandLocale)??snapshot;
         this.sayCurrent(this.t('voice.welcomeName',{name}));
@@ -244,9 +337,8 @@ export class FighterVoiceSession {
       else this.speakContext(snapshot);
       return;
     }
-    const phaseChoices = snapshot.phase === 'fighter_select' ? snapshot.fighters : snapshot.phase === 'map_select' ? snapshot.maps : [];
     const looksLikeChoice = phaseChoices.length > 0 && !!matchChoice(spoken, phaseChoices, this.commandLocale);
-    if (unnamed && (snapshot.phase === 'lobby' || isExplicitName(spoken, this.commandLocale) || !looksLikeChoice)) {
+    if (unnamed && !informationRequest && (snapshot.phase === 'lobby' || isExplicitName(spoken, this.commandLocale) || !looksLikeChoice)) {
       const name = parseFighterSpokenName(spoken, this.commandLocale);
       if (name && !isFighterAdvanceWord(spoken, this.commandLocale) && !isFighterStarAlias(spoken, this.commandLocale)) {
         if(snapshot.phase==='lobby'){
@@ -265,6 +357,10 @@ export class FighterVoiceSession {
     }
     if (snapshot.phase === 'fighter_select') {
       if (isFighterSetupBack(spoken, this.commandLocale)) { this.backOrExplain(snapshot); return; }
+      if (informationRequest) {
+        if (!this.interpret(spoken, snapshot, true)) this.sayCurrent(this.informationFallback(snapshot));
+        return;
+      }
       const fighter = matchChoice(spoken, snapshot.fighters, this.commandLocale);
       if (fighter) {
         this.applyingSelection=true;
@@ -288,6 +384,10 @@ export class FighterVoiceSession {
     if (snapshot.phase === 'map_select') {
       if(!snapshot.automaticSetup&&!snapshot.isController){this.sayWaitOnce(this.t('voice.playerOneChoosingArena'));return;}
       if (isFighterSetupBack(spoken, this.commandLocale)) { this.backOrExplain(snapshot); return; }
+      if (informationRequest) {
+        if (!this.interpret(spoken, snapshot, true)) this.sayCurrent(this.informationFallback(snapshot));
+        return;
+      }
       const map = matchChoice(spoken, snapshot.maps, this.commandLocale);
       if (map) {
         this.applyingSelection=true;const selected=this.deps.selectMap(this.code!,this.playerId!,map.id);this.applyingSelection=false;
@@ -305,6 +405,10 @@ export class FighterVoiceSession {
       this.sayCurrent(this.t('voice.arenaUnknown', { prompt: this.t('voice.choiceArena') })); return;
     }
     if (snapshot.phase === 'fight') {
+      if (informationRequest) {
+        if (!this.interpret(spoken, snapshot, true)) this.sayCurrent(this.informationFallback(snapshot, spoken));
+        return;
+      }
       const commands=matchFighterCommands(spoken,this.commandLocale);
       if(!commands.length){if(!this.interpret(spoken,snapshot))this.sayCurrent(this.t('voice.fightHelp'));return;}
       this.submitCommands(commands);
@@ -347,6 +451,7 @@ export class FighterVoiceSession {
   onStateChanged(): void {
     if (!this.code || !this.playerId) return;
     const snapshot = this.deps.snapshot(this.code, this.playerId, this.commandLocale); if (!snapshot) return;
+    if(snapshot.phase!==this.introPhase)this.introExpired=true;
     if(this.isNameConfirmed(snapshot))this.awaitingName=false;
     if(this.semanticScopeAtRequest!==null&&this.semanticScopeAtRequest!==this.semanticScope(snapshot))this.abortSemantic();
     const lobbyReady=this.isLobbyReady(snapshot);
@@ -414,11 +519,25 @@ export class FighterVoiceSession {
     if (event.type === 'hit' && Date.now() - this.lastCombatCueAt > 1200) {
       this.lastCombatCueAt = Date.now();
       const damage = formatNumber(this.commandLocale, event.damage);
-      if (event.defender === snapshot.mySide) this.sayCurrent(event.blocked ? this.t('voice.selfBlocked') : this.t('voice.tookDamage', { damage }),this.phaseGuard('fight'));
-      else if (event.attacker === snapshot.mySide) this.sayCurrent(event.blocked ? this.t('voice.theyBlocked') : this.t('voice.hitDamage', { damage }),this.phaseGuard('fight'));
+      if (event.defender === snapshot.mySide) this.sayCombatCue(event.blocked ? this.t('voice.selfBlocked') : this.t('voice.tookDamage', { damage }));
+      else if (event.attacker === snapshot.mySide) this.sayCombatCue(event.blocked ? this.t('voice.theyBlocked') : this.t('voice.hitDamage', { damage }));
     } else if (event.type === 'miss' && event.attacker === snapshot.mySide && Date.now() - this.lastCombatCueAt > 1200) {
-      this.lastCombatCueAt = Date.now(); this.sayCurrent(this.t('voice.missed'),this.phaseGuard('fight'));
+      this.lastCombatCueAt = Date.now(); this.sayCombatCue(this.t('voice.missed'));
     }
+  }
+
+  /** Combat ticks update health faster than Relay can read a damage sentence. Preserve the
+   *  current cue through later hits, but drop it on caller barge-in or a new match/phase. */
+  private sayCombatCue(text:string):void{
+    const code=this.code,playerId=this.playerId,speechEpoch=this.speechEpoch;
+    const snapshot=code&&playerId?this.deps.snapshot(code,playerId,this.commandLocale):null;
+    if(!code||!playerId||snapshot?.phase!=='fight')return;
+    const generation=snapshot.loadingGeneration;
+    this.deps.say(text,()=>{
+      const current=this.deps.snapshot(code,playerId,this.commandLocale);
+      return this.code===code&&this.playerId===playerId&&this.speechEpoch===speechEpoch
+        &&current?.phase==='fight'&&current.loadingGeneration===generation;
+    });
   }
 
   /** Final resolution arrives from the same server loop that publishes the world event. */
@@ -462,9 +581,9 @@ export class FighterVoiceSession {
     else this.awaitingName=false;
   }
 
-  private interpret(transcript:string,snapshot:FighterVoiceSnapshot):boolean{
+  private interpret(transcript:string,snapshot:FighterVoiceSnapshot,informationOnly=false):boolean{
     if(!this.deps.interpret)return false;
-    const actions=this.semanticActions(snapshot),facts=this.semanticFacts(snapshot);
+    const actions=informationOnly?[]:this.semanticActions(snapshot),facts=this.semanticFacts(snapshot);
     if(!actions.length&&!facts.length)return false;
     const choices=(snapshot.phase==='fighter_select'?snapshot.fighters
       :snapshot.phase==='map_select'?snapshot.maps:[]).map(choice=>({id:choice.id,label:choice.name}));
@@ -480,11 +599,14 @@ export class FighterVoiceSession {
         const fact=this.semanticFacts(current).find(candidate=>candidate.id===result.factId);
         if(fact)this.sayCurrent(fact.text,()=>this.semanticCurrent(epoch,scope,controller));
       }else if(result.kind==='clarify')this.speakClarification(result.reason,current);
-      else this.sayCurrent(this.t('voice.noAction'));
+      else this.sayCurrent(informationOnly?this.informationFallback(current,transcript):this.t('voice.noAction'));
     }).catch(()=>{
       if(this.semanticCurrent(epoch,scope,controller)){
         const current=this.deps.snapshot(this.code!,this.playerId!,this.commandLocale);
-        if(current)this.speakContext(current);
+        if(current){
+          if(informationOnly)this.sayCurrent(this.informationFallback(current,transcript));
+          else this.speakContext(current);
+        }
       }
     }).finally(()=>{if(this.semanticController===controller){this.semanticController=null;this.semanticScopeAtRequest=null;}});
     return true;
@@ -536,19 +658,62 @@ export class FighterVoiceSession {
   private semanticFacts(snapshot:FighterVoiceSnapshot):VoiceInterpretFact[]{
     const facts:VoiceInterpretFact[]=[{id:'help',text:snapshot.phase==='fight'
       ?this.t('voice.fightHelp'):this.contextText(snapshot)}];
-    if(snapshot.phase==='fighter_select')facts.push({id:'fighters',text:
-      this.t('voice.availableFighters',{names:snapshot.fighters.map(fighter=>fighter.name).join(', ')})});
-    if(snapshot.phase==='map_select')facts.push({id:'arenas',text:
-      this.t('voice.availableArenas',{names:snapshot.maps.map(map=>this.localizedMapName(map)).join(', ')})});
-    if(snapshot.phase==='fight')facts.push({id:'health',text:snapshot.hudPresented
-      ?this.t('voice.currentHealth',{mine:formatNumber(this.commandLocale,snapshot.myHealth??100),
-        theirs:formatNumber(this.commandLocale,snapshot.foeHealth??100)})
-      :this.t('voice.healthOnDisplay')});
+    if(snapshot.phase==='fighter_select'){
+      facts.push({id:'fighters',text:
+        this.t('voice.availableFighters',{names:snapshot.fighters.map(fighter=>fighter.name).join(', ')})});
+      for(const fighter of snapshot.fighters){
+        if(!FIGHTER_ROSTER.some(entry=>entry.id===fighter.id))continue;
+        facts.push({id:`fighter:${fighter.id}`,text:this.t('voice.fighterInfo',{
+          name:fighter.name,description:this.t(`content.fighter.${fighter.id}` as FighterMessageKey),
+        })});
+      }
+    }
+    if(snapshot.phase==='map_select'){
+      facts.push({id:'arenas',text:
+        this.t('voice.availableArenas',{names:snapshot.maps.map(map=>this.localizedMapName(map)).join(', ')})});
+      for(const map of snapshot.maps){
+        if(!FIGHTER_MAP_NAME_KEYS[map.id])continue;
+        facts.push({id:`arena:${map.id}`,text:this.t('voice.arenaDescription',{
+          name:this.localizedMapName(map),description:this.t(`content.map.${map.id}` as FighterMessageKey),
+        })});
+      }
+    }
+    if(snapshot.phase==='fight'){
+      facts.push({id:'health',text:snapshot.hudPresented
+        ?this.t('voice.currentHealth',{mine:formatNumber(this.commandLocale,snapshot.myHealth??100),
+          theirs:formatNumber(this.commandLocale,snapshot.foeHealth??100)})
+        :this.t('voice.healthOnDisplay')});
+      if(snapshot.foeName)facts.push({id:'opponent',text:snapshot.foeFighterName
+        ?this.t('voice.opponentInfo',{name:snapshot.foeName,fighter:snapshot.foeFighterName})
+        :this.t('voice.opponentNameOnly',{name:snapshot.foeName})});
+      if(snapshot.selectedMap){
+        const map=snapshot.maps.find(candidate=>candidate.id===snapshot.selectedMap);
+        facts.push({id:'arena',text:this.t('voice.currentArena',{
+          arena:map?this.localizedMapName(map):snapshot.selectedMap,
+        })});
+      }
+      if(snapshot.myFighterName)facts.push({id:'fighter',text:this.t('voice.currentFighter',{
+        fighter:snapshot.myFighterName,
+      })});
+    }
     if((snapshot.phase==='victory'||snapshot.phase==='results'
       &&(snapshot.resultsPresented!==false||snapshot.resultsPresentationTimedOut===true))&&snapshot.winnerName)
       facts.push({id:'winner',text:snapshot.winnerSide===snapshot.mySide?this.t('voice.youWin')
         :this.t('voice.winnerWins',{name:snapshot.winnerName})});
     return facts;
+  }
+
+  private informationFallback(snapshot:FighterVoiceSnapshot,spoken=''):string{
+    const facts=this.semanticFacts(snapshot);
+    if(snapshot.phase==='fighter_select')return facts.find(fact=>fact.id==='fighters')?.text??this.contextText(snapshot);
+    if(snapshot.phase==='map_select')return facts.find(fact=>fact.id==='arenas')?.text??this.contextText(snapshot);
+    if(snapshot.phase==='fight'){
+      const topic=normalizeForMatching(spoken,this.commandLocale);
+      const id=/\b(?:opponent|rival|enemy|fighting|adversario|inimigo|lutando)\b/.test(topic)
+        ?'opponent':/\b(?:arena|map|stage|venue|lugar|mapa)\b/.test(topic)?'arena':'help';
+      return facts.find(fact=>fact.id===id)?.text??this.t('voice.fightHelp');
+    }
+    return this.contextText(snapshot);
   }
 
   private contextText(snapshot:FighterVoiceSnapshot):string{
@@ -557,11 +722,8 @@ export class FighterVoiceSession {
     if(snapshot.phase==='fight')return this.t('voice.fightHelp');
     if(snapshot.phase==='loading'||snapshot.phase==='intro'||snapshot.phase==='countdown')return this.t('voice.getReady');
     if(snapshot.phase==='victory')return this.t('voice.victoryPlaying');
-    if(snapshot.phase==='results')return snapshot.resultsPresentationTimedOut===true&&!snapshot.resultsPresented
-      ?this.t('voice.resultsDisplayTimeout',{winner:snapshot.winnerName??this.t('voice.winnerFallback')})
-      :snapshot.resultsPresented===false?this.t('voice.waitResultsDisplay')
-        :this.stationManaged?this.t('voice.waitOperator')
-          :this.t(snapshot.isController?'voice.controllerRematch':'voice.playerOneRematch');
+    if(snapshot.phase==='results')return snapshot.winnerName
+      ?`${this.resultWinnerText(snapshot)} ${this.resultTail(snapshot)}`:this.resultTail(snapshot);
     return this.t('voice.sayStart');
   }
 
@@ -626,12 +788,12 @@ export class FighterVoiceSession {
   }
 
   private speakContext(snapshot: FighterVoiceSnapshot): void {
+    if(snapshot.phase==='victory'){this.sayVictoryWinner(snapshot);return;}
+    if(snapshot.phase==='results'){this.sayResultCue(snapshot);return;}
     const confirmed=this.isNameConfirmed(snapshot);
     const say=(text:string)=>{
       const guard=this.phaseGuard(snapshot.phase,confirmed);
-      this.sayCurrent(text,()=>guard()&&(snapshot.phase!=='results'
-        ||(this.deps.snapshot(this.code!,this.playerId!,this.commandLocale)?.resultsPresented===snapshot.resultsPresented
-          &&this.deps.snapshot(this.code!,this.playerId!,this.commandLocale)?.resultsPresentationTimedOut===snapshot.resultsPresentationTimedOut)));
+      this.sayCurrent(text,guard);
     };
     if(!confirmed){say(this.t('voice.tellName'));return;}
     if (snapshot.phase === 'lobby') {
@@ -659,14 +821,6 @@ export class FighterVoiceSession {
     else if (snapshot.phase === 'fight') say(this.lastPhase === 'countdown' ? this.t('voice.fight')
       : snapshot.hudPresented===false ? this.t('voice.fightHelp')
         : this.t('voice.fightProgress', { health: formatNumber(this.commandLocale, snapshot.myHealth ?? 100) }));
-    else if (snapshot.phase === 'victory') {
-      say(snapshot.winnerSide === snapshot.mySide ? this.t('voice.youWin')
-        : this.t('voice.winnerWins', { name: snapshot.winnerName ?? this.t('voice.winnerFallback') }));
-    } else if (snapshot.phase === 'results') say(snapshot.resultsPresentationTimedOut===true&&!snapshot.resultsPresented
-      ? this.contextText(snapshot)
-      : snapshot.resultsPresented===false ? this.t('voice.waitResultsDisplay') : this.stationManaged
-        ? this.t('voice.waitOperator')
-        : this.t(snapshot.isController ? 'voice.controllerRematch' : 'voice.playerOneRematch'));
   }
 
   private speakIntroCue(snapshot: FighterVoiceSnapshot, stage: FighterIntroStage): void {
@@ -739,6 +893,7 @@ export class FighterVoiceSession {
 
 export function matchVoiceChoice(spoken: string, maps: { id: string; name: string }[], locale: SupportedLocale = DEFAULT_LOCALE): { id: string; name: string } | null {
   const raw = normalizeForMatching(spoken, locale);
+  if(isFighterInformationRequest(spoken,locale))return null;
   if(/^(?:which|what|who|how|why|when|is|are|can you tell|tell me about|qual|quais|quem|como|quando|por que|o que)\b/.test(raw))return null;
   const correction=locale==='pt-BR'
     ? /\b(?:nao|quer dizer|na verdade|em vez de|melhor)\b/g
@@ -746,6 +901,7 @@ export function matchVoiceChoice(spoken: string, maps: { id: string; name: strin
   const matches=[...raw.matchAll(correction)];
   const text=matches.length?raw.slice(matches.at(-1)!.index!+matches.at(-1)![0].length).trim():raw;
   if(!text||/\b(?:not|dont|do not|never|nao|nunca|sem|or|ou)\b/.test(text))return null;
+  if(countVoiceChoiceMentions(text,maps,locale)>1)return null;
   const numberWords = locale === 'pt-BR'
     ? ['(?:um|uma)', '(?:dois|duas)', 'tres', 'quatro', 'cinco', 'seis', 'sete', 'oito', 'nove', 'dez', 'onze', 'doze']
     : ['one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten', 'eleven', 'twelve'];
@@ -773,6 +929,20 @@ export function matchVoiceChoice(spoken: string, maps: { id: string; name: strin
 }
 
 const matchChoice = matchVoiceChoice;
+function countVoiceChoiceMentions(text:string,choices:{id:string;name:string}[],locale:SupportedLocale):number{
+  return choices.filter(choice=>[choice.id,choice.name,...(VOICE_CHOICE_ALIASES[choice.id]??[])]
+    .some(form=>containsChoicePhrase(text,normalizeForMatching(form,locale)))).length;
+}
+function hasMultipleVoiceChoiceMentions(spoken:string,choices:{id:string;name:string}[],locale:SupportedLocale):boolean{
+  if(choices.length<2)return false;
+  const raw=normalizeForMatching(spoken,locale);
+  const correction=locale==='pt-BR'
+    ? /\b(?:nao|quer dizer|na verdade|em vez de|melhor)\b/g
+    : /\b(?:no|i mean|actually|instead|rather|wait)\b/g;
+  const matches=[...raw.matchAll(correction)];
+  const intended=matches.length?raw.slice(matches.at(-1)!.index!+matches.at(-1)![0].length).trim():raw;
+  return countVoiceChoiceMentions(intended,choices,locale)>1;
+}
 function containsChoicePhrase(text:string,phrase:string):boolean{
   if(!phrase)return false;
   const escaped=phrase.replace(/[.*+?^${}()|[\]\\]/g,'\\$&').replace(/\s+/g,'\\s+');
@@ -805,6 +975,29 @@ function isFighterQuestionOrNegation(text:string,locale:SupportedLocale):boolean
   return locale==='pt-BR'
     ? /\b(?:nao|nunca|sem|talvez)\b/.test(text)||/^(?:quando|como|por que|qual|quais|devo|posso)\b/.test(text)
     : /\b(?:not|dont|do not|never|maybe)\b/.test(text)||/^(?:when|how|why|which|what|should|can i|could i)\b/.test(text);
+}
+
+function isFighterGameplayHelpRequest(spoken:string,locale:SupportedLocale):boolean{
+  const text=normalizeForMatching(spoken,locale);
+  return locale==='pt-BR'
+    ? /^(?:como (?:eu )?(?:luto|posso lutar|jogo|ataco|dou um golpe)|quais (?:sao )?(?:os )?(?:golpes|comandos|controles))\b/.test(text)
+    : /^(?:how (?:do|can|should) (?:i|we) (?:fight|attack|move|play)|how does (?:the )?fight work|what (?:are|can i use) (?:the )?(?:moves|attacks|controls))\b/.test(text);
+}
+
+function isFighterInformationRequest(spoken:string,locale:SupportedLocale):boolean{
+  const text=normalizeForMatching(spoken,locale);
+  if(locale==='pt-BR'){
+    if(/^(?:posso|podemos|voce pode|pode)\s+(?:por favor\s+)?(?:escolher|selecionar|pegar|jogar|usar|lutar com|comecar)\b/.test(text))return false;
+    return /^(?:o que|qual|quais|como|por que|porque|quem|quando|onde|me conte|me fale|fale sobre|explique|descreva|compare|comparar|pode me (?:contar|falar|explicar|descrever)|devo)\b/.test(text)
+      || /\b(?:o que|qual|quais|como|por que|porque)\b/.test(text)
+      || /\b(?:pode|poderia) me (?:contar|falar|explicar|descrever)\b/.test(text)
+      || /\b(?:pensando em|considerando|comparar|comparacao|diferenca entre|interessado em)\b/.test(text);
+  }
+  if(/^(?:can|could|would|will|may)\s+(?:i|we|you)\s+(?:please\s+)?(?:choose|pick|select|play|use|be|fight as|go with|try|start)\b/.test(text))return false;
+  return /^(?:what|which|how|why|who|where|when|tell me|explain|describe|compare|contrast|should|can you (?:tell|explain|describe|give|say)|could you (?:tell|explain|describe|give|say))\b/.test(text)
+    || /\b(?:what|which|how|why|who|where|when)\b/.test(text)
+    || /\b(?:can|could|would) you (?:tell|explain|describe|give|say)\b/.test(text)
+    || /\b(?:thinking about|considering|wondering about|interested in|leaning toward|leaning towards|difference between|compare|comparing|versus|vs)\b/.test(text);
 }
 
 function isFighterSetupBack(spoken:string,locale:SupportedLocale):boolean{

@@ -88,6 +88,30 @@ export const KARAOKE_VISUAL_OFFSET_STEP_MS = 20;
 export const KARAOKE_VISUAL_OFFSET_LIMIT_MS = 300;
 export const KARAOKE_VISUAL_OFFSET_STORAGE_KEY = 'voice-karaoke-visual-offset-ms';
 export const KARAOKE_GUIDE_AUDIO_URL = '/audio/karaoke/classic-45s.mp3?v=20260828-calibration-1';
+export type KaraokeRenderMode = 'full' | 'light';
+
+export function karaokeInitialRenderMode(rendererName: string, cpuCores: number): KaraokeRenderMode {
+  return /swiftshader|llvmpipe|software/i.test(rendererName)
+    || (Number.isFinite(cpuCores) && cpuCores > 0 && cpuCores <= 4)
+    ? 'light' : 'full';
+}
+
+/** GLB swaps and shader compilation must not compete with timed lyrics or backing audio. */
+export function karaokeCanInstallOptionalAssets(phase: KaraokePhase | null): boolean {
+  return phase === null || phase === 'lobby' || phase === 'song_select' || phase === 'results';
+}
+
+/** Hysteresis prevents visual quality from oscillating during a brief network or decode stall. */
+export function karaokeAdaptiveRenderMode(
+  current: KaraokeRenderMode,
+  averageFrameMs: number,
+  timeSinceSwitchMs: number,
+): KaraokeRenderMode {
+  if (!Number.isFinite(averageFrameMs)) return current;
+  if (current === 'full' && averageFrameMs > 25) return 'light';
+  if (current === 'light' && averageFrameMs < 18 && timeSinceSwitchMs >= 10_000) return 'full';
+  return current;
+}
 
 export class KaraokeCountdownAnnouncer {
   private generation = 0;

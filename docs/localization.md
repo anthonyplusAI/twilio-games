@@ -140,7 +140,7 @@ Use Unicode normalization rather than ASCII-only regular expressions. Keep trans
 | Runtime `channels.voiceNumbers.en-US` and `.pt-BR` | Locale-specific public voice numbers used by lobbies and dialed-number locale detection |
 | `GAME_PHONE_NUMBER` | Legacy fallback only when neither runtime locale number is configured; a shared fallback cannot identify one locale uniquely |
 | `DEFAULT_LOCALE` | Call fallback when neither the dialed number nor the routed display identifies a locale; defaults to `en-US` |
-| `CR_TTS_VOICE` | English ElevenLabs voice ID for all six games; defaults to `xp3gDg85YgFcWpnNVlIu` and deployment pins that value |
+| `CR_TTS_VOICE` | English ElevenLabs voice ID for all six games; defaults to `SA7eD52NRr8WAehitVt1` and deployment pins that value |
 | `CR_TTS_VOICE_PT_BR` | Brazilian Portuguese ElevenLabs voice ID; empty uses Relay's `pt-BR` default |
 
 The Azure deployment reads the environment values from GitHub repository variables. Operators manage `channels.voiceNumbers` in runtime Arcade settings. Validate provider language, model, voice, and number availability before enabling a new locale in production.

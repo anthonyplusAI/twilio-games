@@ -120,7 +120,7 @@ html[data-theme="light"] :is(#veil,.scr-eyebrow,#hud) img { filter:brightness(0)
 .menu-button { min-height: 46px; padding: 9px 22px; border: 1.5px solid var(--red); border-radius: 11px;
   background: var(--red); color: #fff; font: 800 15px var(--disp); letter-spacing: .05em;
   cursor: pointer; touch-action: manipulation; box-shadow: 0 8px 24px rgba(239,34,58,.28); }
-.menu-button.secondary { border-color: var(--glass-brd-2); background: var(--glass-2); box-shadow: none; }
+.menu-button.secondary { border-color: var(--glass-brd-2); background: var(--glass-2); color: var(--ink); box-shadow: none; }
 .menu-button:hover:not(:disabled) { filter: brightness(1.12); transform: translateY(-1px); }
 .menu-button:disabled { opacity: .42; cursor: not-allowed; box-shadow: none; }
 .menu-button:focus-visible, .tile:focus-visible, .map:focus-visible { outline: 3px solid var(--cyan); outline-offset: 3px; }
@@ -327,6 +327,7 @@ html[data-theme="light"] .cl-row.cl-power :is(.cl-say,.cl-action) { color:#0E3E9
 }
 .game-home svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 .game-home:hover { border-color: var(--red); background: rgba(239,34,58,.16); }
+html[data-theme="light"] .game-home:hover { background: #FFE8EB; color: #000D25; }
 .game-home:active { transform: scale(.97); }
 .game-home:focus-visible { outline: 2px solid var(--red); outline-offset: 3px; }
 .hud-pill {
