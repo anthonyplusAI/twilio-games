@@ -24,6 +24,21 @@ describe('deployment rollback safety', () => {
     expect(serverIndex).toContain("throw new Error('OPENAI_API_KEY is required in production for conversational voice commands')");
   });
 
+  it('declares every Container App secret reference before applying the YAML', () => {
+    const secretDeclarations = containerApp.slice(
+      containerApp.indexOf('    secrets:'),
+      containerApp.indexOf('    registries:'),
+    );
+    const declared = new Set(
+      [...secretDeclarations.matchAll(/^\s+- name: ([a-z0-9-]+)$/gm)].map((match) => match[1]),
+    );
+    const referenced = new Set(
+      [...containerApp.matchAll(/\bsecretRef: ([a-z0-9-]+)/g)].map((match) => match[1]),
+    );
+    expect([...referenced].filter((name) => !declared.has(name))).toEqual([]);
+    expect(workflow.match(/"elevenlabs-api-key=\$\{ELEVENLABS_API_KEY:-disabled\}"/g)).toHaveLength(2);
+  });
+
   it('keeps CI independent of Git LFS and verifies the private asset mirror before ACR build', () => {
     expect(ci).not.toMatch(/\blfs:\s*true\b/);
     expect(workflow).not.toMatch(/\blfs:\s*true\b/);
