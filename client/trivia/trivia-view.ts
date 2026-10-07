@@ -334,7 +334,7 @@ function renderRevealStandings(state: Extract<TriviaState, { phase: 'reveal' }>,
     const result = context.answerResults?.get(standing.playerId);
     const status = result ? (result.correct ? copy.correct : copy.incorrect) : standing.answered ? copy.recorded : copy.noAnswer;
     const resultClass = result ? (result.correct ? ' correct' : ' incorrect') : '';
-    return `<div class="standing-row${resultClass}"><b>${standing.rank}</b><div><strong>${escapeHtml(standing.name)}</strong><small>${escapeHtml(status)}${result ? ` · ${result.points > 0 ? '+' : ''}${result.points} ${escapeHtml(copy.points)}` : ''}</small></div><span><strong>${formatScore(standing.rawScore, context.locale)}</strong><small>${escapeHtml(copy.bestStreak)} ${standing.bestStreak}</small></span></div>`;
+    return `<div class="standing-row${resultClass}"><b>${standing.rank}</b><div><strong>${escapeHtml(standing.name)}</strong><small>${escapeHtml(status)}${result ? ` · ${result.points > 0 ? '+' : ''}${result.points} ${escapeHtml(copy.points)}` : ''}</small></div><span><strong>${formatScore(standing.normalizedScore, context.locale)}</strong><small>${escapeHtml(copy.normalized)} · ${escapeHtml(copy.bestStreak)} ${standing.bestStreak}</small></span></div>`;
   }).join('');
 }
 

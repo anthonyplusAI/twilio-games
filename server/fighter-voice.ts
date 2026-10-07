@@ -382,7 +382,12 @@ export class FighterVoiceSession {
         }
         return;
       }
-      if (menuAdvance) { this.advanceOrExplain(snapshot); return; }
+      // A destination request is a clear menu action, even when the caller never
+      // says the generic "next" prompt. Less certain paraphrases still use the
+      // phase-bound semantic interpreter below.
+      if (menuAdvance || isFighterArenaNavigationRequest(spoken, this.commandLocale)) {
+        this.advanceOrExplain(snapshot); return;
+      }
       if(this.interpret(spoken,snapshot))return;
       this.sayCurrent(this.t('voice.fighterUnknown', { prompt: this.t('voice.choiceFighter') })); return;
     }
@@ -984,6 +989,24 @@ function isFighterMenuAdvance(spoken:string,locale:SupportedLocale):boolean{
   return locale==='pt-BR'
     ? /^(?:sim|claro|pode ser|beleza|ta bom|tudo bem|ok|certo|perfeito|vamos nessa|bora|pode continuar|pode seguir)(?: por favor| agora)?$/.test(text)
     : /^(?:yes|yeah|yep|sure|ok|okay|alright|all right|sounds good|go ahead|all set|ready when you are)(?: please| now)?$/.test(text);
+}
+
+/** Fast path for a caller asking to open the next, currently reachable selector.
+ *  Require both a navigation verb and the destination, so a discussion of arenas
+ *  does not accidentally advance. The room still enforces completed fighter picks. */
+function isFighterArenaNavigationRequest(spoken:string,locale:SupportedLocale):boolean{
+  const text=normalizeForMatching(spoken,locale);
+  const question=/[?？¿]/u.test(spoken);
+  if(locale==='pt-BR'){
+    if(/\b(?:nao|nunca|talvez|depois|mais tarde|espere|espera|antes|ou)\b/.test(text))return false;
+    if(question&&!/^(?:posso|podemos|voce pode|pode)\s+(?:por favor\s+)?(?:escolher|selecionar|abrir|mostrar|ir|ver)\b/.test(text))return false;
+    return /\b(?:arena|arenas|mapa|mapas|cenario|cenarios|palco|palcos)\b/.test(text)
+      &&/\b(?:escolher|escolha|selecionar|selecione|abrir|abra|mostrar|mostre|ir|seguir|avancar|ver)\b/.test(text);
+  }
+  if(/\b(?:not|don't|dont|do not|never|maybe|later|wait|hold|before|after|or)\b/.test(text))return false;
+  if(question&&!/^(?:can|could|would|will|may)\s+(?:i|we|you)\s+(?:please\s+)?(?:choose|pick|select|show|open|view|go|move|take|switch)\b/.test(text))return false;
+  return /\b(?:arena|arenas|map|maps|stage|stages|venue|battlefield)\b/.test(text)
+    &&/\b(?:choose|pick|select|show|open|view|go|move|head|take|switch|proceed)\b/.test(text);
 }
 
 function isFighterQuestionOrNegation(text:string,locale:SupportedLocale):boolean{

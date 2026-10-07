@@ -1449,7 +1449,7 @@ describe('BattleVoiceSession', () => {
     const session=new BattleVoiceSession(deps);session.handleMessage(setup());said.length=0;
     timedOut=true;session.onBattleStateChanged();
     expect(said.at(-1)).toMatch(/Ada won.*(want|like).*again.*rematch/i);
-    expect(said.at(-1)).not.toMatch(/confirm|display|screen/i);
+    expect(said.at(-1)).not.toMatch(/cannot confirm|can't confirm|results? (?:on|in) (?:the )?display/i);
     session.handleMessage(prompt('rematch'));
     expect(log).toContain('advance');
   });

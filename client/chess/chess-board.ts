@@ -327,6 +327,11 @@ export class ChessBoardScene {
     this.placeHighlight('pending-to', to, 0x00ed57, 0.78);
   }
 
+  setHint(from: string | null, to: string | null): void {
+    this.placeHighlight('hint-from', from, 0x45c7ff, 0.27);
+    this.placeHighlight('hint-to', to, 0x6fe8ff, 0.46);
+  }
+
   setSelection(square: string | null): void {
     this.placeHighlight('selection', square, 0xf0304c, 0.20);
   }
@@ -652,23 +657,42 @@ export class ChessBoardScene {
     const previous = this.highlights.get(key);
     if (previous) {
       this.board.remove(previous);
+      const materials = new Set<THREE.Material>();
       previous.traverse(child => {
         if (child instanceof THREE.Mesh || child instanceof THREE.LineLoop) {
           child.geometry.dispose();
-          if (Array.isArray(child.material)) child.material.forEach(material => material.dispose());
-          else child.material.dispose();
+          if (Array.isArray(child.material)) child.material.forEach(material => materials.add(material));
+          else materials.add(child.material);
         }
       });
+      materials.forEach(material => material.dispose());
       this.highlights.delete(key);
     }
     const position = square ? squarePosition(square) : null;
     if (!position) return;
     const group = new THREE.Group();
-    group.position.set(position.x, TOP + 0.001, position.z);
+    const hint = key.startsWith('hint-');
+    // Raise recommendation overlays clear of the textured tiles so they remain
+    // legible on the light board and at the shallow camera angle on phones.
+    group.position.set(position.x, TOP + (hint ? 0.012 : 0.001), position.z);
     const fill = new THREE.Mesh(new THREE.PlaneGeometry(0.965, 0.965),
-      new THREE.MeshBasicMaterial({ color, transparent: true, opacity, depthWrite: false, side: THREE.DoubleSide }));
+      new THREE.MeshBasicMaterial({ color, transparent: true, opacity: hint ? Math.max(opacity, 0.42) : opacity,
+        depthWrite: false, side: THREE.DoubleSide, toneMapped: !hint }));
     fill.rotation.x = -Math.PI / 2;
     group.add(fill);
+    if (hint) {
+      const border = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.97,
+        depthWrite: false, side: THREE.DoubleSide, toneMapped: false });
+      for (const [width, height, x, z] of [
+        [0.965, 0.07, 0, -0.447], [0.965, 0.07, 0, 0.447],
+        [0.07, 0.965, -0.447, 0], [0.07, 0.965, 0.447, 0],
+      ]) {
+        const stripe = new THREE.Mesh(new THREE.PlaneGeometry(width!, height!), border);
+        stripe.rotation.x = -Math.PI / 2;
+        stripe.position.set(x!, 0.014, z!);
+        group.add(stripe);
+      }
+    }
     const points = [
       new THREE.Vector3(-0.47, 0.01, -0.47), new THREE.Vector3(0.47, 0.01, -0.47),
       new THREE.Vector3(0.47, 0.01, 0.47), new THREE.Vector3(-0.47, 0.01, 0.47),

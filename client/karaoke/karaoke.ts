@@ -19,7 +19,7 @@ import {
   karaokeAssetManifest,
   type KaraokeLoadedAsset,
 } from './karaoke-assets';
-import { KaraokeAudioTransport } from './karaoke-audio';
+import { KaraokeAudioTransport, KaraokeSelectedSongPreloader } from './karaoke-audio';
 import {
   KARAOKE_VISUAL_OFFSET_LIMIT_MS,
   KARAOKE_VISUAL_OFFSET_STEP_MS,
@@ -53,6 +53,7 @@ const stageLoading = element('stage-loading');
 const stageLoadingProgress = element('stage-loading-progress');
 const stage = new KaraokeStage(element('arena'), element('stage-fallback'));
 const audio = new KaraokeAudioTransport();
+const selectedSongPreloader = new KaraokeSelectedSongPreloader(audio);
 const soundEffects = getSoundEffectsManager();
 const countdownAnnouncer = new KaraokeCountdownAnnouncer();
 const serverClock = new KaraokeServerClock(Date.now(), performance.now());
@@ -109,6 +110,7 @@ let phoneQr = '';
 let lastFlowKey = '';
 let lastAnnouncedResultKey = '';
 let preparationKey = '';
+let preparationAbort: AbortController | null = null;
 let preparedGeneration = 0;
 let readySentGeneration = 0;
 let audioProgress = 0;
@@ -219,6 +221,8 @@ for (const home of document.querySelectorAll<HTMLAnchorElement>('.game-home')) {
 addEventListener('pagehide', () => {
   pageDisposed = true;
   stopVoiceNumber();
+  selectedSongPreloader.dispose();
+  preparationAbort?.abort();
   audio.dispose();
   for (const asset of pendingAssets.splice(0)) disposeKaraokeObjectResources(asset.model);
   stage.dispose();
@@ -344,6 +348,7 @@ function installPendingStageAssets(): void {
 
 function applyState(next: KaraokeState): void {
   const previousPhase = state?.phase;
+  const previousLoadingGeneration = state?.loadingGeneration;
   state = next;
   installPendingStageAssets();
   if (guideMode) {
@@ -353,6 +358,17 @@ function applyState(next: KaraokeState): void {
   catalog = next.catalog.length ? next.catalog : catalog;
   document.body.dataset.phase = next.phase;
   stage.setSong(next.selectedSong);
+  const preloadSong = (next.phase === 'song_select' || next.phase === 'loading') && next.selectedSong
+    ? audioSong(next.selectedSong) : null;
+  const loadingRestarted = next.phase === 'loading' && previousPhase === 'loading'
+    && previousLoadingGeneration !== next.loadingGeneration;
+  if (previousPhase === 'loading' && (next.phase !== 'loading' || loadingRestarted)) {
+    preparationAbort?.abort();
+    preparationAbort = null;
+    preparationKey = '';
+    if (loadingRestarted) selectedSongPreloader.dispose();
+  }
+  selectedSongPreloader.update(next.phase, preloadSong);
   if (next.phase !== previousPhase) {
     flowMessage = '';
     updateMusicForPhase(next.phase);
@@ -392,8 +408,12 @@ function handleEvents(events: KaraokeEvent[]): void {
 async function preparePerformance(target: KaraokeState): Promise<void> {
   const song = target.selectedSong;
   if (!song) return;
-  const key = `${target.loadingGeneration}:${song.id}`;
+  const playableSong = audioSong(song);
+  const key = `${target.loadingGeneration}:${song.id}:${playableSong.audioUrl ?? 'synthesized'}`;
   if (preparationKey === key) return;
+  preparationAbort?.abort();
+  const controller = new AbortController();
+  preparationAbort = controller;
   preparationKey = key;
   preparedGeneration = 0;
   readySentGeneration = 0;
@@ -401,12 +421,14 @@ async function preparePerformance(target: KaraokeState): Promise<void> {
   preparationError = '';
   renderFlow(true);
   try {
-    await audio.preload(audioSong(song), progress => {
-      if (preparationKey !== key) return;
+    await audio.preload(playableSong, progress => {
+      if (preparationKey !== key || state?.phase !== 'loading') return;
       audioProgress = progress;
       updateLoadingProgress();
-    });
-    if (!state || state.phase !== 'loading' || state.loadingGeneration !== target.loadingGeneration) return;
+    }, controller.signal);
+    if (preparationKey !== key || !state || state.phase !== 'loading'
+      || state.loadingGeneration !== target.loadingGeneration
+      || state.selectedSong?.id !== song.id) return;
     stage.setSong(song);
     preparedGeneration = target.loadingGeneration;
     audioProgress = 1;
@@ -414,7 +436,9 @@ async function preparePerformance(target: KaraokeState): Promise<void> {
     await audio.recover(currentServerNow());
     maybeSignalReady();
   } catch (error) {
-    if (preparationKey !== key) return;
+    if (pageDisposed || controller.signal.aborted || preparationKey !== key || state?.phase !== 'loading'
+      || state.loadingGeneration !== target.loadingGeneration
+      || state.selectedSong?.id !== song.id) return;
     console.error('Karaoke backing track preparation failed.', error);
     preparationError = copy.audioError;
     renderFlow(true);
@@ -655,6 +679,9 @@ function wireFlowControls(): void {
   element('retry-loading')?.addEventListener('click', () => {
     preparationError = '';
     preparationKey = '';
+    preparationAbort?.abort();
+    preparationAbort = null;
+    selectedSongPreloader.dispose();
     connection?.retryLoading();
   });
 }

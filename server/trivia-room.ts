@@ -32,6 +32,13 @@ export const TRIVIA_LOADING_TIMEOUT_MS = 30_000;
 export const TRIVIA_QUESTION_PROMPT_TIMEOUT_MS = 60_000;
 export const TRIVIA_ANSWER_CUE_TIMEOUT_MS = 25_000;
 export const TRIVIA_ANSWER_START_DELAY_MS = 0;
+/** The last caller to hear the choices still gets time to answer. */
+export const TRIVIA_MIN_POST_CUE_ANSWER_MS = 8_000;
+/** Caps late playback and retry extensions for a single question. */
+export const TRIVIA_MAX_QUESTION_WINDOW_MS = 135_000;
+const TRIVIA_CUE_ESTIMATE_BUFFER_MS = 2_000;
+const TRIVIA_CUE_DELIVERY_BUFFER_MS = 7_000;
+const TRIVIA_MAX_ESTIMATED_CUE_MS = 120_000;
 export const TRIVIA_FINAL_ANSWER_GRACE_MS = 1_500;
 /** A received spoken final can hold only its own question while semantic intent resolves. */
 export const TRIVIA_SEMANTIC_ANSWER_MAX_MS = 3_000;
@@ -97,6 +104,7 @@ export class TriviaRoom {
   private readonly loadingTimeoutMs: number;
   private readonly questionPromptTimeoutMs: number;
   private readonly answerCueTimeoutMs: number;
+  private readonly answerCueTimeoutCustomized: boolean;
   private readonly finalAnswerGraceMs: number;
   private readonly revealMs: number;
   private categoryValue: TriviaRoundCategoryId | null = null;
@@ -148,6 +156,7 @@ export class TriviaRoom {
       options.questionPromptTimeoutMs ?? TRIVIA_QUESTION_PROMPT_TIMEOUT_MS,
     );
     this.answerCueTimeoutMs = boundedCueDuration(options.answerCueTimeoutMs ?? TRIVIA_ANSWER_CUE_TIMEOUT_MS);
+    this.answerCueTimeoutCustomized = options.answerCueTimeoutMs !== undefined;
     this.finalAnswerGraceMs = nonNegativeDuration(
       options.finalAnswerGraceMs ?? TRIVIA_FINAL_ANSWER_GRACE_MS,
       'finalAnswerGraceMs',
@@ -435,8 +444,20 @@ export class TriviaRoom {
   beginAnswerCueDelivery(playerId: string, questionId: string, questionAttemptId: number): number | null {
     if (!this.canDeliver(playerId, questionId, questionAttemptId, 'answer_cue')
       || this.answerCueReadyPlayerIds.has(playerId)) return null;
+    const now = this.now();
+    const startedAtMs = this.answeringStartsAt;
+    const current = this.currentQuestion();
+    if (startedAtMs === null || !current) return null;
+    const latestCueAt = startedAtMs + TRIVIA_MAX_QUESTION_WINDOW_MS - TRIVIA_MIN_POST_CUE_ANSWER_MS;
+    if (now > latestCueAt) return null;
+    const estimatedCueMs = estimateAnswerCueMs(current, this.locale);
+    const deadlineAtMs = Math.min(latestCueAt, this.answerCueTimeoutCustomized
+      ? now + Math.max(20_000, this.answerCueTimeoutMs)
+      : Math.max(now + this.answerCueTimeoutMs,
+        startedAtMs + estimatedCueMs + TRIVIA_CUE_DELIVERY_BUFFER_MS,
+        (this.questionEndsAt ?? startedAtMs) + TRIVIA_CUE_ESTIMATE_BUFFER_MS));
     const generation = this.nextDeliveryGeneration++;
-    this.cueDeliveries.set(playerId, { generation, deadlineAtMs: this.now() + Math.max(20_000, this.answerCueTimeoutMs) });
+    this.cueDeliveries.set(playerId, { generation, deadlineAtMs });
     return generation;
   }
 
@@ -467,21 +488,57 @@ export class TriviaRoom {
     deliveryGeneration: number): boolean {
     const current = this.currentQuestion();
     const player = this.players.find(candidate => candidate.playerId === playerId);
+    const delivery = this.cueDeliveries.get(playerId);
     if (this.phase !== 'answer_cue' || current?.question.id !== questionId || !player?.connected
       || this.questionAttemptIdValue !== questionAttemptId
-      || this.cueDeliveries.get(playerId)?.generation !== deliveryGeneration) return false;
+      || delivery?.generation !== deliveryGeneration) return false;
+    const receivedAtMs = this.now();
+    if (receivedAtMs > delivery.deadlineAtMs || !this.extendAnswerWindowAfterCue(receivedAtMs)) {
+      this.pauseAudio(questionId, questionAttemptId);
+      return false;
+    }
     this.cueDeliveries.delete(playerId);
     this.answerCueReadyPlayerIds.add(playerId);
-    this.maybeStartAnswering(this.now());
+    this.maybeStartAnswering(receivedAtMs);
     return true;
   }
 
   questionAnswerCueSkipped(playerId: string, questionId: string, questionAttemptId: number): boolean {
-    if (!this.canDeliver(playerId, questionId, questionAttemptId, 'answer_cue')) return false;
+    if (!this.canDeliver(playerId, questionId, questionAttemptId, 'answer_cue')
+      || this.answerCueReadyPlayerIds.has(playerId)) return false;
+    const skippedAtMs = this.now();
+    if ((this.answerCueEndsAt !== null && skippedAtMs > this.answerCueEndsAt
+      && !this.cueDeliveryActiveFor(playerId, skippedAtMs))
+      || !this.extendAnswerWindowAfterCue(skippedAtMs)) {
+      this.pauseAudio(questionId, questionAttemptId);
+      return false;
+    }
     this.cueDeliveries.delete(playerId);
     this.answerCueReadyPlayerIds.add(playerId);
-    this.maybeStartAnswering(this.now());
+    this.maybeStartAnswering(skippedAtMs);
     return true;
+  }
+
+  private extendAnswerWindowAfterCue(receivedAtMs: number): boolean {
+    if (this.answeringStartsAt === null || this.questionEndsAt === null
+      || receivedAtMs > this.answeringStartsAt + TRIVIA_MAX_QUESTION_WINDOW_MS
+        - TRIVIA_MIN_POST_CUE_ANSWER_MS) return false;
+    const deadlineAtMs = receivedAtMs + TRIVIA_MIN_POST_CUE_ANSWER_MS;
+    if (deadlineAtMs > this.questionEndsAt) {
+      this.questionEndsAt = deadlineAtMs;
+      this.finalAnswerDeadlineAt = deadlineAtMs + this.finalAnswerGraceMs;
+    }
+    return true;
+  }
+
+  private cueDeliveryActiveFor(playerId: string, receivedAtMs: number): boolean {
+    const delivery = this.cueDeliveries.get(playerId);
+    return Boolean(delivery && receivedAtMs <= delivery.deadlineAtMs);
+  }
+
+  private sharedCueDeliveryActiveAt(receivedAtMs: number): boolean {
+    return this.players.some(player => player.connected && !this.answerCueReadyPlayerIds.has(player.playerId)
+      && this.cueDeliveryActiveFor(player.playerId, receivedAtMs));
   }
 
   /** Each voice transport gets a fresh generation, so a replaced or retried cue cannot acknowledge its successor. */
@@ -573,6 +630,10 @@ export class TriviaRoom {
     const receivedAtMs = this.now();
     const current = this.currentQuestion();
     const player = this.players.find(candidate => candidate.playerId === playerId);
+    if (this.phase === 'answer_cue' && current?.question.id === questionId
+      && this.questionAttemptIdValue === questionAttemptId && player?.connected
+      && player.submittedChoiceId === null && receivedAtMs > (this.questionEndsAt ?? Infinity)
+      && this.sharedCueDeliveryActiveAt(receivedAtMs)) this.extendAnswerWindowAfterCue(receivedAtMs);
     if ((this.phase !== 'question' && this.phase !== 'answer_cue') || !current || current.question.id !== questionId
       || this.questionAttemptIdValue !== questionAttemptId
       || !player?.connected || player.submittedChoiceId !== null
@@ -620,6 +681,12 @@ export class TriviaRoom {
         && pending.questionId === current?.question.id && receivedAtMs <= pending.expiresAtMs
         ? pending : null;
     if (semanticResolutionId !== undefined && !reservation) return false;
+    const player = this.players.find(candidate => candidate.playerId === playerId);
+    if (!player?.connected || player.submittedChoiceId !== null || !current) return false;
+    const choiceId = this.resolveChoice(current, spokenOrChoiceId);
+    if (!choiceId) return false;
+    if (this.phase === 'answer_cue' && receivedAtMs > (this.questionEndsAt ?? Infinity)
+      && this.sharedCueDeliveryActiveAt(receivedAtMs)) this.extendAnswerWindowAfterCue(receivedAtMs);
     const receivedDeadlineAt = reservation?.expiresAtMs ?? this.finalAnswerDeadlineAt;
     if ((this.phase !== 'question' && this.phase !== 'answer_cue') || !final || this.answeringStartsAt === null
       || this.questionEndsAt === null || receivedDeadlineAt === null
@@ -628,15 +695,13 @@ export class TriviaRoom {
       || answeredAtMs > this.questionEndsAt
       || !Number.isFinite(receivedAtMs) || receivedAtMs < answeredAtMs
       || receivedAtMs > receivedDeadlineAt) return false;
-    const player = this.players.find(candidate => candidate.playerId === playerId);
-    if (!player?.connected || player.submittedChoiceId !== null || !current) return false;
-    const choiceId = this.resolveChoice(current, spokenOrChoiceId);
-    if (!choiceId) return false;
     if (reservation?.lateOnset && (answeredAtMs !== reservation.lateOnset.atMs
       || (reservation.lateOnset.choiceId !== undefined
         && choiceId !== reservation.lateOnset.choiceId))) return false;
 
-    const elapsedMs = answeredAtMs - this.answeringStartsAt;
+    // The published deadline can lengthen for speech. Scoring retains the
+    // established 25-second scale and leaderboard validation bounds.
+    const elapsedMs = Math.min(TRIVIA_ANSWER_WINDOW_MS, answeredAtMs - this.answeringStartsAt);
     const scored = scoreTriviaAnswer(choiceId === current.question.correctChoiceId, elapsedMs, player.currentStreak);
     player.submittedChoiceId = choiceId;
     this.semanticAnswerResolutions.delete(playerId);
@@ -694,9 +759,10 @@ export class TriviaRoom {
         }
       }
       if (this.phase === 'answer_cue') {
-        // Choice audio must finish while the live clock is running. If it does
-        // not, retry this question instead of scoring an unheard option set.
-        if (this.questionEndsAt !== null && now >= this.questionEndsAt) {
+        // A conservative estimate starts the countdown with the question;
+        // an active, bounded delivery may still finish after that estimate.
+        if (this.answeringStartsAt !== null
+          && now >= this.answeringStartsAt + TRIVIA_MAX_QUESTION_WINDOW_MS) {
           this.pauseAudio(this.currentQuestion()!.question.id, this.questionAttemptIdValue);
           changed = true;
           continue;
@@ -918,9 +984,16 @@ export class TriviaRoom {
     if (!current) return;
     this.phase = 'answer_cue';
     this.questionPromptEndsAt = null;
-    this.answerCueEndsAt = startedAtMs + this.answerCueTimeoutMs;
     this.answeringStartsAt = startedAtMs + TRIVIA_ANSWER_START_DELAY_MS;
-    this.questionEndsAt = this.answeringStartsAt + TRIVIA_ANSWER_WINDOW_MS;
+    const estimatedCueMs = estimateAnswerCueMs(current, this.locale);
+    const latestCueAt = this.answeringStartsAt + TRIVIA_MAX_QUESTION_WINDOW_MS
+      - TRIVIA_MIN_POST_CUE_ANSWER_MS;
+    this.answerCueEndsAt = Math.min(latestCueAt, startedAtMs + (this.answerCueTimeoutCustomized
+      ? this.answerCueTimeoutMs
+      : Math.max(this.answerCueTimeoutMs, estimatedCueMs + TRIVIA_CUE_DELIVERY_BUFFER_MS)));
+    this.questionEndsAt = this.answeringStartsAt + Math.min(TRIVIA_MAX_QUESTION_WINDOW_MS,
+      Math.max(TRIVIA_ANSWER_WINDOW_MS, estimatedCueMs + TRIVIA_MIN_POST_CUE_ANSWER_MS
+        + TRIVIA_CUE_ESTIMATE_BUFFER_MS));
     this.finalAnswerDeadlineAt = this.questionEndsAt + this.finalAnswerGraceMs;
     this.answerCueReadyPlayerIds.clear();
     this.promptDeliveries.clear();
@@ -1139,6 +1212,19 @@ export class TriviaRoom {
     this.cueDeliveries.clear();
     this.resultValue = null;
   }
+}
+
+function estimateAnswerCueMs(current: TriviaRoundQuestion, locale: SupportedLocale): number {
+  const localized = current.question.locales[locale];
+  const choices = current.choiceOrder.map(id => localized.choices.find(choice => choice.id === id)?.text ?? '');
+  // Mirror Relay's conservative 9/10-character speech estimate. The extra
+  // characters allow for the spoken option numbers, separators, and preamble.
+  const characterCount = choices.reduce((count, choice) => count + Array.from(choice).length, 48);
+  const punctuationCount = choices.join(' ').match(/[.!?;:]/g)?.length ?? 0;
+  const charactersPerSecond = locale === 'pt-BR' ? 9 : 10;
+  return Math.min(TRIVIA_MAX_ESTIMATED_CUE_MS,
+    Math.ceil(characterCount / charactersPerSecond * 1_000)
+      + (punctuationCount + 4) * 180 + 1_500);
 }
 
 function cleanName(name: string): string {

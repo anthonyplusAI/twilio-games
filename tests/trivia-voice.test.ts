@@ -741,6 +741,34 @@ describe('TriviaVoiceSession question playback and answers', () => {
     expect(game.calls.answers).toEqual([{ choiceId: 'paris', final: true, answeredAtMs: 11_000 }]);
   });
 
+  it('lets the room extend a still-playing choice cue for a locally understood answer', () => {
+    const game = harness(answerCueState({ displayViewReady: false,
+      answeringStartsAtMs: 1_000, questionEndsAtMs: 2_000 }), 'en-US',
+    { resumed: true, acceptAnswerCue: true });
+    game.setup();
+    game.setNow(2_100);
+    game.prompt('Paris');
+
+    expect(game.calls.answers).toEqual([{ choiceId: 'paris', final: true, answeredAtMs: 2_100 }]);
+    expect(game.state.phase).toBe('reveal');
+    expect(game.spoken.map(item => item.text)).not.toContain('Time is up.');
+  });
+
+  it('reserves semantic interpretation during a still-playing cue beyond its initial deadline', async () => {
+    const game = harness(answerCueState({ displayViewReady: false,
+      answeringStartsAtMs: 1_000, questionEndsAtMs: 2_000 }), 'en-US',
+    { resumed: true, acceptAnswerCue: true,
+      resolveIntent: async () => ({ kind: 'action', actionId: 'answer_choice', targetId: 'paris' }) });
+    game.setup();
+    game.setNow(2_100);
+    game.prompt('the city with the big iron tower');
+    await game.session.whenSpeechSettled();
+
+    expect(game.calls.resolutionStarts).toEqual([{ questionId: 'question-1', attemptId: 1, id: 1 }]);
+    expect(game.calls.answers).toEqual([{ choiceId: 'paris', final: true, answeredAtMs: 2_100 }]);
+    expect(game.state.phase).toBe('reveal');
+  });
+
   it('discards a delayed semantic answer when the question attempt changes', async () => {
     let finish!: (result: TriviaIntentResult) => void;
     const pending = new Promise<TriviaIntentResult>(resolve => { finish = resolve; });
@@ -1270,11 +1298,11 @@ describe('TriviaVoiceSession reconnect, reveal, and lifecycle', () => {
 
   it.each([
     { locale: 'en-US' as const, name: 'Ada', result: /Ada wins\. 2,600 points; 2 correct/i,
-      technology: /Twilio Conversation Relay.*heard answers.*scored.*screen/i,
+      technology: /Twilio Conversation Relay.*transcribed phone answers.*scored.*screen.*spoke results/i,
       guidance: /Check messages for coins to replay/i },
     { locale: 'pt-BR' as const, name: 'Ana', result: /Ana venceu\. 2\.600 pontos; 2 acertos/i,
-      technology: /Twilio Conversation Relay.*ouviu respostas.*pontuou.*tela/i,
-      guidance: /Veja mensagens.*moedas.*jogar de novo/i },
+      technology: /Twilio Conversation Relay.*transcreve.*pontua.*tela.*narra/i,
+      guidance: /Veja o SMS.*moedas.*jogar de novo/i },
   ])('queues a compact $locale station result before slow Relay playback settles', async row => {
     const game = harness(resultState([
       resultPlayer('t1', row.name, 2_600, 2, 1),
@@ -1300,10 +1328,10 @@ describe('TriviaVoiceSession reconnect, reveal, and lifecycle', () => {
 
   it.each([
     { locale: 'en-US' as const, outcome: /Ada wins.*2,600/i,
-      technology: /Twilio Conversation Relay.*heard answers.*scored.*screen/i,
+      technology: /Twilio Conversation Relay.*transcribed phone answers.*scored.*screen.*spoke results/i,
       replay: /To play again, say Play again/i },
     { locale: 'pt-BR' as const, outcome: /Ada venceu.*2\.600/i,
-      technology: /Twilio Conversation Relay.*ouviu respostas.*pontuou.*tela/i,
+      technology: /Twilio Conversation Relay.*transcreve.*pontua.*tela.*narra/i,
       replay: /Para jogar novamente, diga Jogar novamente/i },
   ])('explains $locale Trivia voice technology after the standalone result and before replay guidance', async row => {
     const game = harness(resultState([resultPlayer('t1', 'Ada', 2_600, 2, 1)]),
@@ -1406,6 +1434,7 @@ interface HarnessOptions {
   resumed?: boolean;
   resolveIntent?: (request: TriviaIntentRequest) => Promise<TriviaIntentResult>;
   retryOutcome?: 'limit' | 'unavailable';
+  acceptAnswerCue?: boolean;
 }
 
 function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US', options: HarnessOptions = {}) {
@@ -1585,7 +1614,10 @@ function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US'
     },
     answerAt: (_code, _playerId, choiceId, final, answeredAtMs) => {
       calls.answers.push({ choiceId, final, answeredAtMs });
-      if (state.phase !== 'question' || state.myAnswered) return false;
+      if (state.phase !== 'question' && !(options.acceptAnswerCue && state.phase === 'answer_cue')
+        || state.myAnswered) return false;
+      if (state.phase === 'answer_cue' && state.questionEndsAtMs !== null
+        && answeredAtMs > state.questionEndsAtMs) setState({ questionEndsAtMs: answeredAtMs + 8_000 });
       const points = choiceId === 'paris' ? 1_300 : 0;
       const current = state.players.find(candidate => candidate.playerId === 't1')!;
       updateMe({

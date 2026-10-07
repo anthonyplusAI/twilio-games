@@ -45,6 +45,7 @@ export class ChessVoiceSession {
   private active = true;
   private turnEpoch = 0;
   private initiatingResetGameId: number | null = null;
+  private announcedTerminalMoveKey: string | null = null;
   private readonly pendingSpeech = new Set<Promise<unknown>>();
 
   constructor(private readonly deps: ChessVoiceDeps) {}
@@ -85,6 +86,7 @@ export class ChessVoiceSession {
     const reset = events.find(event => event.type === 'reset');
     if (reset?.type === 'reset') {
       this.turnEpoch++;
+      this.announcedTerminalMoveKey = null;
       if (this.initiatingResetGameId === reset.gameId) {
         this.initiatingResetGameId = null;
         return;
@@ -98,10 +100,19 @@ export class ChessVoiceSession {
       return;
     }
     for (const event of events) {
-      if (event.type !== 'move' || event.move.actor !== 'computer') continue;
-      this.speak(describeChessMove(event.move, this.commandLocale));
+      if (event.type !== 'move') continue;
       const current = this.deps.snapshot(this.roomCode);
-      if (current?.result) this.speak(this.resultLine(current));
+      if (current?.result && current.lastMove?.revision === event.move.revision) {
+        const key = `${current.gameId}:${event.move.revision}`;
+        if (this.announcedTerminalMoveKey !== key) {
+          this.announcedTerminalMoveKey = key;
+          // Move events flush before the room-state completion callback. Queue one
+          // terminal cue now so station retirement can see and await the result.
+          this.speak(`${describeChessMove(event.move, this.commandLocale)} ${this.resultLine(current)}`);
+        }
+      } else if (event.move.actor === 'computer') {
+        this.speak(describeChessMove(event.move, this.commandLocale));
+      }
     }
   }
 
@@ -154,6 +165,9 @@ export class ChessVoiceSession {
     if (!this.roomCode || !this.callSid || !spoken.trim()) return;
     this.turnEpoch++;
     const intent = parseChessIntent(spoken, this.commandLocale);
+    // A request for advice is an action even when the caller phrases it as a question.
+    // The room decides whether a hint is currently legal and owns the three-use budget.
+    if (intent.kind === 'hint') { this.runCommand(spoken); return; }
     // Chess questions are read-only, even if they name a legal move or Relay
     // transcribes the question without its final question mark.
     if (isReadOnlyChessInquiry(spoken, this.commandLocale, intent)) {
@@ -210,8 +224,13 @@ export class ChessVoiceSession {
       return;
     }
     if (result.code === 'confirmed' && result.state.lastMove?.actor === 'human') {
-      this.speak(describeChessMove(result.state.lastMove, this.commandLocale), true);
-      if (result.state.result) this.speak(this.resultLine(result.state));
+      if (result.state.result) {
+        const key = `${result.state.gameId}:${result.state.lastMove.revision}`;
+        if (this.announcedTerminalMoveKey !== key) {
+          this.announcedTerminalMoveKey = key;
+          this.speak(`${describeChessMove(result.state.lastMove, this.commandLocale)} ${this.resultLine(result.state)}`);
+        }
+      } else this.speak(describeChessMove(result.state.lastMove, this.commandLocale), true);
     } else if (result.code === 'finished' && this.stationManaged) {
       this.speak(this.stationWaitLine());
     } else {
@@ -276,6 +295,7 @@ export class ChessVoiceSession {
           }
           if (decision.actionId === 'confirm' && before.pendingMove) { this.runCommand('confirm'); return; }
           if (decision.actionId === 'cancel' && (before.pendingMove || before.selection)) { this.runCommand('cancel'); return; }
+          if (decision.actionId === 'hint') { this.runCommand('hint'); return; }
           if (decision.actionId === 'reset' && before.phase === 'finished') { this.handleReset(); return; }
           if (decision.actionId === 'help') { this.runCommand('help'); return; }
         }
@@ -299,6 +319,9 @@ export class ChessVoiceSession {
       { id: 'side', text: this.commandLocale === 'pt-BR'
         ? `Você joga com as ${state.humanColor === 'w' ? 'brancas' : 'pretas'}.`
         : `You play ${state.humanColor === 'w' ? 'White' : 'Black'}.` },
+      { id: 'hints_remaining', text: this.commandLocale === 'pt-BR'
+        ? `Você tem ${state.hintsRemaining} dicas restantes nesta partida.`
+        : `You have ${state.hintsRemaining} hints left in this game.` },
     ];
     if (state.lastMove) facts.push({ id: 'last_move', text: describeChessMove(state.lastMove, this.commandLocale) });
     if (state.pendingMove) facts.push({ id: 'pending_move', text: this.commandLocale === 'pt-BR'
@@ -324,11 +347,11 @@ export class ChessVoiceSession {
     if (this.commandLocale === 'pt-BR') {
       return resumed
         ? `Bem-vindo de volta ao Xadrez por Voz da Twilio Conversation Relay. Você joga com as ${side}. Diga sua jogada ou ajuda.`
-        : `Bem-vindo ao Xadrez por Voz da Twilio Conversation Relay. Você joga com as ${side}. Diga uma jogada, por exemplo, ${opening}, ou diga uma peça e sua casa inicial. Pense com calma antes de dizer o destino. Eu repetirei a jogada; diga confirmar ou cancelar. Para fazer roque, diga roque.`;
+        : `Bem-vindo ao Xadrez por Voz da Twilio Conversation Relay. Você joga com as ${side}. Diga uma jogada, por exemplo, ${opening}, ou diga uma peça e sua casa inicial. Pense com calma antes de dizer o destino. Eu repetirei a jogada; diga confirmar ou cancelar. Para fazer roque, diga roque. Você pode pedir até três dicas.`;
     }
     return resumed
       ? `Welcome back to Voice Chess on Twilio Conversation Relay. You command ${side}. Say your move or help.`
-      : `Welcome to Voice Chess on Twilio Conversation Relay. You command ${side}. Say a move, for example, ${opening}, or name a piece and its starting square. Take your time before naming the destination. I will repeat your move; say confirm or cancel. For castling, say castle.`;
+      : `Welcome to Voice Chess on Twilio Conversation Relay. You command ${side}. Say a move, for example, ${opening}, or name a piece and its starting square. Take your time before naming the destination. I will repeat your move; say confirm or cancel. For castling, say castle. You can ask for up to three hints.`;
   }
 
   private resultLine(state: ChessState): string {
@@ -342,12 +365,12 @@ export class ChessVoiceSession {
       const outcome = drew ? 'Empate.' : won
         ? 'Xeque-mate! Você venceu o duelo de magos.'
         : 'Xeque-mate. O mago rival venceu desta vez.';
-      return `${outcome} A Twilio Conversation Relay transmitiu seus lances falados; o jogo atualizou o tabuleiro. ${next}`;
+      return `${outcome} O Twilio Conversation Relay transcreveu seus lances pelo telefone. O Xadrez por Voz conferiu as jogadas, moveu as peças na tela e anunciou o resultado na chamada. ${next}`;
     }
     const outcome = drew ? 'The duel ends in a draw.' : won
       ? 'Checkmate! You won the wizard duel.'
       : 'Checkmate. The rival wizard wins this time.';
-    return `${outcome} Twilio Conversation Relay carried your spoken moves; the game updated the board. ${next}`;
+    return `${outcome} Twilio Conversation Relay transcribed your spoken moves. Voice Chess checked them, moved the pieces on screen, and announced the result over your call. ${next}`;
   }
 
   private stationWaitLine(): string {
@@ -508,6 +531,10 @@ function legalMoveFacts(state: ChessState, choices: readonly ChessVoiceMoveChoic
 
 function isReadOnlyChessInquiry(spoken: string, locale: SupportedLocale, intent: ChessIntent): boolean {
   const text = normalizeForMatching(spoken, locale);
+  // Asking for move advice is an action, even in question form. Keep count/definition
+  // questions read-only so they cannot spend a hint through the semantic interpreter.
+  if (/\b(?:how many|how much|hints left|hint left|what is|what are|what does|what happens|what if|how do|how does|explain|define|if i|whether|quantas|quantos|restam|sobram|o que e|o que sao|o que acontece|como funciona|explique|defina|se eu)\b/.test(text)) return true;
+  if (/\b(?:hint|tips|tip|suggest|suggestion|recommend|advice|best move|good move|next move|help me choose|help me decide|pick a move|choose a move|safe plan|what should i do|what would you do|what do you suggest|dica|sugira|sugerir|recomenda|recomendar|melhor jogada|melhor lance|me ajude a escolher)\b/.test(text)) return false;
   // Read-only framing wins even if a later clause happens to contain an
   // imperative ("What if I move...?"). Relay punctuation alone is not an
   // inquiry: "Move my bishop to C3?" still needs a fast, confirmation-gated
@@ -548,6 +575,12 @@ function directLegalAnswer(spoken: string, locale: SupportedLocale, state: Chess
   choices: readonly ChessVoiceMoveChoice[], facts: readonly VoiceInterpretFact[]): string | null {
   const text = normalizeForMatching(spoken, locale);
   const fact = (id: string) => facts.find(item => item.id === id)?.text ?? null;
+  // The hint allowance is authoritative room state. Answer count questions here so
+  // they stay read-only even when the semantic interpreter is slow or unavailable.
+  if (/\b(?:hint|hints|dica|dicas)\b/.test(text)
+    && /\b(?:how many|how much|any|left|remaining|remain|count|available|quantas|quantos|alguma|algumas|restam|restantes|sobram|sobraram|tenho)\b/.test(text)) {
+    return fact('hints_remaining');
+  }
   const moveQuestion = /\b(?:move|moves|mover|jogar|jogada|jogadas|go|ir|legal|allowed|permitido|possible|possivel|can|could|pode|posso|destino|destination)\b/.test(text);
   if (!moveQuestion && !/\b(?:castle|castling|roque)\b/.test(text)) return null;
   const squares = questionSquares(text);

@@ -1,4 +1,5 @@
 import type { KaraokeSong } from '../../shared/karaoke';
+import type { KaraokePhase } from '../../shared/karaoke-protocol';
 import { karaokeAudioSchedule } from './karaoke-client-utils';
 
 export type KaraokeWaveform = 'sine' | 'triangle' | 'square' | 'noise';
@@ -71,12 +72,84 @@ interface KaraokeOutputClock {
   source: KaraokeAudioLatencySource;
 }
 
+interface PendingAudioBuffer {
+  readonly request: Promise<AudioBuffer>;
+  readonly controller: AbortController;
+  readonly progressListeners: Set<(progress: number) => void>;
+  progress: number;
+  consumers: number;
+  finished: boolean;
+}
+
+function audioBufferKey(song: KaraokeSong): string {
+  return `${song.id}\u0000${song.audioUrl ?? 'synthesized'}`;
+}
+
+function abortedPreload(): DOMException {
+  return new DOMException('Backing track preload was canceled.', 'AbortError');
+}
+
+/** Keeps optional early work limited to the song currently selected by the room. */
+export class KaraokeSelectedSongPreloader {
+  private selected: {
+    key: string;
+    controller: AbortController;
+    deadline: ReturnType<typeof setTimeout> | null;
+  } | null = null;
+  private phase: KaraokePhase | null = null;
+
+  constructor(
+    private readonly audio: Pick<KaraokeAudioTransport, 'preload'>,
+    private readonly timeoutMs = 10_000,
+  ) {}
+
+  update(phase: KaraokePhase, song: KaraokeSong | null): void {
+    const returningFromLoading = this.phase === 'loading' && phase === 'song_select';
+    this.phase = phase;
+    const key = song ? audioBufferKey(song) : '';
+    if (phase === 'song_select' && song) {
+      if (!returningFromLoading && this.selected?.key === key) return;
+      this.clearSelected();
+      const controller = new AbortController();
+      const deadline = setTimeout(() => {
+        if (this.selected?.controller !== controller) return;
+        this.selected.deadline = null;
+        controller.abort();
+      }, this.timeoutMs);
+      this.selected = { key, controller, deadline };
+      // A selection preload is opportunistic; loading reports any failure and can retry.
+      void this.audio.preload(song, undefined, controller.signal).catch(() => {}).finally(() => {
+        if (this.selected?.controller !== controller || this.selected.deadline === null) return;
+        clearTimeout(this.selected.deadline);
+        this.selected.deadline = null;
+      });
+      return;
+    }
+    // The loading phase must be able to attach to the same in-flight request.
+    if (phase === 'loading' && this.selected?.key === key) return;
+    this.clearSelected();
+  }
+
+  dispose(): void {
+    this.clearSelected();
+    this.phase = null;
+  }
+
+  private clearSelected(): void {
+    const selected = this.selected;
+    if (!selected) return;
+    this.selected = null;
+    if (selected.deadline !== null) clearTimeout(selected.deadline);
+    selected.controller.abort();
+  }
+}
+
 export class KaraokeAudioTransport {
   private context: BrowserAudioContext | null = null;
   private master: GainNode | null = null;
   private source: AudioBufferSourceNode | null = null;
   private readonly buffers = new Map<string, AudioBuffer>();
-  private readonly pending = new Map<string, Promise<AudioBuffer>>();
+  private readonly pending = new Map<string, PendingAudioBuffer>();
   private activeSong: KaraokeSong | null = null;
   private activeStartedAtMs: number | null = null;
   private contextStartedAt = 0;
@@ -106,27 +179,88 @@ export class KaraokeAudioTransport {
     if (this.master) this.master.gain.value = muted ? 0 : .82;
   }
 
-  async preload(song: KaraokeSong, onProgress?: (progress: number) => void): Promise<void> {
-    const key = this.bufferKey(song);
+  async preload(
+    song: KaraokeSong,
+    onProgress?: (progress: number) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (signal?.aborted) throw abortedPreload();
+    const key = audioBufferKey(song);
     if (this.buffers.has(key)) { onProgress?.(1); return; }
-    let request = this.pending.get(key);
-    if (!request) {
+    let pending = this.pending.get(key);
+    if (!pending) {
       const context = this.ensureContext();
-      request = song.audioUrl
-        ? this.loadRemoteBuffer(context, song.audioUrl, onProgress)
-        : Promise.resolve(this.synthesizeBacking(context, song, onProgress));
-      this.pending.set(key, request);
+      const controller = new AbortController();
+      const progressListeners = new Set<(progress: number) => void>();
+      const reportProgress = (progress: number): void => {
+        entry.progress = progress;
+        for (const listener of progressListeners) {
+          try { listener(progress); }
+          catch (error) { console.error('Karaoke audio progress listener failed.', error); }
+        }
+      };
+      const entry: PendingAudioBuffer = {
+        controller, progressListeners, progress: 0, consumers: 0, finished: false,
+        request: Promise.resolve().then(() => {
+          if (controller.signal.aborted) throw abortedPreload();
+          return song.audioUrl
+            ? this.loadRemoteBuffer(context, song.audioUrl, reportProgress, controller.signal)
+            : this.synthesizeBacking(context, song, reportProgress, controller.signal);
+        }),
+      };
+      pending = entry;
+      this.pending.set(key, entry);
+      void entry.request.then(buffer => {
+        entry.finished = true;
+        if (this.pending.get(key) !== entry) return;
+        this.buffers.set(key, buffer);
+        this.pending.delete(key);
+        reportProgress(1);
+      }, () => {
+        entry.finished = true;
+        if (this.pending.get(key) === entry) this.pending.delete(key);
+      });
     }
-    try { this.buffers.set(key, await request); }
-    finally { this.pending.delete(key); }
-    onProgress?.(1);
+    pending.consumers += 1;
+    let onAbort: (() => void) | undefined;
+    let released = false;
+    const release = (): void => {
+      if (released) return;
+      released = true;
+      if (onAbort) signal?.removeEventListener('abort', onAbort);
+      if (onProgress) pending.progressListeners.delete(onProgress);
+      pending.consumers -= 1;
+      if (pending.consumers === 0 && !pending.finished && this.pending.get(key) === pending) {
+        this.pending.delete(key);
+        pending.controller.abort();
+      }
+    };
+    try {
+      if (onProgress) {
+        pending.progressListeners.add(onProgress);
+        onProgress(pending.progress);
+      }
+      if (signal) {
+        await Promise.race([
+          pending.request,
+          new Promise<never>((_, reject) => {
+            onAbort = () => {
+              release();
+              reject(abortedPreload());
+            };
+            signal.addEventListener('abort', onAbort, { once: true });
+            if (signal.aborted) onAbort();
+          }),
+        ]);
+      } else await pending.request;
+    } finally { release(); }
   }
 
-  isReady(song: KaraokeSong): boolean { return this.buffers.has(this.bufferKey(song)); }
+  isReady(song: KaraokeSong): boolean { return this.buffers.has(audioBufferKey(song)); }
 
   /** Schedules or seeks playback against an absolute server start, including reconnect drift repair. */
   async sync(song: KaraokeSong, startedAtMs: number, serverNowMs: number): Promise<void> {
-    if (!this.buffers.has(this.bufferKey(song))) await this.preload(song);
+    if (!this.buffers.has(audioBufferKey(song))) await this.preload(song);
     const context = this.ensureContext();
     const samePerformance = this.activeSong?.id === song.id
       && this.activeSong.audioUrl === song.audioUrl
@@ -224,6 +358,9 @@ export class KaraokeAudioTransport {
 
   dispose(): void {
     this.stop();
+    for (const pending of this.pending.values()) pending.controller.abort();
+    this.pending.clear();
+    this.buffers.clear();
     if (this.contextStateListener) this.context?.removeEventListener('statechange', this.contextStateListener);
     void this.context?.close();
     this.context = null;
@@ -250,7 +387,7 @@ export class KaraokeAudioTransport {
 
   private startSource(song: KaraokeSong, startedAtMs: number, serverNowMs: number): void {
     const context = this.ensureContext();
-    const buffer = this.buffers.get(this.bufferKey(song));
+    const buffer = this.buffers.get(audioBufferKey(song));
     if (!buffer) throw new Error(`Audio for ${song.id} is not ready.`);
     const continuingPerformance = this.activeSong?.id === song.id
       && this.activeSong.audioUrl === song.audioUrl
@@ -281,22 +418,29 @@ export class KaraokeAudioTransport {
     context: BrowserAudioContext,
     url: string,
     onProgress?: (progress: number) => void,
+    signal?: AbortSignal,
   ): Promise<AudioBuffer> {
     onProgress?.(.08);
-    const response = await fetch(url, { credentials: 'same-origin' });
+    const response = await fetch(url, { credentials: 'same-origin', signal });
     if (!response.ok) throw new Error(`Backing track request failed (${response.status}).`);
     const bytes = await response.arrayBuffer();
+    if (signal?.aborted) throw abortedPreload();
     onProgress?.(.62);
     const decoded = await context.decodeAudioData(bytes);
+    if (signal?.aborted) throw abortedPreload();
     onProgress?.(.96);
     return decoded;
   }
 
-  private synthesizeBacking(
+  private async synthesizeBacking(
     context: BrowserAudioContext,
     song: KaraokeSong,
     onProgress?: (progress: number) => void,
-  ): AudioBuffer {
+    signal?: AbortSignal,
+  ): Promise<AudioBuffer> {
+    // Let the selection state paint before allocating and generating a full song buffer.
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    if (signal?.aborted) throw abortedPreload();
     const sampleRate = Math.min(44_100, context.sampleRate);
     const length = Math.ceil(song.durationMs / 1000 * sampleRate);
     const buffer = context.createBuffer(2, length, sampleRate);
@@ -308,7 +452,12 @@ export class KaraokeAudioTransport {
       seed = (seed * 1_664_525 + 1_013_904_223) >>> 0;
       return seed / 0xffff_ffff * 2 - 1;
     };
-    plan.forEach((event, eventIndex) => {
+    for (const [eventIndex, event] of plan.entries()) {
+      if (eventIndex > 0 && eventIndex % 32 === 0) {
+        // Building a procedural backing track should leave time for menu input and painting.
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+        if (signal?.aborted) throw abortedPreload();
+      }
       const start = Math.max(0, Math.floor(event.timeSeconds * sampleRate));
       const end = Math.min(length, start + Math.ceil(event.durationSeconds * sampleRate));
       const pan = event.kind === 'hat' ? (eventIndex % 2 ? .28 : -.28) : 0;
@@ -331,7 +480,7 @@ export class KaraokeAudioTransport {
         right[sample] = (right[sample] ?? 0) + value * (1 + Math.min(0, pan));
       }
       if (eventIndex % 80 === 0) onProgress?.(.08 + .82 * eventIndex / plan.length);
-    });
+    }
     return buffer;
   }
 
@@ -390,10 +539,6 @@ export class KaraokeAudioTransport {
 
   private boundSongTime(value: number): number {
     return Math.min(this.activeSong?.durationMs ?? 0, Math.max(0, value));
-  }
-
-  private bufferKey(song: KaraokeSong): string {
-    return `${song.id}\u0000${song.audioUrl ?? 'synthesized'}`;
   }
 
   private setBlocked(blocked: boolean): void {

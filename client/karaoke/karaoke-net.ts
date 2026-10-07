@@ -5,6 +5,7 @@ import type {
   KaraokeState,
 } from '../../shared/karaoke-protocol';
 import type { SupportedLocale } from '../../shared/i18n/locales';
+import { withDisplaySession } from '../display-session';
 import type { KaraokeClockSyncSample } from './karaoke-client-utils';
 
 export type KaraokeConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'closed';
@@ -43,7 +44,7 @@ export class KaraokeConnection {
 
   private connect(): void {
     const generation = ++this.generation;
-    const ws = this.ws = new WebSocket(this.url);
+    const ws = this.ws = new WebSocket(withDisplaySession(this.url));
     this.connectionCallback?.(generation === 1 ? 'connecting' : 'reconnecting');
     ws.onopen = () => {
       if (generation !== this.generation || this.closed) return;

@@ -2,6 +2,7 @@ import type { SupportedLocale } from '../../shared/i18n/locales';
 import type { TriviaRoundCategoryId } from '../../shared/trivia';
 import type { TriviaEvent, TriviaServerMessage, TriviaState } from '../../shared/trivia-protocol';
 import type { TriviaClockSyncSample } from './trivia-client-utils';
+import { withDisplaySession } from '../display-session';
 
 export type TriviaConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'closed';
 
@@ -37,7 +38,7 @@ export class TriviaConnection {
 
   private connect(): void {
     const generation = ++this.generation;
-    const ws = this.ws = new WebSocket(this.url);
+    const ws = this.ws = new WebSocket(withDisplaySession(this.url));
     this.connectionCallback?.(generation === 1 ? 'connecting' : 'reconnecting');
     ws.onopen = () => {
       if (generation !== this.generation || this.closed) return;

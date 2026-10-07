@@ -9,7 +9,32 @@ import { applyModelTransform } from './model-transform';
 
 const RACER_ASSET_TIMEOUT_MS = 45_000;
 const MAX_CONCURRENT_ASSET_LOADS = 4;
+// Parsing a GLB cannot be interrupted. Reserve two bounded slots so a newly
+// chosen car or gameplay prop can start while four cosmetic models decode.
+const MAX_ASSET_LOADS_WITH_URGENT_RESERVE = MAX_CONCURRENT_ASSET_LOADS + 2;
 type AssetLoadState = 'idle' | 'loading' | 'ready' | 'failed';
+interface ActiveAssetDownload {
+  file: string;
+  controller: AbortController;
+  isCar: boolean;
+  preempted: boolean;
+}
+
+/** Settle the slot even if a fetch or response body ignores its AbortSignal. */
+function downloadUntilAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      reject(new DOMException('aborted', 'AbortError'));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    void promise.then(
+      value => { signal.removeEventListener('abort', onAbort); resolve(value); },
+      error => { signal.removeEventListener('abort', onAbort); reject(error); },
+    );
+    if (signal.aborted) onAbort();
+  });
+}
 
 /** Count mesh descendants of an object (including itself). */
 function meshCount(o: THREE.Object3D): number {
@@ -116,8 +141,10 @@ export class AssetLoader {
   private boostLoadState: AssetLoadState = 'idle';
   private boostLoadGeneration = 0;
   private activeAssetLoads = 0;
+  private activeAssetDownloads = new Set<ActiveAssetDownload>();
   private pendingAssetLoads: { file: string; order: number; start: () => void }[] = [];
   private nextAssetOrder = 0;
+  private optionalDownloadsPaused = false;
   private priorityCarIndexes = new Set<number>();
   private priorityCarFiles = new Set<string>();
 
@@ -180,10 +207,27 @@ export class AssetLoader {
   /** Resolves once every car/barrier/boost GLB has settled (or immediately if none). */
   carsReady: Promise<void> = Promise.resolve();
 
-  /** Raise cars seen in the live menu or race ahead of optional roster downloads. */
+  /** Keep the current selected cars ahead of optional roster downloads. */
   prioritizeCarIndexes(indexes: readonly number[]): void {
-    for (const index of indexes) if (Number.isInteger(index) && index >= 0) this.priorityCarIndexes.add(index);
+    const retry: number[] = [];
+    this.priorityCarIndexes.clear();
+    for (const index of indexes) if (Number.isInteger(index) && index >= 0) {
+      this.priorityCarIndexes.add(index);
+      const actual = this.manifest.cars.length ? index % this.manifest.cars.length : -1;
+      if (actual >= 0 && this.carLoadStates[actual] === 'failed' && this.carLoadGenerations[actual] === 1) retry.push(actual);
+    }
     this.refreshAssetPriorities();
+    // A selected car which failed before the choice was known gets one more early attempt. Keep
+    // the styled/procedural fallback if that fails too; menu broadcasts must not cause a retry loop.
+    for (const index of new Set(retry)) this.startCarLoad(index);
+  }
+
+  /** Hold cosmetic downloads for a chosen map, including ones already on the wire. */
+  setOptionalDownloadsPaused(paused: boolean): void {
+    if (this.optionalDownloadsPaused === paused) return;
+    this.optionalDownloadsPaused = paused;
+    this.preemptOptionalCarDownloads();
+    this.drainPendingAssetLoads();
   }
 
   private refreshAssetPriorities(): void {
@@ -193,6 +237,29 @@ export class AssetLoader {
       .filter((file): file is string => Boolean(file)));
     this.pendingAssetLoads.sort((a, b) => this.assetPriority(a.file) - this.assetPriority(b.file)
       || a.order - b.order);
+    this.preemptOptionalCarDownloads();
+    this.drainPendingAssetLoads();
+  }
+
+  private preemptOptionalCarDownloads(): void {
+    // If a caller selects a car after the optional catalog has filled every
+    // download slot, release only the slots that its newly urgent request needs.
+    // Already-aborting downloads count toward those upcoming free slots.
+    const urgentPending = this.pendingAssetLoads.filter(next => this.assetPriority(next.file) < 2).length;
+    let slotsNeeded = this.optionalDownloadsPaused ? Number.POSITIVE_INFINITY
+      : Math.max(0, urgentPending - Math.max(0, MAX_CONCURRENT_ASSET_LOADS - this.activeAssetLoads));
+    if (!this.optionalDownloadsPaused) {
+      for (const download of this.activeAssetDownloads) {
+        if (download.isCar && download.preempted && this.assetPriority(download.file) >= 2) slotsNeeded--;
+      }
+    }
+    if (slotsNeeded <= 0) return;
+    for (const download of this.activeAssetDownloads) {
+      if (!download.isCar || this.assetPriority(download.file) < 2 || download.controller.signal.aborted) continue;
+      download.preempted = true;
+      download.controller.abort();
+      if (--slotsNeeded <= 0) break;
+    }
   }
 
   private assetPriority(file: string): number {
@@ -202,7 +269,8 @@ export class AssetLoader {
   }
 
   private acquireAssetSlot(file: string): Promise<void> {
-    if (this.activeAssetLoads < MAX_CONCURRENT_ASSET_LOADS) {
+    if (this.canStartAsset(file)
+      && (!this.optionalDownloadsPaused || this.assetPriority(file) < 2)) {
       this.activeAssetLoads++;
       return Promise.resolve();
     }
@@ -213,9 +281,26 @@ export class AssetLoader {
   }
 
   private releaseAssetSlot(): void {
-    const next = this.pendingAssetLoads.shift();
-    if (next) next.start(); // hand the open slot directly to the next prioritized file
-    else this.activeAssetLoads--;
+    this.activeAssetLoads--;
+    this.drainPendingAssetLoads();
+  }
+
+  private canStartAsset(file: string): boolean {
+    return this.activeAssetLoads < MAX_CONCURRENT_ASSET_LOADS
+      || this.assetPriority(file) < 2
+        && this.activeAssetLoads < MAX_ASSET_LOADS_WITH_URGENT_RESERVE;
+  }
+
+  private drainPendingAssetLoads(): void {
+    while (this.activeAssetLoads < MAX_ASSET_LOADS_WITH_URGENT_RESERVE) {
+      const index = this.pendingAssetLoads.findIndex(next =>
+        this.canStartAsset(next.file)
+        && (!this.optionalDownloadsPaused || this.assetPriority(next.file) < 2));
+      if (index < 0) return;
+      const [next] = this.pendingAssetLoads.splice(index, 1);
+      this.activeAssetLoads++;
+      next!.start();
+    }
   }
 
   async waitForGameplayAssets(carIndexes: readonly number[]): Promise<void> {
@@ -252,7 +337,7 @@ export class AssetLoader {
     const generation = (this.carLoadGenerations[index] ?? 0) + 1;
     this.carLoadGenerations[index] = generation;
     this.carLoadStates[index] = 'loading';
-    const load = this.loadRef(ref, CAR_TARGET).then(group => {
+    const load = this.loadRef(ref, CAR_TARGET, true).then(group => {
       if (this.carLoadGenerations[index] !== generation) return;
       if (group) {
         this.cars[index] = group;
@@ -261,6 +346,7 @@ export class AssetLoader {
       }
       if (this.carLoadGenerations[index] !== generation) return;
       if (this.carLoadStates[index] === 'ready') return;
+      if (generation === 1 && this.priorityCarFiles.has(ref.file)) return this.startCarLoad(index);
       this.cars[index] = group;
       this.carLoadStates[index] = 'failed';
     });
@@ -337,50 +423,63 @@ export class AssetLoader {
     });
   }
 
-  private async loadRef(ref: AssetRef, target: number): Promise<THREE.Group | null> {
-    await this.acquireAssetSlot(ref.file);
-    const controller = new AbortController();
-    let timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, RACER_ASSET_TIMEOUT_MS);
-    try {
-      // GLTFLoader.load has no abort handle in this Three version. Fetch the GLB ourselves so a
-      // weak connection can be cancelled rather than leaving hidden downloads behind the slot cap.
-      const response = await fetch(`/assets/${ref.file}`, { signal: controller.signal });
-      if (!response.ok) return null;
-      const bytes = await response.arrayBuffer();
-      if (timedOut) return null;
-      const slash = ref.file.lastIndexOf('/');
-      const resourcePath = `/assets/${slash >= 0 ? ref.file.slice(0, slash + 1) : ''}`;
-      const gltf = await this.loader.parseAsync(bytes, resourcePath);
-      if (timedOut) {
-        disposeUninstalledScene(gltf.scene);
-        return null;
-      }
+  private async loadRef(ref: AssetRef, target: number, isCar = false): Promise<THREE.Group | null> {
+    while (true) {
+      await this.acquireAssetSlot(ref.file);
+      const controller = new AbortController();
+      const download: ActiveAssetDownload = { file: ref.file, controller, isCar, preempted: false };
+      this.activeAssetDownloads.add(download);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, RACER_ASSET_TIMEOUT_MS);
       try {
-        const g = this.normalize(gltf.scene, ref, target);
-        const visible = visibleGeometryBounds(g);
-        const bounds = visible.bounds;
-        const size = bounds.getSize(new THREE.Vector3());
-        if (visible.count === 0 || bounds.isEmpty() || ![size.x, size.y, size.z].every(Number.isFinite)
-          || Math.max(size.x, size.y, size.z) <= 1e-6) throw new Error('asset has no renderable geometry');
-        // Showroom clips often pose the car open. Gameplay only plays clips explicitly opted in.
-        g.userData.clips = ref.animate ? gltf.animations : [];
-        g.userData.allClips = gltf.animations ?? [];
-        return g;
+        // A queued optional car can be handed a slot just before a map becomes urgent.
+        if (this.optionalDownloadsPaused && isCar && this.assetPriority(ref.file) >= 2) {
+          download.preempted = true;
+          controller.abort();
+          continue;
+        }
+        // GLTFLoader.load has no abort handle in this Three version. Fetch the GLB ourselves so a
+        // weak connection can be cancelled rather than leaving hidden downloads behind the slot cap.
+        const response = await downloadUntilAbort(fetch(`/assets/${ref.file}`, { signal: controller.signal }), controller.signal);
+        if (!response.ok) return null;
+        const bytes = await downloadUntilAbort(response.arrayBuffer(), controller.signal);
+        this.activeAssetDownloads.delete(download); // decoding cannot be interrupted safely
+        if (download.preempted) continue;
+        if (timedOut) return null;
+        const slash = ref.file.lastIndexOf('/');
+        const resourcePath = `/assets/${slash >= 0 ? ref.file.slice(0, slash + 1) : ''}`;
+        const gltf = await this.loader.parseAsync(bytes, resourcePath);
+        if (timedOut) {
+          disposeUninstalledScene(gltf.scene);
+          return null;
+        }
+        try {
+          const g = this.normalize(gltf.scene, ref, target);
+          const visible = visibleGeometryBounds(g);
+          const bounds = visible.bounds;
+          const size = bounds.getSize(new THREE.Vector3());
+          if (visible.count === 0 || bounds.isEmpty() || ![size.x, size.y, size.z].every(Number.isFinite)
+            || Math.max(size.x, size.y, size.z) <= 1e-6) throw new Error('asset has no renderable geometry');
+          // Showroom clips often pose the car open. Gameplay only plays clips explicitly opted in.
+          g.userData.clips = ref.animate ? gltf.animations : [];
+          g.userData.allClips = gltf.animations ?? [];
+          return g;
+        } catch {
+          disposeUninstalledScene(gltf.scene);
+          return null;
+        }
       } catch {
-        disposeUninstalledScene(gltf.scene);
-        return null;
+        if (download.preempted && !timedOut) continue;
+        return null; // unavailable or invalid model: the procedural asset stays playable
+      } finally {
+        clearTimeout(timer);
+        this.activeAssetDownloads.delete(download);
+        // Keep a decode slot until its parse settles; an interrupted download releases promptly.
+        this.releaseAssetSlot();
       }
-    } catch {
-      return null; // cancelled, unavailable, or invalid model: the procedural asset stays playable
-    } finally {
-      clearTimeout(timer);
-      // A parse already in progress cannot be interrupted safely. Keep its slot until it settles
-      // so a timeout never makes more than MAX_CONCURRENT_ASSET_LOADS decodes run at once.
-      this.releaseAssetSlot();
     }
   }
 

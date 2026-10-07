@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
 import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { FighterActor } from '../client/fighter/fighter-actor';
-import { FighterActorLoadCoordinator, fighterActorLoadContext } from '../client/fighter/fighter-actor-loading';
+import { FighterActorLoadCoordinator, FighterWarmupRetryBudget, fighterActorLoadContext, fighterShouldRetainActor, fighterWarmupCandidates } from '../client/fighter/fighter-actor-loading';
 import { loadAnimationSources } from '../client/fighter/fighter-assets';
 import type { FighterState } from '../shared/fighter-protocol';
 
@@ -15,7 +15,7 @@ function deferred() {
 
 function state(phase: FighterState['phase'], generation = 4): FighterState {
   return {
-    roomCode: 'TEST', phase, loadingGeneration: generation, selectedMap: 'foundry',
+    roomCode: 'TEST', phase, loadingGeneration: generation, selectedMap: 'foundry', aiFighterId: null,
     mapVotesByPlayerId: {}, expectedPlayerCount: 2, hasExpectedPlayers: true, automaticSetup: false, players: [
       { playerId: 'one', name: 'One', side: 'p1', fighterId: 'nyx', isAi: false },
       { playerId: 'two', name: 'Two', side: 'p2', fighterId: 'wraith', isAi: false },
@@ -208,5 +208,48 @@ describe('Fighter actor loading coordination', () => {
   it('drops actor-loading context outside active match phases', () => {
     expect(fighterActorLoadContext(state('fighter_select'))).toBeNull();
     expect(fighterActorLoadContext(state('results'))).toBeNull();
+  });
+
+  it('warms only selected characters during setup, before arena voting finishes', () => {
+    const lobby=state('lobby');
+    expect(fighterWarmupCandidates(lobby)).toEqual([]);
+    const choosing=state('fighter_select');
+    choosing.players[1]!.fighterId=null;
+    expect(fighterWarmupCandidates(choosing)).toEqual(['nyx']);
+    choosing.players[1]!.fighterId='wraith';
+    expect(fighterWarmupCandidates(choosing)).toEqual(['nyx','wraith']);
+    expect(fighterWarmupCandidates(state('map_select'))).toEqual(['nyx','wraith']);
+    const solo = state('map_select');
+    solo.players.splice(1);
+    solo.aiFighterId = 'gran-slam';
+    expect(fighterWarmupCandidates(solo)).toEqual(['nyx', 'gran-slam']);
+    expect(fighterShouldRetainActor(solo, 'gran-slam')).toBe(true);
+    expect(fighterWarmupCandidates(state('fight'))).toEqual([]);
+  });
+
+  it('discards a late actor once its selection or match is no longer current', () => {
+    const choosing=state('fighter_select');
+    expect(fighterShouldRetainActor(choosing,'nyx')).toBe(true);
+    choosing.players[0]!.fighterId='cinder-capone';
+    expect(fighterShouldRetainActor(choosing,'nyx')).toBe(false);
+    expect(fighterShouldRetainActor(choosing,'cinder-capone')).toBe(true);
+    expect(fighterShouldRetainActor(state('loading'),'wraith')).toBe(true);
+    expect(fighterShouldRetainActor(state('results'),'wraith')).toBe(false);
+  });
+
+  it('gives a selected model one delayed retry after a transient setup failure', () => {
+    const budget = new FighterWarmupRetryBudget(3_500, 2);
+    expect(budget.canStart('nyx', 0)).toBe(true);
+    expect(budget.failed('nyx', 100)).toBe(3_500);
+    expect(budget.canStart('nyx', 3_599)).toBe(false);
+    expect(budget.canStart('nyx', 3_600)).toBe(true);
+    budget.succeeded('nyx');
+    expect(budget.canStart('nyx', 3_600)).toBe(true);
+
+    expect(budget.failed('nyx', 4_000)).toBe(3_500);
+    expect(budget.failed('nyx', 7_500)).toBeNull();
+    expect(budget.canStart('nyx', 100_000)).toBe(false);
+    budget.retainOnly(new Set(['wraith']));
+    expect(budget.canStart('nyx', 100_000)).toBe(true);
   });
 });

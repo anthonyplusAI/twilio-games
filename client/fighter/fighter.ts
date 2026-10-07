@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { FighterActor } from './fighter-actor';
-import { FighterActorLoadCoordinator, fighterActorLoadContext, type FighterActorLoadContext } from './fighter-actor-loading';
+import { FighterActorLoadCoordinator, FighterWarmupRetryBudget, fighterActorLoadContext, fighterShouldRetainActor, fighterWarmupCandidates, type FighterActorLoadContext } from './fighter-actor-loading';
 import { FIGHTERS, FIGHTER_ASSET_VERSION, fighterAssetFirstAttemptMs, loadAnimationSources, preferProceduralFighterAssets } from './fighter-assets';
 import { FighterAtmosphere, fighterAtmosphereSpec, type FighterAtmosphereSpec } from './fighter-atmosphere';
 import { FighterConnection, type FighterConnectionState } from './fighter-net';
@@ -150,6 +150,8 @@ let animationLoadController: AbortController | null = null;
 let animationLoadPromise: Promise<Awaited<ReturnType<typeof loadAnimationSources>>> | null = null;
 const actorLoads = new Map<string, Promise<FighterActor>>();
 const actorLoadControllers = new Map<string, AbortController>();
+const actorWarmupRetries = new FighterWarmupRetryBudget();
+const actorWarmupRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const fallbackActorIds = new Set<string>();
 const deferredRealActors = new Map<string, FighterActor>();
 let preparedFightKey = '';
@@ -225,6 +227,7 @@ connection.onState(next => {
   const choiceChanged = next.selectedMap !== state?.selectedMap
     || next.players.map(player => player.fighterId ?? '').join('|') !== state?.players.map(player => player.fighterId ?? '').join('|');
   const selectionChanged = choiceChanged
+    || next.aiFighterId !== state?.aiFighterId
     || next.players.map(player => `${player.playerId}:${player.fighterId ?? ''}`).join('|') !== state?.players.map(player => `${player.playerId}:${player.fighterId ?? ''}`).join('|');
   if (state && choiceChanged && (next.phase === 'fighter_select' || next.phase === 'map_select')) getSoundEffectsManager().playSelect();
   if (phaseChanged || selectionChanged) {
@@ -234,14 +237,19 @@ connection.onState(next => {
   if (phaseChanged) {
     if (next.phase === 'loading') { preparedFightKey = ''; fightStartedKey = ''; bufferedEvents = []; }
     if (next.phase === 'lobby' || next.phase === 'fighter_select') resetFallbackActors();
+    if (next.phase === 'lobby' || next.phase === 'fighter_select') {
+      actorWarmupRetries.clear();
+      clearActorWarmupRetryTimers();
+    }
     if (next.phase === 'loading' || next.phase === 'intro') countdownSoundPlayed = false;
     if (next.phase !== 'results' && resultTimer) { clearTimeout(resultTimer); resultTimer = null; resultRevealAt = 0; }
     if (['lobby', 'fighter_select', 'map_select', 'loading'].includes(next.phase)) getMusicManager().switchContext('lobby');
   }
   state = next;
-  if (selectionChanged && (next.phase === 'fighter_select' || next.phase === 'map_select')) {
-    cancelActorLoads(new Set(next.players.map(player => player.fighterId).filter((id): id is string => Boolean(id))));
-  }
+  if (phaseChanged || selectionChanged) retainActorWarmupRetries(new Set(fighterWarmupCandidates(next)));
+  if ((selectionChanged || phaseChanged) && (next.phase === 'fighter_select' || next.phase === 'map_select'))
+    cancelActorLoads(new Set(fighterWarmupCandidates(next)));
+  if (phaseChanged && next.phase === 'lobby') cancelActorLoads();
   if (phaseChanged && next.phase === 'fight') cancelOptionalFightDownloads();
   if (!fighterActorLoadContext(next)) actorLoadCoordinator.clear();
   if (next.phase === 'countdown') {
@@ -256,7 +264,7 @@ connection.onState(next => {
     syncAuthoritativePositions(next.world);
   }
   updateNames(next);
-  if (next.phase === 'map_select') for (const player of next.players) if (player.fighterId) preloadFighterActor(player.fighterId);
+  for (const id of fighterWarmupCandidates(next)) preloadFighterActor(id);
   // Start the selected arena while callers are still deciding whether to begin.
   if (next.selectedMap && ['map_select', 'loading', 'intro', 'countdown', 'fight', 'victory', 'results'].includes(next.phase)) applyMapTheme(next.selectedMap);
   if (fighterActorLoadContext(next) && (phaseChanged || selectionChanged || !actors)) prepareFight(next);
@@ -289,6 +297,7 @@ const stopVoiceNumberUpdates = watchVoiceNumber(locale, async number => {
 });
 addEventListener('pagehide', () => {
   stopVoiceNumberUpdates(); actorLoadCoordinator.clear();
+  clearActorWarmupRetryTimers();
   if (readyTimer) { clearTimeout(readyTimer); readyTimer = null; }
 }, { once: true });
 
@@ -321,10 +330,8 @@ async function initialize(): Promise<void> {
     animationLoadPromise = loadAnimationSources(undefined, controller.signal).then(realSources => {
       if (controller.signal.aborted || attempt !== initializationAttempt) return new Map();
       animationSources = realSources;
-      // Warm only the chosen pair while players are in setup. Starting a large FBX during
-      // an active bout would compete with voice, map, and rendering traffic.
-      if (state?.phase === 'map_select') for (const player of state.players)
-        if (player.fighterId) preloadFighterActor(player.fighterId);
+      // Character choices may already have arrived before the clip bank completed.
+      for (const id of fighterWarmupCandidates(state)) preloadFighterActor(id);
       return realSources;
     }, error => {
       if (!controller.signal.aborted) console.warn('Fighter animations failed to load; procedural actors stay active.', error);
@@ -336,6 +343,7 @@ async function initialize(): Promise<void> {
       }
     });
   }
+  for (const id of fighterWarmupCandidates(state)) preloadFighterActor(id);
   if (state?.phase === 'loading' || state?.phase === 'intro' || state?.phase === 'countdown' || state?.phase === 'fight') prepareFight(state);
   maybeSignalReady(); renderFlow();
 }
@@ -638,6 +646,7 @@ function installFallbackActors(context: FighterActorLoadContext): void {
 }
 
 function storeLoadedActor(id: string, actor: FighterActor, keep: Set<string>): void {
+  if (!fighterShouldRetainActor(state, id)) { actor.dispose(); return; }
   const existing = loadedActors.get(id);
   if (!existing) loadedActors.set(id, actor);
   else if (fallbackActorIds.has(id)) {
@@ -664,12 +673,43 @@ function resetFallbackActors(): void {
 }
 
 function preloadFighterActor(id: string): void {
-  if (!animationSources || preferProceduralFighterAssets(browserConnection())
-    || loadedActors.has(id) && !fallbackActorIds.has(id) || actorLoads.has(id)) return;
+  // The chosen FBX can download while the shared clip bank is still loading;
+  // FighterActor.load joins the two once both are ready.
+  if ((!animationSources && !animationLoadPromise) || preferProceduralFighterAssets(browserConnection())
+    || loadedActors.has(id) && !fallbackActorIds.has(id) || actorLoads.has(id)
+    || !actorWarmupRetries.canStart(id, performance.now())) return;
   const spec = FIGHTERS.find(fighter => fighter.id === id); if (!spec) return;
+  clearActorWarmupRetryTimer(id);
   const pending = loadFighterActor(spec); actorLoads.set(id, pending);
-  void pending.then(actor => storeLoadedActor(id, actor, new Set([id])))
+  void pending.then(actor => {
+    if (actorLoads.get(id) === pending) actorWarmupRetries.succeeded(id);
+    storeLoadedActor(id, actor, new Set([id]));
+  }, () => {
+    // A cancelled or superseded selection must not consume the retry budget.
+    if (actorLoads.get(id) !== pending || !fighterWarmupCandidates(state).includes(id)) return;
+    const delay = actorWarmupRetries.failed(id, performance.now());
+    if (delay === null) return;
+    actorWarmupRetryTimers.set(id, setTimeout(() => {
+      actorWarmupRetryTimers.delete(id);
+      if (fighterWarmupCandidates(state).includes(id)) preloadFighterActor(id);
+    }, delay));
+  })
     .finally(() => { if (actorLoads.get(id) === pending) actorLoads.delete(id); }).catch(() => {});
+}
+
+function clearActorWarmupRetryTimer(id: string): void {
+  const timer = actorWarmupRetryTimers.get(id);
+  if (timer) clearTimeout(timer);
+  actorWarmupRetryTimers.delete(id);
+}
+
+function clearActorWarmupRetryTimers(): void {
+  for (const id of actorWarmupRetryTimers.keys()) clearActorWarmupRetryTimer(id);
+}
+
+function retainActorWarmupRetries(ids: ReadonlySet<string>): void {
+  actorWarmupRetries.retainOnly(ids);
+  for (const id of actorWarmupRetryTimers.keys()) if (!ids.has(id)) clearActorWarmupRetryTimer(id);
 }
 
 function browserConnection(): { saveData?: boolean; effectiveType?: string } | undefined {
@@ -791,6 +831,9 @@ function applyEvents(events: FighterEvent[]): void {
 }
 
 function trimActorCache(keep: Set<string>): void {
+  // Setup warmup can complete while another chosen fighter is the oldest cached
+  // actor. Keep both selections so a rematch does not download one again.
+  for (const id of fighterWarmupCandidates(state)) keep.add(id);
   const current = fighterActorLoadContext(state);
   if (current) { keep.add(current.p1Id); keep.add(current.p2Id); }
   for (const [id, actor] of loadedActors) {

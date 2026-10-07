@@ -67,6 +67,9 @@ export class FighterRoom {
     this.expectedHumanPlayers = count >= 2 ? 2 : 1;
     if (fixed) this.fixedExpectedHumanPlayers = true;
     this.automaticSetup=true;
+    if (this.expectedHumanPlayers !== 1 || this.players.length !== 1) this.aiFighterId = null;
+    else if (this.phase === 'map_select' && !this.aiFighterId && this.players[0]?.fighterId)
+      this.aiFighterId = this.chooseSoloAiFighter();
     if (this.expectedHumanPlayers === 1 && this.players.length === 1
       && (this.phase === 'lobby' || this.phase === 'fighter_select' || this.phase === 'map_select')) {
       this.players[0]!.side = 'p1';
@@ -84,13 +87,16 @@ export class FighterRoom {
     else {
       if(!this.fixedExpectedHumanPlayers)this.expectedHumanPlayers=this.players.length;
       if(this.phase==='map_select'&&this.players.length<this.expectedHumanPlayers){
-        this.phase='fighter_select';this.selectedMap=null;
+        this.phase='fighter_select';this.selectedMap=null;this.aiFighterId=null;
       }
       else if (this.phase === 'loading' || this.phase === 'intro' || this.phase === 'fight' || this.phase === 'countdown') {
         this.rejectAllPendingVoiceCommands('match_over');
         this.phase = 'fighter_select'; this.world = null; this.selectedMap = null;this.mapVotes.clear();this.aiFighterId = null;
         this.invalidatePresentation();
       }
+      if (this.phase === 'map_select' && this.players.length === 1
+        && this.expectedHumanPlayers === 1 && !this.aiFighterId && this.players[0]?.fighterId)
+        this.aiFighterId = this.chooseSoloAiFighter();
     }
   }
   setName(id: string, name: string): void { const player = this.players.find(p => p.playerId === id); if (player) { player.name = cleanName(name);player.nameConfirmed=true; } }
@@ -99,7 +105,7 @@ export class FighterRoom {
     if (this.phase !== 'fighter_select' || !FIGHTER_ROSTER.some(f => f.id === fighterId)) return false;
     const player = this.players.find(p => p.playerId === id);
     if (!player || this.players.some(p => p !== player && p.fighterId === fighterId)) return false;
-    player.fighterId=fighterId;return true;
+    player.fighterId=fighterId;this.aiFighterId=null;return true;
   }
   nextUnselectedPlayerId(): string | null { return this.players.find(player => !player.fighterId)?.playerId ?? null; }
   selectMap(playerId:string,mapId: string): boolean {
@@ -113,6 +119,7 @@ export class FighterRoom {
     if (this.phase === 'lobby' && this.players.length >= this.expectedHumanPlayers
       && this.players.every(player=>player.nameConfirmed)) { this.phase = 'fighter_select'; return true; }
     if (this.phase === 'fighter_select' && this.players.length >= this.expectedHumanPlayers && this.players.every(p => p.fighterId)) {
+      this.aiFighterId=this.players.length===1?this.chooseSoloAiFighter():null;
       this.phase = 'map_select';this.selectedMap=this.mapVoteWinner();return true;
     }
     if (this.phase === 'map_select' && this.selectedMap && this.players.length >= this.expectedHumanPlayers
@@ -128,7 +135,7 @@ export class FighterRoom {
   back(playerId?: string): boolean {
     if(this.automaticSetup && (!playerId || !this.hasPlayer(playerId)))return false;
     if (this.phase === 'fighter_select') { this.phase = 'lobby'; return true; }
-    if (this.phase === 'map_select') { this.phase = 'fighter_select'; this.selectedMap = null;this.mapVotes.clear();return true; }
+    if (this.phase === 'map_select') { this.phase = 'fighter_select'; this.selectedMap = null;this.mapVotes.clear();this.aiFighterId=null;return true; }
     if (this.phase === 'loading') { this.phase = 'map_select'; this.world = null; this.countdown = 0; this.loadingElapsed = 0; this.invalidatePresentation(); return true; }
     return false;
   }
@@ -312,6 +319,7 @@ export class FighterRoom {
     const winner = this.world?.winner ?? null;
     return { roomCode: this.code, phase: this.phase,
       players: (this.phase === 'victory' || this.phase === 'results') && this.resultPlayers ? this.resultPlayers : this.lobbyPlayers(),
+      aiFighterId: this.players.length === 1 ? this.aiFighterId : null,
       selectedMap: this.selectedMap,
       mapVotesByPlayerId:Object.fromEntries(this.mapVotes),
       world:this.world,expectedPlayerCount:this.expectedHumanPlayers,hasExpectedPlayers:this.hasExpectedPlayers,automaticSetup:this.automaticSetup,
@@ -363,12 +371,17 @@ export class FighterRoom {
     const ranked=[...counts].sort((left,right)=>right[1]-left[1]||left[0].localeCompare(right[0]));
     return ranked[0]?.[0]??null;
   }
+  private chooseSoloAiFighter(): string {
+    const human = this.players[0]?.fighterId;
+    const choices = FIGHTER_ROSTER.filter(fighter => SOLO_AI_FIGHTERS.includes(fighter.id) && fighter.id !== human);
+    return choices[Math.floor(this.random() * choices.length)]?.id ?? 'cinder-capone';
+  }
   private beginLoading():boolean {
     if(!this.selectedMap)return false;
     const bounds=this.maps.find(map=>map.id===this.selectedMap)?.bounds??[-9,9];
     if(this.players.length===1){
-      const choices=FIGHTER_ROSTER.filter(fighter=>SOLO_AI_FIGHTERS.includes(fighter.id)&&fighter.id!==this.players[0]!.fighterId);
-      this.aiFighterId=choices[Math.floor(this.random()*choices.length)]?.id??'cinder-capone';
+      if (!this.aiFighterId || this.aiFighterId === this.players[0]!.fighterId)
+        this.aiFighterId = this.chooseSoloAiFighter();
     }else this.aiFighterId=null;
     this.rejectAllPendingVoiceCommands('match_over');
     this.invalidatePresentation();

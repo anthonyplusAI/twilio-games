@@ -203,6 +203,35 @@ describe('fighter voice session', () => {
     expect(game.room.phase).toBe('loading');
   });
 
+  it.each([
+    {locale:undefined,request:'choose arena'},
+    {locale:undefined,request:"Let's pick a stage now"},
+    {locale:undefined,request:'Could you open the arena selection screen?'},
+    {locale:'pt-BR',request:'vamos escolher a arena'},
+    {locale:'pt-BR',request:'podemos abrir a seleção de arenas?'}
+  ])('opens arena selection from a spoken navigation request: $request', ({locale,request}) => {
+    const game=voiceGame();
+    const caller=game.connect(`CA-ARENA-NAV-${request}`,'VOICE',locale,'Ada');
+    caller.prompt(locale?'próximo':'next');
+    caller.prompt('Nyx');
+    expect(game.room.phase).toBe('fighter_select');
+    caller.prompt(request);
+    expect(game.room.phase).toBe('map_select');
+  });
+
+  it('keeps arena questions and premature navigation in fighter selection', () => {
+    const game=voiceGame();
+    const caller=game.connect('CA-ARENA-NAV-GUARD','VOICE',undefined,'Ada');
+    caller.prompt('next');
+    caller.prompt('choose arena');
+    expect(game.room.phase).toBe('fighter_select');
+    caller.prompt('Nyx');
+    caller.prompt('Which arena should I choose?');
+    expect(game.room.phase).toBe('fighter_select');
+    caller.prompt("don't choose an arena yet");
+    expect(game.room.phase).toBe('fighter_select');
+  });
+
   it('uses Portuguese assent only after the current Fighter selection is complete', () => {
     const game = voiceGame();
     const caller = game.connect('CA-MENU-PT', 'VOICE', 'pt-BR', 'Ana');
@@ -255,7 +284,7 @@ describe('fighter voice session', () => {
     ada.prompt('Nicks');
     expect(game.room.state().players.find(player => player.playerId === ada.playerId)?.fighterId).toBe('nyx');
     expect(game.room.phase).toBe('fighter_select');
-    expect(ada.spoken.at(-1)).toMatch(/Say next to choose your arena/i);
+    expect(ada.spoken.at(-1)).toMatch(/want to choose an arena/i);
     expect(ada.spoken.length).toBeGreaterThan(afterInterimSelection);
     ada.prompt('next');
     expect(ada.spoken.at(-1)).toBe('Choose your arena. Say the name or number shown on screen.');
@@ -344,6 +373,7 @@ describe('fighter voice session', () => {
     expect(game.room.acknowledgePresentation('results', game.room.state().loadingGeneration)).toBe(true);
     game.stateChanged();
     const replay = ada.spoken.at(-1) ?? '';
+    expect(replay).toMatch(/Twilio Conversation Relay transcribes your phone commands.*speaks the play-by-play.*Voice Fighter animates each attack on screen/i);
     expect(replay).toMatch(/rematch/i);
     expect(replay).not.toMatch(/couldn't confirm/i);
   });
@@ -428,8 +458,8 @@ describe('fighter voice session', () => {
       expect(game.room.phase).toBe('results');expect(game.room.resultsPresented).toBe(false);
       vi.advanceTimersByTime(FIGHTER_RESULTS_PRESENTATION_TIMEOUT_MS+1);game.stateChanged();
       expect(ada.spoken.at(-1)).toMatch(/Ada won.*want another fight.*rematch/i);
-      expect(ada.spoken.at(-1)).toMatch(/Ada won.*Twilio Conversation Relay.*real time.*Want another fight/i);
-      expect(ada.spoken.at(-1)).not.toMatch(/confirm|display|screen/i);
+      expect(ada.spoken.at(-1)).toMatch(/Ada won.*Twilio Conversation Relay transcribes your phone commands.*speaks the play-by-play.*Voice Fighter animates each attack on screen.*Want another fight/i);
+      expect(ada.spoken.at(-1)).not.toMatch(/(?:result|winner) (?:is|was|appeared|shown|visible).*display|cannot confirm/i);
       ada.prompt('rematch');
       expect(game.room.phase).toBe('fighter_select');
     }finally{vi.useRealTimers();}
@@ -445,8 +475,8 @@ describe('fighter voice session', () => {
       const world=game.room.state().world!;world.status='finished';world.winner='p1';game.tick(.1);game.tick(FIGHTER_VICTORY_SECONDS);
       vi.advanceTimersByTime(FIGHTER_RESULTS_PRESENTATION_TIMEOUT_MS+1);game.stateChanged();
       expect(ada.spoken.at(-1)).toMatch(/Ada won.*check your messages/i);
-      expect(ada.spoken.at(-1)).toMatch(/Ada won.*Twilio Conversation Relay.*real time.*check your messages/i);
-      expect(ada.spoken.at(-1)).not.toMatch(/confirm|result.*display|rematch/i);
+      expect(ada.spoken.at(-1)).toMatch(/Ada won.*Twilio Conversation Relay transcribes your phone commands.*speaks the play-by-play.*Voice Fighter animates each attack on screen.*check your messages/i);
+      expect(ada.spoken.at(-1)).not.toMatch(/cannot confirm|result.*display|rematch/i);
       ada.prompt('rematch');
       expect(game.room.phase).toBe('results');
       expect(ada.spoken.at(-1)).toMatch(/Ada won.*check your messages/i);

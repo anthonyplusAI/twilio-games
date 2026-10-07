@@ -1036,8 +1036,17 @@ export class TriviaServer {
   voiceBeginAnswerResolution(code: string, playerId: string, questionId: string,
     questionAttemptId: number, onset?: { choiceId?: string; atMs: number }): number | null {
     code = canonicalRoomCode(code);
-    return this.rooms.get(code)?.beginSemanticAnswerResolution(playerId, questionId,
-      questionAttemptId, onset) ?? null;
+    const room = this.rooms.get(code);
+    if (!room) return null;
+    const previousDeadline = room.state().questionEndsAtMs;
+    const resolutionId = room.beginSemanticAnswerResolution(playerId, questionId,
+      questionAttemptId, onset);
+    if (room.state().questionEndsAtMs !== previousDeadline) {
+      this.flush(room);
+      this.pushState(code);
+      this.syncTimingLoop();
+    }
+    return resolutionId;
   }
 
   voiceFinishAnswerResolution(code: string, playerId: string, questionId: string,

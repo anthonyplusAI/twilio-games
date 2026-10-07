@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 import {
   TRIVIA_COUNTDOWN_MS,
   TRIVIA_FINAL_ANSWER_GRACE_MS,
+  TRIVIA_MAX_QUESTION_WINDOW_MS,
+  TRIVIA_MIN_POST_CUE_ANSWER_MS,
   TRIVIA_SEMANTIC_ANSWER_MAX_MS,
   TRIVIA_REVEAL_MS,
   TRIVIA_REVEAL_MAX_MS,
@@ -19,6 +21,25 @@ import {
 const bank: TriviaQuestionBank = parseTriviaQuestionBankJson(
   readFileSync(new URL('../content/trivia/questions.json', import.meta.url), 'utf8'),
 );
+
+function bankWithLongestLegalChoices(): TriviaQuestionBank {
+  const longText = (id: string) => {
+    const clipped = `${id.toUpperCase()} ${'This answer takes time to read aloud over the phone while the players consider their choice. '.repeat(2)}`.slice(0, 100);
+    return clipped.endsWith(' ') ? `${clipped.slice(0, -1)}.` : clipped;
+  };
+  return parseTriviaQuestionBankJson(JSON.stringify({
+    ...bank,
+    questions: bank.questions.map(question => ({
+      ...question,
+      locales: Object.fromEntries(Object.entries(question.locales).map(([locale, localized]) => [
+        locale,
+        { ...localized, choices: localized.choices.map(choice => ({
+          ...choice, text: longText(choice.id),
+        })) },
+      ])),
+    })),
+  }));
+}
 
 function joined(room: TriviaRoom, name = 'Ada', confirmed = true): string {
   const result = room.addPlayer(name, confirmed);
@@ -106,6 +127,143 @@ describe('authoritative trivia room', () => {
     expect(room.state()).toMatchObject({
       phase: 'question', answeringStartsAtMs: 13_000, questionEndsAtMs: 13_000 + TRIVIA_ANSWER_WINDOW_MS,
     });
+  });
+
+  it.each(['en-US', 'pt-BR'] as const)('keeps four legal 100-character choices and a post-cue answer window in %s', locale => {
+    const longBank = bankWithLongestLegalChoices();
+    const now = { value: 0 };
+    const room = new TriviaRoom('LONG-CHOICES', {
+      bank: longBank, now: () => now.value, preferredLocale: locale,
+    });
+    const player = joined(room);
+    room.advance(player);
+    room.advance(player);
+    room.ready(room.state().loadingGeneration);
+    now.value = TRIVIA_COUNTDOWN_MS;
+    room.tick();
+    const question = room.state().question!;
+    expect(question.choices.map(choice => Array.from(choice.text).length)).toEqual([100, 100, 100, 100]);
+    const attempt = room.state().questionAttemptId!;
+    const prompt = room.beginPromptDelivery(player, question.id, attempt)!;
+    expect(room.questionPromptReady(player, question.id, attempt, prompt)).toBe(true);
+    const clockStartedAt = now.value;
+    expect(room.state().answeringStartsAtMs).toBe(clockStartedAt);
+    expect(room.state().questionEndsAtMs! - clockStartedAt).toBeGreaterThan(50_000);
+    const cue = room.beginAnswerCueDelivery(player, question.id, attempt)!;
+
+    now.value += locale === 'pt-BR' ? 55_000 : 50_000;
+    expect(room.tick()).toBe(false);
+    expect(room.phase).toBe('answer_cue');
+    expect(room.questionAnswerCueReady(player, question.id, attempt, cue)).toBe(true);
+    expect(room.phase).toBe('question');
+    expect(room.state().questionEndsAtMs! - now.value).toBeGreaterThanOrEqual(TRIVIA_MIN_POST_CUE_ANSWER_MS);
+    now.value += 5_000;
+    expect(room.answer(player, correctChoice(room))).toBe(true);
+    expect(room.phase).toBe('reveal');
+    expect(room.state().standings?.[0]?.rawScore).toBeGreaterThan(0);
+    expect(room.drainEvents().some(event => event.type === 'audio_problem')).toBe(false);
+  });
+
+  it('extends a nearly expired clock after late cue playback and still caps retries', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('LATE-CUE', { bank, now: () => now.value });
+    const player = joined(room);
+    room.advance(player);
+    room.advance(player);
+    room.ready(room.state().loadingGeneration);
+    now.value = TRIVIA_COUNTDOWN_MS;
+    room.tick();
+    const question = room.state().question!;
+    const attempt = room.state().questionAttemptId!;
+    const prompt = room.beginPromptDelivery(player, question.id, attempt)!;
+    room.questionPromptReady(player, question.id, attempt, prompt);
+    const firstEnd = room.state().questionEndsAtMs!;
+    const cue = room.beginAnswerCueDelivery(player, question.id, attempt)!;
+    now.value = firstEnd + 1_000;
+    expect(room.tick()).toBe(false);
+    expect(room.phase).toBe('answer_cue');
+    expect(room.questionAnswerCueReady(player, question.id, attempt, cue)).toBe(true);
+    expect(room.state().questionEndsAtMs).toBeGreaterThanOrEqual(now.value + TRIVIA_MIN_POST_CUE_ANSWER_MS);
+    now.value += 6_000;
+    expect(room.answer(player, correctChoice(room))).toBe(true);
+    expect(room.phase).toBe('reveal');
+
+    const delayed = new TriviaRoom('BOUNDED-CUE', { bank, now: () => now.value });
+    const next = joined(delayed);
+    delayed.advance(next);
+    delayed.advance(next);
+    delayed.ready(delayed.state().loadingGeneration);
+    now.value += TRIVIA_COUNTDOWN_MS;
+    delayed.tick();
+    const delayedQuestion = delayed.state().question!;
+    const delayedAttempt = delayed.state().questionAttemptId!;
+    const delayedPrompt = delayed.beginPromptDelivery(next, delayedQuestion.id, delayedAttempt)!;
+    delayed.questionPromptReady(next, delayedQuestion.id, delayedAttempt, delayedPrompt);
+    const secondStart = now.value;
+    for (const delay of [0, 20_000, 40_000, 60_000, 80_000, 100_000, 120_000]) {
+      now.value = secondStart + delay;
+      expect(delayed.tick()).toBe(false);
+      expect(delayed.beginAnswerCueDelivery(next, delayedQuestion.id, delayedAttempt)).not.toBeNull();
+    }
+    now.value = secondStart + TRIVIA_MAX_QUESTION_WINDOW_MS - TRIVIA_MIN_POST_CUE_ANSWER_MS + 1_000;
+    expect(delayed.tick()).toBe(true);
+    expect(delayed.phase).toBe('audio_problem');
+  });
+
+  it('reserves an answer heard during a still-playing cue after its first estimated end', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('LATE-SPEECH', { bank, now: () => now.value });
+    const player = joined(room);
+    room.advance(player);
+    room.advance(player);
+    room.ready(room.state().loadingGeneration);
+    now.value = TRIVIA_COUNTDOWN_MS;
+    room.tick();
+    const question = room.state().question!;
+    const attempt = room.state().questionAttemptId!;
+    const prompt = room.beginPromptDelivery(player, question.id, attempt)!;
+    room.questionPromptReady(player, question.id, attempt, prompt);
+    room.beginAnswerCueDelivery(player, question.id, attempt);
+    now.value = room.state().questionEndsAtMs! + 1_000;
+    expect(room.tick()).toBe(false);
+    const reservation = room.beginSemanticAnswerResolution(player, question.id, attempt);
+    expect(reservation).not.toBeNull();
+    expect(room.state().questionEndsAtMs).toBeGreaterThanOrEqual(now.value + TRIVIA_MIN_POST_CUE_ANSWER_MS);
+    expect(room.answerAt(player, correctChoice(room), true, now.value, reservation!)).toBe(true);
+    expect(room.phase).toBe('reveal');
+  });
+
+  it('gives the last of two callers a full answer window after their choice cue finishes', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('TWO-CUES', { bank, now: () => now.value });
+    const first = joined(room, 'Ada');
+    const second = joined(room, 'Grace');
+    room.advance(first);
+    room.advance(first);
+    room.ready(room.state().loadingGeneration);
+    now.value = TRIVIA_COUNTDOWN_MS;
+    room.tick();
+    const question = room.state().question!;
+    const attempt = room.state().questionAttemptId!;
+    for (const player of [first, second]) {
+      const prompt = room.beginPromptDelivery(player, question.id, attempt)!;
+      room.questionPromptReady(player, question.id, attempt, prompt);
+    }
+    const firstEnd = room.state().questionEndsAtMs!;
+    const firstCue = room.beginAnswerCueDelivery(first, question.id, attempt)!;
+    const secondCue = room.beginAnswerCueDelivery(second, question.id, attempt)!;
+    now.value += 2_000;
+    expect(room.questionAnswerCueReady(first, question.id, attempt, firstCue)).toBe(true);
+    now.value = firstEnd + 1_000;
+    expect(room.tick()).toBe(false);
+    expect(room.answer(first, correctChoice(room))).toBe(true);
+    expect(room.phase).toBe('answer_cue');
+    expect(room.questionAnswerCueReady(second, question.id, attempt, secondCue)).toBe(true);
+    expect(room.phase).toBe('question');
+    expect(room.state().questionEndsAtMs).toBeGreaterThanOrEqual(now.value + TRIVIA_MIN_POST_CUE_ANSWER_MS);
+    now.value += TRIVIA_MIN_POST_CUE_ANSWER_MS - 1_000;
+    expect(room.answer(second, correctChoice(room))).toBe(true);
+    expect(room.phase).toBe('reveal');
   });
 
   it('holds the next question until two staggered voice reveals finish after the visual minimum', () => {

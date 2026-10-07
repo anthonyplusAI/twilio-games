@@ -11,6 +11,7 @@ import { wireFullscreenToggle } from './fullscreen-toggle';
 import { wireThemeToggle } from './theme';
 import { createCoinInsertionPresenter } from './coin-insertion';
 import { getSoundEffectsManager } from './sound-effects';
+import { ensureDisplaySessionId } from './display-session';
 import { calculatePageCount, clampPageIndex, orderByConfiguredIds, STANDALONE_GAMES_PER_PAGE } from './home-nav';
 import {
   captureDisplayToken,
@@ -245,6 +246,8 @@ function renderStandaloneLauncher(): void {
     const link = document.createElement('a');
     const url = new URL(game.route, location.origin);
     url.searchParams.set('display', '1');url.searchParams.set('room', '4821');url.searchParams.set('locale', locale);
+    const displaySessionId = ensureDisplaySessionId();
+    if (displaySessionId) url.searchParams.set('displaySessionId', displaySessionId);
     link.href=url.toString();link.className='standalone-game';link.dataset.game=game.id;
     const preview=selectionVideos[game.id];
     link.innerHTML=`${preview?`<video data-src="${preview}" preload="none" loop muted playsinline aria-hidden="true"></video>`:''}<span>${gameTitle(locale,game.id)}</span><p>${gameBlurbs[game.id]}</p>`;
@@ -454,7 +457,14 @@ function wireFullscreenGameLaunches(): void {
     if (!(event instanceof MouseEvent) || event.button !== 0
       || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
     const target = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>('a.standalone-game') : null;
-    if (target && fullscreenGameShell.launch(target.href)) event.preventDefault();
+    if (target) {
+      const destination = new URL(target.href);
+      const displaySessionId = ensureDisplaySessionId();
+      if (displaySessionId) destination.searchParams.set('displaySessionId', displaySessionId);
+      else destination.searchParams.delete('displaySessionId');
+      target.href = destination.toString();
+      if (fullscreenGameShell.launch(target.href)) event.preventDefault();
+    }
   });
 }
 

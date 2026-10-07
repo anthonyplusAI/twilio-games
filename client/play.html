@@ -19,6 +19,14 @@
         <div class="split-player-card"><span id="split-role-2">Player 2</span><strong id="split-name-2"></strong></div>
       </div>
     </div>
+    <!-- Keep the scene veil and menu in the same stacking context: the QR/name menu
+         must remain visible while optional 3D assets assemble behind it. -->
+    <div id="veil">
+      <img src="/brand/Twilio_Logo_Bug_White.svg" alt="" />
+      <div class="veil-eyebrow">Twilio</div>
+      <div id="veil-title" class="veil-title">Voice Racer</div>
+      <div class="veil-bar"><span></span></div>
+    </div>
   </div>
 
   <a class="game-home" href="/" aria-label="Return to Twilio Games home">
@@ -27,16 +35,6 @@
     </svg>
     <span>Home</span>
   </a>
-
-  <!-- Opaque branded boot veil: covers the 3D scene assembling (map load + camera settle + first
-       attract frame) so the user never sees the ugly connecting→world→top-down→cars cut sequence.
-       Fades out once the attract scene has painted a stable frame. -->
-  <div id="veil">
-    <img src="/brand/Twilio_Logo_Bug_White.svg" alt="" />
-    <div class="veil-eyebrow">Twilio</div>
-    <div id="veil-title" class="veil-title">Voice Racer</div>
-    <div class="veil-bar"><span></span></div>
-  </div>
 
   <!-- In-game HUD (hidden while a menu screen is up via body.in-menu) -->
   <div id="hud" class="hud-pill">

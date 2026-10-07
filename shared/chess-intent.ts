@@ -20,6 +20,7 @@ export type ChessIntent =
   | { kind: 'cancel' }
   | { kind: 'reset' }
   | { kind: 'help' }
+  | { kind: 'hint' }
   | { kind: 'unknown' };
 
 const PIECE_WORDS: ReadonlyArray<readonly [ChessPieceType, readonly string[]]> = [
@@ -176,8 +177,9 @@ export function parseChessIntent(spoken: string, locale: SupportedLocale = 'en-U
     .replace(/^(?:por favor\s+)?(?:voce pode|pode)\s+(?:por favor\s+)?(?=(?:mover|mova|jogar|joga|fazer|faca)\b)/, '');
   if (!text) return { kind: 'unknown' };
 
-  if (/^(?:confirm|confirm move|yes|yes confirm|make the move|do it|confirmar|confirma|confirmo|sim|pode jogar)$/.test(text)
-    || /^(?:yes|yeah|yep|sim)\b.*\b(?:confirm|make|do|play|go ahead|confirma|confirmar|joga|jogar)\b/.test(text)) {
+  const reservedConfirmation = /\b(?:but|wait|hold|not|dont|never|no|nao|mas|espera|aguarde)\b/.test(text);
+  if (!reservedConfirmation && (/^(?:confirm|confirm move|yes|yes please|yes confirm|yeah|yep|sure|sure thing|okay|ok|go ahead|go for it|proceed|sounds good|sounds right|that is right|thats right|that is the move|make the move|do it|confirmar|confirma|confirmo|sim|sim pode jogar|claro|certo|isso|pode jogar|pode fazer)$/.test(text)
+    || /^(?:yes|yeah|yep|sim)\b.*\b(?:confirm|make|do|play|go ahead|confirma|confirmar|joga|jogar)\b/.test(text))) {
     return { kind: 'confirm' };
   }
   if (/^(?:cancel|cancel move|no|no cancel|never mind|nevermind|forget it|cancelar|cancela|nao|nao quero|deixa pra la)$/.test(text)
@@ -189,6 +191,25 @@ export function parseChessIntent(spoken: string, locale: SupportedLocale = 'en-U
   }
   if (/^(?:help|how do i play|what can i say|ajuda|como jogar|o que posso dizer)$/.test(text)) {
     return { kind: 'help' };
+  }
+  // A direct request for advice is an action, even when asked as a question.
+  // Open-ended variants still go to the grounded voice interpreter.
+  if (/^(?:please )?(?:(?:a|one|some|uma|alguma) )?(?:hint|dica)(?: please| por favor)?$/.test(text)
+    || /^(?:can|could|may) (?:i|we) (?:please )?(?:get|have|ask for) (?:a|one|some) hint(?: please)?$/.test(text)
+    || /^(?:posso|podemos) (?:pedir|ter|receber) uma dica(?: por favor)?$/.test(text)
+    || /^(?:hint|a hint|(?:please )?give me a hint|(?:can|could|would|will) you (?:please )?(?:give me a hint|suggest a move)|(?:i need|i want|i could use) a hint|suggest a move|what should i (?:play|do)|what move should i (?:play|make)|what do you suggest|what would you (?:play|do)|any (?:tips|advice)|help me choose a move|dica|uma dica|alguma dica|me de uma dica|me da uma dica|pode me dar uma dica|preciso de uma dica|qual jogada devo fazer|qual lance devo fazer|o que voce sugere)$/.test(text)) {
+    return { kind: 'hint' };
+  }
+  // Common advice requests should still work if the language model is down. The request
+  // framing and move/advice words are both required; board questions remain read-only.
+  const asksForAdvice = /^(?:please |(?:can|could|would|will) you (?:please )?|(?:can|could|may) (?:i|we) (?:please )?|what |whats |which |any |do you have |i (?:need|want|could use) |(?:give|show|tell|help|pick|choose|recommend|suggest)\b|por favor |(?:voce )?pode |posso |podemos |qual |alguma |me (?:de|da|diga|ajude) )/.test(text);
+  const requestsHint = /\b(?:hint|dica)\b/.test(text)
+    && /\b(?:give|show|offer|provide|need|want|use|ask|get|have|de|da|dar|mostre|preciso|quero|pedir|ter|receber)\b/.test(text);
+  const requestsMoveAdvice = /\b(?:move|moves|play|jogada|jogadas|lance|lances|mover|jogar)\b/.test(text)
+    && /\b(?:recommend|suggest|advice|advise|best|good|safe|idea|should|help|choose|pick|recomende|recomendar|sugira|sugerir|melhor|boa|bom|devo|ajude|escolher)\b/.test(text);
+  if (asksForAdvice && (requestsHint || requestsMoveAdvice)
+    && !/\b(?:how many|how much|what does|what happens|explain|if i|whether|hint count|hints left|remaining|quantas|quantos|o que e|explique|se eu|restam|sobram|nao|not|never)\b/.test(text)) {
+    return { kind: 'hint' };
   }
 
   // A self-correction replaces the earlier destination. Retain an explicit source

@@ -132,6 +132,8 @@ describe('Voice Trivia display DOM projection', () => {
     expect(rendered.html.match(/class="correct-choice"/g)).toHaveLength(1);
     expect(rendered.html).toContain('It is an upgraded HTTP connection.');
     expect(rendered.html).toContain('Correct · +1300 pts');
+    expect(rendered.html).toContain('<strong>10,078</strong><small>Leaderboard score');
+    expect(rendered.html).not.toContain('<strong>1,300</strong><small>Best streak');
     expect(rendered.html).toContain('No answer');
     expect(rendered.announcement).toContain('Correct answer: WebSocket');
   });

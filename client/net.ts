@@ -1,5 +1,6 @@
 import type { Intent, Item, WorldSnapshot, GameEvent, LobbyPlayer, Phase, RaceResult, MenuTouchState } from '../shared/types';
 import type { SupportedLocale } from '../shared/i18n/locales';
+import { withDisplaySession } from './display-session';
 
 export interface LobbyMsg { roomCode: string; players: LobbyPlayer[]; phase: Phase; touch?: MenuTouchState }
 export interface SelectStateMsg { roomCode: string; phase: Phase; players: LobbyPlayer[]; maps: string[]; selectedMap: string | null; mapVotes?: Record<string, number>; mapTie?: boolean; touch?: MenuTouchState }
@@ -30,7 +31,7 @@ export class GameConnection {
   }
 
   private connect(): void {
-    this.ws = new WebSocket(this.url);
+    this.ws = new WebSocket(withDisplaySession(this.url));
     this.ws.onmessage = (ev) => {
       const m = JSON.parse(ev.data);
       if (m.type === 'items') this.onItemsCb?.(m.items, m.map);

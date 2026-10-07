@@ -32,6 +32,15 @@ export interface ChessPendingMove extends ChessMovePreview {
   baseRevision: number;
 }
 
+/** A recommendation for the current board, never an automatically played move. */
+export interface ChessHint {
+  from: ChessSquare;
+  to: ChessSquare;
+  piece: ChessPieceType;
+  san: string;
+  revision: number;
+}
+
 export interface ChessMoveRecord extends ChessMovePreview {
   actor: 'human' | 'computer';
   ply: number;
@@ -63,6 +72,9 @@ export type ChessFeedbackCode =
   | 'ambiguous'
   | 'unknown'
   | 'help'
+  | 'hint'
+  | 'hint_limit'
+  | 'hint_unavailable'
   | 'no_pending'
   | 'not_your_turn'
   | 'stale'
@@ -98,6 +110,8 @@ export interface ChessState {
   ply: number;
   selection: ChessSelection | null;
   pendingMove: ChessPendingMove | null;
+  hintsRemaining: number;
+  hint: ChessHint | null;
   lastMove: ChessMoveRecord | null;
   result: ChessResult | null;
   feedback: ChessFeedback | null;

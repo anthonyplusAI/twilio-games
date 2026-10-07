@@ -49,6 +49,11 @@
       <h1 id="status-title" tabindex="-1">Opening the chamber</h1>
       <p id="status-detail">Preparing your chess board.</p>
       <div id="move-prompt" class="move-prompt">Say a piece and square on your call, then confirm the move.</div>
+      <div id="hint-tracker" class="hint-tracker" aria-label="Three move hints available">
+        <div class="hint-tracker-top"><span id="hint-tracker-label">MOVE HINTS</span><strong id="hint-count">3 / 3</strong></div>
+        <div id="hint-pips" class="hint-pips" aria-hidden="true"><i></i><i></i><i></i></div>
+        <div id="hint-move" class="hint-move">Say “hint” for a suggested move.</div>
+      </div>
       <div class="camera-hint"><span id="camera-hint-pointer" class="camera-hint-pointer">Drag to rotate · right-drag to pan · scroll to zoom · double-click to reset</span><span id="camera-hint-touch" class="camera-hint-touch">One finger rotates · two fingers pan or zoom</span></div>
       <div class="mobile-last"><span id="mobile-last-label">Last move</span><strong id="mobile-last-move">—</strong></div>
     </section>

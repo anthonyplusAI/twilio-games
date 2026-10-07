@@ -1,4 +1,5 @@
 import type { ChessEvent, ChessServerMessage, ChessState } from '../../shared/chess-protocol';
+import { withDisplaySession } from '../display-session';
 
 export type ChessConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'closed';
 
@@ -47,7 +48,7 @@ export class ChessConnection {
   private connect(): void {
     if (this.stopped) return;
     const generation = ++this.generation;
-    const socket = this.socket = new WebSocket(this.url);
+    const socket = this.socket = new WebSocket(withDisplaySession(this.url));
     this.connectionListener?.(generation === 1 ? 'connecting' : 'reconnecting');
     socket.onopen = () => {
       if (this.stopped || generation !== this.generation) return;

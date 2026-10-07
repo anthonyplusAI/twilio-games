@@ -35,6 +35,10 @@ const callCardNumber = element<HTMLAnchorElement>('call-card-number');
 const callCardAvailability = element<HTMLParagraphElement>('call-card-availability');
 const turnLabel = element<HTMLSpanElement>('turn-label');
 const prompt = element<HTMLDivElement>('move-prompt');
+const hintTracker = element<HTMLDivElement>('hint-tracker');
+const hintCount = element<HTMLElement>('hint-count');
+const hintMove = element<HTMLDivElement>('hint-move');
+const hintPips = [...element<HTMLDivElement>('hint-pips').querySelectorAll<HTMLElement>('i')];
 const lastMoveLabel = element<HTMLElement>('last-move');
 const mobileLastMove = element<HTMLElement>('mobile-last-move');
 const lastCaption = element<HTMLParagraphElement>('last-caption');
@@ -182,6 +186,8 @@ function synchronizeScene(scene: ChessBoardScene, current: ChessState): void {
   scene.setCheck(checkedKing);
   scene.setPendingMove(current.pendingMove?.from ?? null, current.pendingMove?.to ?? null);
   scene.setSelection(current.selection?.from ?? null);
+  scene.setHint(current.pendingMove ? null : current.hint?.from ?? null,
+    current.pendingMove ? null : current.hint?.to ?? null);
 }
 
 if (stationLaunchRequested && !stationDisplay.displayToken) {
@@ -306,6 +312,8 @@ async function processBoardQueue(): Promise<void> {
       visualState = next;
       board?.setPendingMove(next.pendingMove?.from ?? null, next.pendingMove?.to ?? null);
       board?.setSelection(next.selection?.from ?? null);
+      board?.setHint(next.pendingMove ? null : next.hint?.from ?? null,
+        next.pendingMove ? null : next.hint?.to ?? null);
       renderAccessiblePosition(next);
       hasRenderedRoomState = true;
       maybeMarkStationReady();
@@ -329,6 +337,7 @@ function validRoomState(state: ChessState): boolean {
     || !Number.isSafeInteger(state.revision) || state.revision < 0
     || !Number.isSafeInteger(state.ply) || state.ply < 0
     || !['waiting', 'playing', 'pending', 'finished'].includes(state.phase)
+    || !Number.isInteger(state.hintsRemaining) || state.hintsRemaining < 0 || state.hintsRemaining > 3
     || !['w', 'b'].includes(state.humanColor) || !['w', 'b'].includes(state.turn)
     || typeof state.fen !== 'string' || !Array.isArray(state.pieces) || state.pieces.length > 32) return false;
   const squares = new Set<string>();
@@ -337,6 +346,9 @@ function validRoomState(state: ChessState): boolean {
       || !['w', 'b'].includes(piece.color) || !['p', 'n', 'b', 'r', 'q', 'k'].includes(piece.type)) return false;
     squares.add(piece.square);
   }
+  if (state.hint && (!/^[a-h][1-8]$/.test(state.hint.from) || !/^[a-h][1-8]$/.test(state.hint.to)
+    || !['p', 'n', 'b', 'r', 'q', 'k'].includes(state.hint.piece)
+    || state.hint.revision !== state.revision)) return false;
   return true;
 }
 
@@ -419,8 +431,27 @@ function renderStatus(): void {
   statusDetail.textContent = detail;
   turnLabel.textContent = label;
   prompt.textContent = hint;
+  renderHintTracker(state);
   app.dataset.phase = state?.phase ?? 'connecting';
   renderCallCard();
+}
+
+function renderHintTracker(state: ChessState | null): void {
+  hintTracker.hidden = state?.phase === 'finished';
+  const remaining = state?.hintsRemaining ?? 3;
+  hintCount.textContent = `${remaining} / 3`;
+  hintTracker.setAttribute('aria-label', isPortuguese
+    ? `${remaining} de 3 dicas de jogada restantes` : `${remaining} of 3 move hints remaining`);
+  hintPips.forEach((pip, index) => pip.classList.toggle('spent', index >= remaining));
+  const recommendation = state?.pendingMove ? null : state?.hint;
+  hintTracker.dataset.active = recommendation ? 'true' : 'false';
+  hintMove.textContent = recommendation
+    ? isPortuguese
+      ? `Dica: ${capitalize(pieceName(recommendation.piece))} ${recommendation.from.toUpperCase()} → ${recommendation.to.toUpperCase()}`
+      : `Hint: ${capitalize(pieceName(recommendation.piece))} ${recommendation.from.toUpperCase()} → ${recommendation.to.toUpperCase()}`
+    : remaining === 0
+      ? isPortuguese ? 'Todas as dicas foram usadas.' : 'All hints have been used.'
+      : isPortuguese ? 'Diga “dica” para sugerir uma jogada.' : 'Say “hint” for a suggested move.';
 }
 
 function renderCallCard(): void {
@@ -559,7 +590,9 @@ function renderAccessiblePosition(state: ChessState): void {
         + (state.lastMove?.to === square ? ' last' : '')
         + (state.selection?.from === square ? ' selected' : '')
         + (state.pendingMove?.from === square ? ' pending-from' : '')
-        + (state.pendingMove?.to === square ? ' pending-to' : '');
+        + (state.pendingMove?.to === square ? ' pending-to' : '')
+        + (!state.pendingMove && state.hint?.from === square ? ' hint-from' : '')
+        + (!state.pendingMove && state.hint?.to === square ? ' hint-to' : '');
       cell.dataset.square = square.toUpperCase();
       if (piece) {
         const glyph = document.createElement('span');
@@ -604,6 +637,7 @@ function localizeStaticCopy(): void {
   element<HTMLElement>('call-card-instructions').textContent = 'Escaneie com o celular ou toque no número.';
   callCardQr.alt = 'Escaneie para ligar e jogar Xadrez por Voz';
   element<HTMLElement>('camera-hint-pointer').textContent = 'Arraste para girar · botão direito para mover · rolagem para ampliar · clique duplo para centralizar';
+  element<HTMLElement>('hint-tracker-label').textContent = 'DICAS DE JOGADA';
   element<HTMLElement>('camera-hint-touch').textContent = 'Um dedo gira · dois dedos movem ou ampliam';
   lastMoveLabel.textContent = 'Nenhum lance ainda';
   lastCaption.textContent = 'As peças aguardam o primeiro comando.';
