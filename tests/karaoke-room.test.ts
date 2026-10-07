@@ -56,6 +56,35 @@ describe('authoritative karaoke room', () => {
     expect(room.state()).toMatchObject({ preferredLocale: 'pt-BR', selectedByPlayerId: singer });
   });
 
+  it('invalidates disclosure readiness when the singer deliberately reselects the same song', () => {
+    const room = new KaraokeRoom('RESELECT');
+    const singer = joined(room);
+    expect(room.advance(singer)).toBe(true);
+    expect(room.state().selectionGeneration).toBe(0);
+    expect(room.selectSong(singer, NEVER_GONNA_GIVE_YOU_UP.id)).toBe(true);
+    expect(room.state().selectionGeneration).toBe(1);
+    expect(room.selectSong(singer, NEVER_GONNA_GIVE_YOU_UP.id)).toBe(true);
+    expect(room.state().selectionGeneration).toBe(2);
+    expect(room.selectSong('stale', NEVER_GONNA_GIVE_YOU_UP.id)).toBe(false);
+    expect(room.state().selectionGeneration).toBe(2);
+  });
+
+  it('rejects an unbound or stale caller replay without clearing the visible result', () => {
+    let now = 0;
+    const room = new KaraokeRoom('REPLAY-GATE', { now: () => now });
+    const singer = joined(room);
+    const generation = loadSong(room, singer);
+    expect(room.ready(generation)).toBe(true);
+    now = KARAOKE_COUNTDOWN_MS + KARAOKE_SONG_DURATION_MS;
+    room.tick();
+    expect(room.finalizeMediaScore(singer, 1_000, finalHits(room.state().selectedSong!, 1_000))).toBe(true);
+    const before = room.state().result;
+    expect(room.advance()).toBe(false);
+    expect(room.advance('stale')).toBe(false);
+    expect(room.state().result).toBe(before);
+    expect(room.advance(singer)).toBe(true);
+  });
+
   it('accepts display readiness only for the current loading generation', () => {
     let now = 1_000;
     const room = new KaraokeRoom('READY', { now: () => now });

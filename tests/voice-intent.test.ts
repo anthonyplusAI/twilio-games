@@ -65,4 +65,26 @@ describe('mapTranscriptToIntent', () => {
     expect(mapTranscriptToIntent('esquerda')).toBeNull();
     expect(mapTranscriptToIntent('left', 'pt-BR')).toBeNull();
   });
+
+  it('does not fire negated controls or questions about controls', () => {
+    expect(intentsFromTranscript("Don't go left, I am asking what nitro does?")).toEqual([]);
+    expect(intentsFromTranscript('Não acelere, o que faz o turbo?', 'pt-BR')).toEqual([]);
+    expect(intentsFromTranscript('Tell me how to use nitro')).toEqual([]);
+    expect(intentsFromTranscript('Could you explain the boost?')).toEqual([]);
+    expect(intentsFromTranscript('Me explica o nitro', 'pt-BR')).toEqual([]);
+    expect(intentsFromTranscript('I want to save my nitro')).toEqual([]);
+    expect(intentsFromTranscript('I have nitro saved')).toEqual([]);
+    expect(intentsFromTranscript('My boost is empty')).toEqual([]);
+    expect(intentsFromTranscript('Please stop talking')).toEqual([]);
+  });
+
+  it('honors a same-utterance correction without executing the discarded command', () => {
+    expect(intentsFromTranscript('left, no, right now')).toEqual(['MOVE_RIGHT']);
+    expect(intentsFromTranscript('esquerda, não, direita agora', 'pt-BR')).toEqual(['MOVE_RIGHT']);
+  });
+
+  it('distinguishes a directional go request from a boost request', () => {
+    expect(intentsFromTranscript('go left')).toEqual(['MOVE_LEFT']);
+    expect(intentsFromTranscript('go faster')).toEqual(['BOOST']);
+  });
 });

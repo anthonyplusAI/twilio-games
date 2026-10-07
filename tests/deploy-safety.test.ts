@@ -11,6 +11,19 @@ const packageManifest = JSON.parse(readFileSync(new URL('../package.json', impor
 };
 
 describe('deployment rollback safety', () => {
+  it('pins the requested English Relay voice while keeping Portuguese independently localized', () => {
+    expect(workflow).toContain('CR_TTS_VOICE: xp3gDg85YgFcWpnNVlIu');
+    expect(workflow).toContain('CR_TTS_VOICE_PT_BR: ${{ vars.CR_TTS_VOICE_PT_BR }}');
+    expect(containerApp).toContain('value: "${CR_TTS_VOICE}"');
+  });
+
+  it('requires the semantic interpreter key before deploying conversational voice games', () => {
+    expect(workflow).toContain('OPENAI_API_KEY is required for conversational voice commands in all six production games.');
+    expect(workflow.match(/"openai-api-key=\$\{OPENAI_API_KEY:-disabled\}"/g)).toHaveLength(2);
+    expect(containerApp).toContain('secretRef: openai-api-key');
+    expect(serverIndex).toContain("throw new Error('OPENAI_API_KEY is required in production for conversational voice commands')");
+  });
+
   it('keeps CI independent of Git LFS and verifies the private asset mirror before ACR build', () => {
     expect(ci).not.toMatch(/\blfs:\s*true\b/);
     expect(workflow).not.toMatch(/\blfs:\s*true\b/);

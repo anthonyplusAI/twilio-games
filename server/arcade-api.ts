@@ -836,6 +836,20 @@ export class ArcadeApi {
     return null;
   }
 
+  /** Resolve a current match for an operator-only engine action without trusting a room code
+   * supplied by the browser. A completed or replaced match cannot target a newer game. */
+  activeStationEngineRoom(game: RoutedStationGame, matchId: string): string | null {
+    if (!matchId) return null;
+    const state = this.playerRuntime?.getInitializedResources()?.store.snapshot();
+    if (!state) return null;
+    for (const station of Object.values(state.stations)) {
+      if (station.phase !== 'PLAYING' || station.activeMatchId !== matchId) continue;
+      const match = state.stationMatches[matchId];
+      if (match?.game === game) return match.engineRoomCode;
+    }
+    return null;
+  }
+
   stationEngineStarted(game: RoutedStationGame, roomCode: string): void {
     void this.playerRuntime?.getForCleanup().then(resources => {
       resources.station.markEngineStarted(game, roomCode);

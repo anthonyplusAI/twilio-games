@@ -10,6 +10,9 @@ export type BattleClientMessage =
   | { type: 'join'; roomCode: string; name: string; sessionId?: string; locale?: SupportedLocale } // become/resume a player
   | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; displayToken?: string } // the shared display (no slot)
   | { type: 'select_monster'; monsterId: string }           // during monster_select
+  | { type: 'display_select_monster'; playerId:string; monsterId:string } // authenticated shared display only
+  | { type: 'ack_event'; generation:number; eventId:number } // displayed battle beat
+  | { type: 'ack_results'; generation:number }              // results overlay paint
   | { type: 'open_fight' }                                  // battle: active side opens its 4 moves
   | { type: 'back_menu' }                                   // battle: active side backs out to root menu
   | { type: 'choose_move'; moveId: string }                 // FIGHT shim (kept for back-compat)
@@ -34,10 +37,13 @@ export type BattleServerMessage =
   | { type: 'roster'; monsters: RosterEntry[] }             // sent on connect for the select screen
   | { type: 'battle_state'; roomCode: string; phase: string;
       players: BattleLobbyPlayer[]; snapshot: BattleSnapshot | null;
+      generation:number; resultsPresented:boolean;
+      canAdvanceLobby:boolean; canStartBattle:boolean;
       activeSide?: 'a' | 'b' | null; activeMenu?: 'root' | 'fight';
       canRematch?: boolean;
       result: { winner: string; winnerName: string } | null }
-  | { type: 'battle_events'; events: BattleEvent[] }         // ordered — renderer/commentator replay
+  | { type: 'battle_events'; generation:number; eventIds:number[]; events: BattleEvent[] } // ordered paint receipts
+  | { type: 'show_results'; generation:number }             // voice/touch skip of optional battle-end hold
   | { type: 'error'; code: string; message: string };
 
 type ParseResult = BattleClientMessage | { type: 'error'; code: string; message: string };
@@ -63,6 +69,18 @@ export function parseBattleClientMessage(raw: string): ParseResult {
     case 'select_monster':
       if (typeof m.monsterId !== 'string') return err('bad_select', 'monsterId required');
       return { type: 'select_monster', monsterId: m.monsterId };
+    case 'display_select_monster':
+      if(typeof m.playerId!=='string'||!m.playerId.trim()||m.playerId.length>64
+        ||typeof m.monsterId!=='string'||!m.monsterId.trim()||m.monsterId.length>64)
+        return err('bad_select','playerId + monsterId required');
+      return {type:'display_select_monster',playerId:m.playerId,monsterId:m.monsterId};
+    case 'ack_event':
+      if(!Number.isSafeInteger(m.generation)||!Number.isSafeInteger(m.eventId)
+        ||(m.generation as number)<1||(m.eventId as number)<1)return err('bad_ack','invalid event receipt');
+      return {type:'ack_event',generation:m.generation as number,eventId:m.eventId as number};
+    case 'ack_results':
+      if(!Number.isSafeInteger(m.generation)||(m.generation as number)<1)return err('bad_ack','invalid result receipt');
+      return {type:'ack_results',generation:m.generation as number};
     case 'open_fight': return { type: 'open_fight' };
     case 'back_menu':  return { type: 'back_menu' };
     case 'choose_move':

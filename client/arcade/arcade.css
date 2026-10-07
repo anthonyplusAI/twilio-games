@@ -131,6 +131,11 @@ input,select{width:100%;color:var(--th-text);background:var(--th-input);border:1
 .station-summary div,.station-detail{padding:18px;border-radius:14px}
 .station-summary dt,.station-detail dt{text-transform:none;letter-spacing:0;font-family:'Twilio Sans Text';font-weight:700;font-size:.74rem}
 .station-controls{padding:18px;border-radius:14px}
+.trivia-audio-recovery{display:flex;align-items:center;justify-content:space-between;gap:24px;margin-top:16px;padding:18px;border:1px solid var(--th-card-border);border-left:5px solid var(--red);border-radius:12px;background:var(--th-sidebar)}
+.trivia-audio-recovery[hidden]{display:none}
+.trivia-audio-recovery h3{margin:3px 0 6px}
+.trivia-audio-recovery p:last-child{margin:0}
+@media(max-width:560px){.trivia-audio-recovery{align-items:stretch;flex-direction:column}.trivia-audio-recovery .button{width:100%}}
 .station-controls>label{max-width:520px}
 
 .settings-heading{align-items:center;padding-bottom:22px;border-bottom:1px solid var(--th-card-border)}

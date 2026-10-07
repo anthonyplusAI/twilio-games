@@ -62,6 +62,7 @@ jobs:
           ARCADE_DISPLAY_TOKEN: ${{ secrets.ARCADE_DISPLAY_TOKEN }}
           VOICE_RELAY_TOKEN: ${{ secrets.VOICE_RELAY_TOKEN }}
           EDITOR_TOKEN: ${{ secrets.EDITOR_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
           ARCADE_OUTBOUND_MESSAGING_ENABLED: ${{ vars.ARCADE_OUTBOUND_MESSAGING_ENABLED }}
           GAME_PHONE_NUMBER: ${{ vars.GAME_PHONE_NUMBER }}
@@ -135,6 +136,10 @@ jobs:
           fi
           if [ -z "$DEEPGRAM_API_KEY" ] || [ "$DEEPGRAM_API_KEY" = "disabled" ]; then
             echo "DEEPGRAM_API_KEY is required while Voice Karaoke is enabled by default." >&2
+            exit 1
+          fi
+          if [ -z "$OPENAI_API_KEY" ] || [ "$OPENAI_API_KEY" = "disabled" ]; then
+            echo "OPENAI_API_KEY is required for conversational voice commands in all six production games." >&2
             exit 1
           fi
           if [[ ! "$TWILIO_ACCOUNT_SID" =~ ^AC[0-9A-Fa-f]{32}$ ]] \
@@ -412,7 +417,8 @@ jobs:
           ACR_SERVER: ${{ steps.acr-creds.outputs.server }}
           ACR_USERNAME: ${{ steps.acr-creds.outputs.username }}
           ACR_PASSWORD: ${{ steps.acr-creds.outputs.password }}
-          CR_TTS_VOICE: ${{ vars.CR_TTS_VOICE }}
+          # Twilio-listed English voice shared by every game. Keep pt-BR independent.
+          CR_TTS_VOICE: xp3gDg85YgFcWpnNVlIu
           CR_TTS_VOICE_PT_BR: ${{ vars.CR_TTS_VOICE_PT_BR }}
           DEFAULT_LOCALE: ${{ vars.DEFAULT_LOCALE }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}

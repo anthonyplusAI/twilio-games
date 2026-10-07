@@ -6,15 +6,23 @@ import { join } from 'node:path';
 import twilio from 'twilio';
 import WebSocket from 'ws';
 import type { ArcadeApi } from '../server/arcade-api';
-import { HttpServer, isSecureKaraokeMediaRequest } from '../server/http-server';
+import {
+  handleRelayPlaybackEvent,
+  HttpServer,
+  isSecureKaraokeMediaRequest,
+  sendRelayTextOutcome,
+} from '../server/http-server';
 import type { KaraokeServer } from '../server/karaoke-server';
+import { KaraokeVoiceSession, type KaraokeVoiceSnapshot } from '../server/karaoke-voice';
+import { DEFAULT_ROOM } from '../shared/constants';
 import { KARAOKE_SONG_DURATION_MS } from '../shared/karaoke';
 import { KARAOKE_COUNTDOWN_MS } from '../shared/karaoke-protocol';
 
 const AUTH_TOKEN = 'karaoke-http-auth-token';
 const DISPLAY_TOKEN = 'karaoke-display-token';
 const PUBLIC_BASE_URL = 'https://games.example';
-const ROOM = 'KHTTP';
+// Standalone inbound calls are intentionally bound to the public default room.
+const ROOM = DEFAULT_ROOM;
 const CALL_SID = 'CAkaraokecall';
 const ACCOUNT_SID = 'ACkaraokeaccount';
 
@@ -25,11 +33,11 @@ const sockets: WebSocket[] = [];
 beforeEach(async () => { directory = await mkdtemp(join(tmpdir(), 'karaoke-http-')); });
 
 afterEach(async () => {
+  vi.useRealTimers();
   for (const socket of sockets.splice(0)) socket.terminate();
   await server?.stop();
   await rm(directory, { recursive: true, force: true });
   server = undefined;
-  vi.useRealTimers();
   vi.restoreAllMocks();
 });
 
@@ -84,7 +92,9 @@ describe('HTTP-hosted Voice Karaoke', () => {
       From: '+14155550199',
       To: '+18555993809',
     });
-    expect(await incoming.text()).toContain('<Parameter name="game" value="karaoke"');
+    const incomingXml = await incoming.text();
+    expect(incomingXml).toContain('<Parameter name="game" value="karaoke"');
+    expect(incomingXml).toContain(`<Parameter name="roomCode" value="${ROOM}"`);
 
     const voiceSignature = twilio.getExpectedTwilioSignature(AUTH_TOKEN, 'wss://games.example/voice', {});
     const unregisteredVoice = await openSocket(`ws://127.0.0.1:${port}/voice`, {
@@ -410,9 +420,10 @@ describe('HTTP-hosted Voice Karaoke', () => {
     display.send(JSON.stringify({ type: 'display_auth', roomCode: ROOM, token: DISPLAY_TOKEN }));
     display.send(JSON.stringify({ type: 'spectate', roomCode: ROOM }));
     await waitForSocketMessage(display, message => message.type === 'host_identity' && message.isHost === true);
-    await signedPost(port, '/voice/incoming', {
+    const incoming = await signedPost(port, '/voice/incoming', {
       AccountSid: ACCOUNT_SID, CallSid: CALL_SID, From: '+14155550199', To: '+18555993809',
     });
+    expect(await incoming.text()).toContain(`<Parameter name="roomCode" value="${ROOM}"`);
 
     const signature = twilio.getExpectedTwilioSignature(AUTH_TOKEN, 'wss://games.example/voice', {});
     const voice = await openSocket(`ws://127.0.0.1:${port}/voice`, { 'X-Twilio-Signature': signature });
@@ -493,6 +504,116 @@ describe('HTTP-hosted Voice Karaoke', () => {
   });
 });
 
+describe('station Karaoke result Relay retirement', () => {
+  it('keeps score and requeue speech alive across station retirement until both lines play', async () => {
+    server = new HttpServer({ port: 0, publicBaseUrl: 'http://localhost', validateSignatures: false,
+      karaokeLeaderboardPath: join(directory, 'karaoke-leaderboard.json') });
+    await server.start();
+    const roomCode = 'KARAOKE-RESULT-DRAIN';
+    const { karaoke, socket, messages, retire } = attachStationResultRelay(server, roomCode);
+
+    await vi.waitFor(() => expect(messages.filter(message => message.type === 'text')).toHaveLength(1));
+    retire(); // Called by the station after its RESULTS display deadline.
+    expect(karaoke.findRoom(roomCode)).toBeDefined();
+
+    const scoreToken = String(messages.find(message => message.type === 'text')?.token ?? '');
+    expect(scoreToken).toContain('score is 900');
+    expect(handleRelayPlaybackEvent(socket, JSON.stringify({
+      type: 'info', name: 'tokensPlayed', value: scoreToken,
+    }))).toBe(true);
+    await vi.waitFor(() => expect(messages.filter(message => message.type === 'text')).toHaveLength(2));
+    expect(karaoke.findRoom(roomCode)).toBeDefined();
+
+    const requeueToken = String(messages.filter(message => message.type === 'text')[1]?.token ?? '');
+    expect(requeueToken).toContain('check your messages');
+    handleRelayPlaybackEvent(socket, JSON.stringify({
+      type: 'info', name: 'tokensPlayed', value: requeueToken,
+    }));
+    await vi.waitFor(() => expect(karaoke.findRoom(roomCode)).toBeUndefined());
+    await vi.waitFor(() => expect(messages.filter(message => message.type === 'end')).toHaveLength(1),
+      { timeout: 2_000 });
+  });
+
+  it('caps stalled result speech, ends Relay, and cannot send old lines into a replacement room', async () => {
+    server = new HttpServer({ port: 0, publicBaseUrl: 'http://localhost', validateSignatures: false,
+      karaokeLeaderboardPath: join(directory, 'karaoke-leaderboard.json') });
+    await server.start();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const roomCode = 'KARAOKE-RESULT-STALL';
+    const { karaoke, socket, messages, retire } = attachStationResultRelay(server, roomCode);
+    await flushMicrotasks();
+    retire();
+
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(karaoke.findRoom(roomCode)).toBeDefined();
+    await vi.advanceTimersByTimeAsync(1);
+    await flushMicrotasks();
+    expect(karaoke.findRoom(roomCode)).toBeUndefined();
+
+    const textCount = messages.filter(message => message.type === 'text').length;
+    const replacement = karaoke.getOrCreateRoom(roomCode);
+    const oldToken = String(messages.find(message => message.type === 'text')?.token ?? '');
+    handleRelayPlaybackEvent(socket, JSON.stringify({
+      type: 'info', name: 'tokensPlayed', value: oldToken,
+    }));
+    await flushMicrotasks();
+    expect(karaoke.findRoom(roomCode)).toBe(replacement);
+    expect(messages.filter(message => message.type === 'text')).toHaveLength(textCount);
+
+    await vi.advanceTimersByTimeAsync(750);
+    expect(messages.filter(message => message.type === 'end')).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(karaoke.findRoom(roomCode)).toBe(replacement);
+    expect(messages.filter(message => message.type === 'text')).toHaveLength(textCount);
+  });
+});
+
+function attachStationResultRelay(http: HttpServer, roomCode: string) {
+  const karaoke = (http as unknown as { karaoke: KaraokeServer }).karaoke;
+  karaoke.getOrCreateRoom(roomCode);
+  const messages: Record<string, unknown>[] = [];
+  const socket = {
+    OPEN: WebSocket.OPEN,
+    readyState: WebSocket.OPEN,
+    send: (data: string, callback?: (error?: Error) => void) => {
+      messages.push(JSON.parse(data) as Record<string, unknown>);
+      callback?.();
+    },
+    terminate: vi.fn(),
+  } as unknown as WebSocket;
+  const snapshot: KaraokeVoiceSnapshot = {
+    phase: 'results', myName: 'Ada', nameConfirmed: true, catalog: [], selectedSong: null,
+    selectedByPlayerId: 'singer', selectionGeneration: 1, loadingGeneration: 1,
+    displayReady: true, score: 900, bestCombo: 3,
+    result: { generation: 1, score: 900, bestCombo: 3 },
+  };
+  const session = new KaraokeVoiceSession({
+    bind: () => ({ playerId: 'singer', resumed: false }),
+    leave: vi.fn(), setName: vi.fn(() => false), selectSong: vi.fn(() => false),
+    advance: vi.fn(() => false), snapshot: () => snapshot,
+    say: (text, guard) => sendRelayTextOutcome(socket, text, 'en-US', guard),
+    requestMediaHandoff: vi.fn(),
+  });
+  session.setStationManaged(true);
+  session.handleMessage(JSON.stringify({
+    type: 'setup', callSid: 'CA-result-relay',
+    customParameters: { roomCode, commandLocale: 'en-US' },
+  }));
+  const internals = http as unknown as {
+    karaokeVoice: Map<string, Set<KaraokeVoiceSession>>;
+    voiceSockets: Map<WebSocket, () => { game: 'karaoke'; roomCode: string } | null>;
+    retireStationEngine(game: 'karaoke', roomCode: string): void;
+  };
+  internals.karaokeVoice.set(roomCode, new Set([session]));
+  internals.voiceSockets.set(socket, () => session.boundRoomCode ? { game: 'karaoke', roomCode } : null);
+  return { karaoke, socket, messages,
+    retire: () => internals.retireStationEngine('karaoke', roomCode) };
+}
+
+async function flushMicrotasks(): Promise<void> {
+  for (let index = 0; index < 10; index++) await Promise.resolve();
+}
+
 async function openSocket(url: string, headers: Record<string, string> = {}): Promise<WebSocket> {
   const socket = new WebSocket(url, { headers });
   sockets.push(socket);
@@ -571,9 +692,10 @@ async function issueKaraokeMediaHandoff(
   display.send(JSON.stringify({ type: 'display_auth', roomCode: ROOM, token: DISPLAY_TOKEN }));
   display.send(JSON.stringify({ type: 'spectate', roomCode: ROOM }));
   await waitForSocketMessage(display, message => message.type === 'host_identity' && message.isHost === true);
-  await signedPost(port, '/voice/incoming', {
+  const incoming = await signedPost(port, '/voice/incoming', {
     AccountSid: ACCOUNT_SID, CallSid: CALL_SID, From: '+14155550199', To: '+18555993809',
   });
+  expect(await incoming.text()).toContain(`<Parameter name="roomCode" value="${ROOM}"`);
 
   const voice = await openSocket(`ws://127.0.0.1:${port}/voice`, {
     'X-Twilio-Signature': twilio.getExpectedTwilioSignature(AUTH_TOKEN, 'wss://games.example/voice', {}),

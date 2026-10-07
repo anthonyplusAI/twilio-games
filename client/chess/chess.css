@@ -73,6 +73,10 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--chess-ruby);outline
 .result-card>span:not(.result-mark){display:block;color:var(--chess-brass);font:13px "Twilio Sans Mono",monospace;letter-spacing:.06em}
 .result-card strong{display:block;margin:10px 0;font:800 clamp(64px,11vw,150px)/.78 "Twilio Sans Display",sans-serif;letter-spacing:-.06em;text-transform:uppercase}
 .result-card p{margin:18px auto 0;max-width:38ch;color:#e6e1d6;font-size:clamp(14px,1.5vw,19px);line-height:1.4}
+.result-replay{pointer-events:auto;min-height:48px;margin:23px auto 0;padding:11px 26px;border:1px solid var(--chess-brass);border-radius:10px;background:rgba(12,25,48,.9);color:#fff;font:800 17px "Twilio Sans Display",sans-serif;cursor:pointer;touch-action:manipulation;box-shadow:0 0 24px rgba(235,190,106,.24)}
+.result-replay:hover:not(:disabled){background:rgba(34,51,77,.96);box-shadow:0 0 34px rgba(235,190,106,.45)}
+.result-replay:focus-visible{outline:3px solid #fff;outline-offset:3px}
+.result-replay:disabled{opacity:.55;cursor:not-allowed}
 .result-overlay[data-result="loss"] .result-card strong{color:#ff6376;text-shadow:0 0 38px rgba(239,48,73,.47),0 3px 24px #000}
 .result-overlay[data-result="win"] .result-card strong{color:#f7e3b8;text-shadow:0 0 45px rgba(255,201,110,.45),0 3px 24px #000}
 .result-overlay[data-result="draw"] .result-card strong{color:#d4e1f0}

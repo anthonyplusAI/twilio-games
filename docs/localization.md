@@ -25,7 +25,7 @@ The server chooses a call's locale in this order:
 
 The dialed locale-specific number takes precedence over a display locale. `ArcadeApi.voiceLocaleForNumber()` returns a locale only when exactly one configured locale uses the normalized E.164 number. A shared legacy fallback number therefore does not identify a locale by itself.
 
-Routing and locale selection remain separate decisions. In station mode, the persisted caller assignment selects the game and its dynamically generated engine room; display recency does not participate. In standalone mode, the most recently opened `display=1` connection selects the game, and the normal standalone room fallback selects the room. Standalone display registration does not validate the station display token. After that route exists, the server applies the locale precedence above.
+Routing and locale selection remain separate decisions. In station mode, the persisted caller assignment selects the game and its dynamically generated engine room. In standalone mode, exactly one eligible `display=1` game display must be open; ambiguous or absent displays cannot receive a call. Standalone display registration does not validate the station display token. After that route exists, the server applies the locale precedence above.
 
 The selected locale drives the Conversation Relay `transcriptionLanguage`, `ttsLanguage`, hints, `locale`, and `commandLocale` values. Server text frames carry the same language code. `CR_TTS_VOICE_PT_BR` can select a Portuguese ElevenLabs voice; when it is empty, Relay uses its `pt-BR` default.
 
@@ -100,11 +100,11 @@ AI-assisted source and editorial audit only. It does not claim human editorial, 
 native Brazilian Portuguese review. A later human review must preserve the AI-assisted provenance and
 identify the actual reviewer rather than relabeling the existing audit.
 
-Runtime publishes the selected localized prompt and choices directly in `question`, starts the shared
-10-second answer window immediately, and speaks localized numbered choices without waiting for Relay
-playback. English uses One through Four; Brazilian Portuguese uses Um through Quatro. Reconnecting
-unanswered callers hear the current numbered question plus remaining-time guidance without changing
-the shared timestamps.
+Runtime publishes the selected localized prompt and choices in `question_prompt` and waits for the
+authenticated display to paint that stage before the phones read the choices. The common 10-second
+answer window opens after caller prompt and cue delivery or an explicit skip. English uses One through
+Four; Brazilian Portuguese uses Um through Quatro. Reconnecting unanswered callers receive current
+question guidance without changing the shared answer deadline.
 
 Use `/editor?game=trivia` to edit the complete bilingual bank, answer key, private voice aliases,
 sources, and review metadata. The API is `no-store`, requires `EDITOR_TOKEN` when configured, and uses
@@ -140,7 +140,7 @@ Use Unicode normalization rather than ASCII-only regular expressions. Keep trans
 | Runtime `channels.voiceNumbers.en-US` and `.pt-BR` | Locale-specific public voice numbers used by lobbies and dialed-number locale detection |
 | `GAME_PHONE_NUMBER` | Legacy fallback only when neither runtime locale number is configured; a shared fallback cannot identify one locale uniquely |
 | `DEFAULT_LOCALE` | Call fallback when neither the dialed number nor the routed display identifies a locale; defaults to `en-US` |
-| `CR_TTS_VOICE` | English ElevenLabs voice ID; empty uses the Relay default |
+| `CR_TTS_VOICE` | English ElevenLabs voice ID for all six games; defaults to `xp3gDg85YgFcWpnNVlIu` and deployment pins that value |
 | `CR_TTS_VOICE_PT_BR` | Brazilian Portuguese ElevenLabs voice ID; empty uses Relay's `pt-BR` default |
 
 The Azure deployment reads the environment values from GitHub repository variables. Operators manage `channels.voiceNumbers` in runtime Arcade settings. Validate provider language, model, voice, and number availability before enabling a new locale in production.

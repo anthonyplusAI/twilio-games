@@ -7,7 +7,7 @@ import { countdownCue } from '../shared/countdown';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../shared/i18n/locales';
 import { RACER_MESSAGES, type RacerMessageKey } from '../shared/i18n/racer';
 import { createTranslator } from '../shared/i18n/translate';
-import { carName } from '../shared/i18n/content';
+import { carName, trackName } from '../shared/i18n/content';
 
 type Text = ReturnType<typeof createTranslator<RacerMessageKey>>;
 
@@ -48,7 +48,8 @@ export function lineForEvent(ev: GameEvent, myPlayerId: string | null, seq = 0,
     case 'enter_map_select': return pick(MAP_SELECT, seq, text);
     case 'car_picked':       return mine(ev.playerId)
       ? text('voice.carPickedLine', { reaction: pick(CAR_PICKED, seq, text), car: carName(locale, ev.car) }) : null;
-    case 'map_picked':       return null;   // the screen host covers the map pick; don't double up
+    case 'map_picked':       return ev.playerId && mine(ev.playerId)
+      ? text('voice.voteTrack', { map: trackName(locale, ev.map) }) : null;
     case 'countdown':
       return ev.n <= 3 ? countdownCue(ev.n, locale) : null;
     case 'go':

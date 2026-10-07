@@ -115,6 +115,11 @@ let menuLevel: 'root' | 'fight' = 'root';   // two-level command menu: root acti
 let phoneNumber = '';   // the number players call to join (from /api/config) — shown in the lobby join flow
 let phoneQr = '/brand/join-qr.png?v=2';
 let joinedHere = false;
+let touchTargetPlayerId: string | null = null;
+let connectionEpoch = 0;
+let lastResultsAckGeneration: number | null = null;
+let pendingResultsAckGeneration: number | null = null;
+let pendingShowResultsGeneration: number | null = null;
 
 function localizeBattleState(message: BattleStateMsg): BattleStateMsg {
   if (!message.snapshot) return message;
@@ -163,15 +168,49 @@ conn.onError((code, msg) => {
     myId = null; joinedHere = false; conn.spectate(roomCode, stationDisplay.displayToken ?? undefined);
   }
 });
-conn.onEvents((events) => queueEvents(events));
+conn.onConnected(() => {
+  connectionEpoch++;
+  cancelPlayback();
+  lastResultsAckGeneration = null;
+  pendingResultsAckGeneration = null;
+});
+conn.onEvents((events, eventIds, generation) => queueEvents(events, eventIds, generation));
+conn.onShowResults((generation) => {
+  if (state?.phase !== 'results' || state.generation !== generation) {
+    pendingShowResultsGeneration = generation;
+    return;
+  }
+  cancelPlayback();
+  dismissContinue();
+});
 
 conn.onState((incoming) => {
   stationStateReady = true; maybeMarkStationReady();
   const m = localizeBattleState(incoming);
   const prevPhase = state?.phase;
+  const prevGeneration = state?.generation;
+  const priorTouchTarget = state?.players.find(player => player.playerId === touchTargetPlayerId);
   const prevPlayerCount = state?.players?.length ?? 0;
   const prevMonsterSelections = state?.players?.filter(p => p.monsterId).length ?? 0;
   state = m;
+  if (prevGeneration !== undefined && prevGeneration !== m.generation) {
+    cancelPlayback();
+    lastActionSide = null;
+    if (pendingShowResultsGeneration !== m.generation) pendingShowResultsGeneration = null;
+  }
+  if (m.phase === 'monster_select' && isDisplay && !joinedHere) {
+    if (priorTouchTarget && !priorTouchTarget.monsterId
+      && m.players.find(player => player.playerId === priorTouchTarget.playerId)?.monsterId) {
+      touchTargetPlayerId = m.players.find(player => !player.isAi && !player.monsterId)?.playerId
+        ?? priorTouchTarget.playerId;
+    }
+    touchTargetPlayerId = resolveTouchTarget(m.players);
+  }
+  if (m.phase === 'results' && pendingShowResultsGeneration === m.generation) {
+    cancelPlayback();
+    pendingShowResultsGeneration = null;
+    awaitingContinue = false;
+  }
   
   // Play select sound on new player join or monster selection
   const currentPlayerCount = m.players?.length ?? 0;
@@ -196,7 +235,6 @@ conn.onState((incoming) => {
   }
   // Leaving results (rematch / reset) drops any pending continue-hold so it can't strand the stage.
   if (m.phase !== 'results') awaitingContinue = false;
-  else stationDisplay.markEngineResultsReady();
   // First time we enter a battle, spin up the 3D arena behind the GB overlay (lazy — no 3D in menus).
   // Pull the editor-authored config from /api/arena; fall back to sensible defaults on any failure.
   if (m.phase === 'battle' && !arenaLoaded) {
@@ -275,9 +313,30 @@ function paintBattle(): void {
 }
 
 // ── paced event playback ──────────────────────────────────────────────────────────────────────────
-let eventQ: BattleEvent[] = [];
-function queueEvents(events: BattleEvent[]): void {
-  eventQ.push(...events);
+interface QueuedBattleEvent { event: BattleEvent; eventId: number; generation: number }
+let eventQ: QueuedBattleEvent[] = [];
+let playbackEpoch = 0;
+let playbackTimer: ReturnType<typeof setTimeout> | null = null;
+function cancelPlayback(): void {
+  playbackEpoch++;
+  if (playbackTimer) clearTimeout(playbackTimer);
+  playbackTimer = null;
+  eventQ = [];
+  pendingHandoff = null;
+  draining = false;
+  awaitingContinue = false;
+  renderer.setActiveSide(null);
+}
+function scheduleNext(delay: number): void {
+  const epoch = playbackEpoch;
+  playbackTimer = setTimeout(() => {
+    playbackTimer = null;
+    if (epoch === playbackEpoch) drainNext();
+  }, delay);
+}
+function queueEvents(events: BattleEvent[], eventIds: number[], generation: number): void {
+  if (events.length !== eventIds.length || generation !== state?.generation) return;
+  eventQ.push(...events.map((event, index) => ({ event, eventId: eventIds[index]!, generation })));
   if (!draining) { draining = true; paintBattle(); drainNext(); }
 }
 let lastActionSide: 'a' | 'b' | null = null;
@@ -290,16 +349,15 @@ function drainNext(): void {
     const who = pendingHandoff; pendingHandoff = null;
     renderer.setEventBanner(handoffText(who));
     renderer.setActiveSide(who);
-    setTimeout(drainNext, HANDOFF_PAUSE_MS);   // hold the "their turn" card so the ping-pong is unmistakable
+    scheduleNext(HANDOFF_PAUSE_MS);   // hold the "their turn" card so the ping-pong is unmistakable
     return;
   }
-  const ev = eventQ.shift();
-  if (!ev) {
+  const beat = eventQ.shift();
+  if (!beat) {
     draining = false; renderer.setActiveSide(null);
     // Battle just ended? Don't jump straight to the results modal — hold on the arena with a
     // "▶ Continue" prompt so the win lands, and wait for the player to acknowledge.
     if (state?.phase === 'results') {
-      stationDisplay.markEngineResultsReady();
       if (stationDisplay.active) {
         awaitingContinue = false;
         renderer.setEventBanner('');
@@ -314,9 +372,11 @@ function drainNext(): void {
     paintBattle(); renderOverlay(); return;
   }
 
+  const ev = beat.event;
+
   const actionSide = sideForActionEvent(ev);
   if (actionSide && lastActionSide && lastActionSide !== actionSide) {
-    lastActionSide = actionSide; pendingHandoff = actionSide; eventQ.unshift(ev); setTimeout(drainNext, 0); return;
+    lastActionSide = actionSide; pendingHandoff = actionSide; eventQ.unshift(beat); scheduleNext(0); return;
   }
   if (actionSide) lastActionSide = actionSide;
   if (ev.kind === 'move_used') {
@@ -341,7 +401,15 @@ function drainNext(): void {
   renderer.playEvent(ev);
   const banner = bannerFor(ev);
   if (banner) renderer.setEventBanner(banner);
-  setTimeout(drainNext, dwellFor(ev));
+  // The voice announcer receives this beat only after the animation and banner have reached a frame.
+  const epoch = playbackEpoch;
+  const socketEpoch = connectionEpoch;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (epoch !== playbackEpoch || socketEpoch !== connectionEpoch
+      || state?.generation !== beat.generation || stageEl.style.display === 'none') return;
+    conn.ackEvent(beat.generation, beat.eventId);
+  }));
+  scheduleNext(dwellFor(ev));
 }
 
 /** "▶ YOUR TURN" when it's the local player's monster, else "▶ RIVAL'S TURN" (names the foe). */
@@ -403,7 +471,10 @@ function renderOverlay(): void {
     return;
   }
   const key = overlayKey(phase);
-  if (key === lastOverlayKey) return;   // nothing meaningful changed → don't rebuild (kills modal spam)
+  if (key === lastOverlayKey) {
+    if (phase === 'results') scheduleResultsReceipt();
+    return;   // nothing meaningful changed → don't rebuild (kills modal spam)
+  }
   lastOverlayKey = key;
   overlay.style.display = 'flex';
   if (phase === 'lobby') overlay.innerHTML = lobbyHtml();
@@ -411,6 +482,30 @@ function renderOverlay(): void {
   else if (phase === 'results') overlay.innerHTML = resultsHtml();
   wireOverlay();
   if (phase === 'monster_select') upgradeSelectPortraits();   // swap placeholders → real GIF/PNG
+  if (phase === 'results') scheduleResultsReceipt();
+}
+
+/** A result is ready for narration only after its overlay has actually painted on this display. */
+function scheduleResultsReceipt(): void {
+  if (state?.phase !== 'results' || draining || awaitingContinue || overlay.style.display === 'none') return;
+  const generation = state.generation;
+  if (pendingResultsAckGeneration === generation || lastResultsAckGeneration === generation) return;
+  pendingResultsAckGeneration = generation;
+  const socketEpoch = connectionEpoch;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (pendingResultsAckGeneration !== generation || socketEpoch !== connectionEpoch
+      || state?.phase !== 'results' || state.generation !== generation
+      || draining || awaitingContinue || overlay.style.display === 'none') {
+      if (pendingResultsAckGeneration === generation) pendingResultsAckGeneration = null;
+      return;
+    }
+    pendingResultsAckGeneration = null;
+    stationDisplay.markEngineResultsReady();
+    if (isDisplay && !joinedHere && !state.resultsPresented) {
+      lastResultsAckGeneration = generation;
+      conn.ackResults(generation);
+    }
+  }));
 }
 /** A stable fingerprint of the overlay's meaningful inputs — only a change here rebuilds the DOM. */
 function overlayKey(phase: string): string {
@@ -428,6 +523,13 @@ function canDrive(): boolean {
   return joinedHere || (isDisplay && havePlayers);
 }
 
+function resolveTouchTarget(players: BattleStateMsg['players']): string | null {
+  const humans = players.filter(player => !player.isAi);
+  if (touchTargetPlayerId && humans.some(player => player.playerId === touchTargetPlayerId))
+    return touchTargetPlayerId;
+  return humans.find(player => !player.monsterId)?.playerId ?? humans[0]?.playerId ?? null;
+}
+
 function lobbyHtml(): string {
   // ONE lobby screen, matching Voice Racer: callers dial in and appear as chips; the shared screen can
   // add a KEYBOARD tester with P. Advance ("Choose your monster") once at least one player is in — no
@@ -437,8 +539,10 @@ function lobbyHtml(): string {
     || `<span class="vm-dim">${text('lobby.waitingChallengers')}</span>`;
   const havePlayers = players.length > 0;
   let action: string;
-  if (havePlayers && canDrive()) {
+  if (havePlayers && canDrive() && state?.canAdvanceLobby) {
     action = `<button class="vm-btn" data-act="advance">${text('lobby.chooseMonster')}</button>`;
+  } else if (havePlayers) {
+    action = `<div class="vm-dim">${text('lobby.waitingReady')}</div>`;
   } else if (isDisplay) {
     // Shared screen, nobody in yet: wait for callers, or press P to add a keyboard tester player.
     action = `<div class="vm-dim">${text('lobby.anyoneCanJoin')}</div>`;
@@ -522,7 +626,17 @@ function monsterSelectHtml(): string {
   const pickedBy = new Map<string, string[]>();
   for (const p of players) if (p.monsterId) pickedBy.set(p.monsterId, [...(pickedBy.get(p.monsterId) ?? []), p.name]);
   const anyPick = players.some(p => p.monsterId);
-  const canBattle = players.length >= 2 ? players.every(p => p.monsterId) : anyPick;
+  const canBattle = !!state?.canStartBattle;
+  const target = isDisplay && !joinedHere ? resolveTouchTarget(players) : myId;
+  const targetPlayer = players.find(player => player.playerId === target);
+  const picker = isDisplay && !joinedHere && players.some(player => !player.isAi)
+    ? `<div class="vm-touch-picker" role="group" aria-label="${esc(text('select.touchTarget'))}">
+        ${players.filter(player => !player.isAi).map(player => `
+          <button type="button" class="vm-touch-player${target === player.playerId ? ' active' : ''}"
+            data-touch-player="${esc(player.playerId)}" aria-pressed="${target === player.playerId}">
+            ${esc(player.name)}${player.monsterId ? ` · ${esc(text('select.chosen'))}` : ''}
+          </button>`).join('')}
+      </div>` : '';
   // MINIMAL cards: portrait + name + type + (who picked it). Portrait starts as the placeholder;
   // upgradeSelectPortraits() swaps in a real GIF/PNG post-mount.
   const cards = roster.map(m => {
@@ -531,6 +645,8 @@ function monsterSelectHtml(): string {
     const typeLabel = monsterTypeLabel(m.type as MonsterType, locale);
     return `
     <button class="vm-mon t-${m.type}${selected ? ' sel' : ''}" data-mon="${m.id}"
+      ${!target || !canDrive() ? 'disabled' : ''}
+      aria-pressed="${targetPlayer?.monsterId === m.id}"
       aria-label="${esc(text('access.monsterOption', { name: m.name, type: typeLabel }))}">
       <div class="portrait"><img data-mon-portrait="${m.id}" src="${placeholderPortrait(m.id, m.type)}" alt=""></div>
       <div class="vm-mon-name">${esc(m.name)}</div>
@@ -540,12 +656,14 @@ function monsterSelectHtml(): string {
   }).join('');
   return `<div class="vm-card wide">
     ${brandHead(text('select.title'), text('select.subtitle'))}
+    ${picker}
     <div class="vm-grid">${cards}</div>
     ${canDrive() && canBattle
       ? `<button class="vm-btn" data-act="advance">${text('select.battle')}</button>`
       : canDrive()
         ? `<div class="vm-dim">${anyPick ? text('select.waitingAll') : text('select.pickFirst')}</div>`
       : `<div class="vm-dim">${text('select.pick')}</div>`}
+    ${canDrive() ? `<button class="vm-btn vm-btn-secondary" data-act="back">${text('select.back')}</button>` : ''}
   </div>`;
 }
 
@@ -564,10 +682,23 @@ function resultsHtml(): string {
 }
 
 function wireOverlay(): void {
+  overlay.querySelectorAll<HTMLElement>('[data-touch-player]').forEach(el =>
+    el.onclick = () => {
+      touchTargetPlayerId = el.dataset.touchPlayer!;
+      lastOverlayKey = '';
+      renderOverlay();
+    });
   overlay.querySelectorAll<HTMLElement>('[data-mon]').forEach(el =>
-    el.onclick = () => conn.selectMonster(el.dataset.mon!));
+    el.onclick = () => {
+      if (isDisplay && !joinedHere) {
+        const playerId = state && resolveTouchTarget(state.players);
+        if (playerId) conn.displaySelectMonster(playerId, el.dataset.mon!);
+      } else conn.selectMonster(el.dataset.mon!);
+    });
   overlay.querySelectorAll<HTMLElement>('[data-act="advance"]').forEach(el =>
     el.onclick = () => conn.advance());
+  overlay.querySelectorAll<HTMLElement>('[data-act="back"]').forEach(el =>
+    el.onclick = () => conn.back());
 }
 
 const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));

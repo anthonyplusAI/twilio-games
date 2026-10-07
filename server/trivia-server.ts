@@ -100,6 +100,7 @@ export class TriviaServer {
     questionPoints: Map<string, number>;
   }>();
   private readonly localKeyboardPlayerIds = new Map<string, Set<string>>();
+  private readonly paintedQuestionViews = new Map<string, { key: string; host: Connection }>();
   private readonly roomFactory: (code: string, options: TriviaRoomOptions) => TriviaRoom;
   private readonly scheduleInterval: typeof setInterval;
   private readonly cancelInterval: typeof clearInterval;
@@ -181,6 +182,15 @@ export class TriviaServer {
     return Boolean(host?.display && host.displayAuthenticated && host.ws.readyState === WebSocket.OPEN);
   }
 
+  /** Checks the live socket binding, not an old `?display=1` upgrade hint. */
+  hasStandaloneDisplay(ws: WebSocket, roomCode: string): boolean {
+    const code = canonicalRoomCode(roomCode);
+    if (!this.rooms.has(code) || ws.readyState !== WebSocket.OPEN) return false;
+    return [...this.conns].some(conn => conn.ws === ws && conn.roomCode === code
+      && conn.display === true && conn.hostAuthorized === true
+      && (!this.requiresDisplayAuth(code) || conn.displayAuthenticated === true));
+  }
+
   preferredLocale(roomCode?: string, fallback: SupportedLocale = DEFAULT_LOCALE): SupportedLocale {
     const code = roomCode ? canonicalRoomCode(roomCode) : undefined;
     const matching = [...this.conns].filter(conn => (!code || conn.roomCode === code) && conn.locale);
@@ -217,6 +227,7 @@ export class TriviaServer {
     this.roomBanks.delete(code);
     this.voiceRuntime.delete(code);
     this.localKeyboardPlayerIds.delete(code);
+    this.paintedQuestionViews.delete(code);
     this.syncTimingLoop();
     return true;
   }
@@ -266,6 +277,7 @@ export class TriviaServer {
       if (code) {
         if (this.hosts.get(code) === conn) {
           this.hosts.delete(code);
+          this.paintedQuestionViews.delete(code);
           this.invalidateDisplayReady(code);
           this.designateHost(code);
         }
@@ -420,6 +432,38 @@ export class TriviaServer {
           this.send(conn, { type: 'error', code: 'select_rejected', message: 'That category vote is unavailable.' });
         }
         break;
+      case 'display_select_category':
+        if (!isHost) this.rejectAuthority(conn);
+        else if (!room.voteCategoryFromDisplay(msg.playerId, msg.category)) {
+          this.send(conn, { type: 'error', code: 'select_rejected', message: 'This voting seat already voted or changed.' });
+        }
+        break;
+      case 'view_rendered': {
+        const state = room.state();
+        if (!isHost) this.rejectAuthority(conn);
+        else if (state.phase !== msg.phase || state.question?.id !== msg.questionId
+          || state.questionAttemptId !== msg.questionAttemptId || state.renderRevision !== msg.renderRevision) {
+          this.send(conn, { type: 'error', code: 'stale_view', message: 'That question view is no longer current.' });
+        } else {
+          this.paintedQuestionViews.set(room.code, {
+            key: `${msg.questionAttemptId}:${msg.phase}:${msg.renderRevision}`,
+            host: conn,
+          });
+          for (const playerId of this.localKeyboardPlayerIds.get(room.code) ?? []) {
+            if (room.phase !== msg.phase) break;
+            if (msg.phase === 'question_prompt') {
+              const generation = room.beginPromptDelivery(playerId, msg.questionId, msg.questionAttemptId);
+              if (generation !== null) room.questionPromptReady(playerId, msg.questionId,
+                msg.questionAttemptId, generation);
+            } else {
+              const generation = room.beginAnswerCueDelivery(playerId, msg.questionId, msg.questionAttemptId);
+              if (generation !== null) room.questionAnswerCueReady(playerId, msg.questionId,
+                msg.questionAttemptId, generation);
+            }
+          }
+        }
+        break;
+      }
       case 'advance':
         if (!isHost) this.rejectAuthority(conn);
         else if (this.requiresDisplayAuth(room.code) && room.phase === 'results') {
@@ -462,6 +506,7 @@ export class TriviaServer {
           conn.playerId = undefined;
           conn.sessionId = undefined;
         }
+        if (conn.display) this.detachDisplay(conn);
         break;
       default:
         break;
@@ -511,20 +556,17 @@ export class TriviaServer {
             runtime.questionPoints.set(event.playerId, event.points);
           }
         }
-        if (event.type === 'question_started') {
-          for (const playerId of this.localKeyboardPlayerIds.get(room.code) ?? []) {
-            if (room.questionPromptReady(playerId, event.questionId)) runtime?.promptReady.add(playerId);
-          }
-        } else if (event.type === 'answer_cue_started') {
-          for (const playerId of this.localKeyboardPlayerIds.get(room.code) ?? []) {
-            if (room.questionAnswerCueReady(playerId, event.questionId)) runtime?.answerCueReady.add(playerId);
-          }
-        }
       }
     }
     if (!events.length) return;
+    const state = room.state();
+    const visibleEvents = events.filter(event => !('questionAttemptId' in event)
+      || event.questionAttemptId === state.questionAttemptId);
     for (const conn of this.conns) {
-      if (conn.roomCode === room.code) this.send(conn, { type: 'trivia_events', events });
+      if (conn.roomCode !== room.code) continue;
+      // The corresponding state must arrive before any attempt-scoped result event.
+      this.send(conn, { type: 'trivia_state', ...room.state(conn.locale ?? state.preferredLocale) });
+      if (visibleEvents.length) this.send(conn, { type: 'trivia_events', events: visibleEvents });
     }
     this.onRoomEvents?.(room.code, events);
   }
@@ -573,7 +615,6 @@ export class TriviaServer {
     room.setPlayerConnected(session.playerId, true);
     if (conn.keyboardTester && this.isAuthorizedHost(code, conn)) {
       this.trackKeyboardPlayer(code, session.playerId);
-      this.settleKeyboardPlayer(room, session.playerId);
     }
     if (conn.displayAuthenticated) this.onDisplayAuthenticated?.(conn.ws);
     if (conn.display) this.onDisplayRegistered?.(conn.ws, code);
@@ -665,15 +706,6 @@ export class TriviaServer {
     return true;
   }
 
-  private settleKeyboardPlayer(room: TriviaRoom, playerId: string): void {
-    const state = room.state();
-    const runtime = this.voiceRuntime.get(room.code);
-    if (state.phase === 'question_prompt' && state.question
-      && room.questionPromptReady(playerId, state.question.id)) runtime?.promptReady.add(playerId);
-    else if (state.phase === 'answer_cue' && state.question
-      && room.questionAnswerCueReady(playerId, state.question.id)) runtime?.answerCueReady.add(playerId);
-  }
-
   private detachDisplay(conn: Connection): void {
     const code = conn.roomCode;
     if (!code) return;
@@ -722,6 +754,12 @@ export class TriviaServer {
       && (!this.requiresDisplayAuth(code) || conn.displayAuthenticated === true);
   }
 
+  private hasLiveHostDisplay(code: string): boolean {
+    const host = this.hosts.get(code);
+    return Boolean(host?.display && host.ws.readyState === WebSocket.OPEN
+      && this.isAuthorizedHost(code, host));
+  }
+
   private reap(code: string): void {
     const room = this.rooms.get(code);
     if (!room?.isEmpty) return;
@@ -732,6 +770,7 @@ export class TriviaServer {
     this.roomBanks.delete(code);
     this.voiceRuntime.delete(code);
     this.localKeyboardPlayerIds.delete(code);
+    this.paintedQuestionViews.delete(code);
   }
 
   voiceJoin(code: string, name: string, expectedPlayers?: number, nameConfirmed = true,
@@ -785,11 +824,18 @@ export class TriviaServer {
     return advanced;
   }
 
-  voiceQuestionPromptReady(code: string, playerId: string, questionId: string): boolean {
+  voiceBeginPromptDelivery(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, estimatedSpeechMs = 0): number | null {
+    code = canonicalRoomCode(code);
+    return this.rooms.get(code)?.beginPromptDelivery(playerId, questionId, questionAttemptId, estimatedSpeechMs) ?? null;
+  }
+
+  voiceQuestionPromptReady(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, deliveryGeneration: number): boolean {
     code = canonicalRoomCode(code);
     const room = this.rooms.get(code);
     if (!room) return false;
-    const accepted = room.questionPromptReady(playerId, questionId);
+    const accepted = room.questionPromptReady(playerId, questionId, questionAttemptId, deliveryGeneration);
     if (accepted) this.voiceRuntime.get(code)?.promptReady.add(playerId);
     this.flush(room);
     this.pushState(code);
@@ -797,16 +843,76 @@ export class TriviaServer {
     return accepted;
   }
 
-  voiceQuestionAnswerCueReady(code: string, playerId: string, questionId: string): boolean {
+  voiceBeginAnswerCueDelivery(code: string, playerId: string, questionId: string,
+    questionAttemptId: number): number | null {
+    code = canonicalRoomCode(code);
+    return this.rooms.get(code)?.beginAnswerCueDelivery(playerId, questionId, questionAttemptId) ?? null;
+  }
+
+  voiceQuestionAnswerCueReady(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, deliveryGeneration: number): boolean {
     code = canonicalRoomCode(code);
     const room = this.rooms.get(code);
     if (!room) return false;
-    const accepted = room.questionAnswerCueReady(playerId, questionId);
+    const accepted = room.questionAnswerCueReady(playerId, questionId, questionAttemptId, deliveryGeneration);
     if (accepted) this.voiceRuntime.get(code)?.answerCueReady.add(playerId);
     this.flush(room);
     this.pushState(code);
     this.syncTimingLoop();
     return accepted;
+  }
+
+  voiceQuestionPromptSkipped(code: string, playerId: string, questionId: string,
+    questionAttemptId: number): boolean {
+    code = canonicalRoomCode(code);
+    const room = this.rooms.get(code);
+    if (!room?.questionPromptSkipped(playerId, questionId, questionAttemptId)) return false;
+    this.flush(room);
+    this.pushState(code);
+    this.syncTimingLoop();
+    return true;
+  }
+
+  voiceQuestionAnswerCueSkipped(code: string, playerId: string, questionId: string,
+    questionAttemptId: number): boolean {
+    code = canonicalRoomCode(code);
+    const room = this.rooms.get(code);
+    if (!room?.questionAnswerCueSkipped(playerId, questionId, questionAttemptId)) return false;
+    this.flush(room);
+    this.pushState(code);
+    this.syncTimingLoop();
+    return true;
+  }
+
+  voiceQueueEarlyAnswer(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, choiceId: string): boolean {
+    code = canonicalRoomCode(code);
+    const room = this.rooms.get(code);
+    if (!room?.queueEarlyAnswer(playerId, questionId, questionAttemptId, choiceId)) return false;
+    this.flush(room);
+    this.pushState(code);
+    this.syncTimingLoop();
+    return true;
+  }
+
+  voicePauseAudio(code: string, questionId: string, questionAttemptId: number): boolean {
+    code = canonicalRoomCode(code);
+    const room = this.rooms.get(code);
+    if (!room?.pauseAudio(questionId, questionAttemptId)) return false;
+    this.flush(room);
+    this.pushState(code);
+    this.syncTimingLoop();
+    return true;
+  }
+
+  retryQuestion(code: string, questionId: string, questionAttemptId: number): boolean {
+    code = canonicalRoomCode(code);
+    const room = this.rooms.get(code);
+    if (!room?.retryQuestion(questionId, questionAttemptId)) return false;
+    this.flush(room);
+    this.pushState(code);
+    this.syncTimingLoop();
+    return true;
   }
 
   /** Trusted voice/DTMF answer API. The local browser keyboard path is isolated in onMessage. */
@@ -823,15 +929,29 @@ export class TriviaServer {
 
   /** Trusted final API using an earlier matching interim/onset timestamp for scoring. */
   voiceAnswerAt(code: string, playerId: string, spokenOrChoiceId: string,
-    final: boolean, answeredAtMs: number): boolean {
+    final: boolean, answeredAtMs: number, semanticResolutionId?: number): boolean {
     code = canonicalRoomCode(code);
     const room = this.rooms.get(code);
     if (!room) return false;
-    const accepted = room.answerAt(playerId, spokenOrChoiceId, final, answeredAtMs);
+    const accepted = room.answerAt(playerId, spokenOrChoiceId, final, answeredAtMs, semanticResolutionId);
     this.flush(room);
     this.pushState(code);
     this.syncTimingLoop();
     return accepted;
+  }
+
+  voiceBeginAnswerResolution(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, onset?: { choiceId: string; atMs: number }): number | null {
+    code = canonicalRoomCode(code);
+    return this.rooms.get(code)?.beginSemanticAnswerResolution(playerId, questionId,
+      questionAttemptId, onset) ?? null;
+  }
+
+  voiceFinishAnswerResolution(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, resolutionId: number): boolean {
+    code = canonicalRoomCode(code);
+    return this.rooms.get(code)?.finishSemanticAnswerResolution(playerId, questionId,
+      questionAttemptId, resolutionId) ?? false;
   }
 
   voiceLeave(code: string, playerId: string): void {
@@ -915,8 +1035,10 @@ export class TriviaServer {
         correctCount: player.correctCount,
       })),
       categoryVoteCounts: state.categoryVoteCounts,
+      myCategoryVote: room.categoryVoteFor(playerId),
       loadingGeneration: state.loadingGeneration,
       questionIndex: state.questionIndex,
+      questionAttemptId: state.questionAttemptId,
       answeringStartsAtMs: state.answeringStartsAtMs,
       questionEndsAtMs: state.questionEndsAtMs,
       question,
@@ -924,8 +1046,11 @@ export class TriviaServer {
       standings: state.standings,
       result: state.result,
       myAnswered: me.answered,
-      myPromptReady: runtime?.promptReady.has(playerId) ?? false,
-      myAnswerCueReady: runtime?.answerCueReady.has(playerId) ?? false,
+      myPromptReady: room.promptReadyFor(playerId),
+      myAnswerCueReady: room.answerCueReadyFor(playerId),
+      displayViewReady: !this.requiresDisplayAuth(code) && !this.hasLiveHostDisplay(code)
+        ? true : Boolean(this.paintedQuestionViews.get(code)?.host === this.hosts.get(code)
+          && this.paintedQuestionViews.get(code)?.key === `${state.questionAttemptId}:${state.phase}:${state.renderRevision}`),
       myQuestionPoints: runtime?.questionPoints.get(playerId) ?? 0,
     };
   }

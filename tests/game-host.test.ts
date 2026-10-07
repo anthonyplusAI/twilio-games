@@ -93,6 +93,13 @@ describe('clearSelectionIndex (deterministic pre-LLM pick)', () => {
   it('does not intercept an out-of-range number', () => {
     expect(clearSelectionIndex('car 99', cars)).toBeNull();
   });
+  it('never executes a rejected or ambiguous selection before semantic interpretation', () => {
+    expect(clearSelectionIndex("I don't want car two", cars)).toBeNull();
+    expect(clearSelectionIndex('one or two', cars)).toBeNull();
+    expect(clearSelectionIndex('the Bronco or the McLaren', cars)).toBeNull();
+    expect(clearSelectionIndex('não quero o carro um', cars, 'pt-BR')).toBeNull();
+    expect(clearSelectionIndex('one, actually two', cars)).toBe(1);
+  });
 });
 
 describe('buildSystemPrompt', () => {

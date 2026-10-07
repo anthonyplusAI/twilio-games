@@ -19,6 +19,14 @@ export interface ChessRoomOptions {
   aiTimeBudgetMs?: number;
 }
 
+/** A legal human move, labeled for the semantic speech interpreter. The ID is
+ * coordinate notation; the caller still has to explicitly confirm the proposal. */
+export interface ChessVoiceMoveChoice {
+  id: string;
+  label: string;
+  aliases: string[];
+}
+
 const PIECE_VALUE: Record<ChessPieceType, number> = { p: 100, n: 320, b: 335, r: 500, q: 900, k: 0 };
 const MATE_SCORE = 100_000;
 const SEARCH_INFINITY = 1_000_000;
@@ -72,6 +80,24 @@ export class ChessRoom {
   }
   get humanColor(): ChessColor { return this.humanColorValue; }
   get playerConnected(): boolean { return this.playerConnectedValue; }
+
+  legalVoiceMoves(locale: SupportedLocale = DEFAULT_LOCALE): ChessVoiceMoveChoice[] {
+    if (!this.playerConnectedValue || this.resultValue || this.chess.turn() !== this.humanColorValue) return [];
+    const names: Record<ChessPieceType, string> = locale === 'pt-BR'
+      ? { p: 'peão', n: 'cavalo', b: 'bispo', r: 'torre', q: 'dama', k: 'rei' }
+      : { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen', k: 'king' };
+    return this.chess.moves({ verbose: true }).map(move => {
+      const id = `${move.from}${move.to}${move.promotion ?? ''}`;
+      const castle = move.isKingsideCastle() ? 'king' : move.isQueensideCastle() ? 'queen' : null;
+      const label = castle
+        ? inLanguage(locale, `Castle ${castle === 'king' ? 'kingside' : 'queenside'} (${move.from.toUpperCase()} to ${move.to.toUpperCase()})`,
+          `Roque ${castle === 'king' ? 'pequeno' : 'grande'} (${move.from.toUpperCase()} para ${move.to.toUpperCase()})`)
+        : inLanguage(locale,
+          `${names[move.piece]} from ${move.from.toUpperCase()} to ${move.to.toUpperCase()}${move.captured ? ' capture' : ''}${move.promotion ? ` promote to ${names[move.promotion]}` : ''}`,
+          `${names[move.piece]} de ${move.from.toUpperCase()} para ${move.to.toUpperCase()}${move.captured ? ' captura' : ''}${move.promotion ? ` promover a ${names[move.promotion]}` : ''}`);
+      return { id, label, aliases: [move.san, `${move.from} ${move.to}`] };
+    });
+  }
 
   state(): ChessState {
     return {

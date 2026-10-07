@@ -53,7 +53,19 @@ export type ClientMessage =
   | { type: 'select_car'; carIndex: number }      // player claims a car (car_select phase)
   | { type: 'select_map'; map: string }           // pick the level (map_select phase)
   | { type: 'advance' }                            // host: move the flow forward one phase
-  | { type: 'back' };                              // host: move the flow back one phase
+  | { type: 'back' }                              // host: move the flow back one phase
+  | { type: 'display_select_car'; roomCode: string; expectedPhase: 'car_select'; forPlayerId: string; carIndex: number }
+  | { type: 'display_select_map'; roomCode: string; expectedPhase: 'map_select'; forPlayerId: string; map: string }
+  | { type: 'display_advance'; roomCode: string; expectedPhase: 'lobby' | 'car_select' | 'map_select' | 'results'; forPlayerId?: string }
+  | { type: 'display_back'; roomCode: string; expectedPhase: 'car_select' | 'map_select' };
+
+/** Shared-screen actions are labeled with the current authoritative caller seat and gates. */
+export interface MenuTouchState {
+  activePlayerId: string | null;
+  advancePlayerId: string | null;
+  canAdvance: boolean;
+  canBack: boolean;
+}
 
 export interface LobbyPlayer {
   playerId: string;
@@ -81,17 +93,17 @@ export type ServerMessage =
   | { type: 'items'; items: Item[]; map?: string | null }   // sent once at race start (map = chosen level)
   | { type: 'snapshot'; snapshot: WorldSnapshot } // sent ~30/s during a race
   | { type: 'event'; event: GameEvent }           // announcer cues (lead change, finish, ...)
-  | { type: 'lobby'; roomCode: string; players: LobbyPlayer[]; phase: Phase }   // roster (~2/s in pre-race)
+  | { type: 'lobby'; roomCode: string; players: LobbyPlayer[]; phase: Phase; touch?: MenuTouchState }   // roster (~2/s in pre-race)
   | { type: 'select_state'; roomCode: string; phase: Phase; players: LobbyPlayer[];
       maps: string[]; selectedMap: string | null;
-      mapVotes?: Record<string, number>; mapTie?: boolean }   // car/map-select screen state (+ live vote tally)
-  | { type: 'results'; roomCode: string; map: string | null; results: RaceResult[] }; // post-race scoreboard
+      mapVotes?: Record<string, number>; mapTie?: boolean; touch?: MenuTouchState }   // car/map-select screen state (+ live vote tally)
+  | { type: 'results'; roomCode: string; map: string | null; results: RaceResult[]; touch?: MenuTouchState }; // post-race scoreboard
 
 export type GameEvent =
   | { kind: 'enter_car_select'; spokenReplyPlayerId?: string }  // flow reached car-select
   | { kind: 'enter_map_select'; spokenReplyPlayerId?: string }  // flow reached map-select
   | { kind: 'car_picked'; playerId: string; name: string; car: string; spokenReplyPlayerId?: string }  // a player locked a car
-  | { kind: 'map_picked'; map: string; playerId?:string } // one caller cast or changed a track vote
+  | { kind: 'map_picked'; map: string; playerId?:string; spokenReplyPlayerId?: string } // one caller cast or changed a track vote
   | { kind: 'countdown'; n: number }
   | { kind: 'go' }
   | { kind: 'lead_change'; playerId: string; name: string }

@@ -2,6 +2,18 @@ import { describe, expect, it } from 'vitest';
 import { FIGHTER_LOADING_TIMEOUT_SECONDS, FIGHTER_VICTORY_SECONDS, FIGHTER_VOICE_COMMAND_TTL_SECONDS, MAX_VOICE_COMMAND_QUEUE, FighterRoom } from '../server/fighter-room';
 import { FIGHTER_INTRO_SECONDS } from '../shared/fighter-protocol';
 
+function readyFightRoom(now: () => number = Date.now): FighterRoom {
+  const room = new FighterRoom('VOICE', 1, undefined, now);
+  const first = room.addPlayer('Ada') as { playerId: string };
+  const second = room.addPlayer('Bo') as { playerId: string };
+  room.advance();
+  room.selectFighter(first.playerId, 'nyx'); room.selectFighter(second.playerId, 'wraith');
+  room.advance(); room.selectMap(first.playerId, 'void'); room.advance();
+  room.ready(room.state().loadingGeneration);
+  room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+  return room;
+}
+
 describe('fighter room', () => {
   it('keeps standalone Fighter in lobby until a named caller explicitly advances', () => {
     const room = new FighterRoom('NAMES', 1);
@@ -223,11 +235,142 @@ describe('fighter room', () => {
     expect(room.advance()).toBe(false);
     room.tick(FIGHTER_VICTORY_SECONDS);
     expect(room.phase).toBe('results');
+    expect(room.advance()).toBe(false);
+    expect(room.acknowledgePresentation('results',room.state().loadingGeneration)).toBe(true);
     expect(room.advance()).toBe(true);
     expect(room.phase).toBe('fighter_select');
   });
 
-  it('keeps at most two pending voice commands and preserves their order', () => {
+  it('accepts only current-match display paint receipts and invalidates them on display loss', () => {
+    const room = new FighterRoom('PAINT', 1);
+    const player=room.addPlayer('Ada');if('error' in player)throw new Error(player.error);
+    room.advance();room.selectFighter(player.playerId,'nyx');room.advance();
+    room.selectMap(player.playerId,'void');room.advance();
+    const generation=room.state().loadingGeneration;
+    room.ready(generation);room.tick(FIGHTER_INTRO_SECONDS);room.tick(6);
+    expect(room.hudPresented).toBe(false);
+    expect(room.acknowledgePresentation('fight',generation+1)).toBe(false);
+    expect(room.acknowledgePresentation('fight',generation)).toBe(true);
+    expect(room.hudPresented).toBe(true);
+    const world=room.state().world!;world.p1.x=0;world.p2.x=1;world.p2.health=10;
+    room.command(player.playerId,'kick');room.tick(.6);room.tick(FIGHTER_VICTORY_SECONDS);
+    expect(room.resultsPresented).toBe(false);
+    expect(room.acknowledgePresentation('results',generation+1)).toBe(false);
+    expect(room.acknowledgePresentation('results',generation)).toBe(true);
+    expect(room.resultsPresented).toBe(true);
+    room.invalidatePresentation();
+    expect(room.resultsPresented).toBe(false);
+  });
+
+  it('exposes a bounded result-presentation recovery deadline without falsely marking paint', () => {
+    let now=10_000;
+    const room=new FighterRoom('RECOVER',1,undefined,()=>now);
+    const player=room.addPlayer('Ada');if('error' in player)throw new Error(player.error);
+    room.advance();room.selectFighter(player.playerId,'nyx');room.advance();
+    room.selectMap(player.playerId,'void');room.advance();
+    room.ready(room.state().loadingGeneration);room.tick(FIGHTER_INTRO_SECONDS);room.tick(6);
+    const world=room.state().world!;world.p1.x=0;world.p2.x=1;world.p2.health=10;
+    room.command(player.playerId,'kick');room.tick(.6);room.tick(FIGHTER_VICTORY_SECONDS);
+    expect(room.resultsPresentationTimedOut).toBe(false);
+    expect(room.resultsPresented).toBe(false);
+    now += 15_001;
+    expect(room.resultsPresentationTimedOut).toBe(true);
+    expect(room.resultsPresented).toBe(false);
+  });
+
+  it('lets a finished caller skip the optional victory hold into results', () => {
+    const room=new FighterRoom('SKIP',1);
+    const player=room.addPlayer('Ada');if('error' in player)throw new Error(player.error);
+    room.advance();room.selectFighter(player.playerId,'nyx');room.advance();
+    room.selectMap(player.playerId,'void');room.advance();
+    room.ready(room.state().loadingGeneration);room.tick(FIGHTER_INTRO_SECONDS);room.tick(6);
+    const world=room.state().world!;world.p1.x=0;world.p2.x=1;world.p2.health=10;
+    room.command(player.playerId,'kick');room.tick(.6);
+    expect(room.phase).toBe('victory');
+    expect(room.revealResults('stale')).toBe(false);
+    expect(room.revealResults(player.playerId)).toBe(true);
+    expect(room.phase).toBe('results');
+    expect(room.resultsPresented).toBe(false);
+  });
+
+  it('rejects a stale caller attempting to replay another player’s finished match', () => {
+    const room = readyFightRoom();
+    const playerId = room.lobbyPlayers().find(player => !player.isAi)!.playerId;
+    const world=room.state().world!;world.status='finished';world.winner='p1';
+    room.tick(.1);room.tick(FIGHTER_VICTORY_SECONDS);
+    room.acknowledgePresentation('results',room.state().loadingGeneration);
+    expect(room.advance('stale-player')).toBe(false);
+    expect(room.phase).toBe('results');
+    expect(room.advance(playerId)).toBe(true);
+  });
+
+  it('supersedes a recovery attack with a newer defensive voice command and resolves both receipts', () => {
+    const room = readyFightRoom();
+    const playerId = room.lobbyPlayers().find(player => player.side === 'p1')!.playerId;
+    expect(room.voiceCommand(playerId, 'punch', 'opening')).toMatchObject({ status: 'executed' });
+    expect(room.voiceCommand(playerId, 'kick', 'stale-attack')).toMatchObject({ status: 'queued' });
+    expect(room.voiceCommand(playerId, 'block', 'new-block')).toMatchObject({ status: 'queued' });
+    expect(room.drainVoiceCommandOutcomes()).toContainEqual(expect.objectContaining({
+      requestId: 'stale-attack', status: 'rejected', reason: 'superseded',
+    }));
+    room.tick(0.8);
+    expect(room.drainVoiceCommandOutcomes()).toContainEqual(expect.objectContaining({
+      requestId: 'new-block', status: 'executed',
+    }));
+    expect(room.drainEvents().flatMap(event => event.type === 'action' && event.fighter === 'p1' ? [event.command] : []))
+      .toEqual(['punch', 'block']);
+  });
+
+  it('keeps both commands from one voice sequence in order through recovery', () => {
+    const room = readyFightRoom();
+    const playerId = room.lobbyPlayers().find(player => player.side === 'p1')!.playerId;
+    room.voiceCommand(playerId, 'punch', 'opening');
+    expect(room.voiceSequence(playerId, ['kick', 'block'], ['pair-1', 'pair-2']))
+      .toEqual([expect.objectContaining({ status: 'queued' }), expect.objectContaining({ status: 'queued' })]);
+    room.tick(0.75);
+    expect(room.drainVoiceCommandOutcomes()).toContainEqual(expect.objectContaining({
+      requestId: 'pair-1', status: 'executed',
+    }));
+    room.tick(1);
+    expect(room.drainVoiceCommandOutcomes()).toContainEqual(expect.objectContaining({
+      requestId: 'pair-2', status: 'executed',
+    }));
+    expect(room.drainEvents().flatMap(event => event.type === 'action' && event.fighter === 'p1' ? [event.command] : []))
+      .toEqual(['punch', 'kick', 'block']);
+  });
+
+  it('reports expired sequence commands instead of silently dropping them', () => {
+    let now = 0;
+    const room = readyFightRoom(() => now);
+    const playerId = room.lobbyPlayers().find(player => player.side === 'p1')!.playerId;
+    room.voiceCommand(playerId, 'punch', 'opening');
+    room.voiceSequence(playerId, ['kick', 'block'], ['pair-1', 'pair-2']);
+    now = FIGHTER_VOICE_COMMAND_TTL_SECONDS * 1000 + 1;
+    room.tick(0.1);
+    expect(room.drainVoiceCommandOutcomes()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requestId: 'pair-1', status: 'rejected', reason: 'expired' }),
+      expect.objectContaining({ requestId: 'pair-2', status: 'rejected', reason: 'expired' }),
+    ]));
+  });
+
+  it('lets only a loaded solo match skip the optional intro and countdown', () => {
+    const solo = new FighterRoom('SOLO');
+    const player = solo.addPlayer('Ada') as { playerId: string };
+    solo.advance(); solo.selectFighter(player.playerId, 'nyx'); solo.advance(); solo.selectMap(player.playerId, 'void'); solo.advance();
+    expect(solo.startNow(player.playerId)).toBe(false);
+    expect(solo.phase).toBe('loading');
+    solo.ready(solo.state().loadingGeneration);
+    expect(solo.startNow(player.playerId)).toBe(true);
+    expect(solo.phase).toBe('fight');
+
+    const duo = readyFightRoom();
+    const first = duo.lobbyPlayers().find(p => p.side === 'p1')!.playerId;
+    duo.phase = 'intro';
+    expect(duo.startNow(first)).toBe(false);
+    expect(duo.phase).toBe('intro');
+  });
+
+  it('treats later standalone voice commands as corrections, leaving at most two dependent commands', () => {
     const room = new FighterRoom('4821'); const a = room.addPlayer('A'), b = room.addPlayer('B');
     if ('error' in a || 'error' in b) throw new Error('join failed');
     room.advance(); room.selectFighter(a.playerId, 'nyx'); room.selectFighter(b.playerId, 'wraith');
@@ -236,11 +379,11 @@ describe('fighter room', () => {
     expect(room.voiceCommand(a.playerId,'jump')).toBe(true);
     expect(room.voiceCommand(a.playerId,'punch')).toBe(true);
     expect(room.voiceCommand(a.playerId,'kick')).toBe(true);
-    expect(room.voiceCommand(a.playerId,'block')).toBe(false);
+    expect(room.voiceCommand(a.playerId,'block')).toBe(true);
     const events = room.drainEvents();
     for (let index = 0; index < 20; index++) { room.tick(0.1); events.push(...room.drainEvents()); }
     expect(events.flatMap(event=>event.type==='action'&&event.fighter==='p1'?[event.command]:[]))
-      .toEqual(['jump','punch','kick']);
+      .toEqual(['jump','block']);
   });
 
   it('expires stale queued voice commands',()=>{

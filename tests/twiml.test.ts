@@ -71,10 +71,11 @@ describe('twimlConnectRelay', () => {
   });
   it('enables barge-in interruption + receiving speech during TTS (headline CR feature)', () => {
     expect(xml).toContain('interruptible="any"');
+    expect(xml).toContain('welcomeGreetingInterruptible="any"');
     expect(xml).toContain('reportInputDuringAgentSpeech="any"');
-    // noisy shared screen: tuned so background chatter/backchannel doesn't falsely cut the host
-    expect(xml).toContain('interruptSensitivity="medium"');
-    expect(xml).toContain('ignoreBackchannel="true"');
+    // Even a short acknowledgement can interrupt a menu or explanation.
+    expect(xml).toContain('interruptSensitivity="high"');
+    expect(xml).toContain('ignoreBackchannel="false"');
   });
   it('subscribes to playback completion for graceful call retirement', () => {
     expect(xml).toContain('events="tokens-played"');

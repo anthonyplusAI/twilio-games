@@ -35,6 +35,7 @@ export class BattleRoom {
   private active: Side | null = null;
   private battleGeneration = 0;
   private resultsReadyAt = 0;
+  private _resultsPresented = false;
   private presentationReadyAt = 0;
   private lastPresentedActionSide: Side | null = null;
   private expectedHumanPlayers = 1;
@@ -51,8 +52,20 @@ export class BattleRoom {
   get playerCount(): number { return this.slots.length; }
   get isEmpty(): boolean { return this.slots.length === 0; }
   get generation(): number { return this.battleGeneration; }
-  get canRematch(): boolean { return this._phase === 'results' && Date.now() >= this.resultsReadyAt; }
-  get rematchReadyInMs(): number { return this._phase === 'results' ? Math.max(0, this.resultsReadyAt - Date.now()) : 0; }
+  get resultsPresented():boolean{return this._phase==='results'&&this._resultsPresented;}
+  get resultsPresentationTimedOut():boolean{return this._phase==='results'&&!this._resultsPresented
+    &&this.resultsReadyAt>0&&Date.now()>=this.resultsReadyAt;}
+  get canRematch(): boolean { return this._phase === 'results' && (this._resultsPresented || Date.now() >= this.resultsReadyAt); }
+  get rematchReadyInMs(): number { return this._phase === 'results'&&!this._resultsPresented ? Math.max(0, this.resultsReadyAt - Date.now()) : 0; }
+  isFinishedBattleParticipant(playerId:string):boolean{return this._phase==='results'&&this.isBattleParticipant(playerId);}
+  acknowledgeResultsPresented(generation:number):boolean{
+    if(this._phase!=='results'||!this._result||generation!==this.battleGeneration||this._resultsPresented)return false;
+    this._resultsPresented=true;return true;
+  }
+  invalidateResultsPresentation():boolean{
+    if(!this._resultsPresented)return false;
+    this._resultsPresented=false;return true;
+  }
   get canAdvanceLobby(): boolean {
     return this._phase === 'lobby' && this.slots.length >= this.expectedHumanPlayers
       && this.slots.every(slot => slot.nameConfirmed);
@@ -142,20 +155,23 @@ export class BattleRoom {
   }
 
   /** Pick a monster during monster_select (validated against the roster). */
-  selectMonster(playerId: string, monsterId: string): void {
-    if (this._phase !== 'monster_select') return;
-    if (!monsterById(monsterId)) return;
+  selectMonster(playerId: string, monsterId: string): boolean {
+    if (this._phase !== 'monster_select') return false;
+    if (!monsterById(monsterId)) return false;
     const s = this.slots.find(x => x.id === playerId);
-    if (s) s.monsterId=monsterId;
+    if (!s) return false;
+    s.monsterId=monsterId;
+    return true;
   }
 
   /** Host advances the flow: lobby → monster_select → battle. From results, "advance" = rematch
    *  (keep the roster, back to monster_select). Starting the battle fills an AI opponent when solo. */
   advance(playerId?: string): boolean {
     if (this._phase === 'results') {
-      if (!this.canRematch) return false;
+      if (!this.canRematch || (playerId && !this.isBattleParticipant(playerId))) return false;
       this.world = null; this.ai = null; this._result = null;
       this.resultsReadyAt = 0;
+      this._resultsPresented = false;
       this.presentationReadyAt = 0;
       this.lastPresentedActionSide = null;
       for (const s of this.slots) s.monsterId = null;
@@ -171,9 +187,10 @@ export class BattleRoom {
     return false;
   }
 
-  back(): void {
-    if(this.automaticSetup)return;
-    if (this._phase === 'monster_select') this._phase = 'lobby';
+  back(playerId?:string): boolean {
+    if(this.automaticSetup&&(!playerId||!this.canControlSetup(playerId)))return false;
+    if (this._phase === 'monster_select') { this._phase = 'lobby'; return true; }
+    return false;
   }
 
   /** Ready to battle when at least one human has picked a monster (the 2nd side is the other human
@@ -207,6 +224,7 @@ export class BattleRoom {
     this.active = this.ai?.side === 'a' ? 'b' : 'a';
     this.battleGeneration++;
     this.resultsReadyAt = 0;
+    this._resultsPresented = false;
     this.presentationReadyAt = 0;
     this.lastPresentedActionSide = null;
     this._phase = 'battle';
@@ -256,14 +274,16 @@ export class BattleRoom {
     return side ? this.menu[side] : 'root';
   }
 
-  openFightMenu(playerId: string): void {
+  openFightMenu(playerId: string): boolean {
     const side = this.sideOfPlayer(playerId);
-    if (side && this.activeSide() === side) this.menu[side] = 'fight';
+    if (side && this.activeSide() === side) { this.menu[side] = 'fight'; return true; }
+    return false;
   }
 
-  backMenu(playerId: string): void {
+  backMenu(playerId: string): boolean {
     const side = this.sideOfPlayer(playerId);
-    if (side && this.activeSide() === side) this.menu[side] = 'root';
+    if (side && this.activeSide() === side) { this.menu[side] = 'root'; return true; }
+    return false;
   }
 
   /** True when it's single-player, we're mid-battle, and the active side is the AI. The server polls
@@ -320,6 +340,7 @@ export class BattleRoom {
       this.active = null;
       this._phase = 'results';
       this.resultsReadyAt = this.presentationReadyAt;
+      this._resultsPresented = false;
     }
   }
 
@@ -328,6 +349,7 @@ export class BattleRoom {
     this.menu = { a: 'root', b: 'root' };
     this.active = null;
     this.resultsReadyAt = 0;
+    this._resultsPresented = false;
     this.presentationReadyAt = 0;
     this.lastPresentedActionSide = null;
     for (const s of this.slots) s.monsterId = null;
@@ -362,6 +384,7 @@ export class BattleRoom {
     this.menu = { a: 'root', b: 'root' };
     this.active = null;
     this.resultsReadyAt = 0;
+    this._resultsPresented = false;
     this.presentationReadyAt = 0;
     this.lastPresentedActionSide = null;
     this._phase = this.slots.length > 0 && this.slots.every(slot => slot.nameConfirmed) ? 'monster_select' : 'lobby';

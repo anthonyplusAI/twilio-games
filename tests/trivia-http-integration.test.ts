@@ -525,7 +525,10 @@ describe('Voice Trivia central runtime', () => {
     const room = runtime.trivia.findRoom(roomCode)!;
     now.value = room.state().countdownEndsAtMs!;
     for (let index = 0; index < 8; index++) {
-      await waitFor(() => room.phase === 'question' && room.state().questionIndex === index ? true : undefined);
+      await waitFor(() => room.phase === 'question_prompt' && room.state().questionIndex === index
+        ? true : undefined);
+      await finishTrustedQuestionAudio(runtime.trivia, room, display, players);
+      expect(room.phase).toBe('question');
       const question = room.state();
       now.value = question.answeringStartsAtMs!;
       for (const playerId of players) {
@@ -754,6 +757,19 @@ describe('Voice Trivia central runtime', () => {
     for (const caller of callers) caller.holdText = text => /^Question 1\b/i.test(text);
     now.value = room.state().countdownEndsAtMs!;
     runtime.tickTrivia();
+    await waitFor(() => room.phase === 'question_prompt' ? true : undefined);
+    await paintTriviaView(display, runtime.trivia, room, 'question_prompt', bindingPlayerIds[0]!);
+    expect(room.state().answeringStartsAtMs).toBeNull();
+    await waitFor(() => callers.every(caller => caller.held.length === 1) ? true : undefined);
+    for (const caller of callers) {
+      expect(caller.acknowledgements).not.toContain(caller.held[0]!.token);
+      expect(caller.held[0]!.text).toMatch(/^Question 1\b/i);
+    }
+    expect(room.phase).toBe('question_prompt');
+    for (const caller of callers) acknowledgeRelayText(caller, caller.held[0]!.token);
+    await waitFor(() => room.phase === 'answer_cue' ? true : undefined);
+    expect(room.state().answeringStartsAtMs).toBeNull();
+    await paintTriviaView(display, runtime.trivia, room, 'answer_cue', bindingPlayerIds[0]!);
     const firstQuestionDisplayState = await waitFor(() => display.messages.find(message => (
       message.type === 'trivia_state' && message.phase === 'question' && message.questionIndex === 0
     )));
@@ -763,9 +779,8 @@ describe('Voice Trivia central runtime', () => {
     expect(firstQuestionState.answeringStartsAtMs).toBe(now.value);
     expect(firstQuestionState.questionEndsAtMs).toBe(now.value + 10_000);
     expect(JSON.stringify(firstQuestionDisplayState)).not.toMatch(/correctChoiceId|submittedChoiceId|aliases|explanation/i);
-    await waitFor(() => callers.every(caller => caller.held.length === 1) ? true : undefined);
     for (const caller of callers) {
-      expect(caller.acknowledgements).not.toContain(caller.held[0]!.token);
+      expect(caller.acknowledgements).toContain(caller.held[0]!.token);
       expect(caller.held[0]!.text).toMatch(/^Question 1\b/i);
     }
 
@@ -780,7 +795,7 @@ describe('Voice Trivia central runtime', () => {
     const firstWrong = firstQuestion.choices.find(choice => choice.id !== firstCorrect)!.id;
     now.value = firstQuestionState.answeringStartsAtMs!;
     const initialLockCounts = callers.map(caller => relaySpeechCount(caller, /Answer locked/i));
-    const initialRevealCounts = callers.map(caller => relaySpeechCount(caller, /The answer was/i));
+    const initialRevealCounts = callers.map(caller => relaySpeechCount(caller, /Correct choice:/i));
 
     const correctIndex = firstQuestion.choices.findIndex(choice => choice.id === firstCorrect);
     const firstInputs = [
@@ -802,7 +817,7 @@ describe('Voice Trivia central runtime', () => {
       expect(callers.map(caller => relaySpeechCount(caller, /Answer locked/i))).toEqual(
         initialLockCounts.map((count, playerIndex) => count + (playerIndex <= index ? 1 : 0)),
       );
-      for (const caller of callers) expect(caller.acknowledgements).not.toContain(caller.held[0]!.token);
+      for (const caller of callers) expect(caller.acknowledgements).toContain(caller.held[0]!.token);
     }
     expect(room.state().players.map(player => ({
       answered: player.answered,
@@ -825,7 +840,7 @@ describe('Voice Trivia central runtime', () => {
     expect(relaySpeechCount(callers[2]!, /Answer locked/i)).toBe(initialLockCounts[2]! + 1);
 
     const staleRevealCaller = callers[0]!;
-    staleRevealCaller.holdText = text => /^The answer was\b/i.test(text);
+    staleRevealCaller.holdText = text => /^Correct choice:/i.test(text);
     firstInputs[3]!();
     await waitFor(() => room.phase === 'reveal' ? true : undefined);
     await waitFor(() => relaySpeechCount(callers[3]!, /Answer locked/i) === initialLockCounts[3]! + 1
@@ -834,25 +849,30 @@ describe('Voice Trivia central runtime', () => {
     expect(room.state().players.map(player => player.correctCount)).toEqual([1, 1, 0, 1]);
     expect(callers.every(caller => relaySpeechCount(caller, /^Question 1\b/i) === 1)).toBe(true);
     for (let index = 0; index < callers.length; index++) {
-      await waitFor(() => relaySpeechCount(callers[index]!, /The answer was/i) === initialRevealCounts[index]! + 1
+      await waitFor(() => relaySpeechCount(callers[index]!, /Correct choice:/i) === initialRevealCounts[index]! + 1
         ? true : undefined);
     }
     await waitFor(() => staleRevealCaller.held.length === 2 ? true : undefined);
     const staleReveal = staleRevealCaller.held[1]!;
-    expect(staleReveal.text).toMatch(/^The answer was\b/i);
+    expect(staleReveal.text).toMatch(/^Correct choice:/i);
     expect(staleRevealCaller.acknowledgements).not.toContain(staleReveal.token);
     const firstRevealSpeech = callers.map(caller => (
-      caller.speech.find(text => /The answer was/i.test(text)) ?? ''
+      caller.speech.find(text => /Correct choice:/i.test(text)) ?? ''
     ));
-    expect(firstRevealSpeech[2]).toMatch(/not correct.*gained 0 points/i);
-    expect(firstRevealSpeech[0]).toMatch(/was correct.*gained/i);
-    expect(firstRevealSpeech[1]).toMatch(/was correct.*gained/i);
-    expect(firstRevealSpeech[3]).toMatch(/was correct.*gained/i);
+    expect(firstRevealSpeech[2]).toMatch(/You earned 0 points/i);
+    expect(firstRevealSpeech[0]).toMatch(/You earned [1-9]/i);
+    expect(firstRevealSpeech[1]).toMatch(/You earned [1-9]/i);
+    expect(firstRevealSpeech[3]).toMatch(/You earned [1-9]/i);
 
     for (let questionIndex = 1; questionIndex < 8; questionIndex++) {
-      const priorRevealCounts = callers.map(caller => relaySpeechCount(caller, /The answer was/i));
+      const priorRevealCounts = callers.map(caller => relaySpeechCount(caller, /Correct choice:/i));
       now.value = room.state().revealEndsAtMs!;
       runtime.tickTrivia();
+      await waitFor(() => room.phase === 'question_prompt' && room.state().questionIndex === questionIndex
+        ? true : undefined);
+      await paintTriviaView(display, runtime.trivia, room, 'question_prompt', bindingPlayerIds[0]!);
+      await waitFor(() => room.phase === 'answer_cue' ? true : undefined);
+      await paintTriviaView(display, runtime.trivia, room, 'answer_cue', bindingPlayerIds[0]!);
       await waitFor(() => room.phase === 'question' && room.state().questionIndex === questionIndex
         ? true : undefined);
       const state = room.state();
@@ -863,7 +883,7 @@ describe('Voice Trivia central runtime', () => {
         });
         await waitForRelaySpeech(staleRevealCaller, 0, text => /^Question 2\b/i.test(text));
         expect(staleRevealCaller.acknowledgements).not.toContain(staleReveal.token);
-        expect(relaySpeechCount(staleRevealCaller, /The answer was/i)).toBe(initialRevealCounts[0]! + 1);
+        expect(relaySpeechCount(staleRevealCaller, /Correct choice:/i)).toBe(initialRevealCounts[0]! + 1);
       }
       const question = state.question!;
       const correct = correctChoiceId(question.id);
@@ -880,7 +900,7 @@ describe('Voice Trivia central runtime', () => {
       }
       await waitFor(() => room.phase === 'reveal' ? true : undefined);
       for (let playerIndex = 0; playerIndex < callers.length; playerIndex++) {
-        await waitFor(() => relaySpeechCount(callers[playerIndex]!, /The answer was/i) === priorRevealCounts[playerIndex]! + 1
+        await waitFor(() => relaySpeechCount(callers[playerIndex]!, /Correct choice:/i) === priorRevealCounts[playerIndex]! + 1
           ? true : undefined);
       }
     }
@@ -961,12 +981,14 @@ describe('Voice Trivia central runtime', () => {
         .filter(message => message.type === 'text')
         .map(message => String(message.token));
       expect(caller.acknowledgements).toEqual(outgoingTokens.filter(token => (
-        !caller.held.some(held => held.token === token)
+        caller !== staleRevealCaller || token !== staleReveal.token
       )));
-      expect(caller.messages.filter(message => message.type === 'text').every(message => (
-        message.last === true && message.lang === 'en-US'
-        && message.interruptible === true && message.preemptible === true
+      const textFrames = caller.messages.filter(message => message.type === 'text');
+      expect(textFrames.every(message => (
+        message.lang === 'en-US' && message.interruptible === true && message.preemptible === true
       ))).toBe(true);
+      expect(textFrames.some(message => message.last === false)).toBe(true);
+      expect(textFrames.at(-1)?.last).toBe(true);
     }
 
     const terminalResult = JSON.stringify(result);
@@ -1478,6 +1500,7 @@ describe('Voice Trivia central runtime', () => {
     now.value = room.state().countdownEndsAtMs!;
     room.tick();
     for (let questionIndex = 0; questionIndex < 8; questionIndex++) {
+      settleRoomQuestionAudio(room, [playerId]);
       const question = room.state().question!;
       now.value = room.state().answeringStartsAtMs!;
       runtime.trivia.voiceAnswer('STATION-TERMINAL', playerId, correctChoiceId(question.id));
@@ -1518,18 +1541,24 @@ describe('Voice Trivia central runtime', () => {
     expect(JSON.stringify(runtime.trivia.findRoom('STATION-TERMINAL')!.state())).toBe(terminalSnapshot);
   });
 
-  it('keeps central Trivia question playback independent from room timing', async () => {
+  it('opens central Trivia clock only after required question and cue playback completes', async () => {
     const now = { value: 0 };
     const runtime = await harness({ now });
+    const display = await connect(runtime.port, '/trivia?display=1');
+    display.ws.send(JSON.stringify({ type: 'display_auth', roomCode: 'CUE-WIRING', token: DISPLAY_TOKEN }));
+    display.ws.send(JSON.stringify({ type: 'spectate', roomCode: 'CUE-WIRING' }));
+    await waitFor(() => display.messages.find(message => message.type === 'host_identity' && message.isHost));
     const internal = server as unknown as {
-      makeTriviaSession(say: (text: string) => Promise<boolean>): TriviaVoiceSession;
+      makeTriviaSession(say: (text: string) => Promise<'played'>): TriviaVoiceSession;
     };
     const promptReady = vi.spyOn(runtime.trivia, 'voiceQuestionPromptReady');
     const cueReady = vi.spyOn(runtime.trivia, 'voiceQuestionAnswerCueReady');
     const spoken: string[] = [];
-    const session = internal.makeTriviaSession(async text => {
+    let finishPrompt!: (outcome: 'played') => void;
+    const pendingPrompt = new Promise<'played'>(resolve => { finishPrompt = resolve; });
+    const session = internal.makeTriviaSession(text => {
       spoken.push(text);
-      return true;
+      return /^Question 1\b/.test(text) ? pendingPrompt : Promise.resolve('played');
     });
     session.setAuthoritativeName('Ada');
     session.handleMessage(JSON.stringify({
@@ -1542,10 +1571,22 @@ describe('Voice Trivia central runtime', () => {
     now.value = room.state().countdownEndsAtMs!;
     room.tick();
     session.onStateChanged();
-    await session.whenSpeechSettled();
-
+    expect(spoken.some(text => /^Question 1\b/.test(text))).toBe(false);
+    await paintTriviaView(display, runtime.trivia, room, 'question_prompt', session.boundPlayerId!);
+    await waitFor(() => spoken.some(text => /^Question 1\b/.test(text)) ? true : undefined);
     expect(promptReady).not.toHaveBeenCalled();
     expect(cueReady).not.toHaveBeenCalled();
+    expect(room.phase).toBe('question_prompt');
+    expect(room.state().answeringStartsAtMs).toBeNull();
+
+    finishPrompt('played');
+    await waitFor(() => room.phase === 'answer_cue' ? true : undefined);
+    expect(cueReady).not.toHaveBeenCalled();
+    expect(room.state().answeringStartsAtMs).toBeNull();
+    await paintTriviaView(display, runtime.trivia, room, 'answer_cue', session.boundPlayerId!);
+    await session.whenSpeechSettled();
+    expect(promptReady).toHaveBeenCalledOnce();
+    expect(cueReady).toHaveBeenCalledOnce();
     expect(room.phase).toBe('question');
     expect(room.state().answeringStartsAtMs).toBe(now.value);
     expect(spoken.join(' ')).toMatch(/Question 1.*choices are One, .*Two, .*Three, .*Four,/i);
@@ -1821,6 +1862,79 @@ function waitForRelaySpeech(
 
 function relaySpeechCount(caller: FakeRelayCaller, pattern: RegExp): number {
   return caller.speech.filter(text => pattern.test(text)).length;
+}
+
+async function paintTriviaView(
+  display: { ws: WebSocket; messages: Record<string, any>[] },
+  trivia: TriviaServer,
+  room: TriviaRoom,
+  phase: 'question_prompt' | 'answer_cue',
+  playerId: string,
+): Promise<void> {
+  const current = room.state();
+  expect(current.phase).toBe(phase);
+  const view = await waitFor(() => display.messages.find(message => (
+    message.type === 'trivia_state' && message.phase === phase
+      && message.question?.id === current.question?.id
+      && message.questionAttemptId === current.questionAttemptId
+      && message.renderRevision === current.renderRevision
+  )));
+  display.ws.send(JSON.stringify({
+    type: 'view_rendered', phase,
+    questionId: view.question.id,
+    questionAttemptId: view.questionAttemptId,
+    renderRevision: view.renderRevision,
+  }));
+  const nextPhase = phase === 'question_prompt' ? 'answer_cue' : 'question';
+  await waitFor(() => room.phase === nextPhase
+    || trivia.voiceSnapshot(room.code, playerId)?.displayViewReady ? true : undefined);
+}
+
+async function finishTrustedQuestionAudio(
+  trivia: TriviaServer,
+  room: TriviaRoom,
+  display: { ws: WebSocket; messages: Record<string, any>[] },
+  playerIds: readonly string[],
+): Promise<void> {
+  await paintTriviaView(display, trivia, room, 'question_prompt', playerIds[0]!);
+  const prompt = room.state();
+  for (const playerId of playerIds) {
+    const generation = trivia.voiceBeginPromptDelivery(room.code, playerId,
+      prompt.question!.id, prompt.questionAttemptId!);
+    expect(generation).not.toBeNull();
+    expect(trivia.voiceQuestionPromptReady(room.code, playerId, prompt.question!.id,
+      prompt.questionAttemptId!, generation!)).toBe(true);
+  }
+  expect(room.phase).toBe('answer_cue');
+  expect(room.state().answeringStartsAtMs).toBeNull();
+  await paintTriviaView(display, trivia, room, 'answer_cue', playerIds[0]!);
+  const cue = room.state();
+  for (const playerId of playerIds) {
+    const generation = trivia.voiceBeginAnswerCueDelivery(room.code, playerId,
+      cue.question!.id, cue.questionAttemptId!);
+    expect(generation).not.toBeNull();
+    expect(trivia.voiceQuestionAnswerCueReady(room.code, playerId, cue.question!.id,
+      cue.questionAttemptId!, generation!)).toBe(true);
+  }
+  expect(room.phase).toBe('question');
+}
+
+function settleRoomQuestionAudio(room: TriviaRoom, playerIds: readonly string[]): void {
+  const prompt = room.state();
+  expect(prompt.phase).toBe('question_prompt');
+  for (const playerId of playerIds) {
+    const generation = room.beginPromptDelivery(playerId, prompt.question!.id, prompt.questionAttemptId!);
+    expect(generation).not.toBeNull();
+    expect(room.questionPromptReady(playerId, prompt.question!.id, prompt.questionAttemptId!, generation!)).toBe(true);
+  }
+  const cue = room.state();
+  expect(cue.phase).toBe('answer_cue');
+  for (const playerId of playerIds) {
+    const generation = room.beginAnswerCueDelivery(playerId, cue.question!.id, cue.questionAttemptId!);
+    expect(generation).not.toBeNull();
+    expect(room.questionAnswerCueReady(playerId, cue.question!.id, cue.questionAttemptId!, generation!)).toBe(true);
+  }
+  expect(room.phase).toBe('question');
 }
 
 function sendFinalTranscript(caller: FakeRelayCaller, voicePrompt: string): void {

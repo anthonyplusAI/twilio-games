@@ -20,6 +20,7 @@ export interface FighterState {
   expectedPlayerCount: number; hasExpectedPlayers: boolean;
   automaticSetup:boolean;
   loadingGeneration: number;
+  hudPresented:boolean; resultsPresented:boolean;
   intro: number | null;
   countdown: number | null;
   result: { winner: 'p1' | 'p2'; winnerName: string } | null;
@@ -31,6 +32,9 @@ export type FighterClientMessage =
   | { type: 'display_auth'; roomCode: string; token: string }
   | { type: 'select_fighter'; fighterId: string }
   | { type: 'select_map'; mapId: string }
+  | { type: 'display_select_fighter'; playerId: string; fighterId: string }
+  | { type: 'display_select_map'; playerId: string; mapId: string }
+  | { type: 'ack_display'; phase:'fight'|'results'; loadingGeneration:number }
   | { type: 'command'; command: FighterCommand }
   | { type: 'advance' }
   | { type: 'ready'; loadingGeneration: number }
@@ -45,6 +49,7 @@ export type FighterServerMessage =
   | { type: 'fighter_roster'; fighters: FighterRosterEntry[]; maps: FighterMapEntry[] }
   | ({ type: 'fighter_state' } & FighterState)
   | { type: 'fighter_events'; events: FighterEvent[] }
+  | { type: 'show_results'; loadingGeneration:number }
   | { type: 'error'; code: string; message: string };
 
 export function parseFighterClientMessage(raw: string): FighterClientMessage | { type: 'error'; code: string; message: string } {
@@ -68,6 +73,17 @@ export function parseFighterClientMessage(raw: string): FighterClientMessage | {
       return { type: 'display_auth', roomCode: m.roomCode as string, token: m.token as string };
     case 'select_fighter': return short(m.fighterId) ? { type: 'select_fighter', fighterId: m.fighterId as string } : error('bad_select', 'fighterId required');
     case 'select_map': return short(m.mapId) ? { type: 'select_map', mapId: m.mapId as string } : error('bad_select', 'mapId required');
+    case 'display_select_fighter': return short(m.playerId) && short(m.fighterId)
+      ? { type: 'display_select_fighter', playerId: m.playerId as string, fighterId: m.fighterId as string }
+      : error('bad_select', 'playerId + fighterId required');
+    case 'display_select_map': return short(m.playerId) && short(m.mapId)
+      ? { type: 'display_select_map', playerId: m.playerId as string, mapId: m.mapId as string }
+      : error('bad_select', 'playerId + mapId required');
+    case 'ack_display':
+      return (m.phase==='fight'||m.phase==='results')&&Number.isSafeInteger(m.loadingGeneration)
+        &&(m.loadingGeneration as number)>=1
+        ? {type:'ack_display',phase:m.phase,loadingGeneration:m.loadingGeneration as number}
+        :error('bad_ack','invalid display paint receipt');
     case 'command': return isCommand(m.command) ? { type: 'command', command: m.command } : error('bad_command', 'invalid fighter command');
     case 'advance': return { type: 'advance' };
     case 'ready':

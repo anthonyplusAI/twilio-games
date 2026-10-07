@@ -437,7 +437,7 @@ function unlockInteraction(): void {
 
 function renderFlow(force = false): void {
   const flowKey = JSON.stringify([
-    state?.phase, state?.singer, state?.selectedSong?.id, state?.loadingGeneration, state?.result,
+    state?.phase, state?.singer, state?.selectedSong?.id, state?.selectionGeneration, state?.loadingGeneration, state?.result,
     catalog.map(song => song.id), playerId, localTester, isHost, connectionState, flowMessage, phoneNumber, phoneQr, preparationError,
     displayPairingRequired,
     concertAudioReady(),
@@ -492,11 +492,11 @@ function renderLobby(): void {
 
 function renderSongSelection(): void {
   const songs = state!.catalog.length ? state!.catalog : catalog;
-  const canSelect = Boolean(playerId) && !stationDisplay.active;
+  const canSelect = isHost && connectionState === 'connected';
   flowOverlay.innerHTML = `<section class="flow-panel selection-panel">${kicker()}<h1>${escapeHtml(copy.songTitle)}</h1><p>${escapeHtml(copy.songBody)}</p><div class="song-grid">${songs.map((song, index) => {
     const selected = state!.selectedSong?.id === song.id;
     return `<button class="song-card${selected ? ' selected' : ''}" data-song="${escapeHtml(song.id)}" ${canSelect ? '' : 'disabled'} aria-pressed="${selected}"><span class="song-number">${String(index + 1).padStart(2, '0')}</span>${selected ? `<em>${escapeHtml(copy.selected)}</em>` : ''}<strong>${escapeHtml(song.title)}</strong><small>${escapeHtml(karaokeSongCredit(song))} · 0:45</small></button>`;
-  }).join('')}</div><div class="flow-actions">${isHost && state!.selectedSong && !stationDisplay.active ? `<button id="advance-flow" class="primary-action">${escapeHtml(copy.start)}</button>` : ''}</div></section>`;
+  }).join('')}</div><div class="flow-actions">${isHost && state!.selectedSong && localTester && !stationDisplay.active ? `<button id="advance-flow" class="primary-action">${escapeHtml(copy.start)}</button>` : ''}</div>${state!.selectedSong && !localTester ? `<p class="flow-note">${escapeHtml(copy.scoringDisclosure)}</p><p class="flow-note">${escapeHtml(copy.phoneStart)}</p>` : ''}</section>`;
 }
 
 function renderLoading(): void {

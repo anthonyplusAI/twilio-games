@@ -27,9 +27,9 @@ In station mode, the server resolves the caller to one persisted admitted player
 
 Room `4821` is the standalone room only. Active station matches use generated 12-character engine room codes.
 
-For standalone testing, pause the event, open the intended shared display before placing the call, and close unused game displays. An eligible display must belong to an operator-enabled game, connect as `display=1`, and remain open. Standalone room `4821` does not use operator pairing or validate the station display token, so expose standalone routing only in a controlled deployment. Generated station rooms are different: their display must inherit the authenticated `ARCADE_DISPLAY_TOKEN` capability installed by `/operator`. If several eligible standalone displays are open, the most recently registered one wins. If none is open, the call receives unavailable TwiML; it does not default to Voice Racer.
+For standalone testing, pause the event, open the intended shared display before placing the call, and close unused game displays. An eligible display must belong to an operator-enabled game, connect as `display=1`, join the call's room, and remain open. A connected socket that has not joined the room cannot claim the call. Standalone room `4821` does not use operator pairing or validate the station display token, so expose standalone routing only in a controlled deployment. Generated station rooms are different: their display must inherit the authenticated `ARCADE_DISPLAY_TOKEN` capability installed by `/operator`. Exactly one eligible standalone game display must be open; zero or multiple different game displays receive unavailable TwiML rather than an inferred game route.
 
-The selected game is passed to `/voice` as a Conversation Relay custom parameter and remains fixed for that call. `POST /voice/join` is a legacy alias: it uses a posted `Digits` value when present and otherwise uses `4821`. Do not configure new numbers to use `/voice/join`.
+The selected game is passed to `/voice` as a Conversation Relay custom parameter and remains fixed for that call. `POST /voice/join` is a legacy alias: it uses a posted `Digits` value when present and otherwise uses `4821`. Non-default Trivia and Chess rooms require a room-authenticated display; the stock standalone pages use `4821`. Do not configure new numbers to use `/voice/join`.
 
 When Conversation Relay ends a session, Twilio calls `POST /voice/session-ended`. The server uses the call SID to recover or clean up all six games.
 
@@ -94,12 +94,12 @@ For a deployed environment, configure the same `POST /voice/incoming` webhook ag
 | `GAME_PHONE_NUMBER` | Optional | Legacy lobby fallback until locale-specific voice numbers are saved in Arcade runtime settings. |
 | `TWILIO_SMS_NUMBER` | Required by production deployment | SMS-capable sender/receiver registered with TAC and used by the join chooser and outbound notices. |
 | `PORT` | No | HTTP and WebSocket port. Defaults to `8080`. |
-| `CR_TTS_VOICE` | No | ElevenLabs voice ID for Conversation Relay talk-back. If unset, Relay uses its default voice. |
+| `CR_TTS_VOICE` | No | English ElevenLabs voice ID for every game's Conversation Relay talk-back. Defaults to `xp3gDg85YgFcWpnNVlIu`; deployment pins that value. |
 | `CR_TTS_VOICE_PT_BR` | No | Optional Brazilian Portuguese ElevenLabs voice ID. Empty uses Relay's `pt-BR` default. |
 | `DEFAULT_LOCALE` | No | Fallback when the dialed `To` number does not identify one locale and the selected display does not provide one. Defaults to `en-US`. |
 | `ARCADE_STANDALONE_VOICE_ENABLED` | No | Set to `true` to permit standalone routing to an eligible open shared display. It does not make a game callable without a display. Production sets this to `true`. |
 | `VOICE_RELAY_TOKEN` | Required by production deployment | Independent token of at least 32 characters that authenticates the Conversation Relay `setup` frame. The generated TwiML passes it to Twilio automatically; do not reuse `TWILIO_AUTH_TOKEN`. |
-| `OPENAI_API_KEY` | No | Enables English free-form menu help for Voice Racer and Voice Monsters. Portuguese free-form OpenAI replies are disabled; deterministic localized setup and gameplay remain available. |
+| `OPENAI_API_KEY` | Required for production | Enables phase-bound semantic interpretation of conversational commands in all six games, including Portuguese. Local runs without it retain deterministic commands. |
 | `OPENAI_MODEL` | No | Overrides the OpenAI model when `OPENAI_API_KEY` is set. |
 | `DEEPGRAM_API_KEY` | Required in production | Direct monolingual Nova-3 streaming lyric recognition with chart keyterms for Voice Karaoke. Production startup and deployment fail closed when missing because Karaoke is enabled by default. |
 | `KARAOKE_CALIBRATION_OFFSET_MS` | No | Measured signed handset/carrier scoring offset from `-5000` to `5000`; defaults to `0`. Positive maps observations later and negative maps them earlier. |
@@ -132,16 +132,17 @@ The generated TwiML uses these settings:
 | `transcriptionLanguage` | Resolved call locale (`en-US` or `pt-BR`) | Recognition language selected from the dialed number, then display or default fallback |
 | `ttsLanguage` | Resolved call locale (`en-US` or `pt-BR`) | Spoken response language selected by the same route |
 | `interruptible` | `any` | Caller speech or keypad input stops active TTS |
+| `welcomeGreetingInterruptible` | `any` | The initial greeting can also be cut off immediately |
 | `reportInputDuringAgentSpeech` | `any` | Delivers speech and keypad input while TTS is playing |
-| `interruptSensitivity` | `medium` | Balances command barge-in against room noise |
-| `ignoreBackchannel` | `true` | Reduces interruption from short acknowledgements |
+| `interruptSensitivity` | `high` | Responds quickly when callers cut off prompts and menus |
+| `ignoreBackchannel` | `false` | Allows short spoken acknowledgments to interrupt the host |
 | `dtmfDetection` | `true` | Enables keypad events |
 | `speechTimeout` | `600` | End-of-speech timeout used by Relay |
 | `eotThreshold` | `0.6` | End-of-turn threshold |
 
 The server supplies localized, game-specific recognition hints. It leaves `welcomeGreeting` empty because each game speaks its own onboarding after the `/voice` WebSocket receives the `setup` frame. See [Localization](localization.md) for locale routing and extension details.
 
-Talk-back is active. The server sends `{ "type": "text", "token": "...", "last": true }` messages for onboarding, menu guidance, countdowns, events, and results. It waits for Relay's `tokensPlayed` acknowledgement before sending the next line. A new prompt or interrupt clears unsent talk-back so old instructions do not play over the caller.
+Talk-back is active. Every server `text` message is interruptible and preemptible. Long cues stream as one Conversation Relay talk cycle, with `last=true` only on the final token, so their own chunks cannot cut off earlier audio. [Twilio documents a `tokens-played` event subscription in TwiML](https://www.twilio.com/docs/voice/twiml/connect/conversationrelay), but its [WebSocket message guide](https://www.twilio.com/docs/voice/conversationrelay/websocket-messages) does not specify the acknowledgement payload or timing. The transport uses a matching acknowledgement when available and otherwise estimates speech duration conservatively. Caller input or a new screen state interrupts stale speech. Gameplay never treats the estimate as proof that audio was heard; Karaoke still needs a separate final caller consent before the media handoff.
 
 Speech barge-in stops Relay TTS. Voice Racer and Voice Monsters also invalidate stale in-flight conversational replies. Voice Fighter resets its interim-command state after an interrupt so a corrected command or selection can be recognized cleanly.
 
@@ -255,7 +256,7 @@ The common 30-second caller binding and up-to-two Relay recovery attempts apply 
 
 ## Voice Trivia
 
-Voice Trivia is the fifth default-enabled game and stable station or Messaging option `5`. Station matches accept 1-4 callers; the default standalone voice route expects one caller. Trivia has no AI opponent and uses deterministic server content and parsing even when `OPENAI_API_KEY` is set. Standalone play opens `/trivia.html?display=1&room=4821`; station play launches `/trivia.html` with a generated room and the current `station`, `match`, and `launchGeneration`. Both use the same-origin `/trivia?display=1` display WebSocket, while callers remain on `/voice`.
+Voice Trivia is the fifth default-enabled game and stable station or Messaging option `5`. Station matches accept 1-4 callers; the default standalone voice route expects one caller. Trivia has no AI opponent and keeps question content, scoring, and timing server-authoritative; the optional semantic interpreter maps conversational answers to one of the current visible choices. Standalone play opens `/trivia.html?display=1&room=4821`; station play launches `/trivia.html` with a generated room and the current `station`, `match`, and `launchGeneration`. Both use the same-origin `/trivia?display=1` display WebSocket, while callers remain on `/voice`.
 
 The standalone lobby displays the configured locale's call QR and linked number. Station launches use the station `/join` QR rail, which registers visitors before their assigned call is routed into the game.
 
@@ -264,8 +265,8 @@ The voice flow is:
 1. In standalone play, each caller says a first name. Station play greets each caller by the registered first name unless it is missing. After all expected callers connect and confirm names, the server leaves `lobby` for `category_select`.
 2. Each caller votes by category name or spoken number: General Knowledge, Science, Geography, History, Entertainment, Sports, Technology, Twilio, or Mixed. Votes can be revised. A unique plurality wins; a tied plurality or no votes selects Mixed.
 3. `loading` snapshots eight questions and shuffled choices from the current bank. The display must authenticate when station-managed and send readiness for the current generation within 30 seconds. Readiness starts the three-second `countdown`; a timeout returns the room to category voting.
-4. After the countdown and each reveal, the server publishes the redacted question directly in `question` with `answeringStartsAtMs` equal to publication time and `questionEndsAtMs` exactly 10 seconds later. It emits `answering_started` immediately, preempts queued or in-flight previous-phase Trivia speech once, then speaks the question plus `One/Two/Three/Four` choices (`Um/Dois/Três/Quatro` in Portuguese). Playback and `tokensPlayed` acknowledgements never gate or move the shared timer.
-5. Callers may answer immediately, including while Relay is still speaking. Prefer `one` through `four`; digits, cardinal and ordinal words, bounded natural phrases such as `my answer is four`, safe exact letter names, explicitly marked `A`-`D` variants, exact or carrier-wrapped answer text/aliases, and DTMF `1`-`4` remain accepted. Bare common homophones such as `be`, `see`, `the`, and `de` are not letter choices and are omitted from hints; marked forms such as `answer be` remain available. Negated, incidental, and multi-choice answer mentions are rejected. The first valid final answer locks even if it is wrong; interim speech can capture an earlier matching onset but cannot lock an answer, and the onset survives the same utterance's Relay interrupt notification. An onset inside the 10 seconds may receive its final frame during the 1.5-second transport grace. An unanswered reconnect replays the current numbered question and remaining time without changing room timestamps; a locked reconnect does not replay it.
+4. After the countdown and each reveal, the server publishes a redacted `question_prompt` and waits for the authenticated display to acknowledge the painted question. Each current caller then hears the question and all four numbered choices. After prompt delivery or an explicit caller skip, a short answer cue is presented; only then does the shared 10-second `question` clock start. Current-attempt and display-revision checks prevent old speech or paint acknowledgments from opening a later question. Relay playback completion uses a conservative duration estimate if no completion event exists. If speech fails, the room pauses in `audio_problem`; an authenticated operator can replay the current question without consuming the answer window.
+5. Callers may interrupt and answer early, including by DTMF `1`-`4`. An early answer is queued only for the current question, then locks when its shared answer window opens. Cardinal and ordinal words, conversational phrases, safe letter names, and the visible choice text or private aliases are accepted when unambiguous. Negated, incidental, and multi-choice mentions are rejected. The first valid final answer locks even when wrong; an on-time interim onset may receive its final frame during the 1.5-second transport grace. An unanswered reconnect receives current-question guidance without changing the shared clock; a locked reconnect does not replay it.
 6. `reveal` lasts four seconds and discloses the correct answer, explanation, per-player raw-point result, and standings. The cycle repeats for eight questions, then `results` reports raw score, normalized leaderboard score, correct answers, best streak, and rank. Winner, tie, and personal phone lines use the normalized leaderboard score shown on the final display. Standalone callers can say `play again`; station callers return through the station requeue flow.
 
 The eight content categories are General Knowledge, Science, Geography, History, Entertainment, Sports, Technology, and Twilio. A selected-category round contains two easy, four medium, and two hard questions. Mixed contains one question from every category with the same overall difficulty split. The complete bank has 200 questions, 25 per category, and requires matching `en-US` and `pt-BR` choice IDs plus localized prompts, choices, optional private voice aliases, and explanations.
@@ -356,6 +357,21 @@ npm test -- chess
 
 The integration tests open fake Conversation Relay and Media Stream WebSockets and verify room binding, setup, handoff security, and deterministic scoring. They do not replace live handset tests for carrier latency, pitch quality, acoustic backing-track bleed, or Twilio callback ordering.
 
+## Live Call Acceptance Pass
+
+Use the actual booth phone numbers and shared display, with the production OpenAI key configured. Run the common checks in both English and Brazilian Portuguese: interrupt the welcome/menu speech with a choice, paraphrase a command, pronounce a visible choice imperfectly, correct yourself mid-turn, and speak while the host is still talking. The old cue should stop, the intended current-screen action should happen once, and an ambiguous request should get a short clarification. Tap every visible menu or selector on the shared screen and confirm the same state change; live movement, attacks, chess moves, and trivia answers remain phone-controlled. After a phase change or reconnect, the host should describe the screen that is actually visible and should never restart name collection mid-game.
+
+| Game | Minimum live flow to verify |
+|---|---|
+| Racer | Choose a car and track by voice and tap; interrupt setup; steer, brake, and boost by phone; finish and hear the result. |
+| Monsters | Choose a monster by voice and tap; use a named move, guard, item, and taunt by phone; finish and start a free-play rematch. |
+| Fighter | Choose fighter and arena by voice and tap; move, jump, defend, and attack by phone; confirm the solo opponent is beatable; hear the result before station retirement. |
+| Trivia | Choose a category by voice and tap; answer while the question is being read; confirm the answer clock starts after the phone cue, and recover a failed cue without a duplicate round. |
+| Chess | Speak a legal move in more than one natural form, clarify an ambiguous move, hear an illegal-move correction, finish, and use the finished-screen replay selector. |
+| Karaoke | Choose a song by voice and tap; hear and see the scoring disclosure; explicitly consent by phone before media starts; sing, score, and reconnect for the result. |
+
+Confirm Twilio accepts `xp3gDg85YgFcWpnNVlIu` for English calls on the deployed account and that Portuguese calls retain their own voice. Check Conversation Relay error events and handset audio as well as the on-screen state; fake Relay tests cannot establish voice entitlement or real acoustic recognition quality.
+
 ## Troubleshooting
 
 ### The call reaches the wrong game
@@ -402,11 +418,11 @@ Confirm the returned TwiML contains `partialPrompts="true"`, `speechModel="flux"
 
 ### Barge-in does not stop the host
 
-Inspect the returned TwiML for `interruptible="any"` and `reportInputDuringAgentSpeech="any"`. Relay should send an `interrupt` frame when speech or keypad input cuts off TTS. Background noise may not interrupt because sensitivity is `medium` and backchannels are ignored.
+Inspect the returned TwiML for `interruptible="any"`, `welcomeGreetingInterruptible="any"`, `reportInputDuringAgentSpeech="any"`, `interruptSensitivity="high"`, and `ignoreBackchannel="false"`. Relay should send an `interrupt` frame when speech or keypad input cuts off TTS. Check live handset behavior in the actual booth environment because room noise can affect recognition.
 
 ### Menus are quiet without an OpenAI key
 
-Voice Racer and Voice Monsters keep deterministic name, number, advance, help, and gameplay paths without OpenAI. English open-ended questions and recommendations require `OPENAI_API_KEY`. Portuguese sessions never send free-form prompts or replies to OpenAI. Voice Fighter, Voice Trivia, and Voice Chess do not use the OpenAI host; Trivia reads only its validated question bank at runtime, and Chess uses its local rules and computer search.
+All six games keep fast deterministic commands without OpenAI. `OPENAI_API_KEY` adds a bounded semantic fallback for accents, paraphrases, and conversational requests in the current game phase in both supported locales. The model receives only current actions and visible choices, and the game server validates the result before changing state. Trivia still reads only its validated question bank, and Chess still uses local rules and computer search.
 
 ### The displayed phone number is missing
 

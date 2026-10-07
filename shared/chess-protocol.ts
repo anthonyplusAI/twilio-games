@@ -101,6 +101,8 @@ export interface ChessState {
   lastMove: ChessMoveRecord | null;
   result: ChessResult | null;
   feedback: ChessFeedback | null;
+  /** Server-authorized result-menu action for this display; absent in voice-only snapshots. */
+  canReplayOnDisplay?: boolean;
 }
 
 export type ChessEvent =
@@ -120,8 +122,10 @@ export interface ChessCommandResult {
 
 export type ChessClientMessage =
   | { type: 'spectate'; roomCode: string; locale?: 'en-US' | 'pt-BR' }
+  | { type: 'leave' }
   | { type: 'display_auth'; roomCode: string; token: string }
-  | { type: 'clock_sync'; clientSentAtMs: number };
+  | { type: 'clock_sync'; clientSentAtMs: number }
+  | { type: 'display_replay'; roomCode: string; gameId: number };
 export type ChessServerMessage =
   | { type: 'chess_capabilities'; displayAuth: boolean }
   | { type: 'clock_sync'; clientSentAtMs: number; serverNowMs: number }

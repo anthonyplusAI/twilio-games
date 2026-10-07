@@ -6,18 +6,24 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { IncomingMessage, Server as HttpServer } from 'http';
 import type { Duplex } from 'stream';
-import { BattleRoom } from './battle-room';
+import { BattleRoom, type BattleResult } from './battle-room';
 import { parseBattleClientMessage, type BattleServerMessage } from '../shared/battle-protocol';
 import { rosterEntries } from '../shared/monster-roster';
 import type { BattleEvent, BattleAction } from '../shared/battle-world';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../shared/i18n/locales';
 
-interface Conn { ws: WebSocket; roomCode?: string; playerId?: string; sessionId?: string; isAlive: boolean; locale?: SupportedLocale; stationDisplay?: boolean; hostAuthorized?: boolean; }
+interface Conn { ws: WebSocket; roomCode?: string; playerId?: string; sessionId?: string; isAlive: boolean; locale?: SupportedLocale; display?: boolean; stationDisplay?: boolean; hostAuthorized?: boolean; }
 interface PlayerSession {
   roomCode: string;
   playerId: string;
   conn: Conn | null;
   leaveTimer: ReturnType<typeof setTimeout> | null;
+}
+export type BattlePresentation =
+  | { kind:'event'; generation:number; eventId:number; event:BattleEvent }
+  | { kind:'results'; generation:number; result:BattleResult };
+interface BattleEventLedger {
+  generation:number; nextEventId:number; events:Map<number,BattleEvent>; acknowledged:Set<number>;
 }
 
 // How often we ping idle battle sockets. Battle traffic is event-driven (a push only on a change), so
@@ -41,6 +47,9 @@ export class BattleServer {
    *  the caller-relevant ones — mirrors the racer's onRoomEvents seam. */
   private onRoomEvents: ((roomCode: string, events: BattleEvent[]) => void) | null = null;
   private onRoomState: ((roomCode: string) => void) | null = null;
+  private onPresentation:((roomCode:string,presentation:BattlePresentation)=>void)|null=null;
+  private displayLeaders=new Map<string,Conn>();
+  private eventLedgers=new Map<string,BattleEventLedger>();
   private allowBrowserPlayer: (roomCode: string) => boolean = () => true;
   private readonly displayToken: string;
   private onDisplayAuthenticated: ((ws: WebSocket) => void) | null = null;
@@ -54,6 +63,7 @@ export class BattleServer {
 
   setOnRoomEvents(fn: (roomCode: string, events: BattleEvent[]) => void): void { this.onRoomEvents = fn; }
   setOnRoomState(fn: (roomCode: string) => void): void { this.onRoomState = fn; }
+  setOnPresentation(fn:(roomCode:string,presentation:BattlePresentation)=>void):void{this.onPresentation=fn;}
   setBrowserPlayerAdmission(fn: (roomCode: string) => boolean): void { this.allowBrowserPlayer = fn; }
   setOnDisplayAuthenticated(fn: (ws: WebSocket) => void): void { this.onDisplayAuthenticated = fn; }
 
@@ -84,6 +94,12 @@ export class BattleServer {
   /** Live WS connections (displays + device players). The voice router uses this to auto-join a caller
    *  to Voice Monsters when its display is the one that's open. */
   get connectionCount(): number { return this.conns.size; }
+  /** A query-string display hint is not authority until this socket has actually joined the room. */
+  hasStandaloneDisplay(ws:WebSocket,roomCode:string):boolean{
+    return [...this.conns].some(conn=>conn.ws===ws&&conn.ws.readyState===WebSocket.OPEN
+      &&conn.roomCode===roomCode&&this.allowBrowserPlayer(roomCode)
+      &&conn.display===true&&conn.hostAuthorized===true);
+  }
   preferredLocale(roomCode?: string, fallback: SupportedLocale = DEFAULT_LOCALE): SupportedLocale {
     const matching = [...this.conns].filter(conn => (!roomCode || conn.roomCode === roomCode) && conn.locale);
     return matching.find(conn => !conn.playerId)?.locale ?? matching[0]?.locale ?? fallback;
@@ -103,8 +119,17 @@ export class BattleServer {
     ws.on('close', () => {
       const code = conn.roomCode;
       if (code && conn.playerId && !this.holdPlayerForReconnect(conn)) this.rooms.get(code)?.removePlayer(conn.playerId);
+      if(code&&this.displayLeaders.get(code)===conn){
+        this.displayLeaders.delete(code);this.rooms.get(code)?.invalidateResultsPresentation();
+      }
       this.conns.delete(conn);
-      if (code) { this.pushState(code); this.reapIfEmpty(code); }
+      if (code) {
+        this.designateDisplayLeader(code);
+        this.pushState(code);
+        const leader=this.displayLeaders.get(code);
+        if(leader)this.replayPendingEvents(leader,code);
+        this.reapIfEmpty(code);
+      }
     });
   }
 
@@ -141,6 +166,7 @@ export class BattleServer {
           this.pushState(conn.roomCode);
           break;
         }
+        if(conn.roomCode&&conn.roomCode!==msg.roomCode)this.detachDisplay(conn);
         if (msg.sessionId) {
           const resumed = this.resumePlayerSession(msg.roomCode, msg.sessionId, conn);
           if (resumed) {
@@ -166,15 +192,38 @@ export class BattleServer {
           this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'bad_display_auth' }); return;
         }
         conn.stationDisplay = stationDisplay;
+        conn.display = true;
         conn.hostAuthorized = !stationDisplay || msg.displayToken === this.displayToken;
         if (this.displayToken && msg.displayToken === this.displayToken) this.onDisplayAuthenticated?.(conn.ws);
+        const priorRoom=conn.roomCode;
+        if(priorRoom&&priorRoom!==msg.roomCode&&this.displayLeaders.get(priorRoom)===conn){
+          this.displayLeaders.delete(priorRoom);
+          this.rooms.get(priorRoom)?.invalidateResultsPresentation();
+        }
         this.room(msg.roomCode);
         conn.roomCode = msg.roomCode;   // display / spectator: no slot
+        this.designateDisplayLeader(msg.roomCode);
+        if(priorRoom&&priorRoom!==msg.roomCode){this.designateDisplayLeader(priorRoom);this.pushState(priorRoom);this.reapIfEmpty(priorRoom);}
         this.pushState(msg.roomCode);
+        if(this.isDisplayLeader(conn,msg.roomCode))this.replayPendingEvents(conn,msg.roomCode);
         break;
       }
       case 'select_monster':
         this.withRoom(conn, (room) => { if (conn.playerId) { room.selectMonster(conn.playerId, msg.monsterId); this.pushState(room.code); } });
+        break;
+      case 'display_select_monster':
+        this.withRoom(conn,room=>{
+          if(!this.isDisplayLeader(conn,room.code)){this.rejectAuthority(conn);return;}
+          if(!room.selectMonster(msg.playerId,msg.monsterId))
+            this.send(conn,{type:'error',code:'select_rejected',message:'That monster or player is unavailable.'});
+          else this.pushState(room.code);
+        });
+        break;
+      case 'ack_event':
+        this.withRoom(conn,room=>this.ackEvent(conn,room,msg.generation,msg.eventId));
+        break;
+      case 'ack_results':
+        this.withRoom(conn,room=>this.ackResults(conn,room,msg.generation));
         break;
       case 'open_fight':
         this.withRoom(conn, (room) => { if (conn.playerId) { room.openFightMenu(conn.playerId); this.pushState(room.code); } });
@@ -194,34 +243,110 @@ export class BattleServer {
         break;
       case 'advance':
         this.withRoom(conn, (room) => {
+          if(!conn.playerId&&!this.isDisplayLeader(conn,room.code)){this.rejectAuthority(conn);return;}
           if (!this.allowBrowserPlayer(room.code) && room.phase === 'results') {
             this.send(conn, { type:'error',code:'station_requeue_required',message:'station_requeue_required' });
             return;
           }
-          room.advance(); this.flushEvents(room); this.pushState(room.code);
+          const owner=conn.playerId??room.lobbyPlayers().find(player=>!player.isAi)?.playerId;
+          if(!room.advance(owner))this.send(conn,{type:'error',code:'not_ready',message:'Complete the current selection first.'});
+          this.flushEvents(room); this.pushState(room.code);
         });
         break;
       case 'back':
-        this.withRoom(conn, (room) => { room.back(); this.pushState(room.code); });
+        this.withRoom(conn, (room) => {
+          if(!conn.playerId&&!this.isDisplayLeader(conn,room.code)){this.rejectAuthority(conn);return;}
+          const owner=conn.playerId??room.lobbyPlayers().find(player=>!player.isAi)?.playerId;
+          if(!room.back(owner))this.send(conn,{type:'error',code:'not_ready',message:'There is no earlier menu.'});
+          else this.pushState(room.code);
+        });
         break;
       case 'leave':
+        {
+        const code=conn.roomCode;
         if (conn.playerId) {
           const playerId = conn.playerId;
           this.withRoom(conn, (room) => {
             this.forgetPlayerSession(conn.sessionId);
             room.removePlayer(playerId); conn.playerId = undefined; conn.sessionId = undefined;
-            this.pushState(room.code); this.reapIfEmpty(room.code);
           });
-        } else if (msg.sessionId) {
+        }
+        if (msg.sessionId) {
           this.releasePlayerSession(msg.sessionId);
         }
+        if(code)this.detachDisplay(conn);
         break;
+        }
     }
   }
 
   private withRoom(conn: Conn, fn: (room: BattleRoom) => void): void {
     const room = conn.roomCode ? this.rooms.get(conn.roomCode) : undefined;
     if (room) fn(room);
+  }
+
+  /** Only the active, authenticated display may claim that a battle beat is on screen. */
+  private designateDisplayLeader(code: string): void {
+    const current = this.displayLeaders.get(code);
+    if (current && this.conns.has(current) && current.ws.readyState === WebSocket.OPEN
+      && current.roomCode === code && current.display && current.hostAuthorized) return;
+    const next = [...this.conns].find(conn => conn.roomCode === code && conn.display
+      && conn.hostAuthorized && conn.ws.readyState === WebSocket.OPEN);
+    if (next) this.displayLeaders.set(code, next);
+    else this.displayLeaders.delete(code);
+  }
+
+  private isDisplayLeader(conn: Conn, code: string): boolean {
+    return conn.roomCode === code && conn.display===true && !!conn.hostAuthorized
+      && conn.ws.readyState === WebSocket.OPEN && this.displayLeaders.get(code) === conn;
+  }
+
+  private detachDisplay(conn:Conn):void{
+    const code=conn.roomCode;if(!code)return;
+    if(this.displayLeaders.get(code)===conn){
+      this.displayLeaders.delete(code);this.rooms.get(code)?.invalidateResultsPresentation();
+    }
+    conn.roomCode=undefined;conn.display=false;conn.stationDisplay=false;conn.hostAuthorized=false;
+    this.designateDisplayLeader(code);this.pushState(code);
+    const leader=this.displayLeaders.get(code);if(leader)this.replayPendingEvents(leader,code);
+    this.reapIfEmpty(code);
+  }
+
+  private rejectAuthority(conn: Conn): void {
+    this.send(conn, { type: 'error', code: 'forbidden', message: 'Only the active display can control this menu.' });
+  }
+
+  private ackEvent(conn: Conn, room: BattleRoom, generation: number, eventId: number): void {
+    if (!this.isDisplayLeader(conn, room.code)) { this.rejectAuthority(conn); return; }
+    const ledger = this.eventLedgers.get(room.code);
+    if (room.generation !== generation || ledger?.generation !== generation) return;
+    const event = ledger.events.get(eventId);
+    if (!event || ledger.acknowledged.has(eventId)) return;
+    const next=Array.from(ledger.events.keys()).find(id=>!ledger.acknowledged.has(id));
+    if(eventId!==next)return;
+    ledger.acknowledged.add(eventId);
+    this.onPresentation?.(room.code, { kind: 'event', generation, eventId, event });
+  }
+
+  private ackResults(conn: Conn, room: BattleRoom, generation: number): void {
+    if (!this.isDisplayLeader(conn, room.code)) { this.rejectAuthority(conn); return; }
+    if (!room.acknowledgeResultsPresented(generation)) return;
+    const ledger=this.eventLedgers.get(room.code);
+    if(ledger?.generation===generation)
+      for(const eventId of ledger.events.keys())ledger.acknowledged.add(eventId);
+    const result = room.result();
+    if (result) this.onPresentation?.(room.code, { kind: 'results', generation, result });
+    this.pushState(room.code);
+  }
+
+  private replayPendingEvents(conn: Conn, code: string): void {
+    const room=this.rooms.get(code);
+    const ledger=this.eventLedgers.get(code);
+    if(!room||!ledger||ledger.generation!==room.generation)return;
+    const pending=[...ledger.events].filter(([id])=>!ledger.acknowledged.has(id));
+    if(!pending.length)return;
+    this.send(conn,{type:'battle_events',generation:ledger.generation,
+      eventIds:pending.map(([id])=>id),events:pending.map(([,event])=>event)});
   }
 
   private rememberPlayerSession(sessionId: string, conn: Conn): void {
@@ -332,6 +457,8 @@ export class BattleServer {
     const msg: BattleServerMessage = {
       type: 'battle_state', roomCode, phase: room.phase,
       players: room.lobbyPlayers(), snapshot: room.snapshot(),
+      generation: room.generation, resultsPresented: room.resultsPresented,
+      canAdvanceLobby: room.canAdvanceLobby, canStartBattle: room.canStart(),
       activeSide: room.activeSide(), activeMenu: room.activeMenu(),
       canRematch: room.canRematch,
       result: res ? { winner: res.winner, winnerName: res.winnerName } : null,
@@ -366,7 +493,25 @@ export class BattleServer {
   private flushEvents(room: BattleRoom): void {
     const events = room.drainEvents();
     if (!events.length) return;
-    for (const c of this.conns) if (c.roomCode === room.code) this.send(c, { type: 'battle_events', events });
+    let ledger = this.eventLedgers.get(room.code);
+    if (!ledger || ledger.generation !== room.generation) {
+      ledger = { generation: room.generation, nextEventId: 1, events: new Map(), acknowledged: new Set() };
+      this.eventLedgers.set(room.code, ledger);
+    }
+    const eventIds = events.map(event => {
+      const id = ledger!.nextEventId++;
+      ledger!.events.set(id, event);
+      return id;
+    });
+    // Keep enough recent events for long turns while bounding receipts for a long-running room.
+    while (ledger.events.size > 128) {
+      const oldest = ledger.events.keys().next().value;
+      if (oldest === undefined) break;
+      ledger.events.delete(oldest);
+      ledger.acknowledged.delete(oldest);
+    }
+    for (const c of this.conns) if (c.roomCode === room.code)
+      this.send(c, { type: 'battle_events', generation: room.generation, eventIds, events });
     this.onRoomEvents?.(room.code, events);
   }
 
@@ -376,6 +521,12 @@ export class BattleServer {
   // so a voice pick/action shows on screen identically. Room is created on demand (the caller may
   // arrive before any browser opens the display).
   getOrCreateRoom(code: string): BattleRoom { return this.room(code); }
+  hasPendingPresentation(code:string):boolean{
+    const room=this.rooms.get(code);
+    const ledger=this.eventLedgers.get(code);
+    if(!room||!ledger||ledger.generation!==room.generation||!this.displayLeaders.get(code))return false;
+    return [...ledger.events.keys()].some(id=>!ledger.acknowledged.has(id));
+  }
 
   abortRoom(code: string): boolean {
     const room = this.rooms.get(code);
@@ -398,6 +549,8 @@ export class BattleServer {
     const results = this.resultsTimers.get(code);
     if (results) clearTimeout(results);
     this.resultsTimers.delete(code);
+    this.displayLeaders.delete(code);
+    this.eventLedgers.delete(code);
     this.rooms.delete(code);
     return true;
   }
@@ -428,17 +581,30 @@ export class BattleServer {
     }
     room.expectHumanPlayers(count,true);this.pushState(code);
   }
-  voiceSelectMonster(code: string, playerId: string, monsterId: string): void {
-    const room = this.rooms.get(code); if (!room) return;
-    room.selectMonster(playerId, monsterId); this.pushState(code);
+  voiceSelectMonster(code: string, playerId: string, monsterId: string): boolean {
+    const room = this.rooms.get(code); if (!room) return false;
+    const selected = room.selectMonster(playerId, monsterId);
+    if (selected) this.pushState(code);
+    return selected;
   }
-  voiceOpenFight(code: string, playerId: string): void {
-    const room = this.rooms.get(code); if (!room) return;
-    room.openFightMenu(playerId); this.pushState(code);
+  voiceOpenFight(code: string, playerId: string): boolean {
+    const room = this.rooms.get(code); if (!room) return false;
+    const opened = room.openFightMenu(playerId);
+    if (opened) this.pushState(code);
+    return opened;
   }
-  voiceBackMenu(code: string, playerId: string): void {
-    const room = this.rooms.get(code); if (!room) return;
-    room.backMenu(playerId); this.pushState(code);
+  voiceBackMenu(code: string, playerId: string): boolean {
+    const room = this.rooms.get(code); if (!room) return false;
+    const backed = room.backMenu(playerId);
+    if (backed) this.pushState(code);
+    return backed;
+  }
+  voiceBackSetup(code: string, playerId: string): boolean {
+    const room = this.rooms.get(code);
+    if (!room?.canControlSetup(playerId)) return false;
+    const backed = room.back(playerId);
+    if (backed) this.pushState(code);
+    return backed;
   }
   /** Commit a voice-driven turn action; resolves + schedules the AI beat exactly like the WS path. */
   voiceChooseAction(code: string, playerId: string, action: BattleAction): boolean {
@@ -454,6 +620,17 @@ export class BattleServer {
     return advanced;
   }
 
+  /** A spoken skip reveals the current result overlay without starting a rematch. */
+  voiceContinueResults(code: string, playerId: string): boolean {
+    const room = this.rooms.get(code);
+    if (!room?.isFinishedBattleParticipant(playerId)) return false;
+    this.designateDisplayLeader(code);
+    const display = this.displayLeaders.get(code);
+    if (!display) return false;
+    this.send(display, { type: 'show_results', generation: room.generation });
+    return true;
+  }
+
   private reapIfEmpty(roomCode: string): void {
     const room = this.rooms.get(roomCode);
     if (!room || !room.isEmpty) return;
@@ -463,6 +640,8 @@ export class BattleServer {
     if (ai) { clearTimeout(ai.timer); this.aiTimers.delete(roomCode); }
     const results = this.resultsTimers.get(roomCode);
     if (results) { clearTimeout(results); this.resultsTimers.delete(roomCode); }
+    this.displayLeaders.delete(roomCode);
+    this.eventLedgers.delete(roomCode);
     this.rooms.delete(roomCode);
   }
 
@@ -481,6 +660,8 @@ export class BattleServer {
     this.aiTimers.clear();
     for (const timer of this.resultsTimers.values()) clearTimeout(timer);
     this.resultsTimers.clear();
+    this.displayLeaders.clear();
+    this.eventLedgers.clear();
     for (const c of this.conns) c.ws.close();
     this.conns.clear();
   }
@@ -493,6 +674,8 @@ export class BattleServer {
       this.aiTimers.clear();
       for (const timer of this.resultsTimers.values()) clearTimeout(timer);
       this.resultsTimers.clear();
+      this.displayLeaders.clear();
+      this.eventLedgers.clear();
       for (const c of this.conns) c.ws.close();
       this.conns.clear();
       if (this.wss) this.wss.close(() => resolve()); else resolve();

@@ -30,6 +30,8 @@ export interface TriviaViewContext {
   error?: string;
   pairingRequired?: boolean;
   canReplay?: boolean;
+  isHost?: boolean;
+  pendingCategoryVoteSeat?: string | null;
   stationMode?: boolean;
   callEntry?: TriviaCallEntryView;
 }
@@ -55,11 +57,14 @@ const COPY = {
     callQrPreparing: 'Preparing the call QR code. You can call the number below.',
     callQrUnavailable: 'QR code unavailable. Call the number below.',
     ready: 'Ready', confirming: 'Confirming name', reconnecting: 'Reconnecting', openSeat: 'Open seat', waiting: 'Waiting',
-    category: 'Choose the category', categoryBody: 'Vote by voice. The live totals decide the round.', vote: 'vote', votes: 'votes',
+    category: 'Choose the category', categoryBody: 'Vote by voice or tap a category for the named player. The live totals decide the round.',
+    categoryTouch: '{name} is voting on this screen', categorySubmitting: "Recording {name}'s vote...", categoryWaiting: 'Waiting for phone votes', vote: 'vote', votes: 'votes',
     loading: 'Building the question deck', loadingBody: 'The display is checking fonts and stage readiness.',
     displayReady: 'Display ready', displayPreparing: 'Preparing display', countdown: 'Round starts in',
     question: 'Question', of: 'of', getReady: 'Get ready', promptBody: 'Phones are finishing the question prompt.',
     cueReady: 'Get ready to answer', cueBody: 'Phones are synchronizing the answer cue.',
+    audioProblem: 'Question audio needs attention', audioProblemBody: 'The answer clock is paused. Ask the operator to retry this question.',
+    audioExpired: 'This round has ended', audioExpiredBody: 'Question audio could not be recovered. Ask the operator about starting a new game.',
     answerNow: 'Answer now', seconds: 'seconds', listening: 'Listening', locked: 'Answer locked',
     reveal: 'Answer reveal', correctAnswer: 'Correct answer', explanation: 'Why it is right',
     correct: 'Correct', incorrect: 'Incorrect', noAnswer: 'No answer', recorded: 'Answer recorded',
@@ -83,11 +88,14 @@ const COPY = {
     callQrPreparing: 'Preparando o código QR. Você pode ligar para o número abaixo.',
     callQrUnavailable: 'Código QR indisponível. Ligue para o número abaixo.',
     ready: 'Pronto', confirming: 'Confirmando nome', reconnecting: 'Reconectando', openSeat: 'Lugar livre', waiting: 'Aguardando',
-    category: 'Escolham a categoria', categoryBody: 'Votem por voz. Os totais ao vivo decidem a rodada.', vote: 'voto', votes: 'votos',
+    category: 'Escolham a categoria', categoryBody: 'Votem por voz ou toquem numa categoria para o jogador indicado. Os totais ao vivo decidem a rodada.',
+    categoryTouch: '{name} está votando nesta tela', categorySubmitting: 'Registrando o voto de {name}...', categoryWaiting: 'Aguardando votos por telefone', vote: 'voto', votes: 'votos',
     loading: 'Montando as perguntas', loadingBody: 'A tela está verificando fontes e o palco.',
     displayReady: 'Tela pronta', displayPreparing: 'Preparando a tela', countdown: 'A rodada começa em',
     question: 'Pergunta', of: 'de', getReady: 'Preparem-se', promptBody: 'Os telefones estão terminando a pergunta.',
     cueReady: 'Preparem-se para responder', cueBody: 'Os telefones estão sincronizando o aviso de resposta.',
+    audioProblem: 'Áudio da pergunta precisa de atenção', audioProblemBody: 'O cronômetro está pausado. Peça ao operador para repetir esta pergunta.',
+    audioExpired: 'Esta rodada terminou', audioExpiredBody: 'Não foi possível recuperar o áudio da pergunta. Fale com o operador para iniciar um novo jogo.',
     answerNow: 'Respondam agora', seconds: 'segundos', listening: 'Escutando', locked: 'Resposta registrada',
     reveal: 'Revelação da resposta', correctAnswer: 'Resposta correta', explanation: 'Por que está certa',
     correct: 'Correto', incorrect: 'Incorreto', noAnswer: 'Sem resposta', recorded: 'Resposta recebida',
@@ -131,6 +139,8 @@ export function renderTriviaView(state: TriviaState | null, context: TriviaViewC
     case 'countdown': view = renderCountdown(state, context); break;
     case 'question_prompt': view = renderQuestion(state, context, 'prompt'); break;
     case 'answer_cue': view = renderQuestion(state, context, 'cue'); break;
+    case 'audio_problem': view = renderAudioProblem(state, context); break;
+    case 'audio_expired': view = renderAudioExpired(state, context); break;
     case 'question': view = renderQuestion(state, context, 'answering'); break;
     case 'reveal': view = renderReveal(state, context); break;
     case 'results': view = renderResults(state, context); break;
@@ -173,15 +183,25 @@ function renderCallEntry(entry: TriviaCallEntryView, locale: SupportedLocale): s
 function renderCategories(state: TriviaState, context: TriviaViewContext): TriviaRenderedView {
   const copy = COPY[context.locale];
   const totalVotes = TRIVIA_ROUND_CATEGORY_IDS.reduce((total, category) => total + state.categoryVoteCounts[category], 0);
+  const seat = state.categoryVotingSeat;
+  const canTap = Boolean(context.isHost && context.connectionState === 'connected' && seat);
+  const submitting = Boolean(seat && context.pendingCategoryVoteSeat === seat.playerId);
   const cards = TRIVIA_ROUND_CATEGORY_IDS.map((category, index) => {
     const votes = state.categoryVoteCounts[category];
-    return `<li class="category-card${votes ? ' has-votes' : ''}"><span class="category-index" aria-hidden="true">${String(index + 1).padStart(2, '0')}</span><strong>${escapeHtml(TRIVIA_CATEGORY_LABELS[context.locale][category])}</strong><span class="vote-count"><b>${votes}</b> ${escapeHtml(votes === 1 ? copy.vote : copy.votes)}</span><i style="--votes:${Math.min(4, votes)}" aria-hidden="true"></i></li>`;
+    const label = TRIVIA_CATEGORY_LABELS[context.locale][category];
+    const content = `<span class="category-index" aria-hidden="true">${String(index + 1).padStart(2, '0')}</span><strong>${escapeHtml(label)}</strong><span class="vote-count"><b>${votes}</b> ${escapeHtml(votes === 1 ? copy.vote : copy.votes)}</span><i style="--votes:${Math.min(4, votes)}" aria-hidden="true"></i>`;
+    return `<li class="category-card${votes ? ' has-votes' : ''}">${canTap
+      ? `<button class="category-tap" type="button" data-category="${escapeHtml(category)}" data-voter="${escapeHtml(seat!.playerId)}" aria-label="${escapeHtml(`${seat!.name}: ${label}`)}"${submitting ? ' disabled' : ''}>${content}</button>`
+      : `<div class="category-tap">${content}</div>`}</li>`;
   }).join('');
+  const seatLabel = seat
+    ? (submitting ? copy.categorySubmitting : copy.categoryTouch).replace('{name}', seat.name)
+    : copy.categoryWaiting;
   const html = `<section class="scene category-scene" data-view="category_select">
-    <header class="scene-heading">${kicker(copy.eyebrow)}<div><h1>${escapeHtml(copy.category)}</h1><p>${escapeHtml(copy.categoryBody)}</p></div><strong class="vote-total">${totalVotes}<small>${escapeHtml(copy.votes)}</small></strong></header>
+    <header class="scene-heading">${kicker(copy.eyebrow)}<div><h1>${escapeHtml(copy.category)}</h1><p>${escapeHtml(copy.categoryBody)}</p><p class="category-voting-seat">${escapeHtml(seatLabel)}</p></div><strong class="vote-total">${totalVotes}<small>${escapeHtml(copy.votes)}</small></strong></header>
     <ol class="category-grid" aria-label="${escapeHtml(copy.category)}">${cards}</ol>
   </section>`;
-  return rendered(`category:${TRIVIA_ROUND_CATEGORY_IDS.map(category => state.categoryVoteCounts[category]).join(':')}`,
+  return rendered(`category:${seat?.playerId ?? 'none'}:${TRIVIA_ROUND_CATEGORY_IDS.map(category => state.categoryVoteCounts[category]).join(':')}`,
     `${totalVotes} ${totalVotes === 1 ? copy.vote : copy.votes}.`, html);
 }
 
@@ -229,7 +249,19 @@ function renderQuestion(
     ? answered > 0 ? `${answered} of ${state.players.length} ${copy.locked}.` : `${copy.answerNow}. ${timing?.remainingSeconds ?? 10} ${copy.seconds}.`
     : stage === 'cue' ? `${copy.cueReady}. ${copy.cueBody}`
       : `${copy.question} ${(state.questionIndex ?? 0) + 1}. ${question.prompt}. ${question.choices.map((choice, index) => `${index + 1}. ${choice.text}`).join('. ')}`;
-  return rendered(`${state.phase}:${question.id}:${stage}:${answered}`, announcement, html);
+  return rendered(`${state.phase}:${state.questionAttemptId}:${question.id}:${stage}:${answered}`, announcement, html);
+}
+
+function renderAudioProblem(state: Extract<TriviaState, { phase: 'audio_problem' }>, context: TriviaViewContext): TriviaRenderedView {
+  const copy = COPY[context.locale];
+  return rendered(`audio_problem:${state.questionAttemptId}`, copy.audioProblem,
+    panel('audio-problem', copy.eyebrow, copy.audioProblem, copy.audioProblemBody, ''));
+}
+
+function renderAudioExpired(state: TriviaState, context: TriviaViewContext): TriviaRenderedView {
+  const copy = COPY[context.locale];
+  return rendered(`audio_expired:${state.questionAttemptId}`, copy.audioExpired,
+    panel('audio-problem', copy.eyebrow, copy.audioExpired, copy.audioExpiredBody, ''));
 }
 
 function renderReveal(state: Extract<TriviaState, { phase: 'reveal' }>, context: TriviaViewContext): TriviaRenderedView {
@@ -241,7 +273,7 @@ function renderReveal(state: Extract<TriviaState, { phase: 'reveal' }>, context:
     <div class="reveal-layout"><article class="question-board"><h1>${escapeHtml(state.question.prompt)}</h1><ol class="choice-grid reveal-choices">${renderChoices(state.question.choices, correctIndex)}</ol><div class="explanation"><span>${escapeHtml(copy.explanation)}</span><p>${escapeHtml(state.reveal.explanation)}</p></div></article>
     <section class="round-board" aria-labelledby="standings-title"><h2 id="standings-title">${escapeHtml(copy.standings)}</h2>${renderRevealStandings(state, context)}</section></div>
   </section>`;
-  return rendered(`reveal:${state.question.id}`, `${copy.correctAnswer}: ${correctText}. ${state.reveal.explanation}`, html);
+  return rendered(`reveal:${state.questionAttemptId}:${state.question.id}`, `${copy.correctAnswer}: ${correctText}.`, html);
 }
 
 function renderResults(state: TriviaState, context: TriviaViewContext): TriviaRenderedView {

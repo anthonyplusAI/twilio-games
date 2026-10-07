@@ -36,6 +36,7 @@ export class KaraokeRoom {
   private locale: SupportedLocale;
   private selectedSongValue: KaraokeSong | null = null;
   private selectedByPlayerId: string | null = null;
+  private selectionGenerationValue = 0;
   private loadingGenerationValue = 0;
   private displayReadyValue = false;
   private mediaReadyValue = false;
@@ -131,6 +132,7 @@ export class KaraokeRoom {
     if (!song) return false;
     this.selectedSongValue = song;
     this.selectedByPlayerId = playerId;
+    this.selectionGenerationValue += 1;
     return true;
   }
 
@@ -145,7 +147,7 @@ export class KaraokeRoom {
       this.beginLoading();
       return true;
     }
-    if (this.phase === 'results' && this.singer?.nameConfirmed) {
+    if (this.phase === 'results' && this.singer?.nameConfirmed && playerId === this.singer.playerId) {
       this.resetRound('song_select');
       return true;
     }
@@ -330,6 +332,7 @@ export class KaraokeRoom {
       catalog: this.catalog(),
       selectedSong: this.selectedSongValue,
       selectedByPlayerId: this.selectedByPlayerId,
+      selectionGeneration: this.selectionGenerationValue,
       loadingGeneration: this.loadingGenerationValue,
       displayReady: this.displayReadyValue,
       mediaReady: this.mediaReadyValue,

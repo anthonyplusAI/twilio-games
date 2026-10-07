@@ -3,6 +3,8 @@ import type { Duplex } from 'node:stream';
 import { WebSocket, WebSocketServer } from 'ws';
 import { DEFAULT_LOCALE, resolveLocale, type SupportedLocale } from '../shared/i18n/locales';
 import { ChessRoom } from './chess-room';
+import type { ChessVoiceMoveChoice } from './chess-room';
+import { parseChessIntent } from '../shared/chess-intent';
 
 type ChessEvents = ReturnType<ChessRoom['drainEvents']>;
 type ChessCommandResult = ReturnType<ChessRoom['handleVoiceCommand']>;
@@ -28,6 +30,7 @@ export interface ChessServerOptions {
   maxRooms?: number;
   maxConnections?: number;
   webSocketServer?: WebSocketServer;
+  roomFactory?: (code: string) => ChessRoom;
 }
 
 /** The only writer of a Voice Chess room; browser sockets are display-only. */
@@ -36,6 +39,7 @@ export class ChessServer {
   private readonly rooms = new Map<string, ChessRoom>();
   private readonly displays = new Set<DisplayConnection>();
   private readonly voiceBindings = new Map<string, VoiceBinding>();
+  private readonly stationRooms = new Set<string>();
   private readonly previouslyBoundRooms = new Set<string>();
   private readonly computerTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private heartbeat: ReturnType<typeof setInterval> | null = null;
@@ -44,6 +48,7 @@ export class ChessServer {
   private readonly computerDelayMs: number;
   private readonly maxRooms: number;
   private readonly maxConnections: number;
+  private readonly roomFactory: (code: string) => ChessRoom;
   private requiresDisplayAuth: (roomCode: string) => boolean = () => false;
   private onDisplayRegistered: ((ws: WebSocket, roomCode: string) => void) | null = null;
   private onDisplayAuthenticated: ((ws: WebSocket) => void) | null = null;
@@ -56,6 +61,7 @@ export class ChessServer {
     this.computerDelayMs = options.computerDelayMs ?? 900;
     this.maxRooms = options.maxRooms ?? 64;
     this.maxConnections = options.maxConnections ?? 64;
+    this.roomFactory = options.roomFactory ?? (code => new ChessRoom(code, { random: this.random }));
     this.wss = options.webSocketServer ?? new WebSocketServer({
       noServer: true,
       maxPayload: 8 * 1024,
@@ -98,7 +104,7 @@ export class ChessServer {
     let room = this.rooms.get(code);
     if (room) return room;
     if (this.rooms.size >= this.maxRooms) return null;
-    room = new ChessRoom(code, { random: this.random });
+    room = this.roomFactory(code);
     this.rooms.set(code, room);
     return room;
   }
@@ -119,6 +125,14 @@ export class ChessServer {
       && display.authenticatedRoomCode === code && display.ws.readyState === WebSocket.OPEN));
   }
 
+  /** A standalone screen must have accepted spectate for this exact room and still be connected. */
+  hasStandaloneDisplay(ws: WebSocket, rawCode: string): boolean {
+    const code = chessRoomCode(rawCode);
+    return Boolean(code && this.rooms.has(code) && !this.stationReplayForbidden(code)
+      && [...this.displays].some(display => display.ws === ws
+        && this.displayAuthorizedForRoom(display, code)));
+  }
+
   voiceJoin(rawCode: string, name: string, callSid: string, _locale: SupportedLocale,
     trustedStationAssignment = false):
     { playerId: string; resumed: boolean } | null {
@@ -131,6 +145,7 @@ export class ChessServer {
       && this.requiresDisplayAuth(code) && !this.hasAuthenticatedDisplay(code)) return null;
     const room = this.getOrCreateRoom(code);
     if (!room) return null;
+    if (trustedStationAssignment) this.stationRooms.add(code);
     if (current) {
       current.connected = true;
       room.setPlayerConnected(true);
@@ -178,11 +193,26 @@ export class ChessServer {
     const room = this.rooms.get(code);
     const binding = this.voiceBindings.get(code);
     if (!room || !binding?.connected || binding.callSid !== callSid.trim()) return null;
+    if (room.state().phase === 'finished' && this.stationReplayForbidden(code)
+      && parseChessIntent(text, locale).kind === 'reset') {
+      return { code: 'finished', state: room.state(),
+        message: locale === 'pt-BR'
+          ? 'A estação vai preparar a próxima partida. Aguarde a próxima rodada.'
+          : 'The station will prepare the next match. Please wait for the next round.' };
+    }
     const result = room.handleVoiceCommand(text, locale);
     this.flush(room);
     this.pushState(code);
     if (result.code === 'confirmed') this.maybeScheduleComputer(code, room);
     return result;
+  }
+
+  voiceLegalMoves(rawCode: string, callSid: string, locale: SupportedLocale): ChessVoiceMoveChoice[] {
+    const code = chessRoomCode(rawCode);
+    if (!code) return [];
+    const binding = this.voiceBindings.get(code);
+    if (!binding?.connected || binding.callSid !== callSid.trim()) return [];
+    return this.rooms.get(code)?.legalVoiceMoves(locale) ?? [];
   }
 
   voiceRestart(rawCode: string, callSid: string): boolean {
@@ -191,7 +221,7 @@ export class ChessServer {
     const room = this.rooms.get(code);
     const binding = this.voiceBindings.get(code);
     if (!room || !binding?.connected || binding.callSid !== callSid.trim()
-      || room.state().phase !== 'finished') return false;
+      || room.state().phase !== 'finished' || this.stationReplayForbidden(code)) return false;
     this.cancelComputer(code);
     room.reset();
     room.setPlayerConnected(true);
@@ -226,6 +256,7 @@ export class ChessServer {
     this.rooms.delete(code);
     this.voiceBindings.delete(code);
     this.previouslyBoundRooms.delete(code);
+    this.stationRooms.delete(code);
     return true;
   }
 
@@ -239,6 +270,7 @@ export class ChessServer {
     this.voiceBindings.clear();
     this.rooms.clear();
     this.previouslyBoundRooms.clear();
+    this.stationRooms.clear();
     this.wss.close();
   }
 
@@ -278,6 +310,11 @@ export class ChessServer {
         this.send(display, { type: 'error', code: 'bad_display_auth', message: 'Invalid display token.' });
         return;
       }
+      const previousCode = display.roomCode;
+      if (previousCode && previousCode !== code) {
+        display.roomCode = null;
+        this.reap(previousCode);
+      }
       display.authenticatedRoomCode = code;
       if (display.roomCode === code) this.onDisplayAuthenticated?.(display.ws);
       return;
@@ -304,8 +341,35 @@ export class ChessServer {
       if (display.authenticatedRoomCode === code) this.onDisplayAuthenticated?.(display.ws);
       this.onDisplayRegistered?.(display.ws, code);
       this.flush(room);
-      this.send(display, { type: 'chess_state', ...room.state() });
+      this.send(display, this.displayState(display, room));
       this.onRoomState?.(code);
+      return;
+    }
+    if (message.type === 'leave') {
+      const code = display.roomCode;
+      display.roomCode = null;
+      display.authenticatedRoomCode = null;
+      if (code) this.reap(code);
+      return;
+    }
+    if (message.type === 'display_replay') {
+      const code = chessRoomCode(message.roomCode);
+      if (!code || display.roomCode !== code) {
+        this.send(display, { type: 'error', code: 'bad_display_auth', message: 'Display is not viewing this room.' });
+        return;
+      }
+      const room = this.rooms.get(code);
+      if (!room || !this.canDisplayReplay(display, room)
+        || !Number.isSafeInteger(message.gameId) || message.gameId !== room.state().gameId) {
+        if (room) this.send(display, this.displayState(display, room));
+        return;
+      }
+      this.cancelComputer(code);
+      room.reset();
+      room.setPlayerConnected(true);
+      this.flush(room);
+      this.pushState(code);
+      this.maybeScheduleComputer(code, room);
       return;
     }
     if (message.type === 'clock_sync' && typeof message.clientSentAtMs === 'number'
@@ -329,9 +393,31 @@ export class ChessServer {
     const room = this.rooms.get(code);
     if (!room) return;
     for (const display of this.displays) {
-      if (display.roomCode === code) this.send(display, { type: 'chess_state', ...room.state() });
+      if (display.roomCode === code) this.send(display, this.displayState(display, room));
     }
     this.onRoomState?.(code);
+  }
+
+  private canDisplayReplay(display: DisplayConnection, room: ChessRoom): boolean {
+    const code = room.code;
+    const binding = this.voiceBindings.get(code);
+    return this.displayAuthorizedForRoom(display, code)
+      && room.state().phase === 'finished' && room.state().playerConnected
+      && Boolean(binding?.connected) && !this.stationReplayForbidden(code);
+  }
+
+  private displayAuthorizedForRoom(display: DisplayConnection, code: string): boolean {
+    return display.roomCode === code && display.ws.readyState === WebSocket.OPEN
+      && (!this.requiresDisplayAuth(code) || display.authenticatedRoomCode === code);
+  }
+
+  private stationReplayForbidden(code: string): boolean {
+    return this.stationRooms.has(code);
+  }
+
+  private displayState(display: DisplayConnection, room: ChessRoom): unknown {
+    return { type: 'chess_state', ...room.state(),
+      canReplayOnDisplay: this.canDisplayReplay(display, room) };
   }
 
   private maybeScheduleComputer(code: string, room: ChessRoom): void {
@@ -375,6 +461,7 @@ export class ChessServer {
     this.cancelComputer(code);
     this.rooms.delete(code);
     this.previouslyBoundRooms.delete(code);
+    this.stationRooms.delete(code);
   }
 
   private send(display: DisplayConnection, message: unknown): void {

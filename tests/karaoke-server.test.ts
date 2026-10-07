@@ -13,9 +13,11 @@ interface Client { ws: WebSocket; messages: Message[]; }
 let http: Server | undefined;
 let karaoke: KaraokeServer | undefined;
 const clients: Client[] = [];
+const serverSockets: WebSocket[] = [];
 
 afterEach(async () => {
   for (const client of clients.splice(0)) client.ws.terminate();
+  serverSockets.length = 0;
   karaoke?.stopLoopOnly();
   karaoke = undefined;
   if (http) await new Promise<void>(resolve => http!.close(() => resolve()));
@@ -25,7 +27,8 @@ afterEach(async () => {
 async function start(options: ConstructorParameters<typeof KaraokeServer>[0] = {}): Promise<number> {
   http = createServer();
   karaoke = new KaraokeServer({ server: http, ...options });
-  http.on('upgrade', (request, socket, head) => karaoke!.handleUpgrade(request, socket, head));
+  http.on('upgrade', (request, socket, head) => karaoke!.handleUpgrade(request, socket, head,
+    ws => serverSockets.push(ws)));
   await new Promise<void>(resolve => http!.listen(0, '127.0.0.1', resolve));
   const address = http.address();
   if (!address || typeof address === 'string') throw new Error('missing port');
@@ -60,6 +63,46 @@ async function waitFor(client: Client, predicate: (message: Message) => boolean,
 }
 
 describe('KaraokeServer authority and lifecycle', () => {
+  it('counts only a currently bound standalone display as voice-routing presence', async () => {
+    const port = await start();
+    const display = await connect(port);
+    const serverWs = serverSockets.at(-1)!;
+    expect(karaoke!.hasStandaloneDisplay(serverWs, '4821')).toBe(false);
+
+    send(display, { type: 'spectate', roomCode: '4821' });
+    await waitFor(display, message => message.type === 'karaoke_state' && message.roomCode === '4821');
+    expect(karaoke!.hasStandaloneDisplay(serverWs, '4821')).toBe(true);
+
+    send(display, { type: 'spectate', roomCode: 'OTHER' });
+    await waitFor(display, message => message.type === 'karaoke_state' && message.roomCode === 'OTHER');
+    expect(karaoke!.hasStandaloneDisplay(serverWs, '4821')).toBe(false);
+    expect(karaoke!.hasStandaloneDisplay(serverWs, 'OTHER')).toBe(true);
+
+    send(display, { type: 'leave' });
+    for (let attempt = 0; attempt < 50 && karaoke!.hasStandaloneDisplay(serverWs, 'OTHER'); attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    expect(karaoke!.hasStandaloneDisplay(serverWs, 'OTHER')).toBe(false);
+  });
+
+  it('counts an authenticated display only after it binds the requested room', async () => {
+    const port = await start({ displayToken: 'secret' });
+    karaoke!.setDisplayAuthenticationRequirement(() => true);
+    const display = await connect(port);
+    const serverWs = serverSockets.at(-1)!;
+
+    send(display, { type: 'spectate', roomCode: '4821' });
+    await waitFor(display, message => message.type === 'error' && message.code === 'bad_display_auth');
+    expect(karaoke!.hasStandaloneDisplay(serverWs, '4821')).toBe(false);
+
+    send(display, { type: 'display_auth', roomCode: '4821', token: 'secret' });
+    expect(karaoke!.hasStandaloneDisplay(serverWs, '4821')).toBe(false);
+    send(display, { type: 'spectate', roomCode: '4821' });
+    await waitFor(display, message => message.type === 'karaoke_state' && message.roomCode === '4821');
+    expect(karaoke!.hasStandaloneDisplay(serverWs, '4821')).toBe(true);
+    expect(karaoke!.hasStandaloneDisplay(serverWs, 'OTHER')).toBe(false);
+  });
+
   it('returns an RTT-compatible authoritative clock sample before room setup', async () => {
     const port = await start({ now: () => 30_100 });
     const client = await connect(port);
@@ -137,7 +180,7 @@ describe('KaraokeServer authority and lifecycle', () => {
     expect(karaoke!.findRoom('NEW')!.state().selectedSong!.chart.words[0]!.startMs).toBe(originalStart + 20);
   });
 
-  it('requires station display authentication and singer-owned setup/readiness', async () => {
+  it('lets an authenticated shared display select a song without granting caller consent', async () => {
     const port = await start({ displayToken: 'secret' });
     karaoke!.setBrowserPlayerAdmission(code => code !== 'PAID');
     karaoke!.setDisplayAuthenticationRequirement(code => code === 'PAID');
@@ -155,8 +198,12 @@ describe('KaraokeServer authority and lifecycle', () => {
     karaoke!.voiceSetName('PAID', singer, 'Ada');
     expect(karaoke!.voiceAdvance('PAID', singer)).toBe(true);
     send(display, { type: 'select_song', songId: PT_BR_ORIGINAL_DEVELOPMENT_SONG.id });
-    await waitFor(display, message => message.type === 'error' && message.code === 'forbidden');
-    expect(karaoke!.voiceSelectSong('PAID', singer, PT_BR_ORIGINAL_DEVELOPMENT_SONG.id)).toBe(true);
+    await waitFor(display, message => message.type === 'karaoke_state'
+      && (message.selectedSong as { id?: string } | null)?.id === PT_BR_ORIGINAL_DEVELOPMENT_SONG.id);
+    expect(karaoke!.findRoom('PAID')!.state().selectedByPlayerId).toBe(singer);
+    send(display, { type: 'advance' });
+    await waitFor(display, message => message.type === 'error' && message.code === 'not_ready');
+    expect(karaoke!.findRoom('PAID')!.state().phase).toBe('song_select');
     expect(karaoke!.voiceAdvance('PAID', singer)).toBe(true);
     const generation = karaoke!.findRoom('PAID')!.state().loadingGeneration;
     send(display, { type: 'ready', loadingGeneration: generation + 1 });

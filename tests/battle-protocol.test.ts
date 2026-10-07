@@ -32,6 +32,12 @@ describe('parseBattleClientMessage', () => {
     expect(parseBattleClientMessage(JSON.stringify({ type: 'leave' })).type).toBe('leave');
     expect(parseBattleClientMessage(JSON.stringify({ type: 'leave', sessionId: 'session-1' })))
       .toEqual({ type: 'leave', sessionId: 'session-1' });
+    expect(parseBattleClientMessage('{"type":"display_select_monster","playerId":"p1","monsterId":"embertail"}'))
+      .toEqual({type:'display_select_monster',playerId:'p1',monsterId:'embertail'});
+    expect(parseBattleClientMessage('{"type":"ack_event","generation":2,"eventId":4}'))
+      .toEqual({type:'ack_event',generation:2,eventId:4});
+    expect(parseBattleClientMessage('{"type":"ack_results","generation":2}'))
+      .toEqual({type:'ack_results',generation:2});
   });
 
   it('parses the four turn actions (choose_action)', () => {
@@ -50,5 +56,7 @@ describe('parseBattleClientMessage', () => {
     expect(parseBattleClientMessage(JSON.stringify({ type: 'choose_action', action: { kind: 'item', item: 'bomb' } })).type).toBe('error'); // bad item
     expect(parseBattleClientMessage(JSON.stringify({ type: 'choose_action', action: { kind: 'nope' } })).type).toBe('error'); // bad kind
     expect(parseBattleClientMessage(JSON.stringify({ type: 'wat' })).type).toBe('error');
+    expect(parseBattleClientMessage('{"type":"ack_event","generation":2,"eventId":-1}')).toMatchObject({type:'error'});
+    expect(parseBattleClientMessage('{"type":"display_select_monster","playerId":"","monsterId":"embertail"}')).toMatchObject({type:'error'});
   });
 });

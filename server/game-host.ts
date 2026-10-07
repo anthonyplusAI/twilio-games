@@ -245,10 +245,19 @@ function isQuestion(spoken: string, locale: SupportedLocale): boolean {
  *  have chatted instead (and so selection works with the LLM disabled). Questions fall through. */
 export function clearSelectionIndex(spoken: string, choices: string[], locale: SupportedLocale = DEFAULT_LOCALE): number | null {
   if (isQuestion(spoken, locale)) return null;
-  const num = parseSelectionNumber(spoken, locale);
+  const normalized = normalizeForMatching(spoken, locale);
+  // A correction such as "one, actually two" is an unambiguous pick of the last clause.
+  // Other negated or multiple-choice turns belong to the semantic interpreter; the fast
+  // path must never select the first name/number the caller explicitly rejected.
+  const correction = locale === 'pt-BR' ? /\b(?:na verdade|corrigindo)\b/g : /\b(?:actually|correction)\b/g;
+  const matches = [...normalized.matchAll(correction)];
+  const last = matches.at(-1);
+  const candidate = last ? normalized.slice(last.index! + last[0].length).trim() : normalized;
+  if (!candidate || /\b(?:don't|dont|don t|do not|can't|cannot|not|never|no|nao|nem|or|ou|either)\b/.test(candidate)) return null;
+  const num = parseSelectionNumber(candidate, locale);
   if (num !== null) return (num >= 1 && num <= choices.length) ? num - 1 : null;
-  const i = fuzzyMatch(spoken, choices, locale);
-  return i >= 0 ? i : null;
+  const matching = choices.flatMap((choice, index) => fuzzyMatch(candidate, [choice], locale) >= 0 ? [index] : []);
+  return matching.length === 1 ? matching[0]! : null;
 }
 
 /** Fuzzy-match a spoken name against a list of choices (case-insensitive substring / word overlap).

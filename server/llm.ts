@@ -1,9 +1,8 @@
-// Thin OpenAI Chat Completions transport for the conversational AI host. Kept SDK-free (raw fetch)
-// so the model is a pure env choice (OPENAI_MODEL) and upgrades need no dependency bump. The brain
-// (system prompt, tools, action interpretation) lives in game-host.ts; this only moves bytes.
+// Thin OpenAI Chat Completions transport for game-host replies and phase-scoped voice intent.
+// Kept SDK-free (raw fetch) so OPENAI_MODEL can change without a dependency bump.
 //
-// Behind the LlmClient interface so game-host + tests use a fake, and so a missing key degrades
-// gracefully to NullLlmClient (the scripted phrase-bank lines still play — the demo never breaks).
+// Behind the LlmClient interface so tests can use a fake and local development without a key
+// can use NullLlmClient. Production voice commands require a configured key.
 
 export interface LlmTurn { role: 'user' | 'assistant'; content: string }
 
@@ -20,10 +19,17 @@ export interface ToolCall { name: string; args: Record<string, unknown> }
 /** What the model returned: something to SAY + any actions to take. */
 export interface LlmReply { say: string; toolCalls: ToolCall[] }
 
+export interface LlmRequestOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  /** Require a declared tool for a turn whose entire reply must be structured. */
+  forceTool?: string;
+}
+
 export interface LlmClient {
   /** One turn: system prompt + conversation history + available tools → reply. Never throws (returns
    *  a safe empty reply on failure) so a flaky API call can't break the call flow. */
-  respond(system: string, history: LlmTurn[], tools: ToolSpec[]): Promise<LlmReply>;
+  respond(system: string, history: LlmTurn[], tools: ToolSpec[], options?: LlmRequestOptions): Promise<LlmReply>;
   readonly enabled: boolean;   // false when no key → callers fall back to scripted lines
 }
 
@@ -59,7 +65,7 @@ export class OpenAiClient implements LlmClient {
     this.doFetch = opts.fetchImpl ?? fetch;
   }
 
-  async respond(system: string, history: LlmTurn[], tools: ToolSpec[]): Promise<LlmReply> {
+  async respond(system: string, history: LlmTurn[], tools: ToolSpec[], options?: LlmRequestOptions): Promise<LlmReply> {
     const body = {
       model: this.model,
       max_tokens: this.maxTokens,
@@ -67,11 +73,17 @@ export class OpenAiClient implements LlmClient {
       ...(tools.length ? {
         tools: tools.map(t => ({ type: 'function', function: {
           name: t.name, description: t.description, parameters: t.parameters } })),
-        tool_choice: 'auto',
+        tool_choice: options?.forceTool && tools.some(t => t.name === options.forceTool)
+          ? { type: 'function', function: { name: options.forceTool } }
+          : 'auto',
       } : {}),
     };
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), this.timeoutMs);
+    const abort = () => ctrl.abort();
+    if (options?.signal?.aborted) abort();
+    else options?.signal?.addEventListener('abort', abort, { once: true });
+    const timeoutMs = Math.min(this.timeoutMs, options?.timeoutMs ?? this.timeoutMs);
+    const timer = setTimeout(abort, timeoutMs);
     try {
       const res = await this.doFetch(`${this.baseUrl}/chat/completions`, {
         method: 'POST',
@@ -82,11 +94,12 @@ export class OpenAiClient implements LlmClient {
       if (!res.ok) { console.log(`[LLM] HTTP ${res.status}`); return { say: '', toolCalls: [] }; }
       const data = await res.json() as OpenAiResponse;
       return parseOpenAiReply(data);
-    } catch (e) {
-      console.log(`[LLM] error: ${(e as Error).message}`);
+    } catch {
+      console.log('[LLM] request failed');
       return { say: '', toolCalls: [] };   // never throw into the call flow
     } finally {
       clearTimeout(timer);
+      options?.signal?.removeEventListener('abort', abort);
     }
   }
 }

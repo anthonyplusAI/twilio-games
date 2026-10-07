@@ -128,6 +128,15 @@ export class KaraokeServer {
 
   get connectionCount(): number { return this.conns.size; }
   get roomCount(): number { return this.rooms.size; }
+  /** A connected, accepted display bound to this room, not merely an upgraded socket. */
+  hasStandaloneDisplay(ws: WebSocket, roomCode: string): boolean {
+    const code = canonicalRoomCode(roomCode);
+    if (!this.rooms.has(code)) return false;
+    return [...this.conns].some(conn => conn.ws === ws && conn.roomCode === code
+      && conn.display === true && conn.hostAuthorized === true
+      && (!this.requiresDisplayAuth(code) || conn.displayAuthenticated === true)
+      && ws.readyState === WebSocket.OPEN);
+  }
   getOrCreateRoom(code: string): KaraokeRoom { return this.room(canonicalRoomCode(code)); }
   findRoom(code: string): KaraokeRoom | undefined { return this.rooms.get(canonicalRoomCode(code)); }
   setOnRoomEvents(fn: (code: string, events: KaraokeEvent[]) => void): void { this.onRoomEvents = fn; }
@@ -367,8 +376,10 @@ export class KaraokeServer {
     const isHost = this.isAuthorizedHost(room.code, conn);
     switch (msg.type) {
       case 'select_song':
-        if (!conn.playerId) this.rejectAuthority(conn);
-        else if (!room.selectSong(conn.playerId, msg.songId)) {
+        // A paired display may choose for the current singer, but never grants the
+        // caller's separate permission to begin capturing their performance.
+        if (!conn.playerId && !isHost) this.rejectAuthority(conn);
+        else if (!room.selectSong(conn.playerId ?? room.state().singer?.playerId ?? '', msg.songId)) {
           this.send(conn, { type: 'error', code: 'select_rejected', message: 'That song is unavailable.' });
         }
         break;
@@ -376,6 +387,8 @@ export class KaraokeServer {
         if (!isHost) this.rejectAuthority(conn);
         else if (this.requiresDisplayAuth(room.code) && room.phase === 'results') {
           this.send(conn, { type: 'error', code: 'station_requeue_required', message: 'Join the queue again to sing again.' });
+        } else if (room.phase === 'song_select' && !conn.playerId) {
+          this.send(conn, { type: 'error', code: 'not_ready', message: 'The singer must say Start on their phone.' });
         } else if (!room.advance(conn.playerId)) {
           this.send(conn, { type: 'error', code: 'not_ready', message: 'Complete the current step first.' });
         }
@@ -404,7 +417,7 @@ export class KaraokeServer {
           if (conn.sessionId) this.dropSession(room.code, conn.sessionId, conn);
           conn.playerId = undefined;
           conn.sessionId = undefined;
-        }
+        } else if (conn.display) { this.detachDisplay(conn); return; }
         break;
       default:
         break;

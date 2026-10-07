@@ -41,6 +41,7 @@ interface OperatorPlayerRecoveryPage {configVersion:number;startingBalance:numbe
 interface MessagingFailedNotice { notificationId:string;kind:string;channel:'sms'|'whatsapp';status:'FAILED';attempts:number;maximumAttempts:number;lastErrorCode:string|null;lastErrorMessage:string|null;terminalReason:string|null;updatedAt:string;expiresAt:string;retryEligible:boolean;retryIneligibleReason:string|null; }
 interface AdminStatus { display:{configured:boolean;connected:boolean;checking:boolean;lastSeenAt:string|null;presenceTimeoutSeconds:number};messaging:{configured:boolean;enabled:boolean;started:boolean;lastError:string|null;channels:Record<'sms'|'whatsapp',boolean>;counts:Record<string,number>;recentFailures:MessagingFailedNotice[];onboarding:Record<'sms'|'whatsapp',boolean>;storage:{players:number;messagingIdentities:number;identityCapacity:number;remainingIdentityCapacity:number;channelAddresses:number;drafts:number;cleanupEligible:number;retentionDays:number;pruneBatchSize:number}|null}|null; }
 interface LeaderboardAdminSummary { games:Array<{game:PlayableGame;resettable:boolean;maps:Array<{map:string;label?:string;records:number}>}>; }
+interface TriviaAudioRecoveryStatus { available:boolean;matchId?:string;questionId?:string;questionAttemptId?:number;recoveryDeadlineAtMs?:number; }
 
 class ApiError extends Error { constructor(readonly status:number,readonly code:string,message:string){super(message);} }
 
@@ -57,7 +58,8 @@ const state: {
   operatorPlayers: OperatorPlayerRecoveryPage | null;
   leaderboardSummary: LeaderboardAdminSummary | null;
   leaderboardEtag: string | null;
-} = { config:null,deployment:null,player:null,wallet:null,station:null,adminConfig:null,operatorStation:null,operatorStationEtag:null,adminStatus:null,operatorPlayers:null,leaderboardSummary:null,leaderboardEtag:null };
+  triviaAudioRecovery: TriviaAudioRecoveryStatus | null;
+} = { config:null,deployment:null,player:null,wallet:null,station:null,adminConfig:null,operatorStation:null,operatorStationEtag:null,adminStatus:null,operatorPlayers:null,leaderboardSummary:null,leaderboardEtag:null,triviaAudioRecovery:null };
 
 const notice = el('notice'), modeBadge = el('mode-badge'), heroBalance = el('hero-balance');
 const PLAYABLE_GAMES: readonly PlayableGame[] = PLAYABLE_ARCADE_GAMES.map(game => game.id);
@@ -81,6 +83,7 @@ let stationResetEtag:string|null=null;
 let gameChoiceSaving=false;
 let displayPresenceExpiresAt=0;
 let playerRecoveryRequest:Promise<void>|null=null;
+let triviaRecoveryRefreshGeneration=0;
 el('refresh').addEventListener('click', () => void refreshAll(true));
 el('operator-logout').addEventListener('click',()=>void logoutOperator());
 el<HTMLFormElement>('registration-form').addEventListener('submit', event => void register(event));
@@ -114,6 +117,7 @@ el('fail-launch').addEventListener('click',()=>void stationAction('fail'));
 el('emergency-complete').addEventListener('click',()=>void stationAction('complete'));
 el('advance-results').addEventListener('click',()=>void stationAction('advance'));
 el('hold-results').addEventListener('click',()=>void stationAction('hold'));
+el('retry-trivia-audio').addEventListener('click',()=>void retryTriviaAudio());
 el('open-station-reset').addEventListener('click',()=>openStationReset());
 el('cancel-station-reset').addEventListener('click',cancelStationReset);
 el<HTMLFormElement>('station-reset-form').addEventListener('submit',event=>{event.preventDefault();void stationAction('reset');});
@@ -1050,6 +1054,51 @@ async function refreshOperatorStation():Promise<void>{
   applyOperatorStation(payload,response);
 }
 
+async function refreshTriviaAudioRecovery():Promise<void>{
+  const view=state.operatorStation;
+  const matchId=view?.station.phase==='PLAYING'&&view.match?.game==='trivia'
+    ?view.station.activeMatchId:null;
+  const generation=++triviaRecoveryRefreshGeneration;
+  if(!matchId){state.triviaAudioRecovery=null;renderTriviaAudioRecovery();return;}
+  try{
+    const status=await api<TriviaAudioRecoveryStatus>(`/api/admin/arcade/trivia/audio-recovery?matchId=${encodeURIComponent(matchId)}`);
+    if(generation!==triviaRecoveryRefreshGeneration||state.operatorStation?.station.activeMatchId!==matchId)return;
+    state.triviaAudioRecovery=status.available?status:null;
+  }catch{
+    if(generation!==triviaRecoveryRefreshGeneration)return;
+    state.triviaAudioRecovery=null;
+  }
+  renderTriviaAudioRecovery();
+}
+
+function renderTriviaAudioRecovery():void{
+  const recovery=state.triviaAudioRecovery;
+  const active=Boolean(recovery?.available&&recovery.matchId===state.operatorStation?.station.activeMatchId
+    &&state.operatorStation?.station.phase==='PLAYING'&&state.operatorStation.match?.game==='trivia');
+  show('trivia-audio-recovery',active);
+}
+
+async function retryTriviaAudio():Promise<void>{
+  const recovery=state.triviaAudioRecovery;
+  if(!recovery?.available||!recovery.matchId||!recovery.questionId||!recovery.questionAttemptId)return;
+  const button=el<HTMLButtonElement>('retry-trivia-audio');
+  button.disabled=true;
+  try{
+    await api('/api/admin/arcade/trivia/audio-recovery',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({matchId:recovery.matchId,questionId:recovery.questionId,
+        questionAttemptId:recovery.questionAttemptId}),
+    });
+    state.triviaAudioRecovery=null;
+    renderTriviaAudioRecovery();
+    setNotice('Question audio is replaying. The answer clock will start after the call audio finishes.','success');
+    await refreshOperatorStation();
+  }catch(error){
+    await refreshOperatorStation().catch(()=>undefined);
+    showError(error);
+  }finally{button.disabled=false;}
+}
+
 async function refreshOperatorPlayers(append=false,force=false):Promise<void>{
   if(!state.adminConfig)return;
   if(playerRecoveryRequest){
@@ -1130,6 +1179,7 @@ function applyOperatorStation(view:OperatorStationView|null,response:Response):v
   if(!etag)throw new Error('Live event status is unavailable. Refresh and try again.');
   if(state.operatorStation&&(!view||view.station.revision<state.operatorStation.station.revision))return;
   state.operatorStation=view;state.operatorStationEtag=etag;renderOperatorStation();renderRuntimeSummary();
+  void refreshTriviaAudioRecovery();
 }
 
 async function stationAction(action:StationAction,game?:PlayableGame):Promise<void>{

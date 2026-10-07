@@ -149,6 +149,39 @@ describe('karaoke weighted scoring', () => {
     expect(JSON.stringify(summary)).not.toContain('provider-secret-transcript');
   });
 
+  it('credits a high-confidence close lyric rendering only inside the timed word window', () => {
+    const word = { ...WORD, text: 'feeling', startMs: 1_000, endMs: 1_200 };
+    const scorer = new KaraokeScoreAccumulator([word], {
+      locale: 'en-US', lyricRecognitionAvailable: true, earlyToleranceMs: 0, lateToleranceMs: 0,
+      lyricAlignmentToleranceMs: 100,
+    });
+    fillWord(scorer, word);
+    scorer.replaceLyricResult('accented-asr', [evidence('feelin', 1_050, 1_150, 0.9)], true);
+    expect(scorer.summary().lyricScore).toBeGreaterThan(0.7);
+
+    const late = new KaraokeScoreAccumulator([word], {
+      locale: 'en-US', lyricRecognitionAvailable: true, earlyToleranceMs: 0, lateToleranceMs: 0,
+      lyricAlignmentToleranceMs: 100,
+    });
+    fillWord(late, word);
+    late.replaceLyricResult('late', [evidence('feelin', 1_500, 1_600, 0.9)], true);
+    expect(late.summary().lyricScore).toBe(0);
+  });
+
+  it('rejects low-confidence and ambiguous approximate lyric evidence', () => {
+    const word = { ...WORD, text: 'feeling', startMs: 1_000, endMs: 1_200 };
+    const uncertain = new KaraokeScoreAccumulator([word], { lyricRecognitionAvailable: true });
+    fillWord(uncertain, word);
+    uncertain.replaceLyricResult('uncertain', [evidence('feelin', 1_050, 1_150, 0.5)], true);
+    expect(uncertain.summary().lyricScore).toBe(0);
+
+    const duplicateWords = [word, { ...word, id: 'duplicate' }];
+    const ambiguous = new KaraokeScoreAccumulator(duplicateWords, { lyricRecognitionAvailable: true });
+    fillWord(ambiguous, word);
+    ambiguous.replaceLyricResult('ambiguous', [evidence('feelin', 1_050, 1_150, 0.95)], true);
+    expect(ambiguous.summary().words.map(item => item.lyricScore)).toEqual([0, 0]);
+  });
+
   it('aligns recognized words in chart order to nearby media-origin timestamps', () => {
     const words: ExpectedChartWord[] = [
       { ...WORD, id: 'first', text: 'first', startMs: 0, endMs: 100 },

@@ -1,10 +1,7 @@
-// Big-screen front-end for the shared display: the AAA, Twilio-branded menu flow — lobby (PRESS
-// START), car-select GRID, map-select, and the post-race results scoreboard. One full-screen GLASS
-// overlay that sits on top of the live attract-mode 3D behind it, re-rendered from the server's
-// lobby / select_state / results messages. Players act by TEXTING (concierge/SMS) or, on the host
-// display, keyboard. Presentation only — styling lives in racer.css; this builds the markup + wires
-// host keys. See [[lobby-character-select-vision]].
-import type { LobbyPlayer, RaceResult } from '../shared/types';
+// Shared-screen Racer menus: lobby, car selection, track vote, and results. The server
+// supplies the current room and eligible caller seat for voice, keyboard, or touch selection.
+// Gameplay input remains on the phone; styling lives in racer.css.
+import type { LobbyPlayer, RaceResult, MenuTouchState } from '../shared/types';
 import { controlsLegendHtml } from './controls-legend';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../shared/i18n/locales';
 import { RACER_MESSAGES, type RacerMessageKey } from '../shared/i18n/racer';
@@ -19,8 +16,10 @@ export interface GlobalEntry { name: string; map: string; carIndex: number; fini
 export interface MapVotes { counts: Record<string, number>; tie: boolean }
 
 export interface ScreensCallbacks {
-  onAdvance(): void;   // host Enter / → : advance a phase or start the race
-  onBack(): void;      // host ← : step a phase backward
+  onAdvance(roomCode: string, phase: 'lobby' | 'car_select' | 'map_select' | 'results', playerId: string | null): void;
+  onBack(roomCode: string, phase: 'car_select' | 'map_select'): void;
+  onSelectCar(roomCode: string, playerId: string, index: number): void;
+  onSelectMap(roomCode: string, playerId: string, map: string): void;
 }
 
 const BUG = '/brand/Twilio_Logo_Bug_White.svg';
@@ -47,6 +46,8 @@ export class Screens {
   private arcadeQr = '';
   private visible = false;
   private phase: 'lobby' | 'car_select' | 'map_select' | 'results' | null = null;
+  private menuRoomCode = '';
+  private menuTouch: MenuTouchState | null = null;
   private lastMapArgs: { maps: string[]; selectedMap: string | null; players: LobbyPlayer[]; votes: MapVotes } | null = null;
   /** Signature of the last rendered state. The server re-broadcasts the roster ~2x/s; rebuilding
    *  innerHTML each time replays the CSS entrance animations → the "flicker" the user saw. We skip
@@ -63,6 +64,44 @@ export class Screens {
     this.root = document.createElement('div');
     this.root.id = 'screens';
     host.appendChild(this.root);
+    this.root.addEventListener('click', event => {
+      const button = (event.target as Element | null)?.closest?.<HTMLButtonElement>('button[data-menu-action]');
+      if (!button || !this.root.contains(button) || button.disabled) return;
+      const action = button.dataset.menuAction;
+      if (action === 'advance') this.advance();
+      else if (action === 'back') this.back();
+      else if (action === 'car') this.selectCar(Number(button.dataset.index));
+      else if (action === 'map' && button.dataset.map) this.selectMap(button.dataset.map);
+    });
+  }
+
+  /** The server labels the exact caller seat a tap can select for, and validates it again. */
+  setMenuTouch(roomCode: string, touch?: MenuTouchState): void {
+    const next = touch ?? null;
+    const same = this.menuRoomCode === roomCode && JSON.stringify(this.menuTouch) === JSON.stringify(next);
+    this.menuRoomCode = roomCode;
+    this.menuTouch = next;
+    if (!same) this.lastKey = '';
+  }
+
+  selectCar(index: number): void {
+    if (!this.visible || this.phase !== 'car_select' || !Number.isInteger(index) || index < 0) return;
+    const playerId = this.menuTouch?.activePlayerId;
+    if (playerId) this.cb.onSelectCar(this.menuRoomCode, playerId, index);
+  }
+  selectMap(map: string): void {
+    if (!this.visible || this.phase !== 'map_select' || !map) return;
+    const playerId = this.menuTouch?.activePlayerId;
+    if (playerId) this.cb.onSelectMap(this.menuRoomCode, playerId, map);
+  }
+  private advance(): void {
+    if (!this.visible || !this.phase || !this.menuTouch?.canAdvance) return;
+    this.cb.onAdvance(this.menuRoomCode, this.phase, this.menuTouch.advancePlayerId);
+  }
+  private back(): void {
+    if (!this.visible || !this.menuTouch?.canBack
+      || (this.phase !== 'car_select' && this.phase !== 'map_select')) return;
+    this.cb.onBack(this.menuRoomCode, this.phase);
   }
 
   /** Supply the join phone number (from /api/config); re-render the lobby if it's up so the QR-flow
@@ -173,8 +212,8 @@ export class Screens {
       ? `<a class="num" href="tel:${esc(this.phoneNumber)}">${esc(this.phoneNumber)}</a>`
       : `<span class="num num-unset">${this.text('screen.lobby.phoneUnset')}</span>`;
     const foot = n === 0
-      ? `<span>${this.text('screen.lobby.everyoneCanJoin')}</span>`
-      : `<span>${this.text('screen.lobby.sayStart')}</span>`;
+      ? this.text('screen.lobby.everyoneCanJoin')
+      : this.text('screen.lobby.sayStart');
     const joinFlow = this.stationManaged
       ? `<div class="join-flow station-call-flow">
           <div class="join-flow-message"><strong>${this.text('screen.lobby.stationTitle')}</strong><span>${this.text('screen.lobby.stationBody')}</span></div>
@@ -204,7 +243,7 @@ export class Screens {
         <div class="lobby-main">
           ${joinFlow}
           ${this.chips(players)}
-          <div class="scr-foot">${foot}</div>
+          ${this.menuFooter(foot, 'lobby')}
         </div>
         ${controlsLegendHtml(this.boostThumb, this.locale)}
       </div>`;
@@ -236,9 +275,9 @@ export class Screens {
       ${this.head(this.text('screen.car.title'), allReady
         ? this.text('screen.car.readySubtitle') : this.text('screen.car.pickSubtitle'))}
       ${this.chips(players)}
+      ${this.touchSeat(players)}
       <div class="scr-body"><div class="grid" style="--cols:${cols}">${tiles}</div></div>
-      <div class="scr-foot">
-        <span>${this.text(allReady ? 'screen.car.readyFooter' : 'screen.car.pickFooter')}</span></div>`;
+      ${this.menuFooter(this.text(allReady ? 'screen.car.readyFooter' : 'screen.car.pickFooter'), 'car_select')}`;
   }
 
   private carTile(i: number, name: string, claimedBy: LobbyPlayer[]): string {
@@ -251,13 +290,17 @@ export class Screens {
       : `<div class="portrait"><img data-car-thumb="${i}" alt="" style="opacity:0"><span class="ph${unavailable ? ' unavailable' : ''}" data-ph="${i}">${this.text('screen.car.placeholder', { number: i + 1 })}</span></div>`;
     const badges = claimedBy.map(p =>
       `<span class="badge" style="background:${cssColor(p.color)}">${esc(p.name)}</span>`).join('');
+    const active = this.lastPlayers.find(player => player.playerId === this.menuTouch?.activePlayerId);
+    const label = this.text('screen.car.touchChoose', { car: name, name: active?.name ?? '' });
     return `
-      <div class="tile${claimed ? ' claimed' : ''}"${claimed ? ` style="--claim:${claim}"` : ''}>
+      <button type="button" class="tile${claimed ? ' claimed' : ''}" data-menu-action="car" data-index="${i}"
+        aria-label="${esc(label)}" aria-pressed="${claimedBy.some(player => player.playerId === active?.playerId)}"
+        ${active ? '' : 'disabled'}${claimed ? ` style="--claim:${claim}"` : ''}>
         <div class="num">${i + 1}</div>
         ${portrait}
         <div class="cname">${esc(name)}</div>
         <div class="badges">${badges}</div>
-      </div>`;
+      </button>`;
   }
 
   // ── Map select ───────────────────────────────────────────────────────────────────────────────
@@ -280,10 +323,13 @@ export class Screens {
       // A vote badge (count + label) so it's clear this is a vote, and which track is winning.
       const voteBadge = `<div class="votes${n > 0 ? ' has' : ''}">${this.text(n === 1 ? 'screen.map.oneVote' : 'screen.map.manyVotes', { count: n })}</div>`;
       return `
-        <div class="map${leading ? ' sel' : ''}">
+        <button type="button" class="map${leading ? ' sel' : ''}" data-menu-action="map" data-map="${esc(m)}"
+          aria-label="${esc(this.text('screen.map.touchVote', { map: localizedTrackName(this.locale, m),
+            name: players.find(player => player.playerId === this.menuTouch?.activePlayerId)?.name ?? '' }))}"
+          ${this.menuTouch?.activePlayerId ? '' : 'disabled'}>
           <div class="thumb">${thumb}<div class="num">${i + 1}</div>${voteBadge}</div>
           <div class="mname">${esc(localizedTrackName(this.locale, m))}${leading ? ` <span class="check">▶ ${this.text('screen.map.leading')}</span>` : ''}</div>
-        </div>`;
+        </button>`;
     }).join('');
     // Headline messaging that makes the vote (and tie-break) explicit.
     const sub = totalVotes === 0 ? this.text('screen.map.noVotesSubtitle')
@@ -294,10 +340,10 @@ export class Screens {
     this.root.innerHTML = `
       ${this.head(this.text('screen.map.title'), sub)}
       ${this.chips(players)}
+      ${this.touchSeat(players)}
       <div class="scr-center"><div class="maps">${tiles}</div></div>
-      <div class="scr-foot">
-        <span>${selectedMap ? this.text(votes.tie ? 'screen.map.startTieFooter' : 'screen.map.startWinnerFooter')
-          : this.text('screen.map.pickFooter')}</span></div>`;
+      ${this.menuFooter(selectedMap ? this.text(votes.tie ? 'screen.map.startTieFooter' : 'screen.map.startWinnerFooter')
+        : this.text('screen.map.pickFooter'), 'map_select')}`;
   }
 
   // ── Results — this race + all-time board ─────────────────────────────────────────────────────
@@ -329,7 +375,7 @@ export class Screens {
         <div class="res-list"><div class="col-label">${this.text('screen.results.thisRace')}</div>${rows}</div>
         ${board}
       </div>
-      <div class="scr-foot">${this.text(this.stationManaged?'screen.results.stationFooter':'screen.results.againFooter')}</div>`;
+      ${this.menuFooter(this.text(this.stationManaged?'screen.results.stationFooter':'screen.results.againFooter'), 'results')}`;
   }
 
   private boardHtml(map: string | null, entries: GlobalEntry[], carNameFor: (i: number) => string): string {
@@ -358,6 +404,23 @@ export class Screens {
       </div>`;
   }
 
+  private touchSeat(players: LobbyPlayer[]): string {
+    const active = players.find(player => player.playerId === this.menuTouch?.activePlayerId);
+    return active ? `<div class="touch-seat">${esc(this.text('screen.touchFor', { name: active.name }))}</div>` : '';
+  }
+
+  private menuFooter(hint: string, phase: 'lobby' | 'car_select' | 'map_select' | 'results'): string {
+    const touch = this.menuTouch;
+    const back = touch?.canBack && (phase === 'car_select' || phase === 'map_select')
+      ? `<button type="button" class="menu-button secondary" data-menu-action="back">${this.text('screen.action.back')}</button>` : '';
+    const actionKey = phase === 'lobby' ? 'screen.action.start'
+      : phase === 'car_select' ? 'screen.action.next'
+        : phase === 'map_select' ? 'screen.action.race' : 'screen.action.replay';
+    const advance = touch && !(this.stationManaged && phase === 'results')
+      ? `<button type="button" class="menu-button" data-menu-action="advance" ${touch.canAdvance ? '' : 'disabled'}>${this.text(actionKey)}</button>` : '';
+    return `<div class="scr-foot"><span>${hint}</span>${back || advance ? `<div class="menu-actions">${back}${advance}</div>` : ''}</div>`;
+  }
+
   private chips(players: LobbyPlayer[]): string {
     if (players.length === 0)
       return `<div class="chips"><div class="chip-empty">${this.text('screen.waitingPlayers')}</div></div>`;
@@ -370,7 +433,7 @@ export class Screens {
             ?? this.text('screen.carFallback', { number: p.carIndex + 1 }))}</span>` : '';
       // Two-line identity stack: a small "Player N" eyebrow over the player's NAME (the main text).
       return `
-        <div class="chip${p.ready ? ' ready' : ''}"${p.ready ? ` style="border-color:${col}"` : ''}>
+        <div class="chip${p.ready ? ' ready' : ''}${p.playerId === this.menuTouch?.activePlayerId ? ' touch-target' : ''}"${p.ready ? ` style="border-color:${col}"` : ''}>
           <span class="dot" style="background:${col};color:${col}"></span>
           <span class="who">
             <span class="plabel">${this.text('screen.playerLabel', { number: i + 1 })}</span>
@@ -395,8 +458,9 @@ export class Screens {
   bindHostKeys(): () => void {
     const handler = (e: KeyboardEvent) => {
       if (!this.visible) return;
-      if (e.key === 'ArrowLeft') this.cb.onBack();
-      else if (e.key === 'ArrowRight' || e.key === 'Enter') this.cb.onAdvance();
+      if ((e.target as Element | null)?.closest?.('button,a,input,textarea,select')) return;
+      if (e.key === 'ArrowLeft') { e.preventDefault(); this.back(); }
+      else if (e.key === 'ArrowRight' || e.key === 'Enter') { e.preventDefault(); this.advance(); }
     };
     addEventListener('keydown', handler);
     return () => removeEventListener('keydown', handler);

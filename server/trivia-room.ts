@@ -28,14 +28,15 @@ import {
 
 export const TRIVIA_COUNTDOWN_MS = 3_000;
 export const TRIVIA_LOADING_TIMEOUT_MS = 30_000;
-/** Legacy prompt-phase timeout retained for protocol compatibility; normal flow does not use it. */
+/** Maximum wait for question prompt delivery to start before audio recovery is needed. */
 export const TRIVIA_QUESTION_PROMPT_TIMEOUT_MS = 60_000;
-/** Legacy cue-phase timeout retained for protocol compatibility; normal flow does not use it. */
 export const TRIVIA_ANSWER_CUE_TIMEOUT_MS = 25_000;
-/** Retained for protocol consumers; answering now opens when the question is published. */
 export const TRIVIA_ANSWER_START_DELAY_MS = 0;
 export const TRIVIA_FINAL_ANSWER_GRACE_MS = 1_500;
+/** A received spoken final can hold only its own question while semantic intent resolves. */
+export const TRIVIA_SEMANTIC_ANSWER_MAX_MS = 3_000;
 export const TRIVIA_REVEAL_MS = 4_000;
+export const TRIVIA_AUDIO_RECOVERY_MS = 120_000;
 
 export interface TriviaRoomOptions {
   bank: TriviaQuestionBank | readonly TriviaQuestionDefinition[];
@@ -70,6 +71,7 @@ interface RoomPlayer extends TriviaAuthoritativePlayer {
   submittedElapsedMs: number | null;
   submittedCorrect: boolean | null;
   submittedPoints: number;
+  earlyChoiceId: string | null;
   rank?: number;
   normalizedScore?: number;
 }
@@ -103,14 +105,27 @@ export class TriviaRoom {
   private countdownEndsAt: number | null = null;
   private countdownValue: 1 | 2 | 3 | null = null;
   private questionIndexValue: number | null = null;
+  private questionAttemptIdValue = 0;
   private questionPromptEndsAt: number | null = null;
   private answerCueEndsAt: number | null = null;
   private answeringStartsAt: number | null = null;
   private questionEndsAt: number | null = null;
   private finalAnswerDeadlineAt: number | null = null;
+  private nextSemanticResolutionId = 1;
+  private readonly semanticAnswerResolutions = new Map<string, {
+    id: number;
+    questionId: string;
+    questionAttemptId: number;
+    expiresAtMs: number;
+    lateOnset?: { choiceId: string; atMs: number };
+  }>();
   private revealEndsAt: number | null = null;
   private readonly promptReadyPlayerIds = new Set<string>();
   private readonly answerCueReadyPlayerIds = new Set<string>();
+  private nextDeliveryGeneration = 1;
+  private readonly promptDeliveries = new Map<string, { generation: number; deadlineAtMs: number }>();
+  private readonly cueDeliveries = new Map<string, { generation: number; deadlineAtMs: number }>();
+  private audioProblemValue: { questionId: string; questionAttemptId: number; recoveryDeadlineAtMs: number } | null = null;
   private resultValue: TriviaResult | null = null;
   private events: TriviaEvent[] = [];
 
@@ -175,6 +190,7 @@ export class TriviaRoom {
       submittedElapsedMs: null,
       submittedCorrect: null,
       submittedPoints: 0,
+      earlyChoiceId: null,
     };
     this.players.push(player);
     this.players.sort((a, b) => a.playerOrder - b.playerOrder);
@@ -188,9 +204,15 @@ export class TriviaRoom {
     const index = this.players.findIndex(player => player.playerId === playerId);
     if (index < 0) return false;
     if (this.stationFixedValue && this.phase === 'results' && this.resultValue) return false;
+    if (this.stationFixedValue && (this.phase === 'question_prompt' || this.phase === 'answer_cue')) {
+      this.pauseAudio(this.currentQuestion()?.question.id ?? '', this.questionAttemptIdValue);
+    }
     this.players.splice(index, 1);
+    this.semanticAnswerResolutions.delete(playerId);
     this.promptReadyPlayerIds.delete(playerId);
     this.answerCueReadyPlayerIds.delete(playerId);
+    this.promptDeliveries.delete(playerId);
+    this.cueDeliveries.delete(playerId);
     this.events.push({ type: 'player_left', playerId, atMs: this.now() });
     if (!this.players.length) {
       const stationPregame = this.stationFixedValue
@@ -249,6 +271,7 @@ export class TriviaRoom {
     this.countdownEndsAt = null;
     this.countdownValue = null;
     this.questionIndexValue = null;
+    this.audioProblemValue = null;
     this.questionPromptEndsAt = null;
     this.answerCueEndsAt = null;
     this.answeringStartsAt = null;
@@ -257,6 +280,8 @@ export class TriviaRoom {
     this.revealEndsAt = null;
     this.promptReadyPlayerIds.clear();
     this.answerCueReadyPlayerIds.clear();
+    this.promptDeliveries.clear();
+    this.cueDeliveries.clear();
     this.resultValue = null;
     this.resetPlayersForRound();
     return true;
@@ -318,6 +343,14 @@ export class TriviaRoom {
     return true;
   }
 
+  /** A shared display may cast only the currently named unvoted seat's vote. */
+  voteCategoryFromDisplay(playerId: string, category: TriviaRoundCategoryId): boolean {
+    if (this.categoryVotingSeat()?.playerId !== playerId) return false;
+    const player = this.players.find(candidate => candidate.playerId === playerId);
+    if (!player || player.categoryVote !== null) return false;
+    return this.voteCategory(playerId, category);
+  }
+
   advance(playerId?: string): boolean {
     this.tick();
     if (this.phase !== 'results' && this.automaticSetupValue && (!playerId || !this.hasPlayer(playerId))) return false;
@@ -332,7 +365,7 @@ export class TriviaRoom {
       this.beginLoading();
       return true;
     }
-    if (this.phase === 'results' && this.allowReplayValue && this.players.length) {
+    if (this.phase === 'results' && this.allowReplayValue && playerId && this.hasPlayer(playerId)) {
       this.resetPlayersForRound();
       this.phase = 'category_select';
       this.categoryValue = null;
@@ -366,24 +399,117 @@ export class TriviaRoom {
     return true;
   }
 
-  /** Trusted phone-prompt seam. Readiness is scoped to the currently visible question. */
-  questionPromptReady(playerId: string, questionId: string): boolean {
+  beginPromptDelivery(playerId: string, questionId: string, questionAttemptId: number,
+    estimatedSpeechMs = 0): number | null {
+    if (!this.canDeliver(playerId, questionId, questionAttemptId, 'question_prompt')
+      || this.promptReadyPlayerIds.has(playerId)) return null;
+    const generation = this.nextDeliveryGeneration++;
+    this.promptDeliveries.set(playerId, {
+      generation,
+      deadlineAtMs: this.now() + Math.max(20_000, Math.min(90_000, estimatedSpeechMs + 10_000)),
+    });
+    return generation;
+  }
+
+  beginAnswerCueDelivery(playerId: string, questionId: string, questionAttemptId: number): number | null {
+    if (!this.canDeliver(playerId, questionId, questionAttemptId, 'answer_cue')
+      || this.answerCueReadyPlayerIds.has(playerId)) return null;
+    const generation = this.nextDeliveryGeneration++;
+    this.cueDeliveries.set(playerId, { generation, deadlineAtMs: this.now() + Math.max(20_000, this.answerCueTimeoutMs) });
+    return generation;
+  }
+
+  /** Trusted phone-prompt seam. Only a current delivery's completed playback can ready it. */
+  questionPromptReady(playerId: string, questionId: string, questionAttemptId: number,
+    deliveryGeneration: number): boolean {
     const current = this.currentQuestion();
     const player = this.players.find(candidate => candidate.playerId === playerId);
-    if (this.phase !== 'question_prompt' || current?.question.id !== questionId || !player?.connected) return false;
+    if (this.phase !== 'question_prompt' || current?.question.id !== questionId || !player?.connected
+      || this.questionAttemptIdValue !== questionAttemptId
+      || this.promptDeliveries.get(playerId)?.generation !== deliveryGeneration) return false;
+    this.promptDeliveries.delete(playerId);
     this.promptReadyPlayerIds.add(playerId);
     this.maybeStartAnswerCue(this.now());
     return true;
   }
 
-  /** Trusted answer-cue seam. Readiness is scoped to the current question and never resets its timer. */
-  questionAnswerCueReady(playerId: string, questionId: string): boolean {
+  questionPromptSkipped(playerId: string, questionId: string, questionAttemptId: number): boolean {
+    if (!this.canDeliver(playerId, questionId, questionAttemptId, 'question_prompt')) return false;
+    this.promptDeliveries.delete(playerId);
+    this.promptReadyPlayerIds.add(playerId);
+    this.maybeStartAnswerCue(this.now());
+    return true;
+  }
+
+  /** Trusted answer-cue seam. Readiness is scoped to this playback attempt. */
+  questionAnswerCueReady(playerId: string, questionId: string, questionAttemptId: number,
+    deliveryGeneration: number): boolean {
     const current = this.currentQuestion();
     const player = this.players.find(candidate => candidate.playerId === playerId);
-    if (this.phase !== 'answer_cue' || current?.question.id !== questionId || !player?.connected) return false;
+    if (this.phase !== 'answer_cue' || current?.question.id !== questionId || !player?.connected
+      || this.questionAttemptIdValue !== questionAttemptId
+      || this.cueDeliveries.get(playerId)?.generation !== deliveryGeneration) return false;
+    this.cueDeliveries.delete(playerId);
     this.answerCueReadyPlayerIds.add(playerId);
     this.maybeStartAnswering(this.now());
     return true;
+  }
+
+  questionAnswerCueSkipped(playerId: string, questionId: string, questionAttemptId: number): boolean {
+    if (!this.canDeliver(playerId, questionId, questionAttemptId, 'answer_cue')) return false;
+    this.cueDeliveries.delete(playerId);
+    this.answerCueReadyPlayerIds.add(playerId);
+    this.maybeStartAnswering(this.now());
+    return true;
+  }
+
+  /** Holds a final early choice for the shared start; it never exposes the answer key. */
+  queueEarlyAnswer(playerId: string, questionId: string, questionAttemptId: number,
+    spokenOrChoiceId: string): boolean {
+    if ((this.phase !== 'question_prompt' && this.phase !== 'answer_cue')
+      || this.questionAttemptIdValue !== questionAttemptId) return false;
+    const current = this.currentQuestion();
+    const player = this.players.find(candidate => candidate.playerId === playerId);
+    if (!current || current.question.id !== questionId || !player?.connected || player.earlyChoiceId) return false;
+    const choiceId = this.resolveChoice(current, spokenOrChoiceId);
+    if (!choiceId) return false;
+    player.earlyChoiceId = choiceId;
+    if (this.phase === 'question_prompt') return this.questionPromptSkipped(playerId, questionId, questionAttemptId);
+    return this.questionAnswerCueSkipped(playerId, questionId, questionAttemptId);
+  }
+
+  pauseAudio(questionId: string, questionAttemptId: number): boolean {
+    if ((this.phase !== 'question_prompt' && this.phase !== 'answer_cue')
+      || this.currentQuestion()?.question.id !== questionId
+      || this.questionAttemptIdValue !== questionAttemptId) return false;
+    this.phase = 'audio_problem';
+    this.questionPromptEndsAt = null;
+    this.answerCueEndsAt = null;
+    this.answeringStartsAt = null;
+    this.questionEndsAt = null;
+    this.finalAnswerDeadlineAt = null;
+    this.promptDeliveries.clear();
+    this.cueDeliveries.clear();
+    this.audioProblemValue = { questionId, questionAttemptId,
+      recoveryDeadlineAtMs: this.now() + TRIVIA_AUDIO_RECOVERY_MS };
+    this.events.push({ type: 'audio_problem', questionId, questionAttemptId,
+      recoveryDeadlineAtMs: this.audioProblemValue.recoveryDeadlineAtMs, atMs: this.now() });
+    return true;
+  }
+
+  retryQuestion(questionId: string, questionAttemptId: number): boolean {
+    if (this.phase !== 'audio_problem' || this.audioProblemValue?.questionId !== questionId
+      || this.audioProblemValue.questionAttemptId !== questionAttemptId
+      || this.questionIndexValue === null) return false;
+    this.startQuestion(this.questionIndexValue, this.now());
+    return true;
+  }
+
+  private canDeliver(playerId: string, questionId: string, questionAttemptId: number,
+    phase: 'question_prompt' | 'answer_cue'): boolean {
+    return this.phase === phase && this.questionAttemptIdValue === questionAttemptId
+      && this.currentQuestion()?.question.id === questionId
+      && Boolean(this.players.find(player => player.playerId === playerId && player.connected));
   }
 
   /** Trusted voice/DTMF seam. Non-final transcripts never lock an answer. */
@@ -392,30 +518,77 @@ export class TriviaRoom {
     return this.commitAnswer(playerId, spokenOrChoiceId, final, answeredAtMs, answeredAtMs);
   }
 
+  /** Reserve bounded interpretation time only for a final heard during this attempt's ten-second clock. */
+  beginSemanticAnswerResolution(playerId: string, questionId: string, questionAttemptId: number,
+    onset?: { choiceId: string; atMs: number }): number | null {
+    const receivedAtMs = this.now();
+    const current = this.currentQuestion();
+    const player = this.players.find(candidate => candidate.playerId === playerId);
+    if (this.phase !== 'question' || !current || current.question.id !== questionId
+      || this.questionAttemptIdValue !== questionAttemptId
+      || !player?.connected || player.submittedChoiceId !== null
+      || this.answeringStartsAt === null || this.questionEndsAt === null
+      || this.finalAnswerDeadlineAt === null || receivedAtMs < this.answeringStartsAt
+      || receivedAtMs > this.finalAnswerDeadlineAt) return null;
+    const lateOnset = receivedAtMs > this.questionEndsAt ? onset : undefined;
+    if (receivedAtMs > this.questionEndsAt && (!lateOnset
+      || !Number.isSafeInteger(lateOnset.atMs) || lateOnset.atMs < this.answeringStartsAt
+      || lateOnset.atMs > this.questionEndsAt || lateOnset.atMs > receivedAtMs
+      || !current.question.locales[this.locale].choices.some(choice => choice.id === lateOnset.choiceId))) return null;
+    const id = this.nextSemanticResolutionId++;
+    this.semanticAnswerResolutions.set(playerId, {
+      id, questionId, questionAttemptId,
+      expiresAtMs: receivedAtMs + TRIVIA_SEMANTIC_ANSWER_MAX_MS,
+      ...(lateOnset ? { lateOnset } : {}),
+    });
+    return id;
+  }
+
+  /** Release a canceled, failed, or non-answer interpretation without extending the round. */
+  finishSemanticAnswerResolution(playerId: string, questionId: string, questionAttemptId: number,
+    resolutionId: number): boolean {
+    const pending = this.semanticAnswerResolutions.get(playerId);
+    if (!pending || pending.id !== resolutionId || pending.questionId !== questionId
+      || pending.questionAttemptId !== questionAttemptId) return false;
+    this.semanticAnswerResolutions.delete(playerId);
+    return true;
+  }
+
   /** Trusted final seam using the matching interim/onset timestamp for speed scoring. */
-  answerAt(playerId: string, spokenOrChoiceId: string, final: boolean, answeredAtMs: number): boolean {
-    return this.commitAnswer(playerId, spokenOrChoiceId, final, answeredAtMs, this.now());
+  answerAt(playerId: string, spokenOrChoiceId: string, final: boolean, answeredAtMs: number,
+    semanticResolutionId?: number): boolean {
+    return this.commitAnswer(playerId, spokenOrChoiceId, final, answeredAtMs, this.now(), semanticResolutionId);
   }
 
   private commitAnswer(playerId: string, spokenOrChoiceId: string, final: boolean,
-    answeredAtMs: number, receivedAtMs: number): boolean {
+    answeredAtMs: number, receivedAtMs: number, semanticResolutionId?: number): boolean {
     if (this.phase !== 'question') this.tick();
+    const pending = this.semanticAnswerResolutions.get(playerId);
+    const current = this.currentQuestion();
+    const reservation = semanticResolutionId === undefined ? null
+      : pending?.id === semanticResolutionId && pending.questionAttemptId === this.questionAttemptIdValue
+        && pending.questionId === current?.question.id && receivedAtMs <= pending.expiresAtMs
+        ? pending : null;
+    if (semanticResolutionId !== undefined && !reservation) return false;
+    const receivedDeadlineAt = reservation?.expiresAtMs ?? this.finalAnswerDeadlineAt;
     if (this.phase !== 'question' || !final || this.answeringStartsAt === null
-      || this.questionEndsAt === null || this.finalAnswerDeadlineAt === null
+      || this.questionEndsAt === null || receivedDeadlineAt === null
       || !Number.isSafeInteger(answeredAtMs)
       || answeredAtMs < this.answeringStartsAt
       || answeredAtMs > this.questionEndsAt
       || !Number.isFinite(receivedAtMs) || receivedAtMs < answeredAtMs
-      || receivedAtMs > this.finalAnswerDeadlineAt) return false;
+      || receivedAtMs > receivedDeadlineAt) return false;
     const player = this.players.find(candidate => candidate.playerId === playerId);
-    const current = this.currentQuestion();
     if (!player?.connected || player.submittedChoiceId !== null || !current) return false;
     const choiceId = this.resolveChoice(current, spokenOrChoiceId);
     if (!choiceId) return false;
+    if (reservation?.lateOnset && (choiceId !== reservation.lateOnset.choiceId
+      || answeredAtMs !== reservation.lateOnset.atMs)) return false;
 
     const elapsedMs = answeredAtMs - this.answeringStartsAt;
     const scored = scoreTriviaAnswer(choiceId === current.question.correctChoiceId, elapsedMs, player.currentStreak);
     player.submittedChoiceId = choiceId;
+    this.semanticAnswerResolutions.delete(playerId);
     player.submittedElapsedMs = elapsedMs;
     player.submittedCorrect = scored.correct;
     player.submittedPoints = scored.points;
@@ -450,18 +623,48 @@ export class TriviaRoom {
           continue;
         }
       }
-      if (this.phase === 'question_prompt' && this.questionPromptEndsAt !== null && now >= this.questionPromptEndsAt) {
-        this.beginAnswerCue(this.questionPromptEndsAt);
-        changed = true;
-        continue;
+      if (this.phase === 'question_prompt') {
+        const expiredDelivery = this.players.some(player => !this.promptReadyPlayerIds.has(player.playerId)
+          && (this.promptDeliveries.get(player.playerId)?.deadlineAtMs ?? Infinity) <= now);
+        const neverStarted = this.questionPromptEndsAt !== null && now >= this.questionPromptEndsAt
+          && this.players.some(player => !this.promptReadyPlayerIds.has(player.playerId)
+            && !this.promptDeliveries.has(player.playerId));
+        if (expiredDelivery || neverStarted) {
+          this.pauseAudio(this.currentQuestion()!.question.id, this.questionAttemptIdValue);
+          changed = true;
+          continue;
+        }
       }
-      if (this.phase === 'answer_cue' && this.answerCueEndsAt !== null && now >= this.answerCueEndsAt) {
-        this.beginAnswering(this.answerCueEndsAt);
+      if (this.phase === 'answer_cue') {
+        const expiredDelivery = this.players.some(player => !this.answerCueReadyPlayerIds.has(player.playerId)
+          && (this.cueDeliveries.get(player.playerId)?.deadlineAtMs ?? Infinity) <= now);
+        const neverStarted = this.answerCueEndsAt !== null && now >= this.answerCueEndsAt
+          && this.players.some(player => !this.answerCueReadyPlayerIds.has(player.playerId)
+            && !this.cueDeliveries.has(player.playerId));
+        if (expiredDelivery || neverStarted) {
+          this.pauseAudio(this.currentQuestion()!.question.id, this.questionAttemptIdValue);
+          changed = true;
+          continue;
+        }
+      }
+      if (this.phase === 'audio_problem' && this.audioProblemValue
+        && now >= this.audioProblemValue.recoveryDeadlineAtMs) {
+        this.events.push({ type: 'audio_recovery_expired', questionId: this.audioProblemValue.questionId,
+          questionAttemptId: this.audioProblemValue.questionAttemptId, atMs: now });
+        this.phase = 'audio_expired';
+        this.audioProblemValue = null;
         changed = true;
         continue;
       }
       if (this.phase === 'question' && this.finalAnswerDeadlineAt !== null && now >= this.finalAnswerDeadlineAt) {
-        this.revealQuestion(this.finalAnswerDeadlineAt);
+        const currentQuestionId = this.currentQuestion()?.question.id;
+        const pendingUntil = Math.max(this.finalAnswerDeadlineAt, ...[...this.semanticAnswerResolutions]
+          .filter(([playerId, pending]) => pending.questionId === currentQuestionId
+            && pending.questionAttemptId === this.questionAttemptIdValue
+            && this.players.some(player => player.playerId === playerId && player.submittedChoiceId === null))
+          .map(([, pending]) => pending.expiresAtMs));
+        if (now < pendingUntil) break;
+        this.revealQuestion(pendingUntil);
         changed = true;
         continue;
       }
@@ -492,11 +695,16 @@ export class TriviaRoom {
       preferredLocale: this.locale,
       category: this.categoryValue,
       categoryVoteCounts: this.categoryVoteCounts(),
+      categoryVotingSeat: this.categoryVotingSeat(),
       players: this.players,
       serverNowMs: this.now(),
       loadingGeneration: this.loadingGenerationValue,
       displayReady: this.displayReadyValue,
       questionIndex: this.questionIndexValue,
+      questionAttemptId: this.questionIndexValue === null ? null : this.questionAttemptIdValue,
+      renderRevision: this.questionIndexValue === null ? 0
+        : this.questionAttemptIdValue * 8 + (({ question_prompt: 1, answer_cue: 2,
+          question: 3, reveal: 4, audio_problem: 5 } as Partial<Record<TriviaPhase, number>>)[this.phase] ?? 0),
       countdownEndsAtMs: this.countdownEndsAt,
       questionPromptEndsAtMs: this.questionPromptEndsAt,
       answerCueEndsAtMs: this.answerCueEndsAt,
@@ -505,10 +713,16 @@ export class TriviaRoom {
       revealEndsAtMs: this.revealEndsAt,
       currentQuestion: this.currentQuestion(),
       result: this.resultValue,
+      audioProblem: this.audioProblemValue,
     }, locale);
   }
 
   hasPlayer(playerId: string): boolean { return this.players.some(player => player.playerId === playerId); }
+  categoryVoteFor(playerId: string): TriviaRoundCategoryId | null {
+    return this.players.find(player => player.playerId === playerId)?.categoryVote ?? null;
+  }
+  promptReadyFor(playerId: string): boolean { return this.promptReadyPlayerIds.has(playerId); }
+  answerCueReadyFor(playerId: string): boolean { return this.answerCueReadyPlayerIds.has(playerId); }
   canControlSetup(playerId: string): boolean { return this.hasPlayer(playerId); }
   get playerCount(): number { return this.players.length; }
   get expectedPlayerCount(): 1 | 2 | 3 | 4 { return this.expectedPlayerCountValue; }
@@ -519,7 +733,7 @@ export class TriviaRoom {
   get isTimingActive(): boolean {
     return this.phase === 'loading' || this.phase === 'countdown'
       || this.phase === 'question_prompt' || this.phase === 'answer_cue'
-      || this.phase === 'question' || this.phase === 'reveal';
+      || this.phase === 'question' || this.phase === 'reveal' || this.phase === 'audio_problem';
   }
 
   private canFreezeRoster(): boolean {
@@ -549,12 +763,15 @@ export class TriviaRoom {
     this.countdownEndsAt = null;
     this.countdownValue = null;
     this.questionIndexValue = null;
+    this.audioProblemValue = null;
     this.questionPromptEndsAt = null;
     this.answerCueEndsAt = null;
     this.answeringStartsAt = null;
     this.questionEndsAt = null;
     this.finalAnswerDeadlineAt = null;
     this.revealEndsAt = null;
+    this.promptDeliveries.clear();
+    this.cueDeliveries.clear();
     this.resultValue = null;
     this.resetPlayersForRound(false);
   }
@@ -585,30 +802,30 @@ export class TriviaRoom {
   private startQuestion(index: number, publishedAtMs: number): void {
     const current = this.round[index];
     if (!current) throw new Error('trivia round is missing a planned question');
-    this.phase = 'question';
+    this.phase = 'question_prompt';
     this.countdownEndsAt = null;
     this.countdownValue = null;
     this.questionIndexValue = index;
-    this.questionPromptEndsAt = null;
+    this.questionAttemptIdValue += 1;
+    this.questionPromptEndsAt = publishedAtMs + this.questionPromptTimeoutMs;
     this.answerCueEndsAt = null;
-    this.answeringStartsAt = publishedAtMs;
-    this.questionEndsAt = publishedAtMs + TRIVIA_ANSWER_WINDOW_MS;
-    this.finalAnswerDeadlineAt = this.questionEndsAt + this.finalAnswerGraceMs;
+    this.answeringStartsAt = null;
+    this.questionEndsAt = null;
+    this.finalAnswerDeadlineAt = null;
+    this.semanticAnswerResolutions.clear();
     this.revealEndsAt = null;
+    this.audioProblemValue = null;
     this.promptReadyPlayerIds.clear();
     this.answerCueReadyPlayerIds.clear();
+    this.promptDeliveries.clear();
+    this.cueDeliveries.clear();
     for (const player of this.players) this.clearSubmittedAnswer(player);
     this.events.push({
       type: 'question_started',
       questionId: current.question.id,
+      questionAttemptId: this.questionAttemptIdValue,
       questionIndex: index,
-      endsAtMs: this.questionEndsAt,
-    });
-    this.events.push({
-      type: 'answering_started',
-      questionId: current.question.id,
-      startsAtMs: this.answeringStartsAt,
-      endsAtMs: this.questionEndsAt,
+      promptDeadlineAtMs: this.questionPromptEndsAt,
     });
   }
 
@@ -626,9 +843,12 @@ export class TriviaRoom {
     this.questionPromptEndsAt = null;
     this.answerCueEndsAt = startedAtMs + this.answerCueTimeoutMs;
     this.answerCueReadyPlayerIds.clear();
+    this.promptDeliveries.clear();
+    for (const player of this.players) if (player.earlyChoiceId) this.answerCueReadyPlayerIds.add(player.playerId);
     this.events.push({
       type: 'answer_cue_started',
       questionId: current.question.id,
+      questionAttemptId: this.questionAttemptIdValue,
       endsAtMs: this.answerCueEndsAt,
     });
     this.maybeStartAnswering(startedAtMs);
@@ -647,6 +867,7 @@ export class TriviaRoom {
     this.phase = 'question';
     this.questionPromptEndsAt = null;
     this.answerCueEndsAt = null;
+    this.cueDeliveries.clear();
     const startedAtMs = transitionedAtMs + TRIVIA_ANSWER_START_DELAY_MS;
     this.answeringStartsAt = startedAtMs;
     this.questionEndsAt = startedAtMs + TRIVIA_ANSWER_WINDOW_MS;
@@ -654,9 +875,15 @@ export class TriviaRoom {
     this.events.push({
       type: 'answering_started',
       questionId: current.question.id,
+      questionAttemptId: this.questionAttemptIdValue,
       startsAtMs: startedAtMs,
       endsAtMs: this.questionEndsAt,
     });
+    for (const player of this.players) {
+      if (this.phase !== 'question') break;
+      if (player.earlyChoiceId) this.commitAnswer(player.playerId, player.earlyChoiceId, true,
+        startedAtMs, startedAtMs);
+    }
   }
 
   private revealQuestion(revealedAtMs: number): void {
@@ -668,8 +895,10 @@ export class TriviaRoom {
     this.answerCueEndsAt = null;
     this.questionEndsAt = null;
     this.finalAnswerDeadlineAt = null;
+    this.semanticAnswerResolutions.clear();
     this.revealEndsAt = revealedAtMs + this.revealMs;
-    this.events.push({ type: 'question_revealed', questionId: current.question.id, atMs: revealedAtMs });
+    this.events.push({ type: 'question_revealed', questionId: current.question.id,
+      questionAttemptId: this.questionAttemptIdValue, atMs: revealedAtMs });
     for (const player of this.players) {
       player.rawScore += player.submittedPoints;
       player.currentStreak = player.submittedCorrect ? player.currentStreak + 1 : 0;
@@ -681,6 +910,7 @@ export class TriviaRoom {
       if (player.submittedCorrect !== null) {
         this.events.push({
           type: 'answer_result',
+          questionAttemptId: this.questionAttemptIdValue,
           playerId: player.playerId,
           correct: player.submittedCorrect,
           points: player.submittedPoints,
@@ -731,6 +961,8 @@ export class TriviaRoom {
     this.answeringStartsAt = null;
     this.questionEndsAt = null;
     this.finalAnswerDeadlineAt = null;
+    this.promptReadyPlayerIds.clear();
+    this.answerCueReadyPlayerIds.clear();
     this.revealEndsAt = null;
     const standings = this.state().standings as readonly TriviaPublicStanding[];
     this.events.push({ type: 'round_finished', standings, result: this.resultValue, atMs: completedAtMs });
@@ -761,10 +993,16 @@ export class TriviaRoom {
     return Object.freeze(counts);
   }
 
+  private categoryVotingSeat(): { playerId: string; name: string } | null {
+    if (this.phase !== 'category_select') return null;
+    const player = this.players.find(candidate => candidate.categoryVote === null && candidate.connected);
+    return player ? { playerId: player.playerId, name: player.name } : null;
+  }
+
   private currentQuestion(): TriviaRoundQuestion | null {
     if (this.questionIndexValue === null
       || (this.phase !== 'question_prompt' && this.phase !== 'answer_cue'
-        && this.phase !== 'question' && this.phase !== 'reveal')) return null;
+        && this.phase !== 'question' && this.phase !== 'reveal' && this.phase !== 'audio_problem')) return null;
     return this.round[this.questionIndexValue] ?? null;
   }
 
@@ -787,6 +1025,7 @@ export class TriviaRoom {
     player.submittedElapsedMs = null;
     player.submittedCorrect = null;
     player.submittedPoints = 0;
+    player.earlyChoiceId = null;
   }
 
   private resetEmptyRoom(): void {
@@ -803,14 +1042,18 @@ export class TriviaRoom {
     this.countdownEndsAt = null;
     this.countdownValue = null;
     this.questionIndexValue = null;
+    this.audioProblemValue = null;
     this.questionPromptEndsAt = null;
     this.answerCueEndsAt = null;
     this.answeringStartsAt = null;
     this.questionEndsAt = null;
     this.finalAnswerDeadlineAt = null;
+    this.semanticAnswerResolutions.clear();
     this.revealEndsAt = null;
     this.promptReadyPlayerIds.clear();
     this.answerCueReadyPlayerIds.clear();
+    this.promptDeliveries.clear();
+    this.cueDeliveries.clear();
     this.resultValue = null;
   }
 }

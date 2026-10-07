@@ -53,6 +53,10 @@ describe('voice-lines', () => {
     expect(lineForEvent({ kind: 'car_picked', playerId: 'p1', name: 'Me', car: 'Lotus Elise' }, 'p1')).toContain('Lotus Elise');
     // silent for another player's pick
     expect(lineForEvent({ kind: 'car_picked', playerId: 'p2', name: 'Them', car: 'Beetle' }, 'p1')).toBeNull();
+    expect(lineForEvent({ kind: 'map_picked', playerId: 'p1', map: 'Drift' }, 'p1')).toContain('Drift');
+    expect(lineForEvent({ kind: 'map_picked', playerId: 'p1', map: 'Silver Lake' }, 'p1', 0, 'pt-BR'))
+      .toContain('Lago Prateado');
+    expect(lineForEvent({ kind: 'map_picked', playerId: 'p2', map: 'Drift' }, 'p1')).toBeNull();
   });
 
   it('placeLine covers podium + generic ordinals', () => {

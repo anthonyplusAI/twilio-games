@@ -20,7 +20,7 @@ import { FIGHTER_RUN_BACKWARD_DURATION, FIGHTER_RUN_FORWARD_DURATION,
   FIGHTER_REACTION_PLAYBACK_SPEED,
   type FighterCommand, type FighterEvent, type FighterId, type FighterWorld } from '../../shared/fighter-world';
 import type { FighterMapEntry, FighterRosterEntry } from '../../shared/fighter-roster';
-import { fighterIntroStage, type FighterState } from '../../shared/fighter-protocol';
+import { fighterIntroStage, type FighterLobbyPlayer, type FighterState } from '../../shared/fighter-protocol';
 import { FIGHTER_MESSAGES, type FighterMessageKey } from '../../shared/i18n/fighter';
 import { createTranslator } from '../../shared/i18n/translate';
 import { fighterName as translatedFighterName } from '../../shared/i18n/content';
@@ -64,7 +64,7 @@ const fightCall = $('fight-call'), errorBox = $('error');
 const connectionStatus = $('connection-status');
 const p1FighterName = $('p1-fighter-name'), p2FighterName = $('p2-fighter-name');
 const p1PlayerName = $('p1-player-name'), p2PlayerName = $('p2-player-name');
-const commandButtons = [...document.querySelectorAll<HTMLButtonElement>('[data-command]')];
+const commandButtons = [...document.querySelectorAll<HTMLElement>('[data-command]')];
 injectMusicToggle('music-toggle-container');
 injectFullscreenToggle('music-toggle-container', {
   enter: commonText('fullscreen.enter'), exit: commonText('fullscreen.exit'),
@@ -107,6 +107,7 @@ let actors: Record<FighterId, FighterActor> | null = null;
 let actorKey = '';
 let state: FighterState | null = null;
 let playerId: string | null = null;
+let touchTargetPlayerId: string | null = null;
 let roster: FighterRosterEntry[] = [];
 let maps: FighterMapEntry[] = [];
 let phoneNumber = t('phone.fallback');
@@ -154,27 +155,53 @@ let isHost = false;
 let fighterConnectionState: FighterConnectionState = 'connecting';
 let resultRevealAt = 0;
 let resultTimer: ReturnType<typeof setTimeout> | null = null;
+let forcedResultGeneration: number | null = null;
 let introSegment = '';
 let countdownSoundPlayed = false;
 let assetRetryGeneration: number | null = null;
 let assetRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let presentationEpoch=0;
+let pendingFightReceipt='';
+let sentFightReceipt='';
+let pendingResultReceipt='';
+let sentResultReceipt='';
 
 connection.onRoster((fighters, mapEntries) => { roster = fighters; maps = mapEntries; renderFlow(); });
 connection.onJoined(id => { playerId = id; renderFlow(); });
 connection.onEvents(handleEvents);
+connection.onShowResults(generation => {
+  if (state && generation < state.loadingGeneration) return;
+  forcedResultGeneration = generation;
+  resultRevealAt = 0;
+  if (resultTimer) { clearTimeout(resultTimer); resultTimer = null; }
+  if (state?.phase === 'results' && state.loadingGeneration === generation && state.result) showResult(state.result.winner);
+});
 connection.onError((code, message) => { console.error(`[fighter] ${code}: ${message}`); flowMessage = localizedServerError(code) ?? t('error.invalidResponse'); lastOverlayKey = ''; renderFlow(); });
-connection.onHostIdentity(host => { isHost = host; lastOverlayKey = ''; renderFlow(); });
+connection.onHostIdentity(host => {
+  if(isHost!==host){presentationEpoch++;pendingFightReceipt='';pendingResultReceipt='';
+    if(host){sentFightReceipt='';sentResultReceipt='';}}
+  isHost = host; lastOverlayKey = ''; renderFlow();
+  scheduleFightReceipt();
+  scheduleResultReceipt();
+});
 connection.onConnectionState(status => {
   fighterConnectionState = status;
   connectionStatus.dataset.state = status;
   connectionStatus.textContent = commonText(status === 'closed' ? 'connection.closed' : `connection.${status}`);
   if (status !== 'connected') {
     isHost = false;
+    presentationEpoch++;pendingFightReceipt='';pendingResultReceipt='';
+    sentFightReceipt='';sentResultReceipt='';
     readySentFor = '';
     if (readyTimer) { clearTimeout(readyTimer); readyTimer = null; }
   }
 });
 connection.onState(next => {
+  if (forcedResultGeneration !== null && next.loadingGeneration > forcedResultGeneration) forcedResultGeneration = null;
+  if (next.phase === 'results' && next.loadingGeneration === forcedResultGeneration) {
+    resultRevealAt = 0;
+    if (resultTimer) { clearTimeout(resultTimer); resultTimer = null; }
+  }
   if (assetRetryGeneration !== null && next.loadingGeneration > assetRetryGeneration) {
     if (assetRetryTimer) clearTimeout(assetRetryTimer);
     location.reload(); return;
@@ -189,6 +216,7 @@ connection.onState(next => {
   if (phaseChanged || selectionChanged) {
     flowMessage = ''; numericBuffer = ''; if (numericTimer) { clearTimeout(numericTimer); numericTimer = null; }
   }
+  updateTouchTarget(next,state);
   if (phaseChanged) {
     if (next.phase === 'loading') { preparedFightKey = ''; fightStartedKey = ''; bufferedEvents = []; }
     if (next.phase === 'lobby' || next.phase === 'fighter_select') resetFallbackActors();
@@ -217,9 +245,10 @@ connection.onState(next => {
   if (previousPhase === 'intro' && next.phase === 'countdown') endIntro(next);
   if (next.phase === 'loading') maybeSignalReady();
   if (phaseChanged && next.phase === 'fight') beginFight(next);
-  if (next.phase === 'results' && next.result) { stationDisplay.markEngineResultsReady(); showResult(next.result.winner); }
+  if (next.phase === 'results' && next.result) showResult(next.result.winner);
   else if (next.phase !== 'results') { result.hidden = true; setFightControlsEnabled(next.phase === 'fight'); }
   renderFlow();
+  scheduleFightReceipt();
 });
 connection.spectate(roomCode);
 let phoneQrGeneration = 0;
@@ -258,6 +287,7 @@ async function initialize(): Promise<void> {
   setTimeout(() => {
     if (attempt !== initializationAttempt) return;
     loading.classList.add('done'); loading.setAttribute('aria-busy', 'false'); renderFlow();
+    scheduleFightReceipt();scheduleResultReceipt();
   }, 250);
   try {
     animationSources = await loadAnimationSources((loaded, total) => setLoading(loaded / total, t('loading.preparingAssets')));
@@ -285,7 +315,8 @@ function renderFlow(): void {
   const phaseBeforeRender = lastPhase;
   const countdownKey = state.countdown === null ? null : Math.ceil(state.countdown) > 3 ? 'ready' : Math.ceil(state.countdown);
   const introKey = state.intro === null ? null : fighterIntroStage(state.intro);
-  const key = JSON.stringify([state.phase, state.players, state.selectedMap, introKey, countdownKey, playerId, isHost, roster, maps, phoneNumber, flowMessage]);
+  const key = JSON.stringify([state.phase, state.players, state.selectedMap, state.mapVotesByPlayerId,
+    introKey, countdownKey, playerId, touchTargetPlayerId, isHost, roster, maps, phoneNumber, flowMessage]);
   if (key === lastOverlayKey || state.phase === 'fight' || state.phase === 'victory' || state.phase === 'results') {
     if (state.phase === 'fight' || state.phase === 'victory' || state.phase === 'results') overlay.replaceChildren();
     return;
@@ -305,12 +336,18 @@ function renderFlow(): void {
     overlay.innerHTML = `<section class="flow-panel lobby-panel"><div class="lobby-head"><h1>${t('app.title')}</h1><p>${t(stationDisplay.active?'lobby.stationTagline':'lobby.tagline')}</p></div><div class="lobby-layout">${joinCard}<div class="lobby-center"><h2>${t('lobby.getStarted')}</h2><ol class="join-steps">${steps.map((step,index)=>`<li><b>${index+1}</b><span>${t(step)}</span></li>`).join('')}</ol><div class="player-list"><h2>${t(state.players.length ? 'lobby.challengers' : 'lobby.title')}</h2>${state.players.length ? state.players.map(playerChip).join('') : `<p>${t('lobby.waitingFirst')}</p>`}</div></div><aside class="how-to"><h2>${t('lobby.howToFight')}</h2><p>${t('lobby.rules')}</p><div class="instruction-grid"><span><b>${t('command.forward')}</b> ${t('instruction.forward')}</span><span><b>${t('command.back')}</b> ${t('instruction.back')}</span><span><b>${t('command.jump')}</b> ${t('instruction.jump')}</span><span><b>${t('command.punch')}</b> ${t('instruction.punch')}</span><span><b>${t('command.kick')}</b> ${t('instruction.kick')}</span><span><b>${t('command.block')}</b> ${t('instruction.block')}</span></div><p class="voice-tip">${t('lobby.voiceTip')}</p></aside></div><div class="flow-actions lobby-actions">${localAction}<button id="flow-next" ${state.players.length && isHost ? '' : 'disabled'}>${t('lobby.chooseFighters')}</button></div>${isHost||isDisplay ? '' : `<p class="flow-hint">${t('lobby.viewOnly')}</p>`}</section>`;
   } else if (state.phase === 'fighter_select') {
     const allPicked = state.hasExpectedPlayers && state.players.length > 0 && state.players.every(player => player.fighterId);
+    const target=activeTouchPlayer(state);
     overlay.innerHTML = selectScreen(t('select.fighterTitle'), t('select.fighterDescription'), roster.map((fighter, index) => {
       const owner = state!.players.find(player => player.fighterId === fighter.id);
-      return { id: fighter.id, name: localizedFighterName(fighter), detail: owner ? t('select.selectedBy', { name: owner.name }) : localizedFighterTitle(fighter), color: fighter.color, number: index + 1, selected: !!owner, taken: !!owner };
-    }), 'fighter', allPicked && isHost);
+      return { id: fighter.id, name: localizedFighterName(fighter), detail: owner ? t('select.selectedBy', { name: owner.name }) : localizedFighterTitle(fighter), color: fighter.color, number: index + 1,
+        selected:owner?.playerId===target?.playerId,taken:Boolean(owner&&owner.playerId!==target?.playerId) };
+    }), 'fighter', allPicked && isHost,touchPicker(state,target,'fighter'));
   } else if (state.phase === 'map_select') {
-    overlay.innerHTML = selectScreen(t('select.arenaTitle'), t('select.arenaDescription'), maps.map((map, index) => ({ id: map.id, name: localizedMapName(map), detail: localizedMapBlurb(map), color: map.color, number: index + 1, selected: state!.selectedMap === map.id, taken: false })), 'map', !!state.selectedMap && isHost);
+    const target=activeTouchPlayer(state);
+    const allVotes=state.hasExpectedPlayers&&state.players.filter(player=>!player.isAi)
+      .every(player=>Boolean(state!.mapVotesByPlayerId[player.playerId]));
+    overlay.innerHTML = selectScreen(t('select.arenaTitle'), t('select.arenaDescription'), maps.map((map, index) => ({ id: map.id, name: localizedMapName(map), detail: localizedMapBlurb(map), color: map.color, number: index + 1,
+      selected:state!.mapVotesByPlayerId[target?.playerId??'']===map.id,taken:false })), 'map', allVotes && isHost,touchPicker(state,target,'map'));
   } else if (state.phase === 'loading') {
     overlay.innerHTML = `<section class="countdown-screen loading-arena"><span>${t('loading.preparingStage')}</span><strong>${t('loading.loading')}</strong><small>${escapeHtml(localizedMapName(maps.find(map => map.id === state!.selectedMap)))}</small></section>`;
   } else if (state.phase === 'intro') {
@@ -329,8 +366,48 @@ function renderFlow(): void {
   });
 }
 
-function selectScreen(title: string, description: string, cards: { id: string; name: string; detail: string; color: string; number: number; selected: boolean; taken: boolean }[], kind: string, ready: boolean): string {
-  return `<section class="flow-panel selection-panel"><span class="flow-kicker">${t('app.title')}</span><h1 tabindex="-1">${title}</h1><p>${description}</p><div class="select-grid ${kind}-grid">${cards.map(card => { const preview = kind === 'fighter' ? roster.find(entry => entry.id === card.id)?.preview : maps.find(map => map.id === card.id)?.preview; return `<button class="select-card ${card.selected ? 'selected' : ''} ${card.taken ? 'taken' : ''}" data-${kind}="${card.id}" aria-pressed="${card.selected}" aria-label="${String(card.number).padStart(2, '0')}, ${escapeHtml(card.name)}, ${escapeHtml(card.detail)}" style="--card-color:${card.color}" ${card.taken && kind === 'fighter' ? 'disabled' : ''}><div class="card-preview" aria-hidden="true" ${preview ? `style="background-image:url('${preview}')"` : ''}></div><span class="number">${String(card.number).padStart(2, '0')}</span><strong>${escapeHtml(card.name)}</strong><span>${escapeHtml(card.detail)}</span></button>`; }).join('')}</div><div class="flow-actions"><button id="flow-back" class="secondary">${t('select.back')}</button><button id="flow-next" ${ready ? '' : 'disabled'}>${t(kind === 'map' ? 'select.startFight' : 'select.chooseArena')}</button></div><div class="flow-hint">${t('select.hint')}</div></section>`;
+function selectScreen(title: string, description: string, cards: { id: string; name: string; detail: string; color: string; number: number; selected: boolean; taken: boolean }[], kind: 'fighter'|'map', ready: boolean,picker=''): string {
+  return `<section class="flow-panel selection-panel"><span class="flow-kicker">${t('app.title')}</span><h1 tabindex="-1">${title}</h1><p>${description}</p>${picker}<div class="select-grid ${kind}-grid">${cards.map(card => { const preview = kind === 'fighter' ? roster.find(entry => entry.id === card.id)?.preview : maps.find(map => map.id === card.id)?.preview; return `<button class="select-card ${card.selected ? 'selected' : ''} ${card.taken ? 'taken' : ''}" data-${kind}="${card.id}" aria-pressed="${card.selected}" aria-label="${String(card.number).padStart(2, '0')}, ${escapeHtml(card.name)}, ${escapeHtml(card.detail)}" style="--card-color:${card.color}" ${card.taken && kind === 'fighter' ? 'disabled' : ''}><div class="card-preview" aria-hidden="true" ${preview ? `style="background-image:url('${preview}')"` : ''}></div><span class="number">${String(card.number).padStart(2, '0')}</span><strong>${escapeHtml(card.name)}</strong><span>${escapeHtml(card.detail)}</span></button>`; }).join('')}</div><div class="flow-actions"><button id="flow-back" class="secondary">${t('select.back')}</button><button id="flow-next" ${ready ? '' : 'disabled'}>${t(kind === 'map' ? 'select.startFight' : 'select.chooseArena')}</button></div><div class="flow-hint">${t('select.hint')}</div></section>`;
+}
+
+function activeTouchPlayer(current:FighterState):FighterLobbyPlayer|null{
+  const humans=current.players.filter(player=>!player.isAi);
+  if(!isHost&&playerId)return humans.find(player=>player.playerId===playerId)??null;
+  const assigned=humans.find(player=>player.playerId===touchTargetPlayerId);
+  if(assigned)return assigned;
+  const waiting=current.phase==='fighter_select'
+    ?humans.find(player=>!player.fighterId)
+    :humans.find(player=>!current.mapVotesByPlayerId[player.playerId]);
+  const target=waiting??humans[0]??null;
+  touchTargetPlayerId=target?.playerId??null;
+  return target;
+}
+
+function updateTouchTarget(next:FighterState,previous:FighterState|null):void{
+  if(next.phase!==previous?.phase){touchTargetPlayerId=null;return;}
+  if(!touchTargetPlayerId||!previous)return;
+  const before=previous.players.find(player=>player.playerId===touchTargetPlayerId);
+  const after=next.players.find(player=>player.playerId===touchTargetPlayerId);
+  if(!after){touchTargetPlayerId=null;return;}
+  const choiceChanged=next.phase==='fighter_select'&&before?.fighterId!==after.fighterId&&Boolean(after.fighterId);
+  const voteChanged=next.phase==='map_select'
+    &&previous.mapVotesByPlayerId[touchTargetPlayerId]!==next.mapVotesByPlayerId[touchTargetPlayerId]
+    &&Boolean(next.mapVotesByPlayerId[touchTargetPlayerId]);
+  if(choiceChanged||voteChanged){
+    const waiting=next.players.filter(player=>!player.isAi).find(player=>next.phase==='fighter_select'
+      ?!player.fighterId:!next.mapVotesByPlayerId[player.playerId]);
+    if(waiting)touchTargetPlayerId=waiting.playerId;
+  }
+}
+
+function touchPicker(current:FighterState,target:FighterLobbyPlayer|null,kind:'fighter'|'map'):string{
+  if(!isHost||!target)return '';
+  const humans=current.players.filter(player=>!player.isAi);
+  const prompt=t(kind==='fighter'?'select.touchFighterFor':'select.touchArenaFor',{name:target.name});
+  return `<div class="touch-player-picker"><p>${escapeHtml(prompt)}</p><div class="touch-player-options">${humans.map(player=>{
+    const chosen=kind==='fighter'?Boolean(player.fighterId):Boolean(current.mapVotesByPlayerId[player.playerId]);
+    return `<button type="button" data-touch-player="${escapeHtml(player.playerId)}" aria-pressed="${player.playerId===target.playerId}" class="${player.playerId===target.playerId?'active':''}">${escapeHtml(player.name)}${chosen?' ✓':''}</button>`;
+  }).join('')}</div></div>`;
 }
 
 function focusedControlKey(): string | null {
@@ -339,6 +416,7 @@ function focusedControlKey(): string | null {
   if (active.id) return `#${CSS.escape(active.id)}`;
   if (active.dataset.fighter) return `[data-fighter="${CSS.escape(active.dataset.fighter)}"]`;
   if (active.dataset.map) return `[data-map="${CSS.escape(active.dataset.map)}"]`;
+  if (active.dataset.touchPlayer) return `[data-touch-player="${CSS.escape(active.dataset.touchPlayer)}"]`;
   return null;
 }
 
@@ -375,8 +453,19 @@ function wireFlowButtons(): void {
   $('flow-next')?.addEventListener('click', () => { flowMessage = ''; connection.advance(); });
   $('flow-back')?.addEventListener('click', () => { if (isHost) connection.back(); });
   $('local-join')?.addEventListener('click', toggleLocalPlayer);
-  for (const button of overlay.querySelectorAll<HTMLElement>('[data-fighter]')) button.addEventListener('click', () => { if (!isHost && !playerId) return; flowMessage = ''; connection.selectFighter(button.dataset.fighter!); });
-  for (const button of overlay.querySelectorAll<HTMLElement>('[data-map]')) button.addEventListener('click', () => { if (!playerId) return; flowMessage = ''; connection.selectMap(button.dataset.map!); });
+  for(const button of overlay.querySelectorAll<HTMLElement>('[data-touch-player]'))button.addEventListener('click',()=>{
+    touchTargetPlayerId=button.dataset.touchPlayer??null;lastOverlayKey='';renderFlow();
+  });
+  for (const button of overlay.querySelectorAll<HTMLElement>('[data-fighter]')) button.addEventListener('click', () => {
+    if(!state)return;flowMessage='';
+    if(isHost){const target=activeTouchPlayer(state);if(target)connection.displaySelectFighter(target.playerId,button.dataset.fighter!);}
+    else if(playerId)connection.selectFighter(button.dataset.fighter!);
+  });
+  for (const button of overlay.querySelectorAll<HTMLElement>('[data-map]')) button.addEventListener('click', () => {
+    if(!state)return;flowMessage='';
+    if(isHost){const target=activeTouchPlayer(state);if(target)connection.displaySelectMap(target.playerId,button.dataset.map!);}
+    else if(playerId)connection.selectMap(button.dataset.map!);
+  });
 }
 
 function introHtml(current: FighterState): string {
@@ -566,6 +655,24 @@ function startFightPresentation(key: string): void {
   if (fightStartedKey === key) return;
   fightStartedKey = key; hideAssetError(); result.hidden = true; setFightControlsEnabled(true);
   fightCall.classList.remove('show'); void fightCall.offsetWidth; fightCall.classList.add('show'); announce(t('event.fight'));
+  scheduleFightReceipt();
+}
+
+function scheduleFightReceipt():void{
+  if(!state||state.phase!=='fight'||state.hudPresented||!isHost
+    ||fighterConnectionState!=='connected'||!loading.classList.contains('done')||!actors||!fightStartedKey)return;
+  const key=`${state.roomCode}:${state.loadingGeneration}`;
+  if(sentFightReceipt===key||pendingFightReceipt===key)return;
+  pendingFightReceipt=key;
+  const epoch=presentationEpoch;
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    if(pendingFightReceipt===key)pendingFightReceipt='';
+    if(epoch!==presentationEpoch||!state||state.phase!=='fight'||state.hudPresented
+      ||`${state.roomCode}:${state.loadingGeneration}`!==key||!isHost
+      ||fighterConnectionState!=='connected'||!loading.classList.contains('done')||!actors||!fightStartedKey)return;
+    sentFightReceipt=key;
+    connection.ackDisplay('fight',state.loadingGeneration);
+  }));
 }
 
 function handleEvents(events: FighterEvent[]): void {
@@ -657,6 +764,7 @@ function announce(text: string): void { voiceCommand.textContent = text.replace(
 function flashButton(command: FighterCommand): void { const button = commandButtons.find(item => item.dataset.command === command); button?.classList.add('active'); setTimeout(() => button?.classList.remove('active'), 220); }
 function showImpact(text: string, defender: FighterId): void { document.body.classList.remove('shake'); void document.body.offsetWidth; document.body.classList.add('shake'); const element = document.createElement('div'); element.className = 'impact'; element.style.left = defender === 'p1' ? '39%' : '61%'; element.textContent = text; document.body.appendChild(element); setTimeout(() => element.remove(), 600); }
 function showResult(winner: FighterId): void {
+  if(state?.phase!=='results'||state.result?.winner!==winner)return;
   if (resultTimer) clearTimeout(resultTimer);
   const delay = Math.max(0, resultRevealAt - performance.now());
   if (delay > 0) {
@@ -667,9 +775,28 @@ function showResult(winner: FighterId): void {
   const player = state?.players.find(row => row.side === winner); const fighter = roster.find(row => row.id === player?.fighterId);
   rematch.hidden = stationDisplay.active;
   resultTitle.textContent = t('result.wins', { name: fighter ? localizedFighterName(fighter) : winner }); result.hidden = false; setFightControlsEnabled(false);
+  scheduleResultReceipt();
   if (!stationDisplay.active && !result.contains(document.activeElement)) requestAnimationFrame(() => rematch.focus());
 }
-function setFightControlsEnabled(enabled: boolean): void { for (const button of commandButtons) button.disabled = !enabled; }
+function scheduleResultReceipt():void{
+  if(!state||state.phase!=='results'||!state.result||result.hidden||!loading.classList.contains('done'))return;
+  const key=`${state.roomCode}:${state.loadingGeneration}`;
+  if(pendingResultReceipt===key)return;
+  if(sentResultReceipt===key)return;
+  pendingResultReceipt=key;
+  const epoch=presentationEpoch;
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{
+    if(pendingResultReceipt===key)pendingResultReceipt='';
+    if(epoch!==presentationEpoch||!state||state.phase!=='results'||!state.result
+      ||`${state.roomCode}:${state.loadingGeneration}`!==key||result.hidden||!loading.classList.contains('done'))return;
+    stationDisplay.markEngineResultsReady();
+    if(isHost&&fighterConnectionState==='connected'&&!state.resultsPresented&&sentResultReceipt!==key){
+      sentResultReceipt=key;
+      connection.ackDisplay('results',state.loadingGeneration);
+    }
+  }));
+}
+function setFightControlsEnabled(enabled: boolean): void { for (const label of commandButtons) label.classList.toggle('inactive', !enabled); }
 function applyMapTheme(mapId: string): void {
   // Fight state arrives at 20 Hz. Reapplying the saved camera on every snapshot fights the smooth
   // tracking camera and produces a visible judder; map setup is a one-time phase transition.
@@ -987,7 +1114,6 @@ function buildArena(): { ring: THREE.Mesh<THREE.RingGeometry, THREE.MeshBasicMat
   scene.add(key, key.target, red, red.target, cyan, cyan.target, ambient); return { ring, floor, key, red, cyan, ambient, procedural, foundry, voidStage };
 }
 
-for (const button of commandButtons) button.addEventListener('click', () => connection.command(button.dataset.command as FighterCommand));
 const keyCommands: Record<string, FighterCommand> = { a: 'back', d: 'forward', w: 'jump', ' ': 'jump', j: 'punch', k: 'kick', l: 'block' };
 addEventListener('keydown', event => {
   if (event.repeat || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || isInteractiveShortcutTarget(event.target)) return;
@@ -1005,8 +1131,12 @@ function handleNumericSelection(key: string): void {
   if (numericTimer) clearTimeout(numericTimer);
   const select = (number: number) => {
     const id = entries[number - 1]?.id; if (!id) return;
-    if (state?.phase === 'fighter_select' && (isHost || playerId)) connection.selectFighter(id);
-    else if (state?.phase === 'map_select' && playerId) connection.selectMap(id);
+    if(isHost&&state){
+      const target=activeTouchPlayer(state);if(!target)return;
+      if(state.phase==='fighter_select')connection.displaySelectFighter(target.playerId,id);
+      else if(state.phase==='map_select')connection.displaySelectMap(target.playerId,id);
+    }else if(state?.phase==='fighter_select'&&playerId)connection.selectFighter(id);
+    else if(state?.phase==='map_select'&&playerId)connection.selectMap(id);
   };
   if (next.selection) select(next.selection);
   else if (next.waiting) numericTimer = setTimeout(() => {

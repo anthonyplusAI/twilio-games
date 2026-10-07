@@ -220,6 +220,42 @@ describe('Voice Trivia display DOM projection', () => {
     expect(portuguese.html).toContain('Sair');
   });
 
+  it('makes only the named current category voting seat touchable', () => {
+    const categories = renderTriviaView(state({
+      phase: 'category_select', categoryVotingSeat: { playerId: 'p2', name: 'Grace' },
+    }), { ...context, isHost: true });
+    expect(categories.html).toContain('Grace');
+    expect(categories.html).toContain('data-category="science"');
+    expect(categories.html).toContain('data-voter="p2"');
+    const spectator = renderTriviaView(state({
+      phase: 'category_select', categoryVotingSeat: { playerId: 'p2', name: 'Grace' },
+    }), { ...context, isHost: false });
+    expect(spectator.html).not.toContain('data-voter=');
+  });
+
+  it('binds announcements to question attempt and keeps reveal speech short', () => {
+    const first = renderTriviaView(state({ phase: 'question_prompt', questionIndex: 0,
+      questionAttemptId: 5, question }), context);
+    const retry = renderTriviaView(state({ phase: 'question_prompt', questionIndex: 0,
+      questionAttemptId: 6, question }), context);
+    expect(first.announcementKey).not.toBe(retry.announcementKey);
+    const reveal = renderTriviaView(state({ phase: 'reveal', questionIndex: 0,
+      questionAttemptId: 6, question,
+      reveal: { questionId: question.id, correctChoiceId: 'bravo-secret',
+        explanation: 'A very long explanation should remain visible but should not be announced.' },
+    }), context);
+    expect(reveal.html).toContain('A very long explanation');
+    expect(reveal.announcement).not.toContain('A very long explanation');
+  });
+
+  it('shows a terminal audio failure once the operator retry window expires', () => {
+    const expired = renderTriviaView(state({ phase: 'audio_expired', question: null,
+      questionAttemptId: 7, audioProblem: null }), context);
+    expect(expired.html).toContain('This round has ended');
+    expect(expired.html).not.toContain('retry this question');
+    expect(expired.announcementKey).toContain('7');
+  });
+
   it('escapes server-provided text and includes the accessibility and motion contracts', () => {
     const rendered = renderTriviaView(state({
       phase: 'question', questionIndex: 0,

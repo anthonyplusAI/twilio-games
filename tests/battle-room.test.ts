@@ -233,6 +233,82 @@ describe('BattleRoom', () => {
     expect(r.result()).not.toBeNull();
   });
 
+  it('lets only a finished-battle participant request its rematch', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      const r = room();
+      const original = r.addPlayer('Ada') as { playerId: string };
+      r.advance(); r.selectMonster(original.playerId, 'embertail'); r.advance();
+      for (let i = 0; i < 100 && r.phase === 'battle'; i++) {
+        const snap = r.snapshot()!;
+        r.chooseMove(original.playerId, snap.a.moves[1]!.id);
+        if (r.aiPending()) r.resolveAiTurn();
+      }
+      expect(r.phase).toBe('results');
+      const result = r.result();
+      const newcomer = r.addPlayer('Late') as { playerId: string };
+      expect(r.resultsPresentationTimedOut).toBe(false);
+      vi.advanceTimersByTime(r.rematchReadyInMs + 1);
+      expect(r.resultsPresentationTimedOut).toBe(true);
+
+      expect(r.advance(newcomer.playerId)).toBe(false);
+      expect(r.advance('stale-player')).toBe(false);
+      expect(r.phase).toBe('results');
+      expect(r.result()).toEqual(result);
+      expect(r.advance(original.playerId)).toBe(true);
+      expect(r.phase).toBe('monster_select');
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('unlocks a finished participant’s rematch when the matching result overlay is actually presented', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      const r=room(),player=r.addPlayer('Ada') as {playerId:string};
+      r.advance();r.selectMonster(player.playerId,'embertail');r.advance();
+      for(let index=0;index<100&&r.phase==='battle';index++){
+        const snap=r.snapshot()!;r.chooseMove(player.playerId,snap.a.moves[1]!.id);
+        if(r.aiPending())r.resolveAiTurn();
+      }
+      expect(r.phase).toBe('results');
+      expect(r.resultsPresented).toBe(false);
+      expect(r.acknowledgeResultsPresented(r.generation+1)).toBe(false);
+      expect(r.canRematch).toBe(false);
+      expect(r.acknowledgeResultsPresented(r.generation)).toBe(true);
+      expect(r.resultsPresented).toBe(true);
+      expect(r.canRematch).toBe(true);
+      expect(r.advance(player.playerId)).toBe(true);
+      expect(r.resultsPresented).toBe(false);
+    }finally{vi.useRealTimers();}
+  });
+
+  it('lets a bound station caller return to the previous setup menu',()=>{
+    const r=room();r.expectHumanPlayers(1);
+    const player=r.addPlayer('Ada') as {playerId:string};
+    r.advance(player.playerId);
+    expect(r.back()).toBe(false);
+    expect(r.back('stale')).toBe(false);
+    expect(r.back(player.playerId)).toBe(true);
+    expect(r.phase).toBe('lobby');
+  });
+
+  it('reports setup and battle-menu changes only when the caller actually changed them', () => {
+    const r = room();
+    const joined = r.addPlayer('Ada') as { playerId: string };
+    expect(r.selectMonster(joined.playerId, M0)).toBe(false);
+    expect(r.back()).toBe(false);
+    r.advance();
+    expect(r.selectMonster(joined.playerId, M0)).toBe(true);
+    expect(r.selectMonster('missing', M1)).toBe(false);
+    expect(r.back()).toBe(true);
+    expect(r.phase).toBe('lobby');
+    r.advance(); r.selectMonster(joined.playerId, M0); r.advance();
+    expect(r.openFightMenu('missing')).toBe(false);
+    expect(r.openFightMenu(joined.playerId)).toBe(true);
+    expect(r.backMenu(joined.playerId)).toBe(true);
+  });
+
   it('returns a rematch to lobby when a late caller still needs to confirm a name', () => {
     vi.useFakeTimers();
     try {

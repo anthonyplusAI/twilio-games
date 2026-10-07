@@ -30,6 +30,12 @@ export class ChessConnection {
   onError(listener: (code: string, message: string) => void): void { this.errorListener = listener; }
   onConnection(listener: (status: ChessConnectionState) => void): void { this.connectionListener = listener; }
 
+  /** A result-menu tap is discarded while disconnected; replay must match the visible game ID. */
+  replay(gameId: number): void {
+    if (!Number.isSafeInteger(gameId) || gameId < 1 || this.socket?.readyState !== WebSocket.OPEN) return;
+    this.socket.send(JSON.stringify({ type: 'display_replay', roomCode: this.roomCode, gameId }));
+  }
+
   close(): void {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);

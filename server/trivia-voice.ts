@@ -26,10 +26,29 @@ import {
   type MessageValues,
 } from '../shared/i18n/translate';
 import { parseFirstName } from '../shared/spoken-name';
+import { TRIVIA_SEMANTIC_ANSWER_MAX_MS } from './trivia-room';
 
-const FINAL_REPEAT_GUARD_MS = 5_000;
+const FINAL_REPEAT_GUARD_MS = 160;
 export const TRIVIA_SPEECH_RETRY_DELAY_MS = 300;
-export const TRIVIA_SPEECH_MAX_ATTEMPTS = 3;
+export const TRIVIA_SPEECH_MAX_ATTEMPTS = 2;
+export type TriviaSpeechOutcome = 'played' | 'estimated' | 'interrupted' | 'failed';
+
+export interface TriviaIntentRequest {
+  game: 'trivia';
+  phase: TriviaPhase;
+  locale: SupportedLocale;
+  transcript: string;
+  actions: readonly { id: string; description: string; targetIds?: readonly string[] }[];
+  choices: readonly { id: string; label: string; aliases?: readonly string[] }[];
+  facts: readonly { id: string; text: string }[];
+  signal?: AbortSignal;
+}
+
+export type TriviaIntentResult =
+  | { kind: 'action'; actionId: string; targetId?: string }
+  | { kind: 'answer'; factId: string }
+  | { kind: 'clarify'; reason?: string }
+  | { kind: 'none' };
 
 export interface TriviaVoiceChoice {
   readonly id: string;
@@ -63,8 +82,10 @@ export interface TriviaVoiceSnapshot {
   readonly automaticSetup: boolean;
   readonly players: readonly TriviaVoicePlayer[];
   readonly categoryVoteCounts: TriviaCategoryVoteCounts;
+  readonly myCategoryVote: TriviaRoundCategoryId | null;
   readonly loadingGeneration: number;
   readonly questionIndex: number | null;
+  readonly questionAttemptId: number | null;
   readonly answeringStartsAtMs: number | null;
   readonly questionEndsAtMs: number | null;
   readonly question: TriviaVoiceQuestion | null;
@@ -76,6 +97,8 @@ export interface TriviaVoiceSnapshot {
   readonly myPromptReady: boolean;
   /** Lets a replacement transport avoid replaying an already-settled answer cue. */
   readonly myAnswerCueReady: boolean;
+  /** The current question or cue is painted on the authoritative display. */
+  readonly displayViewReady: boolean;
   /** Supports an accurate reveal delta after a transport reconnect. */
   readonly myQuestionPoints: number;
 }
@@ -96,9 +119,27 @@ export interface TriviaVoiceDeps {
   setName(code: string, playerId: string, name: string): boolean;
   voteCategory(code: string, playerId: string, category: TriviaRoundCategoryId): boolean;
   advance(code: string, playerId: string): boolean;
-  questionPromptReady(code: string, playerId: string, questionId: string): boolean;
-  questionAnswerCueReady(code: string, playerId: string, questionId: string): boolean;
-  answerAt(code: string, playerId: string, choiceId: string, final: true, answeredAtMs: number): boolean;
+  beginPromptDelivery(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, estimatedSpeechMs?: number): number | null;
+  questionPromptReady(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, deliveryGeneration: number): boolean;
+  questionPromptSkipped(code: string, playerId: string, questionId: string,
+    questionAttemptId: number): boolean;
+  beginAnswerCueDelivery(code: string, playerId: string, questionId: string,
+    questionAttemptId: number): number | null;
+  questionAnswerCueReady(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, deliveryGeneration: number): boolean;
+  questionAnswerCueSkipped(code: string, playerId: string, questionId: string,
+    questionAttemptId: number): boolean;
+  queueEarlyAnswer(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, choiceId: string): boolean;
+  pauseAudio(code: string, questionId: string, questionAttemptId: number): boolean;
+  beginAnswerResolution(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, onset?: { choiceId: string; atMs: number }): number | null;
+  finishAnswerResolution(code: string, playerId: string, questionId: string,
+    questionAttemptId: number, resolutionId: number): boolean;
+  answerAt(code: string, playerId: string, choiceId: string, final: true, answeredAtMs: number,
+    resolutionId?: number): boolean;
   snapshot(code: string, playerId: string, locale: SupportedLocale): TriviaVoiceSnapshot | null;
   /** Optional pure resolver for aliases not included on the server-only voice question. */
   resolveAnswer?(
@@ -107,8 +148,9 @@ export interface TriviaVoiceDeps {
     spoken: string,
     locale: SupportedLocale,
   ): string | null;
-  /** Resolve true only after Relay reports successful playback of all text chunks. */
-  say(text: string, isCurrent?: () => boolean): void | Promise<boolean>;
+  /** `played` is Relay-confirmed playback; `estimated` is a conservative completion fallback. */
+  say(text: string, isCurrent?: () => boolean): Promise<TriviaSpeechOutcome>;
+  resolveIntent?(request: TriviaIntentRequest): Promise<TriviaIntentResult>;
   /** Cancels queued or in-flight speech before a newly published question is spoken. */
   preemptSpeech(): void;
   now?: () => number;
@@ -127,16 +169,16 @@ type ExtraMessageKey =
 const EXTRA_MESSAGES: LocalizedCatalog<ExtraMessageKey> = {
   'en-US': {
     waitingPlayers: 'Waiting for all {count} players to join and confirm their names.',
-    revealCorrect: 'The answer was {choice}, {answer}; your answer was correct and gained {points} points; standings: {standings}.',
-    revealIncorrect: 'The answer was {choice}, {answer}; your answer was not correct and gained {points} points; standings: {standings}.',
+    revealCorrect: 'Correct choice: {choice}. You earned {points} points.',
+    revealIncorrect: 'Correct choice: {choice}. You earned {points} points.',
     standing: '{rank}, {name}, {score} points',
     winner: '{name} wins with a leaderboard score of {score}.',
     tie: 'It is a tie between {names}, each with a leaderboard score of {score}.',
   },
   'pt-BR': {
     waitingPlayers: 'Aguardando os {count} jogadores entrarem e confirmarem seus nomes.',
-    revealCorrect: 'A resposta era {choice}, {answer}; você acertou e ganhou {points} pontos; classificação: {standings}.',
-    revealIncorrect: 'A resposta era {choice}, {answer}; você não acertou e ganhou {points} pontos; classificação: {standings}.',
+    revealCorrect: 'Opção correta: {choice}. Você ganhou {points} pontos.',
+    revealIncorrect: 'Opção correta: {choice}. Você ganhou {points} pontos.',
     standing: '{rank}, {name}, {score} pontos',
     winner: '{name} venceu com pontuação no ranking de {score}.',
     tie: 'Houve empate entre {names}, cada um com pontuação no ranking de {score}.',
@@ -162,16 +204,20 @@ export class TriviaVoiceSession {
   private lobbyAttempt = '';
   private lobbyWaitingCue = '';
   private categoryAdvanceAttempt = '';
+  private announcedCategoryVote: string | null = null;
   private readonly preparingGenerations = new Set<number>();
   private activeQuestionKey: string | null = null;
   private observedStateQuestionKey: string | null = null;
   private inputStreamScope: string | null = null;
   private readonly promptAttempts = new Set<string>();
+  private readonly interruptedPromptKeys = new Set<string>();
   private promptAttemptToken: symbol | null = null;
   private answerOnset: { scope: string; choiceId: string; atMs: number } | null = null;
   private observedInputScope: string | null = null;
   private readonly lockedQuestions = new Set<string>();
   private readonly answerCueAttempts = new Set<string>();
+  private readonly interruptedCueKeys = new Set<string>();
+  private readonly skippedAudioKeys = new Set<string>();
   private answerCueAttemptToken: symbol | null = null;
   private readonly announcedAnswerStarts = new Set<string>();
   private readonly answerStartAttempts = new Set<string>();
@@ -179,6 +225,17 @@ export class TriviaVoiceSession {
   private readonly revealAttempts = new Set<string>();
   private readonly announcedResults = new Set<string>();
   private readonly resultAttempts = new Set<string>();
+  private readonly announcedAudioProblems = new Set<number>();
+  private readonly announcedAudioExpiries = new Set<number>();
+  private semanticController: AbortController | null = null;
+  private semanticEpoch = 0;
+  private semanticResolution: {
+    code: string;
+    playerId: string;
+    questionId: string;
+    questionAttemptId: number;
+    resolutionId: number;
+  } | null = null;
   private readonly requiredSpeechAttempts = new Map<string, number>();
   private readonly requiredSpeechTimers = new Map<string, {
     timer: ReturnType<typeof setTimeout>;
@@ -229,6 +286,20 @@ export class TriviaVoiceSession {
     if (message.type === 'interrupt') {
       this.inputStreamScope = null;
       this.lastFinal = null;
+      this.abortSemantic();
+      const current = this.currentSnapshot();
+      const key = questionKey(current);
+      if (key && current?.phase === 'question_prompt') {
+        this.promptAttemptToken = null;
+        this.promptAttempts.delete(key);
+        this.interruptedPromptKeys.add(key);
+        this.releaseRequiredSpeechAttempt(`prompt:${key}`);
+      } else if (key && current?.phase === 'answer_cue') {
+        this.answerCueAttemptToken = null;
+        this.answerCueAttempts.delete(key);
+        this.interruptedCueKeys.add(key);
+        this.releaseRequiredSpeechAttempt(`cue:${key}`);
+      }
       return;
     }
     if (message.type === 'dtmf') {
@@ -259,7 +330,8 @@ export class TriviaVoiceSession {
     if (this.lastFinal?.text === normalized && this.lastFinal.afterContext === beforeContext
       && now - this.lastFinal.at < FINAL_REPEAT_GUARD_MS) return;
 
-    this.handleFinal(message.voicePrompt, snapshot, answerOnset);
+    this.abortSemantic();
+    this.handleFinal(message.voicePrompt, snapshot, answerOnset, now);
     this.lastFinal = {
       text: normalized,
       afterContext: this.finalContext(this.currentSnapshot()),
@@ -330,6 +402,7 @@ export class TriviaVoiceSession {
     if (!snapshot) return;
     this.awaitingName = !snapshot.nameConfirmed;
     this.lastPhase = snapshot.phase;
+    this.announcedCategoryVote = this.categoryVoteContext(snapshot);
     this.observedStateQuestionKey = questionKey(snapshot);
     this.observeQuestion(snapshot);
 
@@ -348,22 +421,27 @@ export class TriviaVoiceSession {
       }
       void this.speak(snapshot.nameConfirmed && snapshot.myName
         ? this.text('voice.returnedName', { name: snapshot.myName })
-        : this.text('voice.returned'));
+        : this.text('voice.returned'), this.phaseGuard(snapshot.phase));
       this.speakContext(snapshot);
       return;
     }
 
-    void this.speak(this.text('voice.welcome'));
+    void this.speak(this.text('voice.welcome'), this.setupGuard());
     if (!snapshot.nameConfirmed) {
       this.askName();
       return;
     }
-    if (snapshot.myName) void this.speak(this.text('voice.welcomeName', { name: snapshot.myName }));
-    void this.speak(this.text('voice.gameplay'));
+    if (snapshot.myName) void this.speak(this.text('voice.welcomeName', { name: snapshot.myName }),
+      this.setupGuard(snapshot.myName));
+    void this.speak(this.text('voice.gameplay'), this.setupGuard());
     this.onStateChanged();
   }
 
   private handleInterim(spoken: string, snapshot: TriviaVoiceSnapshot): void {
+    // A new partial is the start of a possible correction. Never let the previous final's
+    // asynchronous interpretation lock an answer before this stream reaches its own final.
+    this.abortSemantic();
+    this.lastFinal = null;
     this.inputStreamScope ??= inputScope(snapshot);
     if (snapshot.phase !== 'question' || snapshot.myAnswered || !this.activeQuestionKey) {
       this.answerOnset = null;
@@ -389,17 +467,32 @@ export class TriviaVoiceSession {
     spoken: string,
     snapshot: TriviaVoiceSnapshot,
     answerOnset: { scope: string; choiceId: string; atMs: number } | null,
+    receivedAtMs: number,
   ): void {
-    if (this.awaitingName || !snapshot.nameConfirmed) {
+    if (!snapshot.nameConfirmed) {
       this.captureName(spoken);
       return;
     }
+    this.awaitingName = false;
     if (snapshot.phase === 'category_select') {
       this.chooseCategory(spoken, snapshot);
       return;
     }
+    if (snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue') {
+      this.handleQuestionPreparation(spoken, snapshot);
+      return;
+    }
     if (snapshot.phase === 'question') {
-      this.commitAnswer(spoken, snapshot, answerOnset);
+      if (isTriviaRepeatQuestion(spoken, this.commandLocale) && !this.resolveAnswer(spoken, snapshot)) {
+        const key = questionKey(snapshot);
+        if (key) void this.speak(this.questionPrompts(snapshot).join(' '), this.questionGuard(key, ['question']));
+        return;
+      }
+      this.commitAnswer(spoken, snapshot, answerOnset, receivedAtMs);
+      return;
+    }
+    if (snapshot.phase === 'audio_expired') {
+      void this.speak(this.text('voice.audioExpired'), this.phaseGuard('audio_expired'));
       return;
     }
     if (snapshot.phase === 'results' && isPlayAgain(spoken, this.commandLocale)) {
@@ -410,64 +503,279 @@ export class TriviaVoiceSession {
       const advanced = this.applyAuthority(() => this.deps.advance(this.code!, this.playerId!));
       if (!advanced) void this.speak(this.text('voice.notReady'), this.phaseGuard('results'));
       this.onStateChanged();
+      return;
     }
+    this.interpret(spoken, snapshot, receivedAtMs);
   }
 
   private captureName(spoken: string): void {
     const name = parseTriviaName(spoken, this.commandLocale);
     if (!name) {
-      void this.speak(this.text('voice.invalidName'));
+      void this.speak(this.text('voice.invalidName'), this.nameGuard());
       return;
     }
     const accepted = this.applyAuthority(() => this.deps.setName(this.code!, this.playerId!, name));
     const snapshot = this.currentSnapshot();
     if (!accepted || !snapshot?.nameConfirmed) {
-      void this.speak(this.text('voice.invalidName'));
+      void this.speak(this.text('voice.invalidName'), this.nameGuard());
       this.onStateChanged();
       return;
     }
     this.awaitingName = false;
     this.namePrompted = false;
-    void this.speak(this.text('voice.welcomeName', { name: snapshot.myName ?? name }));
-    void this.speak(this.text('voice.gameplay'));
+    void this.speak(this.text('voice.welcomeName', { name: snapshot.myName ?? name }),
+      this.setupGuard(snapshot.myName ?? name));
+    void this.speak(this.text('voice.gameplay'), this.setupGuard());
     this.onStateChanged();
   }
 
   private chooseCategory(spoken: string, snapshot: TriviaVoiceSnapshot): void {
     const category = matchTriviaCategory(spoken, this.commandLocale);
     if (!category) {
-      void this.speak(this.text('voice.unknownCategory'), this.phaseGuard('category_select'));
+      this.interpret(spoken, snapshot, this.now());
       return;
     }
     const accepted = this.applyAuthority(() => this.deps.voteCategory(
       this.code!, this.playerId!, category,
     ));
     if (accepted) {
-      void this.speak(this.text('voice.categorySelected', {
-        category: TRIVIA_CATEGORY_LABELS[this.commandLocale][category],
-      }), this.categoryOrLoadingGuard());
+      const current = this.currentSnapshot();
+      if (current) this.announceCategoryVote(current);
     } else {
       void this.speak(this.text('voice.unknownCategory'), this.phaseGuard(snapshot.phase));
     }
     this.onStateChanged();
   }
 
+  private handleQuestionPreparation(spoken: string, snapshot: TriviaVoiceSnapshot): void {
+    const key = questionKey(snapshot);
+    if (!key) return;
+    const choiceId = this.resolveAnswer(spoken, snapshot);
+    if (choiceId) {
+      this.holdEarlyAnswer(choiceId, snapshot);
+      return;
+    }
+    if (isTriviaSkipReading(spoken, this.commandLocale)) {
+      this.skipQuestionAudio(snapshot);
+      return;
+    }
+    if (isTriviaRepeatQuestion(spoken, this.commandLocale)) {
+      this.interruptedPromptKeys.delete(key);
+      this.interruptedCueKeys.delete(key);
+      this.deps.preemptSpeech();
+      if (snapshot.phase === 'question_prompt') this.presentQuestion(snapshot);
+      else this.presentAnswerCue(snapshot, true);
+      return;
+    }
+    this.interpret(spoken, snapshot, this.now());
+  }
+
+  private holdEarlyAnswer(spokenOrChoiceId: string, snapshot: TriviaVoiceSnapshot): void {
+    const key = questionKey(snapshot);
+    const question = snapshot.question;
+    const attemptId = snapshot.questionAttemptId;
+    if (!key || !question || attemptId === null || this.lockedQuestions.has(key)) return;
+    const choiceId = question.choices.some(choice => choice.id === spokenOrChoiceId)
+      ? spokenOrChoiceId : this.resolveAnswer(spokenOrChoiceId, snapshot);
+    if (!choiceId) return;
+    const accepted = this.applyAuthority(() => this.deps.queueEarlyAnswer(
+      this.code!, this.playerId!, question.id, attemptId, choiceId,
+    ));
+    if (!accepted) return;
+    this.lockedQuestions.add(key);
+    this.deps.preemptSpeech();
+    void this.speak(this.text('voice.earlyAnswerAccepted'), this.questionGuard(key,
+      ['question_prompt', 'answer_cue', 'question']));
+    this.onStateChanged();
+  }
+
+  private skipQuestionAudio(snapshot: TriviaVoiceSnapshot): void {
+    const key = questionKey(snapshot);
+    const question = snapshot.question;
+    const attemptId = snapshot.questionAttemptId;
+    if (!key || !question || attemptId === null) return;
+    this.skippedAudioKeys.add(key);
+    const accepted = this.applyAuthority(() => snapshot.phase === 'question_prompt'
+      ? this.deps.questionPromptSkipped(this.code!, this.playerId!, question.id, attemptId)
+      : this.deps.questionAnswerCueSkipped(this.code!, this.playerId!, question.id, attemptId));
+    if (!accepted) return;
+    this.deps.preemptSpeech();
+    this.onStateChanged();
+  }
+
+  private interpret(spoken: string, snapshot: TriviaVoiceSnapshot, receivedAtMs: number,
+    answerOnset: { scope: string; choiceId: string; atMs: number } | null = null): void {
+    const resolveIntent = this.deps.resolveIntent;
+    if (!resolveIntent) {
+      this.speakUnclear(snapshot);
+      return;
+    }
+    const question = snapshot.question;
+    const choices = snapshot.phase === 'category_select'
+      ? TRIVIA_ROUND_CATEGORY_IDS.map(id => ({ id, label: TRIVIA_CATEGORY_LABELS[this.commandLocale][id],
+        aliases: TRIVIA_CATEGORY_ALIASES[this.commandLocale][id] }))
+      : question?.choices.map(choice => ({ id: choice.id, label: choice.text, aliases: choice.aliases })) ?? [];
+    const actions: TriviaIntentRequest['actions'] = snapshot.phase === 'category_select'
+      ? [{ id: 'select_category', description: 'Vote for one displayed category',
+          targetIds: TRIVIA_ROUND_CATEGORY_IDS }]
+      : snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue'
+        ? [{ id: 'answer_choice', description: 'Commit one displayed answer for the common start',
+            targetIds: question?.choices.map(choice => choice.id) ?? [] },
+          { id: 'skip_reading', description: 'Stop reading this question and wait for the shared answer start' },
+          { id: 'repeat_question', description: 'Read this question and its choices again' }]
+        : snapshot.phase === 'question'
+          ? [{ id: 'answer_choice', description: 'Commit one displayed answer',
+              targetIds: question?.choices.map(choice => choice.id) ?? [] },
+            { id: 'repeat_question', description: 'Read the visible question again' }]
+          : snapshot.phase === 'results' && !this.stationManaged
+            ? [{ id: 'play_again', description: 'Start another trivia round' }]
+            : [];
+    const facts = this.voiceFacts(snapshot);
+    const controller = new AbortController();
+    this.semanticController = controller;
+    const epoch = ++this.semanticEpoch;
+    const scope = questionKey(snapshot);
+    const resultId = snapshot.result?.resultId;
+    const validOnset = snapshot.phase === 'question' && answerOnset
+      && answerOnset.scope === inputScope(snapshot)
+      && snapshot.answeringStartsAtMs !== null && snapshot.questionEndsAtMs !== null
+      && answerOnset.atMs >= snapshot.answeringStartsAtMs
+      && answerOnset.atMs <= snapshot.questionEndsAtMs && answerOnset.atMs <= receivedAtMs
+      && question?.choices.some(choice => choice.id === answerOnset.choiceId)
+      ? answerOnset : null;
+    const lateOnset = snapshot.phase === 'question' && snapshot.questionEndsAtMs !== null
+      && receivedAtMs > snapshot.questionEndsAtMs && validOnset
+      ? { choiceId: validOnset.choiceId, atMs: validOnset.atMs } : undefined;
+    const resolutionId = snapshot.phase === 'question' && question && snapshot.questionAttemptId !== null
+      ? this.deps.beginAnswerResolution(this.code!, this.playerId!, question.id,
+        snapshot.questionAttemptId, lateOnset)
+      : null;
+    if (resolutionId !== null && question && snapshot.questionAttemptId !== null) {
+      this.semanticResolution = {
+        code: this.code!, playerId: this.playerId!, questionId: question.id,
+        questionAttemptId: snapshot.questionAttemptId, resolutionId,
+      };
+    }
+    const timer = setTimeout(() => {
+      if (this.semanticController === controller && epoch === this.semanticEpoch) this.abortSemantic();
+    }, TRIVIA_SEMANTIC_ANSWER_MAX_MS);
+    timer.unref?.();
+    const request: TriviaIntentRequest = {
+      game: 'trivia', phase: snapshot.phase, locale: this.commandLocale,
+      transcript: spoken, actions, choices, facts, signal: controller.signal,
+    };
+    const job = Promise.resolve().then(() => resolveIntent(request)).then(result => {
+      if (controller.signal.aborted || epoch !== this.semanticEpoch || !this.active) return;
+      const current = this.currentSnapshot();
+      if (!current || current.phase !== snapshot.phase || questionKey(current) !== scope
+        || current.result?.resultId !== resultId || !current.nameConfirmed) return;
+      if (snapshot.phase === 'category_select' && current.myCategoryVote !== snapshot.myCategoryVote) return;
+      if (result.kind === 'answer') {
+        const fact = this.voiceFacts(current).find(candidate => candidate.id === result.factId);
+        if (fact) void this.speak(fact.text, this.snapshotGuard(current));
+        return;
+      }
+      if (result.kind !== 'action') {
+        this.speakUnclear(current);
+        return;
+      }
+      const allowed = actions.find(action => action.id === result.actionId);
+      if (!allowed || (allowed.targetIds && (!result.targetId || !allowed.targetIds.includes(result.targetId)))) return;
+      if (result.actionId === 'select_category' && result.targetId
+        && TRIVIA_ROUND_CATEGORY_IDS.includes(result.targetId as TriviaRoundCategoryId)) {
+        const category = result.targetId as TriviaRoundCategoryId;
+        const accepted = this.applyAuthority(() => this.deps.voteCategory(this.code!, this.playerId!, category));
+        if (accepted) {
+          const updated = this.currentSnapshot();
+          if (updated) this.announceCategoryVote(updated);
+          this.onStateChanged();
+        }
+      } else if (result.actionId === 'answer_choice' && result.targetId) {
+        if (current.phase === 'question') this.commitAnswerAt(result.targetId, current,
+          validOnset?.choiceId === result.targetId ? validOnset.atMs : receivedAtMs,
+          resolutionId ?? undefined);
+        else this.holdEarlyAnswer(result.targetId, current);
+      } else if (result.actionId === 'skip_reading'
+        && (current.phase === 'question_prompt' || current.phase === 'answer_cue')) {
+        this.skipQuestionAudio(current);
+      } else if (result.actionId === 'repeat_question') {
+        if (scope) {
+          this.interruptedPromptKeys.delete(scope);
+          this.interruptedCueKeys.delete(scope);
+        }
+        if (current.phase === 'question_prompt') this.presentQuestion(current);
+        else if (current.phase === 'answer_cue') this.presentAnswerCue(current, true);
+        else if (current.phase === 'question') void this.speak(this.questionPrompts(current).join(' '),
+          this.questionGuard(scope!, ['question']));
+      } else if (result.actionId === 'play_again' && current.phase === 'results') {
+        this.applyAuthority(() => this.deps.advance(this.code!, this.playerId!));
+        this.onStateChanged();
+      }
+    }).catch(() => {
+      if (!controller.signal.aborted && epoch === this.semanticEpoch) this.speakUnclear(snapshot);
+    }).finally(() => {
+      clearTimeout(timer);
+      if (resolutionId !== null) this.releaseSemanticResolution(resolutionId);
+      if (this.semanticController === controller) this.semanticController = null;
+    });
+    this.track(job);
+  }
+
+  private voiceFacts(snapshot: TriviaVoiceSnapshot): TriviaIntentRequest['facts'] {
+    if (snapshot.phase === 'category_select') return [{ id: 'categories', text: this.text('voice.chooseCategory', {
+      categories: formatList(this.commandLocale,
+        TRIVIA_ROUND_CATEGORY_IDS.map(category => TRIVIA_CATEGORY_LABELS[this.commandLocale][category])),
+    }) }];
+    if (snapshot.question && (snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue'
+      || snapshot.phase === 'question')) return [{ id: 'question', text: this.questionPrompts(snapshot).join(' ') }];
+    if (snapshot.phase === 'reveal' && snapshot.reveal && snapshot.question) {
+      const correct = snapshot.question.choices.find(choice => choice.id === snapshot.reveal!.correctChoiceId);
+      return correct ? [{ id: 'reveal', text: `${correct.text}. ${snapshot.reveal.explanation}` }] : [];
+    }
+    if (snapshot.phase === 'results' && snapshot.result) return [{ id: 'standings', text:
+      snapshot.result.players.map(player => `${player.name}: ${formatNumber(this.commandLocale,
+        player.normalizedScore)}`).join('; ') }];
+    return [];
+  }
+
+  private speakUnclear(snapshot: TriviaVoiceSnapshot): void {
+    const key = snapshot.phase === 'category_select' ? 'voice.unknownCategory'
+      : (snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue')
+        && (this.interruptedPromptKeys.has(questionKey(snapshot) ?? '')
+          || this.interruptedCueKeys.has(questionKey(snapshot) ?? ''))
+        ? 'voice.readingInterrupted' : 'voice.answerUnknown';
+    if (snapshot.phase === 'category_select' || snapshot.phase === 'question'
+      || snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue') {
+      void this.speak(this.text(key), this.snapshotGuard(snapshot));
+    }
+  }
+
   private commitAnswer(
     spoken: string,
     snapshot: TriviaVoiceSnapshot,
     answerOnset: { scope: string; choiceId: string; atMs: number } | null = null,
+    receivedAtMs = this.now(),
   ): void {
     const questionKey = this.activeQuestionKey;
     if (!questionKey || snapshot.myAnswered || this.lockedQuestions.has(questionKey)) return;
     const choiceId = this.resolveAnswer(spoken, snapshot);
     if (!choiceId) {
-      void this.speak(this.text('voice.answerUnknown'), this.questionGuard(questionKey, ['question']));
+      this.interpret(spoken, snapshot, receivedAtMs, answerOnset);
       return;
     }
     if (snapshot.answeringStartsAtMs === null || snapshot.questionEndsAtMs === null) return;
     const answeredAtMs = answerOnset?.scope === inputScope(snapshot) && answerOnset.choiceId === choiceId
       ? answerOnset.atMs
-      : this.now();
+      : receivedAtMs;
+    this.commitAnswerAt(choiceId, snapshot, answeredAtMs);
+  }
+
+  private commitAnswerAt(choiceId: string, snapshot: TriviaVoiceSnapshot, answeredAtMs: number,
+    semanticResolutionId?: number): void {
+    const questionKey = this.activeQuestionKey;
+    if (!questionKey || snapshot.myAnswered || this.lockedQuestions.has(questionKey)
+      || !snapshot.question?.choices.some(choice => choice.id === choiceId)
+      || snapshot.answeringStartsAtMs === null || snapshot.questionEndsAtMs === null) return;
     if (answeredAtMs < snapshot.answeringStartsAtMs) return;
     if (answeredAtMs > snapshot.questionEndsAtMs) {
       void this.speak(this.text('voice.answerTooLate'), this.questionGuard(questionKey, ['question']));
@@ -475,7 +783,7 @@ export class TriviaVoiceSession {
     }
 
     const accepted = this.applyAuthority(() => this.deps.answerAt(
-      this.code!, this.playerId!, choiceId, true, answeredAtMs,
+      this.code!, this.playerId!, choiceId, true, answeredAtMs, semanticResolutionId,
     ));
     if (accepted) {
       this.lockedQuestions.add(questionKey);
@@ -496,6 +804,10 @@ export class TriviaVoiceSession {
     }
     if (snapshot.phase === 'category_select' && /^[1-9]$/.test(digit)) this.chooseCategory(digit, snapshot);
     else if (snapshot.phase === 'question' && /^[1-4]$/.test(digit)) this.commitAnswer(digit, snapshot);
+    else if ((snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue')
+      && /^[1-4]$/.test(digit)) this.holdEarlyAnswer(digit, snapshot);
+    else if ((snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue')
+      && digit === '#') this.skipQuestionAudio(snapshot);
   }
 
   private processSnapshot(snapshot: TriviaVoiceSnapshot): void {
@@ -518,6 +830,7 @@ export class TriviaVoiceSession {
       return;
     }
     if (snapshot.phase === 'category_select') {
+      this.announceCategoryVote(snapshot);
       if (previousPhase === 'loading') {
         this.categoryAdvanceAttempt = '';
         void this.speak(this.text('voice.loadingTimeout'), this.phaseGuard('category_select'));
@@ -527,6 +840,7 @@ export class TriviaVoiceSession {
       return;
     }
     if (snapshot.phase === 'loading') {
+      this.announceCategoryVote(snapshot);
       if (!this.preparingGenerations.has(snapshot.loadingGeneration)) {
         this.preparingGenerations.add(snapshot.loadingGeneration);
         void this.speak(this.text('voice.preparing'), this.loadingGuard(snapshot.loadingGeneration));
@@ -543,6 +857,22 @@ export class TriviaVoiceSession {
     }
     if (snapshot.phase === 'question') {
       this.presentAnswerStart(snapshot);
+      return;
+    }
+    if (snapshot.phase === 'audio_problem') {
+      const attemptId = snapshot.questionAttemptId;
+      if (attemptId !== null && !this.announcedAudioProblems.has(attemptId)) {
+        this.announcedAudioProblems.add(attemptId);
+        void this.speak(this.text('voice.audioProblem'), this.questionGuard(questionKey(snapshot)!, ['audio_problem']));
+      }
+      return;
+    }
+    if (snapshot.phase === 'audio_expired') {
+      const attemptId = snapshot.questionAttemptId;
+      if (attemptId !== null && !this.announcedAudioExpiries.has(attemptId)) {
+        this.announcedAudioExpiries.add(attemptId);
+        void this.speak(this.text('voice.audioExpired'), this.phaseGuard('audio_expired'));
+      }
       return;
     }
     if (snapshot.phase === 'reveal') {
@@ -603,6 +933,10 @@ export class TriviaVoiceSession {
       this.presentAnswerCue(snapshot);
     } else if (snapshot.phase === 'question') {
       this.presentAnswerStart(snapshot);
+    } else if (snapshot.phase === 'audio_problem') {
+      this.processSnapshot(snapshot);
+    } else if (snapshot.phase === 'audio_expired') {
+      this.processSnapshot(snapshot);
     } else if (snapshot.phase === 'reveal') {
       this.announceReveal(snapshot);
     } else if (snapshot.phase === 'results') {
@@ -611,40 +945,86 @@ export class TriviaVoiceSession {
   }
 
   private speakCategories(): void {
+    const snapshot = this.currentSnapshot();
+    if (!snapshot || snapshot.phase !== 'category_select' || snapshot.myCategoryVote !== null) return;
+    const generation = snapshot.loadingGeneration;
     const labels = TRIVIA_ROUND_CATEGORY_IDS.slice(0, -1).map((category, index) =>
       `${index + 1}, ${TRIVIA_CATEGORY_LABELS[this.commandLocale][category]}`);
     const mixed = TRIVIA_CATEGORY_LABELS[this.commandLocale].mixed;
     const prompt = this.text('voice.chooseCategory', {
       categories: formatList(this.commandLocale, labels),
     }).replace(mixed, `9, ${mixed}`);
-    void this.speak(prompt, this.phaseGuard('category_select'));
+    void this.speak(prompt, () => {
+      const current = this.currentSnapshot();
+      return Boolean(current && current.phase === 'category_select'
+        && current.loadingGeneration === generation && current.myCategoryVote === null);
+    });
   }
 
-  private presentQuestion(snapshot: TriviaVoiceSnapshot): void {
+  private categoryVoteContext(snapshot: TriviaVoiceSnapshot): string | null {
+    if (!snapshot.myCategoryVote
+      || (snapshot.phase !== 'category_select' && snapshot.phase !== 'loading')) return null;
+    const roundGeneration = snapshot.phase === 'loading'
+      ? snapshot.loadingGeneration - 1 : snapshot.loadingGeneration;
+    return `${roundGeneration}:${snapshot.myCategoryVote}`;
+  }
+
+  private announceCategoryVote(snapshot: TriviaVoiceSnapshot): void {
+    const context = this.categoryVoteContext(snapshot);
+    const category = snapshot.myCategoryVote;
+    if (!context || !category || context === this.announcedCategoryVote) return;
+    this.announcedCategoryVote = context;
+    this.deps.preemptSpeech();
+    void this.speak(this.text('voice.categorySelected', {
+      category: TRIVIA_CATEGORY_LABELS[this.commandLocale][category],
+    }), () => {
+      const current = this.currentSnapshot();
+      return Boolean(current && current.myCategoryVote === category
+        && this.categoryVoteContext(current) === context);
+    });
+  }
+
+  private presentQuestion(snapshot: TriviaVoiceSnapshot, concise = false): void {
     const question = snapshot.question;
     const questionKey = this.activeQuestionKey;
     const attemptKey = `prompt:${questionKey}`;
-    if (!question || !questionKey || snapshot.myPromptReady || this.promptAttempts.has(questionKey)
+    if (!question || !questionKey || snapshot.questionAttemptId === null || snapshot.myPromptReady
+      || !snapshot.displayViewReady
+      || this.interruptedPromptKeys.has(questionKey) || this.promptAttempts.has(questionKey)
       || !this.beginRequiredSpeech(attemptKey)) return;
+    const prompt = concise
+      ? this.compactQuestionPrompt(snapshot)
+      : this.questionPrompts(snapshot).join(' ');
+    const generation = this.deps.beginPromptDelivery(this.code!, this.playerId!, question.id,
+      snapshot.questionAttemptId, Math.ceil(prompt.length / 12) * 1_000);
+    if (generation === null) {
+      this.releaseRequiredSpeechAttempt(attemptKey);
+      return;
+    }
     this.promptAttempts.add(questionKey);
     const token = Symbol(questionKey);
     this.promptAttemptToken = token;
-    const prompts = this.questionPrompts(snapshot);
-    const guard = this.questionGuard(questionKey, ['question_prompt']);
-    const delivery = Promise.all(prompts.map(prompt => this.speak(prompt, guard)));
-    const settlement = delivery.then(played => {
+    const guard = this.paintedQuestionGuard(questionKey, 'question_prompt');
+    const settlement = this.speakOutcome(prompt, guard).then(outcome => {
       if (this.promptAttemptToken !== token) return;
       this.promptAttemptToken = null;
-      if (!played.every(result => result) || !guard() || !this.code || !this.playerId) {
+      if (outcome === 'interrupted') {
+        this.promptAttempts.delete(questionKey);
+        this.interruptedPromptKeys.add(questionKey);
+        this.releaseRequiredSpeechAttempt(attemptKey);
+        return;
+      }
+      if (!isDeliveredSpeech(outcome) || !guard() || !this.code || !this.playerId) {
         this.promptAttempts.delete(questionKey);
         this.retryRequiredSpeech(attemptKey, guard, () => {
           const current = this.currentSnapshot();
-          if (current) this.presentQuestion(current);
-        });
+          if (current) this.presentQuestion(current, true);
+        }, () => this.deps.pauseAudio(this.code!, question.id, snapshot.questionAttemptId!));
         return;
       }
       const accepted = this.applyAuthority(() => (
-        this.deps.questionPromptReady(this.code!, this.playerId!, question.id)
+        this.deps.questionPromptReady(this.code!, this.playerId!, question.id,
+          snapshot.questionAttemptId!, generation)
       ));
       if (!accepted) this.promptAttempts.delete(questionKey);
       this.finishRequiredSpeech(attemptKey);
@@ -655,36 +1035,61 @@ export class TriviaVoiceSession {
         this.promptAttempts.delete(questionKey);
         this.retryRequiredSpeech(attemptKey, guard, () => {
           const current = this.currentSnapshot();
-          if (current) this.presentQuestion(current);
-        });
+          if (current) this.presentQuestion(current, true);
+        }, () => this.deps.pauseAudio(this.code!, question.id, snapshot.questionAttemptId!));
       }
     });
     this.track(settlement);
   }
 
-  private presentAnswerCue(snapshot: TriviaVoiceSnapshot): void {
+  private presentAnswerCue(snapshot: TriviaVoiceSnapshot, repeatQuestion = false): void {
     const questionKey = this.activeQuestionKey;
     const question = snapshot.question;
     const attemptKey = `cue:${questionKey}`;
-    if (!questionKey || !question || snapshot.myAnswerCueReady || this.answerCueAttempts.has(questionKey)
+    if (!questionKey || !question || snapshot.questionAttemptId === null || snapshot.myAnswerCueReady
+      || !snapshot.displayViewReady) return;
+    if (this.skippedAudioKeys.has(questionKey)) {
+      const accepted = this.applyAuthority(() => this.deps.questionAnswerCueSkipped(
+        this.code!, this.playerId!, question.id, snapshot.questionAttemptId!,
+      ));
+      if (accepted) this.onStateChanged();
+      return;
+    }
+    if (this.interruptedCueKeys.has(questionKey) || this.answerCueAttempts.has(questionKey)
       || !this.beginRequiredSpeech(attemptKey)) return;
+    const generation = this.deps.beginAnswerCueDelivery(this.code!, this.playerId!, question.id,
+      snapshot.questionAttemptId);
+    if (generation === null) {
+      this.releaseRequiredSpeechAttempt(attemptKey);
+      return;
+    }
     this.answerCueAttempts.add(questionKey);
     const token = Symbol(questionKey);
     this.answerCueAttemptToken = token;
-    const guard = this.questionGuard(questionKey, ['answer_cue']);
-    const settlement = this.speak(this.text('voice.getReady'), guard).then(played => {
+    const guard = this.paintedQuestionGuard(questionKey, 'answer_cue');
+    const cue = repeatQuestion
+      ? `${this.questionPrompts(snapshot).join(' ')} ${this.text('voice.getReady')}`
+      : this.text('voice.getReady');
+    const settlement = this.speakOutcome(cue, guard).then(outcome => {
       if (this.answerCueAttemptToken !== token) return;
       this.answerCueAttemptToken = null;
-      if (!played || !guard() || !this.code || !this.playerId) {
+      if (outcome === 'interrupted') {
+        this.answerCueAttempts.delete(questionKey);
+        this.interruptedCueKeys.add(questionKey);
+        this.releaseRequiredSpeechAttempt(attemptKey);
+        return;
+      }
+      if (!isDeliveredSpeech(outcome) || !guard() || !this.code || !this.playerId) {
         this.answerCueAttempts.delete(questionKey);
         this.retryRequiredSpeech(attemptKey, guard, () => {
           const current = this.currentSnapshot();
           if (current) this.presentAnswerCue(current);
-        });
+        }, () => this.deps.pauseAudio(this.code!, question.id, snapshot.questionAttemptId!));
         return;
       }
       const accepted = this.applyAuthority(() => (
-        this.deps.questionAnswerCueReady(this.code!, this.playerId!, question.id)
+        this.deps.questionAnswerCueReady(this.code!, this.playerId!, question.id,
+          snapshot.questionAttemptId!, generation)
       ));
       if (!accepted) this.answerCueAttempts.delete(questionKey);
       this.finishRequiredSpeech(attemptKey);
@@ -696,7 +1101,7 @@ export class TriviaVoiceSession {
         this.retryRequiredSpeech(attemptKey, guard, () => {
           const current = this.currentSnapshot();
           if (current) this.presentAnswerCue(current);
-        });
+        }, () => this.deps.pauseAudio(this.code!, question.id, snapshot.questionAttemptId!));
       }
     });
     this.track(settlement);
@@ -704,32 +1109,25 @@ export class TriviaVoiceSession {
 
   private presentAnswerStart(snapshot: TriviaVoiceSnapshot, resumed = false): void {
     const questionKey = this.activeQuestionKey;
-    const attemptKey = `answer-start:${questionKey}`;
     if (!questionKey || snapshot.myAnswered || this.announcedAnswerStarts.has(questionKey)
-      || this.answerStartAttempts.has(questionKey) || !this.beginRequiredSpeech(attemptKey)) return;
+      || this.answerStartAttempts.has(questionKey)) return;
     const remainingSeconds = snapshot.answeringStartsAtMs === null || snapshot.questionEndsAtMs === null
       ? 0
       : Math.max(0, Math.ceil((snapshot.questionEndsAtMs
         - Math.max(this.now(), snapshot.answeringStartsAtMs)) / 1_000));
-    const prompts = [...this.questionPrompts(snapshot)];
-    if (resumed) prompts.push(this.text('voice.answerResume', { seconds: remainingSeconds }));
+    if (!resumed) {
+      this.announcedAnswerStarts.add(questionKey);
+      return;
+    }
+    const prompt = this.text('voice.answerResume', { seconds: remainingSeconds });
     const guard = this.unansweredQuestionGuard(questionKey);
     this.answerStartAttempts.add(questionKey);
-    const settlement = Promise.all(prompts.map(prompt => this.speak(prompt, guard))).then(played => {
+    const settlement = this.speak(prompt, guard).then(() => {
       this.answerStartAttempts.delete(questionKey);
-      if (played.every(result => result) && guard()) {
-        this.announcedAnswerStarts.add(questionKey);
-        this.finishRequiredSpeech(attemptKey);
-      } else this.retryRequiredSpeech(attemptKey, guard, () => {
-        const current = this.currentSnapshot();
-        if (current) this.presentAnswerStart(current, resumed);
-      });
+      this.announcedAnswerStarts.add(questionKey);
     }).catch(() => {
       this.answerStartAttempts.delete(questionKey);
-      this.retryRequiredSpeech(attemptKey, guard, () => {
-        const current = this.currentSnapshot();
-        if (current) this.presentAnswerStart(current, resumed);
-      });
+      this.announcedAnswerStarts.add(questionKey);
     });
     this.track(settlement);
   }
@@ -745,21 +1143,17 @@ export class TriviaVoiceSession {
     const correctChoice = question.choices[correctIndex];
     if (!correctChoice) return;
     const points = snapshot.myQuestionPoints;
-    const standings = (snapshot.standings ?? []).map(standing => this.extra('standing', {
-      rank: standing.rank,
-      name: standing.name,
-      score: formatNumber(this.commandLocale, standing.rawScore),
-    }));
     const guard = this.questionGuard(questionKey, ['reveal']);
     this.revealAttempts.add(questionKey);
-    const settlement = this.speak(this.extra(points > 0 ? 'revealCorrect' : 'revealIncorrect', {
+    const settlement = this.speakOutcome(this.extra(points > 0 ? 'revealCorrect' : 'revealIncorrect', {
       choice: this.choiceNumber(correctIndex),
-      answer: correctChoice.text,
       points: formatNumber(this.commandLocale, points),
-      standings: standings.length ? formatList(this.commandLocale, standings) : '-',
-    }), guard).then(played => {
+    }), guard).then(outcome => {
       this.revealAttempts.delete(questionKey);
-      if (played && guard()) {
+      if (outcome === 'interrupted') {
+        this.announcedReveals.add(questionKey);
+        this.finishRequiredSpeech(attemptKey);
+      } else if (isDeliveredSpeech(outcome) && guard()) {
         this.announcedReveals.add(questionKey);
         this.finishRequiredSpeech(attemptKey);
       } else this.retryRequiredSpeech(attemptKey, guard, () => {
@@ -802,9 +1196,19 @@ export class TriviaVoiceSession {
     }));
     prompts.push(this.text(this.stationManaged ? 'voice.stationRequeue' : 'voice.playAgain'));
     this.resultAttempts.add(result.resultId);
-    const settlement = Promise.all(prompts.map(prompt => this.speak(prompt, guard))).then(played => {
+    const settlement = (async (): Promise<TriviaSpeechOutcome> => {
+      for (const prompt of prompts) {
+        if (!guard()) return 'failed';
+        const outcome = await this.speakOutcome(prompt, guard);
+        if (!isDeliveredSpeech(outcome)) return outcome;
+      }
+      return 'played';
+    })().then(outcome => {
       this.resultAttempts.delete(result.resultId);
-      if (played.every(resultPlayed => resultPlayed) && guard()) {
+      if (outcome === 'interrupted') {
+        this.announcedResults.add(result.resultId);
+        this.finishRequiredSpeech(attemptKey);
+      } else if (isDeliveredSpeech(outcome) && guard()) {
         this.announcedResults.add(result.resultId);
         this.finishRequiredSpeech(attemptKey);
       } else this.retryRequiredSpeech(attemptKey, guard, () => {
@@ -833,6 +1237,13 @@ export class TriviaVoiceSession {
     })];
   }
 
+  private compactQuestionPrompt(snapshot: TriviaVoiceSnapshot): string {
+    const question = snapshot.question;
+    if (!question) return '';
+    return `${(snapshot.questionIndex ?? 0) + 1}. ${question.prompt} ${question.choices.map((choice, index) =>
+      `${index + 1}. ${choice.text}`).join('; ')}`;
+  }
+
   private choiceNumber(index: number): string {
     return (this.commandLocale === 'pt-BR'
       ? ['Um', 'Dois', 'Três', 'Quatro']
@@ -857,15 +1268,16 @@ export class TriviaVoiceSession {
     }
     const key = questionKey(snapshot);
     if (!key || key === this.activeQuestionKey) return;
+    this.abortSemantic();
     this.activeQuestionKey = key;
     this.answerOnset = null;
     this.lastFinal = null;
   }
 
   private askName(): void {
-    if (this.namePrompted) return;
+    if (this.namePrompted || this.currentSnapshot()?.nameConfirmed) return;
     this.namePrompted = true;
-    void this.speak(this.text('voice.askName'));
+    void this.speak(this.text('voice.askName'), this.nameGuard());
   }
 
   private currentSnapshot(): TriviaVoiceSnapshot | null {
@@ -879,11 +1291,38 @@ export class TriviaVoiceSession {
       ? TRIVIA_ROUND_CATEGORY_IDS.map(category => snapshot.categoryVoteCounts[category]).join(',')
       : '';
     return `${snapshot?.phase ?? 'unavailable'}:${snapshot?.nameConfirmed ? 1 : 0}:`
-      + `${questionKey(snapshot)}:${snapshot?.myAnswered ? 1 : 0}:${votes}`;
+      + `${questionKey(snapshot)}:${snapshot?.myAnswered ? 1 : 0}:${votes}:${snapshot?.result?.resultId ?? ''}`;
   }
 
   private phaseGuard(phase: TriviaPhase): () => boolean {
     return () => this.currentSnapshot()?.phase === phase;
+  }
+
+  private nameGuard(): () => boolean {
+    return () => {
+      const snapshot = this.currentSnapshot();
+      return Boolean(snapshot && snapshot.phase === 'lobby' && !snapshot.nameConfirmed);
+    };
+  }
+
+  private snapshotGuard(snapshot: TriviaVoiceSnapshot): () => boolean {
+    const key = questionKey(snapshot);
+    const resultId = snapshot.result?.resultId;
+    const categoryVote = snapshot.myCategoryVote;
+    return () => {
+      const current = this.currentSnapshot();
+      return Boolean(current && current.phase === snapshot.phase && questionKey(current) === key
+        && current.result?.resultId === resultId
+        && (snapshot.phase !== 'category_select' || current.myCategoryVote === categoryVote));
+    };
+  }
+
+  private setupGuard(name?: string): () => boolean {
+    return () => {
+      const snapshot = this.currentSnapshot();
+      return Boolean(snapshot && (snapshot.phase === 'lobby' || snapshot.phase === 'category_select')
+        && (name === undefined || snapshot.myName === name));
+    };
   }
 
   private loadingGuard(generation: number): () => boolean {
@@ -893,17 +1332,18 @@ export class TriviaVoiceSession {
     };
   }
 
-  private categoryOrLoadingGuard(): () => boolean {
-    return () => {
-      const phase = this.currentSnapshot()?.phase;
-      return phase === 'category_select' || phase === 'loading';
-    };
-  }
-
   private questionGuard(question: string, phases: readonly TriviaPhase[]): () => boolean {
     return () => {
       const snapshot = this.currentSnapshot();
       return Boolean(snapshot && phases.includes(snapshot.phase) && questionKey(snapshot) === question);
+    };
+  }
+
+  private paintedQuestionGuard(question: string, phase: 'question_prompt' | 'answer_cue'): () => boolean {
+    return () => {
+      const snapshot = this.currentSnapshot();
+      return Boolean(snapshot && snapshot.phase === phase && snapshot.displayViewReady
+        && questionKey(snapshot) === question);
     };
   }
 
@@ -920,18 +1360,23 @@ export class TriviaVoiceSession {
   }
 
   private speak(text: string, guard?: () => boolean): Promise<boolean> {
-    if (!this.active) return Promise.resolve(false);
+    return this.speakOutcome(text, guard).then(isDeliveredSpeech);
+  }
+
+  private speakOutcome(text: string, guard?: () => boolean): Promise<TriviaSpeechOutcome> {
+    if (!this.active) return Promise.resolve('failed');
     const isCurrent = () => this.active && (!guard || guard());
-    let delivery: void | Promise<boolean>;
+    let delivery: Promise<TriviaSpeechOutcome>;
     try {
-      if (!isCurrent()) return Promise.resolve(false);
+      if (!isCurrent()) return Promise.resolve('failed');
       delivery = this.deps.say(text, isCurrent);
     } catch {
-      return Promise.resolve(false);
+      return Promise.resolve('failed');
     }
     const settled = delivery && typeof delivery.then === 'function'
-      ? Promise.resolve(delivery).then(played => played === true, () => false)
-      : Promise.resolve(true);
+      ? Promise.resolve(delivery).then(outcome => ['played', 'estimated', 'interrupted', 'failed'].includes(outcome)
+        ? outcome : 'failed', () => 'failed' as const)
+      : Promise.resolve('failed' as const);
     return this.track(settled);
   }
 
@@ -943,13 +1388,18 @@ export class TriviaVoiceSession {
     return true;
   }
 
-  private retryRequiredSpeech(key: string, guard: () => boolean, retry: () => void): void {
+  private retryRequiredSpeech(key: string, guard: () => boolean, retry: () => void,
+    exhausted?: () => void): void {
     if (!this.active || !guard()) {
       this.requiredSpeechAttempts.delete(key);
       return;
     }
     const attempts = this.requiredSpeechAttempts.get(key) ?? 0;
-    if (attempts >= TRIVIA_SPEECH_MAX_ATTEMPTS || this.requiredSpeechTimers.has(key)) return;
+    if (attempts >= TRIVIA_SPEECH_MAX_ATTEMPTS) {
+      exhausted?.();
+      return;
+    }
+    if (this.requiredSpeechTimers.has(key)) return;
     let settle!: () => void;
     const pending = new Promise<void>(resolve => { settle = resolve; });
     const callback = () => {
@@ -969,6 +1419,12 @@ export class TriviaVoiceSession {
   private finishRequiredSpeech(key: string): void {
     this.cancelRequiredSpeechRetry(key);
     this.requiredSpeechAttempts.delete(key);
+  }
+
+  private releaseRequiredSpeechAttempt(key: string): void {
+    const attempts = this.requiredSpeechAttempts.get(key) ?? 0;
+    if (attempts <= 1) this.requiredSpeechAttempts.delete(key);
+    else this.requiredSpeechAttempts.set(key, attempts - 1);
   }
 
   private cancelRequiredSpeechRetry(key: string): void {
@@ -998,6 +1454,7 @@ export class TriviaVoiceSession {
 
   private clear(): void {
     this.active = false;
+    this.abortSemantic();
     for (const key of [...this.requiredSpeechTimers.keys()]) this.cancelRequiredSpeechRetry(key);
     this.requiredSpeechAttempts.clear();
     this.promptAttemptToken = null;
@@ -1011,6 +1468,25 @@ export class TriviaVoiceSession {
     this.callSid = null;
     this.stateDirty = false;
   }
+
+  private abortSemantic(): void {
+    this.semanticEpoch += 1;
+    this.semanticController?.abort();
+    this.semanticController = null;
+    this.releaseSemanticResolution();
+  }
+
+  private releaseSemanticResolution(resolutionId?: number): void {
+    const pending = this.semanticResolution;
+    if (!pending || (resolutionId !== undefined && pending.resolutionId !== resolutionId)) return;
+    this.semanticResolution = null;
+    this.deps.finishAnswerResolution(pending.code, pending.playerId, pending.questionId,
+      pending.questionAttemptId, pending.resolutionId);
+  }
+}
+
+function isDeliveredSpeech(outcome: TriviaSpeechOutcome): boolean {
+  return outcome === 'played' || outcome === 'estimated';
 }
 
 export function matchTriviaCategory(
@@ -1020,11 +1496,13 @@ export function matchTriviaCategory(
   if (typeof spoken !== 'string' || Array.from(spoken).length > 200) return null;
   const normalized = normalizeForMatching(spoken, locale);
   if (!normalized) return null;
-  const numbered = matchSelectionNumber(normalized, TRIVIA_ROUND_CATEGORY_IDS.length, locale, 'category');
+  const intended = latestTriviaCorrection(normalized, locale);
+  if (isNegatedTriviaChoice(intended, locale)) return null;
+  const numbered = matchSelectionNumber(intended, TRIVIA_ROUND_CATEGORY_IDS.length, locale, 'category');
   if (numbered !== null) return TRIVIA_ROUND_CATEGORY_IDS[numbered] ?? null;
   const matches = TRIVIA_ROUND_CATEGORY_IDS.filter(category => {
     const forms = [TRIVIA_CATEGORY_LABELS[locale][category], ...TRIVIA_CATEGORY_ALIASES[locale][category]];
-    return forms.some(form => containsPhrase(normalized, normalizeForMatching(form, locale)));
+    return forms.some(form => containsPhrase(intended, normalizeForMatching(form, locale)));
   });
   return matches.length === 1 ? matches[0]! : null;
 }
@@ -1037,9 +1515,11 @@ export function matchTriviaAnswer(
   if (typeof spoken !== 'string' || Array.from(spoken).length > 300 || question.choices.length !== 4) return null;
   const normalized = normalizeForMatching(spoken, locale);
   if (!normalized) return null;
-  const letter = matchSelectionLetter(normalized, locale);
+  const intended = latestTriviaCorrection(normalized, locale);
+  if (isNegatedTriviaChoice(intended, locale)) return null;
+  const letter = matchSelectionLetter(intended, locale);
   if (letter !== null) return question.choices[letter]?.id ?? null;
-  const numbered = matchSelectionNumber(normalized, question.choices.length, locale, 'answer');
+  const numbered = matchSelectionNumber(intended, question.choices.length, locale, 'answer');
   if (numbered !== null) return question.choices[numbered]?.id ?? null;
 
   const matches = new Set<string>();
@@ -1047,10 +1527,29 @@ export function matchTriviaAnswer(
     for (const form of [choice.text, ...(choice.aliases ?? [])]) {
       const candidate = normalizeForMatching(form, locale);
       if (!candidate) continue;
-      if (matchesBoundedAnswerForm(normalized, candidate, locale)) matches.add(choice.id);
+      if (matchesBoundedAnswerForm(intended, candidate, locale)) matches.add(choice.id);
     }
   }
   return matches.size === 1 ? [...matches][0]! : null;
+}
+
+function latestTriviaCorrection(normalized: string, locale: SupportedLocale): string {
+  if (/^(?:no|nao)\b/.test(normalized)) return normalized;
+  const marker = locale === 'pt-BR'
+    ? /\b(?:na verdade|quer dizer|melhor|em vez disso|nao|desculpa|mas)\b/g
+    : /\b(?:actually|i mean|rather|instead|wait|sorry|no)\b/g;
+  let intended = normalized;
+  for (const match of normalized.matchAll(marker)) {
+    const after = normalized.slice(match.index! + match[0].length).trim();
+    if (after) intended = after;
+  }
+  return intended;
+}
+
+function isNegatedTriviaChoice(normalized: string, locale: SupportedLocale): boolean {
+  return locale === 'pt-BR'
+    ? /\b(?:nao|nunca|sem)\b/.test(normalized)
+    : /\b(?:no|not|never|dont|do not|without)\b/.test(normalized);
 }
 
 function parseTriviaName(spoken: string, locale: SupportedLocale): string | null {
@@ -1068,9 +1567,23 @@ function isPlayAgain(spoken: string, locale: SupportedLocale): boolean {
     : /^(?:play again|again|another round|new round|rematch)$/.test(normalized);
 }
 
+function isTriviaSkipReading(spoken: string, locale: SupportedLocale): boolean {
+  const normalized = normalizeForMatching(spoken, locale);
+  return locale === 'pt-BR'
+    ? /\b(?:pular|pule|dispensar|nao leia|sem ler|ir direto)\b/.test(normalized)
+    : /\b(?:skip|stop reading|do not read|dont read|go straight|move on|i can see it)\b/.test(normalized);
+}
+
+function isTriviaRepeatQuestion(spoken: string, locale: SupportedLocale): boolean {
+  const normalized = normalizeForMatching(spoken, locale);
+  return locale === 'pt-BR'
+    ? /\b(?:repita|repetir|de novo|leia de novo|qual era a pergunta)\b/.test(normalized)
+    : /\b(?:repeat|say it again|read it again|what was the question|tell me the choices)\b/.test(normalized);
+}
+
 function questionKey(snapshot: TriviaVoiceSnapshot | null): string | null {
   if (!snapshot?.question || snapshot.questionIndex === null) return null;
-  return `${snapshot.loadingGeneration}:${snapshot.questionIndex}:${snapshot.question.id}`;
+  return `${snapshot.loadingGeneration}:${snapshot.questionIndex}:${snapshot.questionAttemptId}:${snapshot.question.id}`;
 }
 
 function inputScope(snapshot: TriviaVoiceSnapshot): string {

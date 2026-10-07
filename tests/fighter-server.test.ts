@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server } from 'http';
 import { WebSocket } from 'ws';
 import { FighterServer } from '../server/fighter-server';
@@ -18,9 +18,9 @@ afterEach(async () => {
   http = undefined;
 });
 
-async function start(displayToken?: string, heartbeatMs?: number): Promise<number> {
+async function start(displayToken?: string, heartbeatMs?: number, connected?: (ws:WebSocket)=>void): Promise<number> {
   http = createServer(); fighter = new FighterServer({ server: http, displayToken, heartbeatMs });
-  http.on('upgrade', (request, socket, head) => fighter!.handleUpgrade(request, socket, head));
+  http.on('upgrade', (request, socket, head) => fighter!.handleUpgrade(request, socket, head, connected));
   await new Promise<void>(resolve => http!.listen(0, '127.0.0.1', resolve));
   const address = http.address(); if (!address || typeof address === 'string') throw new Error('missing port');
   return address.port;
@@ -51,6 +51,114 @@ function latestState(client: Client): Message | undefined {
 }
 
 describe('FighterServer WebSocket authority and lifecycle', () => {
+  it('recognizes only a live, room-bound and authorized standalone display',async()=>{
+    let serverSideDisplay:WebSocket|undefined;
+    const port=await start('display-token',undefined,ws=>serverSideDisplay=ws);
+    fighter!.setBrowserPlayerAdmission(code=>code!=='PAID');
+    const display=await connect(port);
+    expect(serverSideDisplay).toBeDefined();
+    expect(fighter!.hasStandaloneDisplay(serverSideDisplay!,'PAID')).toBe(false);
+    send(display,{type:'display_auth',roomCode:'PAID',token:'display-token'});
+    expect(fighter!.hasStandaloneDisplay(serverSideDisplay!,'PAID')).toBe(false);
+    send(display,{type:'spectate',roomCode:'PAID'});
+    await waitFor(display,message=>message.type==='fighter_state'&&message.roomCode==='PAID');
+    expect(fighter!.hasStandaloneDisplay(serverSideDisplay!,'PAID')).toBe(false);
+    expect(fighter!.hasStandaloneDisplay(serverSideDisplay!,'OTHER')).toBe(false);
+    send(display,{type:'spectate',roomCode:'FREE'});
+    await waitFor(display,message=>message.type==='fighter_state'&&message.roomCode==='FREE');
+    expect(fighter!.hasStandaloneDisplay(serverSideDisplay!,'FREE')).toBe(true);
+    send(display,{type:'leave'});await new Promise(resolve=>setTimeout(resolve,20));
+    expect(fighter!.hasStandaloneDisplay(serverSideDisplay!,'FREE')).toBe(false);
+    send(display,{type:'spectate',roomCode:'FREE'});
+    await new Promise(resolve=>setTimeout(resolve,20));
+    expect(fighter!.hasStandaloneDisplay(serverSideDisplay!,'FREE')).toBe(true);
+    send(display,{type:'spectate',roomCode:'OTHER'});
+    await waitFor(display,message=>message.type==='fighter_state'&&message.roomCode==='OTHER');
+    expect(fighter!.hasStandaloneDisplay(serverSideDisplay!,'FREE')).toBe(false);
+    expect(fighter!.hasStandaloneDisplay(serverSideDisplay!,'OTHER')).toBe(true);
+    display.ws.close();await new Promise<void>(resolve=>display.ws.once('close',()=>resolve()));
+    expect(fighter!.hasStandaloneDisplay(serverSideDisplay!,'OTHER')).toBe(false);
+  });
+
+  it('accepts only the current host’s current-match fight and result paint receipts', async () => {
+    const port=await start('paint-token');fighter!.setBrowserPlayerAdmission(code=>code!=='PAINT');
+    const playerId=fighter!.voiceJoin('PAINT','Ada')!;
+    fighter!.voiceAdvance('PAINT',playerId);fighter!.voiceSelectFighter('PAINT',playerId,'nyx');
+    fighter!.voiceAdvance('PAINT',playerId);fighter!.voiceSelectMap('PAINT',playerId,'void');
+    fighter!.voiceAdvance('PAINT',playerId);
+    const room=fighter!.findRoom('PAINT')!;
+    const generation=room.state().loadingGeneration;
+    room.ready(generation);room.tick(FIGHTER_INTRO_SECONDS);room.tick(6);
+    const display=await connect(port);
+    send(display,{type:'display_auth',roomCode:'PAINT',token:'paint-token'});
+    send(display,{type:'spectate',roomCode:'PAINT'});
+    await waitFor(display,message=>message.type==='host_identity'&&message.isHost===true);
+    send(display,{type:'ack_display',phase:'fight',loadingGeneration:generation+1});
+    await new Promise(resolve=>setTimeout(resolve,20));expect(room.hudPresented).toBe(false);
+    send(display,{type:'ack_display',phase:'fight',loadingGeneration:generation});
+    await waitFor(display,message=>message.type==='fighter_state'&&message.hudPresented===true);
+    expect(room.hudPresented).toBe(true);
+
+    const world=room.state().world!;world.status='finished';world.winner='p1';
+    room.tick(.1);room.tick(10.5);
+    expect(room.phase).toBe('results');
+    send(display,{type:'ack_display',phase:'results',loadingGeneration:generation+1});
+    await new Promise(resolve=>setTimeout(resolve,20));expect(room.resultsPresented).toBe(false);
+    send(display,{type:'ack_display',phase:'results',loadingGeneration:generation});
+    await waitFor(display,message=>message.type==='fighter_state'&&message.resultsPresented===true);
+    expect(room.resultsPresented).toBe(true);
+  });
+
+  it('does not carry one station display authentication into another station room', async () => {
+    const port=await start('room-token');fighter!.setBrowserPlayerAdmission(()=>false);
+    const display=await connect(port);
+    send(display,{type:'display_auth',roomCode:'ROOM-A',token:'room-token'});
+    send(display,{type:'spectate',roomCode:'ROOM-B'});
+    await waitFor(display,message=>message.type==='error'&&message.code==='bad_display_auth');
+    expect(fighter!.findRoom('ROOM-B')).toBeUndefined();
+  });
+
+  it('wakes station lifecycle at the bounded result-presentation recovery deadline', async () => {
+    await start();
+    vi.useFakeTimers({toFake:['Date','setTimeout','clearTimeout']});
+    try{
+      const playerId=fighter!.voiceJoin('RECOVER','Ada')!;
+      fighter!.voiceAdvance('RECOVER',playerId);fighter!.voiceSelectFighter('RECOVER',playerId,'nyx');
+      fighter!.voiceAdvance('RECOVER',playerId);fighter!.voiceSelectMap('RECOVER',playerId,'void');
+      fighter!.voiceAdvance('RECOVER',playerId);
+      const room=fighter!.findRoom('RECOVER')!;
+      const generation=room.state().loadingGeneration;
+      room.ready(generation);room.tick(FIGHTER_INTRO_SECONDS);room.tick(6);
+      const world=room.state().world!;world.status='finished';world.winner='p1';
+      room.tick(.1);room.tick(10.5);
+      const observed:boolean[]=[];
+      fighter!.setOnRoomState(()=>observed.push(room.resultsPresentationTimedOut));
+      fighter!.voiceSelectFighter('RECOVER',playerId,'nyx');
+      expect(observed.at(-1)).toBe(false);
+      await vi.advanceTimersByTimeAsync(15_010);
+      expect(observed.at(-1)).toBe(true);
+      expect(room.resultsPresented).toBe(false);
+    }finally{vi.useRealTimers();}
+  });
+
+  it('lets a caller reveal the victory result on the current display without rematching', async () => {
+    const port=await start();
+    const playerId=fighter!.voiceJoin('REVEAL','Ada')!;
+    fighter!.voiceAdvance('REVEAL',playerId);fighter!.voiceSelectFighter('REVEAL',playerId,'nyx');
+    fighter!.voiceAdvance('REVEAL',playerId);fighter!.voiceSelectMap('REVEAL',playerId,'void');
+    fighter!.voiceAdvance('REVEAL',playerId);
+    const room=fighter!.findRoom('REVEAL')!;
+    room.ready(room.state().loadingGeneration);room.tick(FIGHTER_INTRO_SECONDS);room.tick(6);
+    const world=room.state().world!;world.status='finished';world.winner='p1';room.tick(.1);
+    expect(room.phase).toBe('victory');
+    const display=await connect(port);send(display,{type:'spectate',roomCode:'REVEAL'});
+    await waitFor(display,message=>message.type==='host_identity'&&message.isHost===true);
+    expect(fighter!.voiceShowResults('REVEAL','stale')).toBe(false);
+    expect(fighter!.voiceShowResults('REVEAL',playerId)).toBe(true);
+    expect(room.phase).toBe('results');
+    await waitFor(display,message=>message.type==='show_results'&&message.loadingGeneration===room.state().loadingGeneration);
+  });
+
   it('does not advance a paid station fight out of results', async () => {
     const port=await start('paid-station-display-token');fighter!.setBrowserPlayerAdmission(code=>code!=='PAID');
     const playerId=fighter!.voiceJoin('PAID','Ada')!;
@@ -65,6 +173,70 @@ describe('FighterServer WebSocket authority and lifecycle', () => {
 
     expect(fighter!.voiceAdvance('PAID',playerId)).toBe(false);
     expect(room.phase).toBe('results');
+  });
+  it('lets the authenticated shared touchscreen choose each caller’s fighter and arena without enabling live attacks', async () => {
+    const port = await start('station-touch-token');
+    fighter!.setBrowserPlayerAdmission(code => code !== 'TOUCH');
+    const first = fighter!.voiceJoin('TOUCH', 'Ada', 'p1', 2)!;
+    const second = fighter!.voiceJoin('TOUCH', 'Bo', 'p2', 2)!;
+    const display = await connect(port);
+    send(display, { type: 'display_auth', roomCode: 'TOUCH', token: 'station-touch-token' });
+    send(display, { type: 'spectate', roomCode: 'TOUCH' });
+    await waitFor(display, message => message.type === 'host_identity' && message.isHost === true);
+    send(display, { type: 'advance' });
+    await waitFor(display, message => message.type === 'fighter_state' && message.phase === 'fighter_select');
+    send(display, { type: 'display_select_fighter', playerId: first, fighterId: 'nyx' });
+    await waitFor(display, message => message.type === 'fighter_state' && (message.players as { fighterId: string | null }[])[0]?.fighterId === 'nyx');
+    send(display, { type: 'display_select_fighter', playerId: second, fighterId: 'wraith' });
+    await waitFor(display, message => message.type === 'fighter_state' && (message.players as { fighterId: string | null }[])[1]?.fighterId === 'wraith');
+    send(display, { type: 'advance' });
+    await waitFor(display, message => message.type === 'fighter_state' && message.phase === 'map_select');
+    send(display, { type: 'display_select_map', playerId: first, mapId: 'void' });
+    await waitFor(display, message => message.type === 'fighter_state' && (message.mapVotesByPlayerId as Record<string,string>)[first] === 'void');
+    send(display, { type: 'display_select_map', playerId: second, mapId: 'foundry' });
+    await waitFor(display, message => message.type === 'fighter_state' && (message.mapVotesByPlayerId as Record<string,string>)[second] === 'foundry');
+    send(display, { type: 'command', command: 'punch' });
+    await waitFor(display, message => message.type === 'error' && message.code === 'forbidden');
+    expect(fighter!.findRoom('TOUCH')?.state().world).toBeNull();
+  });
+
+  it('rejects display selector spoofing from a spectator and from an unknown player ID', async () => {
+    const port = await start();
+    const first = fighter!.voiceJoin('SELECT-SECURE', 'Ada')!;
+    fighter!.voiceAdvance('SELECT-SECURE', first);
+    const host = await connect(port), spectator = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'SELECT-SECURE' });
+    await waitFor(host, message => message.type === 'host_identity' && message.isHost === true);
+    send(spectator, { type: 'spectate', roomCode: 'SELECT-SECURE' });
+    await waitFor(spectator, message => message.type === 'host_identity' && message.isHost === false);
+    send(spectator, { type: 'display_select_fighter', playerId: first, fighterId: 'nyx' });
+    await waitFor(spectator, message => message.type === 'error' && message.code === 'forbidden');
+    send(host, { type: 'display_select_fighter', playerId: 'stale', fighterId: 'nyx' });
+    await waitFor(host, message => message.type === 'error' && message.code === 'select_rejected');
+    expect(fighter!.findRoom('SELECT-SECURE')?.lobbyPlayers()[0]?.fighterId).toBeNull();
+  });
+
+  it('publishes final queued voice command outcomes when they execute or are superseded', async () => {
+    await start();
+    const first = fighter!.voiceJoin('RECEIPTS', 'Ada')!;
+    const room = fighter!.findRoom('RECEIPTS')!;
+    fighter!.voiceAdvance('RECEIPTS', first);
+    fighter!.voiceSelectFighter('RECEIPTS', first, 'nyx');
+    fighter!.voiceAdvance('RECEIPTS', first);
+    fighter!.voiceSelectMap('RECEIPTS', first, 'void');
+    fighter!.voiceAdvance('RECEIPTS', first);
+    room.ready(room.state().loadingGeneration);
+    room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    const received: unknown[] = [];
+    fighter!.setOnVoiceCommandOutcomes((_code, outcomes) => received.push(...outcomes));
+    expect(fighter!.voiceCommand('RECEIPTS', first, 'punch', 'one')).toMatchObject({ status: 'executed' });
+    expect(fighter!.voiceCommand('RECEIPTS', first, 'kick', 'two')).toMatchObject({ status: 'queued' });
+    expect(fighter!.voiceCommand('RECEIPTS', first, 'block', 'three')).toMatchObject({ status: 'queued' });
+    expect(received).toContainEqual(expect.objectContaining({ requestId: 'two', status: 'rejected', reason: 'superseded' }));
+    room.tick(1);
+    // The production timer uses this same flush path.
+    fighter!.flushVoiceCommandOutcomes('RECEIPTS');
+    expect(received).toContainEqual(expect.objectContaining({ requestId: 'three', status: 'executed' }));
   });
   it('requires the configured display token before granting host authority', async () => {
     const port = await start('secret'); const display = await connect(port);
@@ -284,7 +456,7 @@ describe('FighterServer WebSocket authority and lifecycle', () => {
     expect(fighter!.voiceCommand('VOICE', p1, 'forward')).toBe(true);
     expect(fighter!.voiceCommand('VOICE', p1, 'forward')).toBe(true);
     expect(fighter!.voiceCommand('VOICE', p1, 'punch')).toBe(true);
-    expect(fighter!.voiceCommand('VOICE', p1, 'kick')).toBe(false);
+    expect(fighter!.voiceCommand('VOICE', p1, 'kick')).toBe(true);
   });
 
   it('hard-aborts a station room and reconnect state', async () => {

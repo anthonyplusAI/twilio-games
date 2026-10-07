@@ -40,6 +40,21 @@ describe('Voice Chess room', () => {
     expect(room.drainEvents().filter(event => event.type === 'move')).toHaveLength(1);
   });
 
+  it('exposes only current legal human moves for semantic speech interpretation', () => {
+    const room = whiteRoom();
+    const opening = room.legalVoiceMoves('en-US');
+    expect(opening).toContainEqual(expect.objectContaining({ id: 'e2e4', label: expect.stringMatching(/pawn.*E2.*E4/i) }));
+    expect(opening.some(move => move.id === 'e2e5')).toBe(false);
+    expect(room.handleVoiceCommand('pawn from E2 to E4').code).toBe('proposed');
+    expect(room.legalVoiceMoves('en-US').some(move => move.id === 'e2e4')).toBe(true);
+    expect(room.handleVoiceCommand('confirm').code).toBe('confirmed');
+    expect(room.legalVoiceMoves('en-US')).toEqual([]);
+    room.playComputerMove(room.state().revision);
+    expect(room.legalVoiceMoves('pt-BR').length).toBeGreaterThan(0);
+    room.setPlayerConnected(false);
+    expect(room.legalVoiceMoves('en-US')).toEqual([]);
+  });
+
   it('cancels proposals and refuses stale or illegal commands without changing the board', () => {
     const room = whiteRoom();
     const fen = room.state().fen;

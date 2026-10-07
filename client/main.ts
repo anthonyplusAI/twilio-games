@@ -151,8 +151,10 @@ function paintGauge(snap: import('../shared/types').WorldSnapshot | null): void 
 lobbyEl.style.display = 'none';   // legacy overlay retired; the Screens overlay handles pre/post-race
 // SSB-style front-end (lobby → car grid → map select → results). Host actions go back to the server.
 const screens = new Screens(document.getElementById('app')!, {
-  onAdvance: () => { if (!stationDisplay.active || flowPhase !== 'results') conn.advance(); },
-  onBack: () => conn.back(),
+  onAdvance: (room, phase, playerId) => conn.displayAdvance(room, phase, playerId),
+  onBack: (room, phase) => conn.displayBack(room, phase),
+  onSelectCar: (room, playerId, index) => conn.displaySelectCar(room, playerId, index),
+  onSelectMap: (room, playerId, map) => conn.displaySelectMap(room, playerId, map),
 }, locale, stationDisplay.active);
 
 const roomCode = new URLSearchParams(location.search).get('room') ?? DEFAULT_ROOM;
@@ -196,8 +198,8 @@ function commitTypedDigits(): void {
   typedDigits = ''; typedPhase = null;
   if (!Number.isFinite(n) || n < 1) return;
   if (phase !== flowPhase) return;                                // phase moved on — drop the stale pick
-  if (phase === 'car_select') conn.selectCar(n - 1);             // tiles are 1-based on screen
-  else if (phase === 'map_select') { const m = flowMaps[n - 1]; if (m) conn.selectMap(m); }
+  if (phase === 'car_select') screens.selectCar(n - 1);             // tiles are 1-based on screen
+  else if (phase === 'map_select') { const m = flowMaps[n - 1]; if (m) screens.selectMap(m); }
 }
 
 // Visual commentary ticker only. Browser speechSynthesis sounded robotic on the shared display;
@@ -323,6 +325,7 @@ conn.onLobby((m) => {
     getSoundEffectsManager().playSelect();
   }
   lastLobbyPlayerCount = m.players.length;
+  screens.setMenuTouch(m.roomCode, m.touch);
   screens.renderLobby(m.roomCode, m.players); startAttract();
 });
 conn.onSelectState((m) => {
@@ -332,6 +335,7 @@ conn.onSelectState((m) => {
     liftVeil();
   }
   raceLive = false; flowEpoch++; big.textContent = '';
+  screens.setMenuTouch(m.roomCode, m.touch);
   if (m.phase === 'car_select') { flowPhase = 'car_select'; screens.renderCarSelect(m.players); }
   else if (m.phase === 'map_select') { flowPhase = 'map_select'; flowMaps = m.maps; screens.renderMapSelect(m.maps, m.selectedMap, m.players, { counts: m.mapVotes ?? {}, tie: m.mapTie ?? false }); }
   startAttract();
@@ -352,6 +356,7 @@ conn.onResults((m) => {
   // Render with the cached board if it's for THIS map (so a repeat broadcast doesn't strip it back to
   // the race-only view); otherwise show race-only until the fetch lands the board (one fold-in).
   const cached = lastBoard && lastBoard.map === m.map ? lastBoard : undefined;
+  screens.setMenuTouch(m.roomCode, m.touch);
   screens.renderResults(m.results, (i) => localizedCarName(locale, assets.carName(i)), cached);
   const q = m.map ? `?map=${encodeURIComponent(m.map)}&limit=10` : '?limit=10';
   fetch(`/api/leaderboard${q}`)

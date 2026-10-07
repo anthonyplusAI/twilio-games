@@ -1,9 +1,9 @@
-import type { Intent, Item, WorldSnapshot, GameEvent, LobbyPlayer, Phase, RaceResult } from '../shared/types';
+import type { Intent, Item, WorldSnapshot, GameEvent, LobbyPlayer, Phase, RaceResult, MenuTouchState } from '../shared/types';
 import type { SupportedLocale } from '../shared/i18n/locales';
 
-export interface LobbyMsg { roomCode: string; players: LobbyPlayer[]; phase: Phase }
-export interface SelectStateMsg { roomCode: string; phase: Phase; players: LobbyPlayer[]; maps: string[]; selectedMap: string | null; mapVotes?: Record<string, number>; mapTie?: boolean }
-export interface ResultsMsg { roomCode: string; map: string | null; results: RaceResult[] }
+export interface LobbyMsg { roomCode: string; players: LobbyPlayer[]; phase: Phase; touch?: MenuTouchState }
+export interface SelectStateMsg { roomCode: string; phase: Phase; players: LobbyPlayer[]; maps: string[]; selectedMap: string | null; mapVotes?: Record<string, number>; mapTie?: boolean; touch?: MenuTouchState }
+export interface ResultsMsg { roomCode: string; map: string | null; results: RaceResult[]; touch?: MenuTouchState }
 
 export class GameConnection {
   private ws!: WebSocket;
@@ -91,6 +91,20 @@ export class GameConnection {
   selectMap(map: string) { this.send({ type: 'select_map', map }); }
   advance() { this.send({ type: 'advance' }); }
   back() { this.send({ type: 'back' }); }
+  /** Shared-screen taps are never queued over reconnects: their screen/seat context may expire. */
+  displaySelectCar(roomCode: string, forPlayerId: string, carIndex: number) {
+    this.rawSend({ type: 'display_select_car', roomCode, expectedPhase: 'car_select', forPlayerId, carIndex });
+  }
+  displaySelectMap(roomCode: string, forPlayerId: string, map: string) {
+    this.rawSend({ type: 'display_select_map', roomCode, expectedPhase: 'map_select', forPlayerId, map });
+  }
+  displayAdvance(roomCode: string, expectedPhase: 'lobby' | 'car_select' | 'map_select' | 'results', forPlayerId: string | null) {
+    this.rawSend({ type: 'display_advance', roomCode, expectedPhase,
+      ...(forPlayerId ? { forPlayerId } : {}) });
+  }
+  displayBack(roomCode: string, expectedPhase: 'car_select' | 'map_select') {
+    this.rawSend({ type: 'display_back', roomCode, expectedPhase });
+  }
 
   onItems(cb: (items: Item[], map?: string | null) => void) { this.onItemsCb = cb; }
   onSnapshot(cb: (s: WorldSnapshot) => void) { this.onSnapCb = cb; }

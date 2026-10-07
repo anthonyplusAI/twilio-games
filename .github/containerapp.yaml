@@ -176,8 +176,8 @@ properties:
           # Direct signed webhooks own SMS/WhatsApp game commands; TAC enriches Conversation Memory.
           - name: ARCADE_TAC_ENABLED
             value: "true"
-          # Optional ElevenLabs voiceId for Conversation Relay talk-back. Empty uses Relay's calmer
-          # default voice. Rendered from the CR_TTS_VOICE repository variable.
+          # English ElevenLabs voiceId shared by every game's Conversation Relay session.
+          # The deployment workflow pins the requested voice; local runs can override CR_TTS_VOICE.
           - name: CR_TTS_VOICE
             value: "${CR_TTS_VOICE}"
           # Optional Portuguese-specific ElevenLabs voice. Empty uses Relay's pt-BR default.

@@ -1,8 +1,10 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import { WebSocket } from 'ws';
-import { GameServer, RACER_BROADCAST_HZ } from '../server/game-server';
+import { GameServer, RACER_BROADCAST_HZ, parseClientMessage } from '../server/game-server';
 import { HttpServer, isLateRacerGameplayPrompt } from '../server/http-server';
-import type { ServerMessage } from '../shared/types';
+import { clearSelectionIndex } from '../server/game-host';
+import type { GameEvent, ServerMessage } from '../shared/types';
+import { STEP } from '../shared/constants';
 import { mkdir, unlink, writeFile } from 'node:fs/promises';
 
 let server: GameServer;
@@ -17,6 +19,67 @@ function connect(port: number) {
 const wait = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 describe('GameServer integration', () => {
+  it('recognizes only the currently bound standalone display socket', async () => {
+    server = new GameServer({ port: 0, displayToken: 'station-display-token' });
+    server.setBrowserPlayerAdmission(code => code !== 'PAID');
+    const port = await server.start();
+    const display = connect(port); await display.open();
+    const serverSocket = [...(server as unknown as { conns: Set<{ ws: WebSocket }> }).conns][0]!.ws;
+    expect(server.hasStandaloneDisplay(serverSocket, 'SOLO')).toBe(false);
+
+    display.ws.send(JSON.stringify({ type: 'spectate', roomCode: 'SOLO' }));
+    await vi.waitFor(() => expect(server.hasStandaloneDisplay(serverSocket, 'SOLO')).toBe(true));
+    expect(server.hasStandaloneDisplay(serverSocket, 'OTHER')).toBe(false);
+
+    display.ws.send(JSON.stringify({ type: 'spectate', roomCode: 'OTHER' }));
+    await vi.waitFor(() => expect(server.hasStandaloneDisplay(serverSocket, 'OTHER')).toBe(true));
+    expect(server.hasStandaloneDisplay(serverSocket, 'SOLO')).toBe(false);
+
+    display.ws.send(JSON.stringify({ type: 'leave' }));
+    await vi.waitFor(() => expect(server.hasStandaloneDisplay(serverSocket, 'OTHER')).toBe(false));
+
+    display.ws.send(JSON.stringify({ type: 'spectate', roomCode: 'PAID', displayToken: 'station-display-token' }));
+    await vi.waitFor(() => expect(display.inbox.some(message => message.type === 'lobby' && message.roomCode === 'PAID')).toBe(true));
+    expect(server.hasStandaloneDisplay(serverSocket, 'PAID')).toBe(false);
+
+    display.ws.close();
+    await new Promise<void>(resolve => display.ws.once('close', () => resolve()));
+    expect(server.hasStandaloneDisplay(serverSocket, 'PAID')).toBe(false);
+  });
+
+  it('releases old room and roster bindings when one socket switches identity', async () => {
+    server = new GameServer({ port: 0 });
+    const port = await server.start();
+    const client = connect(port); await client.open();
+    const serverSocket = [...(server as unknown as { conns: Set<{ ws: WebSocket }> }).conns][0]!.ws;
+
+    client.ws.send(JSON.stringify({ type: 'join', roomCode: 'FIRST', name: 'Ada' }));
+    await vi.waitFor(() => expect(client.inbox.some(message => message.type === 'joined' && message.roomCode === 'FIRST')).toBe(true));
+    expect(server.findRoom('FIRST')?.lobbyPlayers()).toHaveLength(1);
+
+    client.ws.send(JSON.stringify({ type: 'spectate', roomCode: 'SECOND' }));
+    await vi.waitFor(() => expect(client.inbox.some(message => message.type === 'lobby' && message.roomCode === 'SECOND')).toBe(true));
+    expect(server.findRoom('FIRST')).toBeUndefined();
+    expect(server.findRoom('SECOND')?.lobbyPlayers()).toEqual([]);
+    expect(server.hasStandaloneDisplay(serverSocket, 'SECOND')).toBe(true);
+
+    client.ws.send(JSON.stringify({ type: 'join', roomCode: 'THIRD', name: 'Ada' }));
+    await vi.waitFor(() => expect(client.inbox.some(message => message.type === 'joined' && message.roomCode === 'THIRD')).toBe(true));
+    expect(server.findRoom('SECOND')).toBeUndefined();
+    expect(server.findRoom('THIRD')?.lobbyPlayers()).toHaveLength(1);
+    expect(server.hasStandaloneDisplay(serverSocket, 'THIRD')).toBe(false);
+    client.ws.close();
+  });
+
+  it('parses phase-bound display selections and rejects malformed target seats', () => {
+    expect(parseClientMessage(JSON.stringify({ type: 'display_select_car', roomCode: 'RACE', expectedPhase: 'car_select', forPlayerId: 'p1', carIndex: 2 })))
+      .toEqual({ type: 'display_select_car', roomCode: 'RACE', expectedPhase: 'car_select', forPlayerId: 'p1', carIndex: 2 });
+    expect(parseClientMessage(JSON.stringify({ type: 'display_select_map', roomCode: 'RACE', expectedPhase: 'map_select', forPlayerId: 'p1', map: 'Drift' })))
+      .toEqual({ type: 'display_select_map', roomCode: 'RACE', expectedPhase: 'map_select', forPlayerId: 'p1', map: 'Drift' });
+    expect(parseClientMessage(JSON.stringify({ type: 'display_select_car', roomCode: 'RACE', expectedPhase: 'car_select', carIndex: 2 })))
+      .toMatchObject({ type: 'error' });
+  });
+
   it('uses 30Hz snapshots by default',()=>{expect(RACER_BROADCAST_HZ).toBe(30);});
   it('a client can join and receive a joined ack with a lane', async () => {
     server = new GameServer({ port: 0, broadcastHz: 30 });
@@ -97,6 +160,90 @@ describe('GameServer integration', () => {
     const beforeDisconnect = room.snapshot()!.countdown;
     server.stepRoomForTest(room, 1);
     expect(room.snapshot()!.countdown).toBe(beforeDisconnect);
+  });
+
+  it('applies shared-screen taps only to the current station caller seat and current menu', async () => {
+    server = new GameServer({ port: 0, displayToken: 'station-display-token' });
+    const events: GameEvent[] = [];
+    server.setOnRoomEvents((_roomCode, emitted) => events.push(...emitted));
+    server.setBrowserPlayerAdmission(() => false);
+    server.setRoomConfigProvider(() => ({ carCount: 3, maps: ['Silver Lake', 'Drift'] }));
+    const port = await server.start();
+    const room = server.getOrCreateRoom('TAP');
+    room.expectHumanPlayers(2);
+    const ada = room.addPlayer('Ada', undefined, 0) as { playerId: string };
+    const rex = room.addPlayer('Rex', undefined, 1) as { playerId: string };
+    const display = connect(port); await display.open();
+    display.ws.send(JSON.stringify({ type: 'spectate', roomCode: 'TAP', displayToken: 'station-display-token' }));
+    await wait(30);
+    display.ws.send(JSON.stringify({ type: 'display_advance', roomCode: 'TAP', expectedPhase: 'lobby', forPlayerId: ada.playerId }));
+    await wait(30);
+    expect(room.phase).toBe('car_select');
+    expect((display.inbox.find(message => message.type === 'select_state') as any).touch.activePlayerId).toBe(ada.playerId);
+
+    display.ws.send(JSON.stringify({ type: 'display_select_car', roomCode: 'TAP', expectedPhase: 'car_select', forPlayerId: rex.playerId, carIndex: 2 }));
+    await wait(30);
+    expect(room.lobbyPlayers().map(player => player.carIndex)).toEqual([null, null]);
+    display.ws.send(JSON.stringify({ type: 'display_select_car', roomCode: 'TAP', expectedPhase: 'car_select', forPlayerId: ada.playerId, carIndex: 1 }));
+    await wait(30);
+    expect(room.lobbyPlayers().map(player => player.carIndex)).toEqual([1, null]);
+    display.ws.send(JSON.stringify({ type: 'display_select_car', roomCode: 'TAP', expectedPhase: 'car_select', forPlayerId: ada.playerId, carIndex: 0 }));
+    display.ws.send(JSON.stringify({ type: 'display_select_car', roomCode: 'TAP', expectedPhase: 'car_select', forPlayerId: rex.playerId, carIndex: 2 }));
+    await wait(30);
+    expect(room.lobbyPlayers().map(player => player.carIndex)).toEqual([1, 2]);
+    display.ws.send(JSON.stringify({ type: 'display_advance', roomCode: 'TAP', expectedPhase: 'lobby', forPlayerId: ada.playerId }));
+    await wait(30);
+    expect(room.phase).toBe('car_select');
+    display.ws.send(JSON.stringify({ type: 'display_advance', roomCode: 'TAP', expectedPhase: 'car_select', forPlayerId: ada.playerId }));
+    await wait(30);
+    expect(room.phase).toBe('map_select');
+    display.ws.send(JSON.stringify({ type: 'display_select_map', roomCode: 'TAP', expectedPhase: 'map_select', forPlayerId: rex.playerId, map: 'Drift' }));
+    await wait(30);
+    expect(room.mapVotes().counts).toEqual({});
+    display.ws.send(JSON.stringify({ type: 'display_select_map', roomCode: 'TAP', expectedPhase: 'map_select', forPlayerId: ada.playerId, map: 'Drift' }));
+    display.ws.send(JSON.stringify({ type: 'display_select_map', roomCode: 'TAP', expectedPhase: 'map_select', forPlayerId: rex.playerId, map: 'Silver Lake' }));
+    await wait(30);
+    expect(room.mapVotes().counts).toEqual({ Drift: 1, 'Silver Lake': 1 });
+    const touchVote = events.filter(event => event.kind === 'map_picked').at(-1);
+    expect(touchVote).toMatchObject({ kind: 'map_picked', map: 'Silver Lake', playerId: rex.playerId });
+    expect(touchVote).not.toHaveProperty('spokenReplyPlayerId');
+    expect(server.voiceSelectMap('TAP', 'Silver Lake', ada.playerId, true)).toBe(true);
+    expect(events.filter(event => event.kind === 'map_picked').at(-1)).toMatchObject({
+      kind: 'map_picked', map: 'Silver Lake', playerId: ada.playerId, spokenReplyPlayerId: ada.playerId,
+    });
+  });
+
+  it('holds results on a connected display after the last voice caller leaves, then admits a new round', async () => {
+    server = new GameServer({ port: 0 });
+    server.setRoomConfigProvider(() => ({ carCount: 1, maps: ['Silver Lake'] }));
+    const port = await server.start();
+    const room = server.getOrCreateRoom('SCORE-HOLD');
+    const first = room.addPlayer('Ada') as { playerId: string };
+    room.start();
+    for (let i = 0; i < 60 * 120 && room.phase !== 'results'; i++) room.tick(STEP);
+    expect(room.phase).toBe('results');
+    const standings = room.results();
+
+    const display = connect(port); await display.open();
+    display.ws.send(JSON.stringify({ type: 'spectate', roomCode: room.code }));
+    await wait(30);
+    server.voiceLeave(room.code, first.playerId);
+    await wait(30);
+    expect(room.phase).toBe('results');
+    expect(room.results()).toEqual(standings);
+    expect([...display.inbox].reverse().find(message => message.type === 'results'))
+      .toMatchObject({ type: 'results', touch: { canAdvance: false } });
+
+    const next = room.addPlayer('Bo') as { playerId: string };
+    server.voiceSetupChanged(room.code, 'results');
+    await wait(30);
+    expect([...display.inbox].reverse().find(message => message.type === 'results'))
+      .toMatchObject({ type: 'results', touch: { canAdvance: true, advancePlayerId: null } });
+    display.ws.send(JSON.stringify({ type: 'display_advance', roomCode: room.code, expectedPhase: 'results' }));
+    await wait(30);
+    expect(room.phase).toBe('lobby');
+    expect(room.lobbyPlayers().map(player => player.playerId)).toEqual([next.playerId]);
+    display.ws.close();
   });
 
   it('two clients in the same room both appear in the snapshot', async () => {
@@ -527,6 +674,27 @@ describe('HttpServer voice routing seams', () => {
     expect(room.phase).toBe('map_select');
     expect(http.directSelectionForTest(room,second.playerId,'start')).toMatch(/race/i);
     expect(room.phase).toBe('countdown');
+  });
+
+  it('never picks a rejected car or track before the caller finishes correcting themselves', async () => {
+    http=new HttpServer({port:0,publicBaseUrl:'http://localhost',validateSignatures:false});await http.start();
+    const game=(http as unknown as {game:GameServer}).game;
+    game.setRoomConfigProvider(()=>({carCount:2,carNames:['Roadster','Coupe'],maps:['Silver Lake','Drift']}));
+    const room=game.getOrCreateRoom('CORRECTION');
+    const player=room.addPlayer('Ada') as {playerId:string};
+    room.advance();
+
+    expect(clearSelectionIndex('not Blue, the Red one',['Blue','Red'])).toBeNull();
+    expect(http.directSelectionForTest(room,player.playerId,'not one, two')).toBeNull();
+    expect(room.lobbyPlayers()[0]?.carIndex).toBeNull();
+    expect(http.directSelectionForTest(room,player.playerId,'one, actually two')).toMatch(/Coupe/i);
+    expect(room.lobbyPlayers()[0]?.carIndex).toBe(1);
+
+    room.advance();
+    expect(http.directSelectionForTest(room,player.playerId,'not Silver Lake, Drift')).toBeNull();
+    expect(room.mapVotes().counts).toEqual({});
+    expect(http.directSelectionForTest(room,player.playerId,'Silver Lake, actually Drift')).toMatch(/Drift/i);
+    expect(room.mapVotes().counts).toEqual({Drift:1});
   });
 
   it('gives the voice host a leaderboard filtered to the current track', async () => {

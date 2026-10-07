@@ -1,13 +1,13 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { IncomingMessage, Server as HttpServer } from 'http';
 import type { Duplex } from 'stream';
-import { FighterRoom } from './fighter-room';
+import { FighterRoom, type FighterVoiceCommandOutcome } from './fighter-room';
 import { FIGHTER_MAPS, FIGHTER_ROSTER } from '../shared/fighter-roster';
 import { parseFighterClientMessage, type FighterServerMessage } from '../shared/fighter-protocol';
 import type { FighterCommand, FighterEvent, FighterId } from '../shared/fighter-world';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../shared/i18n/locales';
 
-interface Conn { ws: WebSocket; roomCode?: string; playerId?: string; sessionId?: string; display?: boolean; hostAuthorized?: boolean; displayAuthenticated?: boolean; locale?: SupportedLocale; isAlive: boolean; }
+interface Conn { ws: WebSocket; roomCode?: string; playerId?: string; sessionId?: string; display?: boolean; hostAuthorized?: boolean; displayAuthenticated?: boolean; authorizedRoomCode?:string; locale?: SupportedLocale; isAlive: boolean; }
 interface Session {
   roomCode: string; playerId: string; conn: Conn | null; timer: ReturnType<typeof setTimeout> | null;
   display: boolean; wasHost: boolean;
@@ -29,6 +29,8 @@ export class FighterServer {
   private maps = FIGHTER_MAPS;
   private onRoomEvents: ((code: string, events: FighterEvent[]) => void) | null = null;
   private onRoomState: ((code: string) => void) | null = null;
+  private onVoiceCommandOutcomes: ((code: string, outcomes: FighterVoiceCommandOutcome[]) => void) | null = null;
+  private resultsFallbackTimers=new Map<string,{timer:ReturnType<typeof setTimeout>;generation:number}>();
   private allowBrowserPlayer: (roomCode: string) => boolean = () => true;
 
   private readonly displayToken: string;
@@ -45,6 +47,13 @@ export class FighterServer {
     this.wss.handleUpgrade(req, socket, head, ws => {connected?.(ws);this.onConnection(ws);});
   }
   get connectionCount(): number { return this.conns.size; }
+  /** A socket is a display only after it binds to this room and passes its room’s display policy. */
+  hasStandaloneDisplay(ws:WebSocket,roomCode:string):boolean{
+    const code=canonicalRoomCode(roomCode);
+    return [...this.conns].some(conn=>conn.ws===ws&&conn.ws.readyState===WebSocket.OPEN
+      &&conn.roomCode===code&&this.allowBrowserPlayer(code)
+      &&conn.display===true&&conn.hostAuthorized===true);
+  }
   setOnDisplayAuthenticated(fn: (ws: WebSocket) => void): void { this.onDisplayAuthenticated = fn; }
   preferredLocale(roomCode?: string, fallback: SupportedLocale = DEFAULT_LOCALE): SupportedLocale {
     const matching = [...this.conns].filter(conn => (!roomCode || conn.roomCode === roomCode) && conn.locale);
@@ -71,11 +80,15 @@ export class FighterServer {
       this.sessions.delete(key);
     }
     this.hosts.delete(code);
+    this.clearResultsFallback(code);
     this.rooms.delete(code);
     return true;
   }
   setOnRoomEvents(fn: (code: string, events: FighterEvent[]) => void): void { this.onRoomEvents = fn; }
   setOnRoomState(fn: (code: string) => void): void { this.onRoomState = fn; }
+  setOnVoiceCommandOutcomes(fn: (code: string, outcomes: FighterVoiceCommandOutcome[]) => void): void {
+    this.onVoiceCommandOutcomes = fn;
+  }
   setBrowserPlayerAdmission(fn: (roomCode: string) => boolean): void { this.allowBrowserPlayer = fn; }
   setMaps(maps: typeof FIGHTER_MAPS): void {
     if (!maps.length) return;
@@ -99,10 +112,17 @@ export class FighterServer {
     ws.on('error', () => {});
     ws.on('close', () => {
       const code = conn.roomCode;
-      if (conn.playerId && code && !this.holdSession(conn)) this.rooms.get(code)?.removePlayer(conn.playerId);
+      if (conn.playerId && code && !this.holdSession(conn)) {
+        const room=this.rooms.get(code);room?.removePlayer(conn.playerId);if(room)this.flushVoiceCommandOutcomes(code);
+      }
       this.conns.delete(conn);
       if (code) {
-        if (this.hosts.get(code) === conn) { this.hosts.delete(code); this.invalidateDisplayReady(code, 'host connection closed'); this.designateHost(code); }
+        if (this.hosts.get(code) === conn) {
+          this.hosts.delete(code);
+          this.rooms.get(code)?.invalidatePresentation();
+          this.invalidateDisplayReady(code, 'host connection closed');
+          this.designateHost(code);
+        }
         this.pushState(code); this.reap(code);
       }
     });
@@ -150,8 +170,15 @@ export class FighterServer {
       if (!this.displayToken || msg.token !== this.displayToken) {
         this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'Invalid display token.' }); return;
       }
-      conn.hostAuthorized = true; conn.displayAuthenticated = true;
-      if (conn.roomCode === code && conn.display && !this.hosts.has(code)) { this.hosts.set(code, conn); this.pushHostIdentity(code); }
+      if(conn.roomCode&&conn.roomCode!==code){
+        this.send(conn,{type:'error',code:'bad_display_auth',message:'Display authentication is scoped to one room.'});return;
+      }
+      conn.authorizedRoomCode=code;
+      conn.displayAuthenticated = true;
+      if (conn.roomCode === code && conn.display) {
+        conn.hostAuthorized=true;
+        if(!this.hosts.has(code)){this.hosts.set(code, conn);this.pushHostIdentity(code);}
+      }
       return;
     }
     if (msg.type === 'spectate') {
@@ -160,11 +187,11 @@ export class FighterServer {
       const code = canonicalRoomCode(msg.roomCode);
       if (conn.roomCode && conn.roomCode !== code) this.detachDisplay(conn);
       const stationDisplay = !this.allowBrowserPlayer(code);
-      if (stationDisplay && !conn.hostAuthorized) {
+      if (stationDisplay && conn.authorizedRoomCode!==code) {
         this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'Invalid display token.' }); return;
       }
-      conn.roomCode = code; conn.display = true; conn.hostAuthorized = !stationDisplay || conn.hostAuthorized === true; this.room(code);
-      if (conn.displayAuthenticated) this.onDisplayAuthenticated?.(conn.ws);
+      conn.roomCode = code; conn.display = true; conn.hostAuthorized = !stationDisplay || conn.authorizedRoomCode===code; this.room(code);
+      if (conn.displayAuthenticated&&conn.authorizedRoomCode===code) this.onDisplayAuthenticated?.(conn.ws);
       if (!this.hosts.has(code) && conn.hostAuthorized) this.hosts.set(code, conn);
       this.pushHostIdentity(code); this.pushState(code); return;
     }
@@ -180,18 +207,33 @@ export class FighterServer {
         if (target && !room.selectFighter(target, msg.fighterId)) this.send(conn, { type: 'error', code: 'select_rejected', message: 'That fighter is unavailable.' });
         break;
       }
+      case 'display_select_fighter':
+        if (!isHost || !conn.display) this.rejectAuthority(conn);
+        else if (!room.selectFighter(msg.playerId, msg.fighterId))
+          this.send(conn, { type: 'error', code: 'select_rejected', message: 'That fighter or player is unavailable.' });
+        break;
       case 'select_map':
         {const voter=conn.playerId??(isHost&&!room.state().automaticSetup?room.lobbyPlayers().find(player=>!player.isAi)?.playerId:undefined);
         if(!voter)this.rejectAuthority(conn);
         else if(!room.selectMap(voter,msg.mapId))this.send(conn,{type:'error',code:'select_rejected',message:'That map is unavailable.'});}
         break;
-      case 'command': if (conn.playerId) room.command(conn.playerId, msg.command); break;
+      case 'display_select_map':
+        if (!isHost || !conn.display) this.rejectAuthority(conn);
+        else if (!room.selectMap(msg.playerId, msg.mapId))
+          this.send(conn, { type: 'error', code: 'select_rejected', message: 'That map or player is unavailable.' });
+        break;
+      case 'ack_display':
+        if(!isHost||!conn.display){this.rejectAuthority(conn);break;}
+        if(room.acknowledgePresentation(msg.phase,msg.loadingGeneration))this.pushState(room.code);
+        return;
+      case 'command': if (conn.playerId) room.command(conn.playerId, msg.command); else this.rejectAuthority(conn); break;
       case 'advance':
         if (!isHost) this.rejectAuthority(conn);
         else if (!this.allowBrowserPlayer(room.code) && room.phase === 'results') {
           this.send(conn, { type:'error',code:'station_requeue_required',message:'Join the queue again for another match.' });
         }
-        else if (!room.advance()) this.send(conn, { type: 'error', code: 'not_ready', message: 'Complete the current selection first.' });
+        else if (!room.advance(conn.playerId ?? (conn.display && isHost ? room.lobbyPlayers().find(player => !player.isAi)?.playerId : undefined)))
+          this.send(conn, { type: 'error', code: 'not_ready', message: 'Complete the current selection first.' });
         break;
       case 'ready':
         if (!isHost) this.rejectAuthority(conn);
@@ -201,14 +243,20 @@ export class FighterServer {
         if (!isHost) this.rejectAuthority(conn);
         else if (!room.retryLoading(msg.loadingGeneration)) this.send(conn, { type: 'error', code: 'stale_ready', message: 'The arena is not awaiting this retry.' });
         break;
-      case 'back': if (!isHost) this.rejectAuthority(conn); else room.back(); break;
+      case 'back':
+        if (!isHost) this.rejectAuthority(conn);
+        else if (!room.back(conn.playerId ?? (conn.display && isHost ? room.lobbyPlayers().find(player => !player.isAi)?.playerId : undefined)))
+          this.send(conn, { type: 'error', code: 'not_ready', message: 'There is no earlier selection to return to.' });
+        break;
       case 'leave':
         if (conn.playerId) {
           room.removePlayer(conn.playerId);
           if (conn.sessionId) this.dropSession(room.code, conn.sessionId, conn);
           conn.playerId = undefined; conn.sessionId = undefined;
         }
-        break;
+        this.flush(room);
+        this.detachDisplay(conn);
+        return;
       default: break;
     }
     this.flush(room);
@@ -223,15 +271,50 @@ export class FighterServer {
     }
   }
   private flush(room: FighterRoom): void {
-    const events = room.drainEvents(); if (!events.length) return;
-    for (const conn of this.conns) if (conn.roomCode === room.code) this.send(conn, { type: 'fighter_events', events });
-    this.onRoomEvents?.(room.code, events);
+    const events = room.drainEvents();
+    if (events.length) {
+      for (const conn of this.conns) if (conn.roomCode === room.code) this.send(conn, { type: 'fighter_events', events });
+      this.onRoomEvents?.(room.code, events);
+    }
+    this.flushVoiceCommandOutcomes(room.code);
+  }
+  flushVoiceCommandOutcomes(code: string): void {
+    code = canonicalRoomCode(code);
+    const outcomes = this.rooms.get(code)?.drainVoiceCommandOutcomes() ?? [];
+    if (outcomes.length) this.onVoiceCommandOutcomes?.(code, outcomes);
   }
   private pushState(code: string): void {
     const room = this.rooms.get(code); if (!room) return;
     const msg: FighterServerMessage = { type: 'fighter_state', ...room.state() };
     for (const conn of this.conns) if (conn.roomCode === code) this.send(conn, msg);
     this.onRoomState?.(code);
+    this.scheduleResultsFallback(room);
+  }
+  private clearResultsFallback(code:string):void{
+    const current=this.resultsFallbackTimers.get(code);
+    if(current)clearTimeout(current.timer);
+    this.resultsFallbackTimers.delete(code);
+  }
+  /** Wake the host once if no result overlay receipt arrives, so paid matches can recover. */
+  private scheduleResultsFallback(room:FighterRoom):void{
+    const code=room.code;
+    if(room.phase!=='results'||room.resultsPresented||room.resultsPresentationTimedOut){
+      this.clearResultsFallback(code);return;
+    }
+    const remaining=room.resultsPresentationRemainingMs;
+    if(remaining<=0)return;
+    const generation=room.state().loadingGeneration;
+    const current=this.resultsFallbackTimers.get(code);
+    if(current?.generation===generation)return;
+    this.clearResultsFallback(code);
+    const timer=setTimeout(()=>{
+      if(this.resultsFallbackTimers.get(code)?.timer!==timer)return;
+      this.resultsFallbackTimers.delete(code);
+      if(this.rooms.get(code)!==room||room.state().loadingGeneration!==generation||room.phase!=='results')return;
+      this.pushState(code);
+    },remaining+5);
+    (timer as {unref?:()=>void}).unref?.();
+    this.resultsFallbackTimers.set(code,{timer,generation});
   }
   private send(conn: Conn, message: FighterServerMessage): void { if (conn.ws.readyState === WebSocket.OPEN) conn.ws.send(JSON.stringify(message)); }
 
@@ -259,7 +342,11 @@ export class FighterServer {
   private release(key: string): void {
     const session = this.sessions.get(key); if (!session) return;
     if (session.timer) clearTimeout(session.timer);
-    this.sessions.delete(key); this.rooms.get(session.roomCode)?.removePlayer(session.playerId); this.pushState(session.roomCode); this.reap(session.roomCode);
+    this.sessions.delete(key);
+    const room=this.rooms.get(session.roomCode);
+    room?.removePlayer(session.playerId);
+    if(room)this.flushVoiceCommandOutcomes(session.roomCode);
+    this.pushState(session.roomCode); this.reap(session.roomCode);
   }
 
   private dropSession(code: string, id: string, owner: Conn): void {
@@ -272,13 +359,19 @@ export class FighterServer {
   private rejectAuthority(conn: Conn): void { this.send(conn, { type: 'error', code: 'forbidden', message: 'This connection cannot control the display.' }); }
   private detachDisplay(conn: Conn): void {
     const code = conn.roomCode; if (!code) return;
-    conn.roomCode = undefined; conn.display = false;
-    if (this.hosts.get(code) === conn) { this.hosts.delete(code); this.invalidateDisplayReady(code, 'host changed rooms'); this.designateHost(code); }
+    conn.roomCode = undefined; conn.display = false;conn.hostAuthorized=false;
+    if (this.hosts.get(code) === conn) {
+      this.hosts.delete(code);
+      this.rooms.get(code)?.invalidatePresentation();
+      this.invalidateDisplayReady(code, 'host changed rooms');
+      this.designateHost(code);
+    }
     this.pushState(code); this.reap(code);
   }
   private designateHost(code: string): void {
     const next = [...this.conns].find(candidate => candidate.roomCode === code && candidate.display
-      && (!this.displayToken || candidate.hostAuthorized) && candidate.ws.readyState === WebSocket.OPEN);
+      && (this.allowBrowserPlayer(code)||candidate.authorizedRoomCode===code)
+      && candidate.ws.readyState === WebSocket.OPEN);
     if (next) this.hosts.set(code, next);
     this.pushHostIdentity(code);
   }
@@ -297,7 +390,7 @@ export class FighterServer {
     const room = this.rooms.get(code); if (!room?.isEmpty) return;
     if ([...this.conns].some(conn => conn.roomCode === code)) return;
     if ([...this.sessions.values()].some(session => session.roomCode === code)) return;
-    this.hosts.delete(code); this.rooms.delete(code);
+    this.hosts.delete(code);this.clearResultsFallback(code);this.rooms.delete(code);
   }
 
   voiceJoin(code: string, name: string, preferredSide?: FighterId, expectedPlayers?:number, nameConfirmed = true): string | null {
@@ -305,7 +398,7 @@ export class FighterServer {
     else if(room.playerCount>=1)room.expectHumanPlayers(2,false);
     const result = room.addPlayer(name, preferredSide, nameConfirmed); if ('error' in result) return null; this.pushState(code); return result.playerId;
   }
-  voiceLeave(code: string, id: string): void { code = canonicalRoomCode(code); this.rooms.get(code)?.removePlayer(id); this.pushState(code); this.reap(code); }
+  voiceLeave(code: string, id: string): void { code = canonicalRoomCode(code); const room=this.rooms.get(code);room?.removePlayer(id);if(room)this.flush(room);this.pushState(code); this.reap(code); }
   voiceSetName(code:string,id:string,name:string):void {
     code=canonicalRoomCode(code);const room=this.rooms.get(code);if(!room)return;
     room.setName(id,name);room.expectHumanPlayers(Math.max(1,room.playerCount),false);this.pushState(code);
@@ -327,9 +420,43 @@ export class FighterServer {
     if (room?.phase === 'loading') this.pushHostIdentity(code);
     this.pushState(code); return ok;
   }
-  voiceCommand(code: string, id: string, command: FighterCommand): boolean {
-    code = canonicalRoomCode(code); const room = this.rooms.get(code); if (!room) return false;
-    const accepted = room.voiceCommand(id, command); this.flush(room); this.pushState(code); return accepted;
+  voiceBack(code: string, id: string): boolean {
+    code=canonicalRoomCode(code);const room=this.rooms.get(code);
+    const ok=room?.back(id)??false;if(ok)this.pushState(code);return ok;
+  }
+  voiceSkipIntro(code: string, id: string): boolean {
+    code=canonicalRoomCode(code);const room=this.rooms.get(code);
+    const ok=room?.skipIntro(id)??false;if(ok)this.pushState(code);return ok;
+  }
+  voiceStartNow(code: string, id: string): boolean {
+    code=canonicalRoomCode(code);const room=this.rooms.get(code);
+    const ok=room?.startNow(id)??false;if(ok)this.pushState(code);return ok;
+  }
+  voiceShowResults(code:string,id:string):boolean{
+    code=canonicalRoomCode(code);
+    const room=this.rooms.get(code);
+    const host=this.hosts.get(code);
+    if(!room||!host?.display||host.ws.readyState!==WebSocket.OPEN||!room.revealResults(id))return false;
+    this.send(host,{type:'show_results',loadingGeneration:room.state().loadingGeneration});
+    this.pushState(code);
+    return true;
+  }
+  voiceCommand(code: string, id: string, command: FighterCommand): boolean;
+  voiceCommand(code: string, id: string, command: FighterCommand, requestId: string): FighterVoiceCommandOutcome;
+  voiceCommand(code: string, id: string, command: FighterCommand, requestId?: string): boolean | FighterVoiceCommandOutcome {
+    code = canonicalRoomCode(code); const room = this.rooms.get(code);
+    if (!room) return requestId === undefined ? false : {requestId, command, status:'rejected', reason:'not_player'};
+    const outcome=room.voiceCommand(id,command,requestId??`legacy-${Date.now()}`);
+    this.flush(room);if(outcome.status==='executed')this.pushState(code);
+    return requestId===undefined ? outcome.status!=='rejected' : outcome;
+  }
+  voiceSequence(code: string, id: string, commands: readonly [FighterCommand,FighterCommand],
+    requestIds: readonly [string,string]): readonly FighterVoiceCommandOutcome[] {
+    code=canonicalRoomCode(code);const room=this.rooms.get(code);
+    if(!room)return commands.map((command,index)=>({requestId:requestIds[index]!,command,status:'rejected' as const,reason:'not_player' as const}));
+    const outcomes=room.voiceSequence(id,commands,requestIds);
+    this.flush(room);if(outcomes.some(outcome=>outcome.status==='executed'))this.pushState(code);
+    return outcomes;
   }
   releaseBrowserSession(code: string, sessionId: string): boolean {
     const key = sessionKey(canonicalRoomCode(code), sessionId);
@@ -340,7 +467,9 @@ export class FighterServer {
   stopLoopOnly(): void {
     clearInterval(this.loop); if (this.heartbeat) { clearInterval(this.heartbeat); this.heartbeat = null; }
     for (const session of this.sessions.values()) if (session.timer) clearTimeout(session.timer);
-    this.sessions.clear(); this.hosts.clear(); for (const conn of this.conns) conn.ws.close(); this.conns.clear();
+    this.sessions.clear(); this.hosts.clear();
+    for(const code of this.resultsFallbackTimers.keys())this.clearResultsFallback(code);
+    for (const conn of this.conns) conn.ws.close(); this.conns.clear();
   }
 }
 

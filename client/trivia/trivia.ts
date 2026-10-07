@@ -67,6 +67,11 @@ let stageError = '';
 let lastAnnouncementKey = '';
 let countdownAnnouncement = '';
 let questionTimeAnnouncement = '';
+let pendingAnnouncementFrame: number | null = null;
+let lastPaintAckKey = '';
+let pendingPaintAckKey = '';
+let pendingCategoryVoteSeat: string | null = null;
+let pendingCategoryVoteTimer: ReturnType<typeof setTimeout> | null = null;
 let callNumber = '';
 let callQrCode: string | null = null;
 let callQrLoading = false;
@@ -120,6 +125,7 @@ requestAnimationFrame(updateTimeDrivenUi);
 
 addEventListener('pagehide', () => {
   callQrGeneration += 1;
+  clearPendingCategoryVote();
   stopVoiceNumberUpdates();
   connection?.close();
   musicManager.stop();
@@ -157,6 +163,22 @@ addEventListener('keydown', event => {
   event.preventDefault();
 });
 stage.addEventListener('click', event => {
+  const category = (event.target as Element | null)?.closest?.<HTMLButtonElement>('[data-category][data-voter]');
+  if (category && state?.phase === 'category_select' && isHost && connectionState === 'connected'
+    && category.dataset.voter === state.categoryVotingSeat?.playerId) {
+    const seat = category.dataset.voter!;
+    if (pendingCategoryVoteSeat === seat) return;
+    clearPendingCategoryVote();
+    pendingCategoryVoteSeat = seat;
+    pendingCategoryVoteTimer = setTimeout(() => {
+      if (pendingCategoryVoteSeat !== seat) return;
+      clearPendingCategoryVote();
+      render();
+    }, 5_000);
+    connection?.displaySelectCategory(seat, category.dataset.category as NonNullable<TriviaState['category']>);
+    render();
+    return;
+  }
   const replay = (event.target as Element | null)?.closest?.('#trivia-replay');
   if (!replay || !isHost || stationDisplay.active || stationLaunchRequested) return;
   connection?.advance();
@@ -176,7 +198,12 @@ function connect(): void {
     connectionState = next;
     connectionStatus.dataset.state = next;
     connectionStatus.textContent = copy.connection[next];
-    if (next !== 'connected') isHost = false;
+    if (next !== 'connected') {
+      isHost = false;
+      lastPaintAckKey = '';
+      pendingPaintAckKey = '';
+      clearPendingCategoryVote();
+    }
     render();
   });
   connection.onClockSync(sample => serverClock.observeSync(sample));
@@ -184,14 +211,17 @@ function connect(): void {
     playerId = id;
     localTester = true;
     localTesterPending = false;
+    render();
   });
   connection.onHostIdentity(host => {
     isHost = host;
     maybeSignalDisplayReady();
+    render();
   });
   connection.onEvents(handleEvents);
   connection.onError((code, message) => {
     console.error(`[trivia] ${code}: ${message}`);
+    clearPendingCategoryVote();
     if (localTesterPending && ['station_voice_only', 'room_full', 'round_in_progress', 'forbidden'].includes(code)) {
       localTester = false;
       localTesterPending = false;
@@ -235,11 +265,14 @@ async function prepareEssentialStage(): Promise<void> {
 
 function applyState(next: TriviaState): void {
   serverClock.observeSync({ serverNowMs: next.serverNowMs, clientReceivedAtMs: Date.now() });
-  const previousQuestionId = state?.question?.id;
+  const previousQuestionKey = `${state?.question?.id}:${state?.questionAttemptId}`;
   const readinessChanged = next.phase === 'loading'
     && displayReadinessContext(next) !== rejectedReadyContext;
   state = next;
-  if (next.question?.id !== previousQuestionId) answerResults.clear();
+  if (next.phase !== 'category_select' || next.categoryVotingSeat?.playerId !== pendingCategoryVoteSeat) {
+    clearPendingCategoryVote();
+  }
+  if (`${next.question?.id}:${next.questionAttemptId}` !== previousQuestionKey) answerResults.clear();
   stageError = '';
   document.body.dataset.phase = next.phase;
   if (next.phase !== 'loading') rejectedReadyContext = '';
@@ -253,6 +286,7 @@ function applyState(next: TriviaState): void {
 
 function handleEvents(events: readonly TriviaEvent[]): void {
   for (const event of events) {
+    if ('questionAttemptId' in event && event.questionAttemptId !== state?.questionAttemptId) continue;
     if (event.type === 'question_started') answerResults.clear();
     else if (event.type === 'answer_result') {
       answerResults.set(event.playerId, {
@@ -288,10 +322,13 @@ function render(): void {
     error: stageError,
     pairingRequired,
     canReplay: isHost && !stationDisplay.active && !stationLaunchRequested,
+    isHost,
+    pendingCategoryVoteSeat,
     stationMode,
     callEntry: stationMode ? undefined : { number: callNumber, qrCode: callQrCode, loading: callQrLoading },
   });
   stage.innerHTML = view.html;
+  maybeAcknowledgeQuestionPaint();
   stage.setAttribute('aria-busy', String(!state || state.phase === 'loading'));
   if (state?.phase === 'countdown' && state.countdownEndsAtMs !== null) {
     countdownAnnouncement = `${state.loadingGeneration}:${triviaCountdownCount(state.countdownEndsAtMs, currentServerNow())}`;
@@ -300,6 +337,12 @@ function render(): void {
     lastAnnouncementKey = view.announcementKey;
     announce(view.announcement);
   }
+}
+
+function clearPendingCategoryVote(): void {
+  if (pendingCategoryVoteTimer !== null) clearTimeout(pendingCategoryVoteTimer);
+  pendingCategoryVoteTimer = null;
+  pendingCategoryVoteSeat = null;
 }
 
 function updateTimeDrivenUi(): void {
@@ -325,7 +368,7 @@ function updateTimeDrivenUi(): void {
     if (fill) fill.style.width = `${timing.progress * 100}%`;
     fill?.parentElement?.setAttribute('aria-valuenow', String(Math.round(timing.progress * 100)));
     if (timing.remainingSeconds === 5 || timing.remainingSeconds === 0) {
-      const key = `${current.question.id}:${timing.remainingSeconds}`;
+      const key = `${current.questionAttemptId}:${current.question.id}:${timing.remainingSeconds}`;
       if (questionTimeAnnouncement !== key) {
         questionTimeAnnouncement = key;
         announce(timing.remainingSeconds === 0
@@ -348,8 +391,34 @@ function currentServerNow(): number {
 }
 
 function announce(message: string): void {
+  if (pendingAnnouncementFrame !== null) cancelAnimationFrame(pendingAnnouncementFrame);
   announcer.textContent = '';
-  requestAnimationFrame(() => { announcer.textContent = message; });
+  pendingAnnouncementFrame = requestAnimationFrame(() => {
+    pendingAnnouncementFrame = null;
+    announcer.textContent = message;
+  });
+}
+
+function maybeAcknowledgeQuestionPaint(): void {
+  const current = state;
+  if (!current || (current.phase !== 'question_prompt' && current.phase !== 'answer_cue')
+    || !current.question || current.questionAttemptId === null || !isHost
+    || connectionState !== 'connected') return;
+  const key = `${current.questionAttemptId}:${current.phase}:${current.renderRevision}`;
+  if (key === lastPaintAckKey || key === pendingPaintAckKey) return;
+  pendingPaintAckKey = key;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (pendingPaintAckKey !== key) return;
+    pendingPaintAckKey = '';
+    const latest = state;
+    if (!isHost || connectionState !== 'connected'
+      || latest?.questionAttemptId !== current.questionAttemptId || latest.phase !== current.phase
+      || latest.renderRevision !== current.renderRevision
+      || !stage.querySelector(`[data-view="${current.phase}"]`)) return;
+    lastPaintAckKey = key;
+    connection?.viewRendered(current.question!.id, current.questionAttemptId!, current.phase,
+      current.renderRevision);
+  }));
 }
 
 function localizedError(code: string): string {

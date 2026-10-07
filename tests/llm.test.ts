@@ -43,6 +43,19 @@ describe('OpenAiClient', () => {
     expect(seenAuth).toBe('Bearer sk-test');
     expect(r.say).toBe('Hi racer!');
   });
+  it('requires the declared resolver tool for a semantic game command', async () => {
+    let body: Record<string, unknown> | undefined;
+    const fakeFetch = (async (_url: string, init: RequestInit) => {
+      body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return { ok: true, json: async () => ({ choices: [{ message: {
+        tool_calls: [{ function: { name: 'resolve_voice_turn', arguments: '{"kind":"none"}' } }],
+      } }] }) } as Response;
+    }) as unknown as typeof fetch;
+    const client = new OpenAiClient({ apiKey: 'sk-test', fetchImpl: fakeFetch });
+    await client.respond('sys', [], [{ name: 'resolve_voice_turn', description: 'resolve', parameters: {} }],
+      { forceTool: 'resolve_voice_turn' });
+    expect(body?.tool_choice).toEqual({ type: 'function', function: { name: 'resolve_voice_turn' } });
+  });
   it('never throws on a network error (returns empty reply → scripted fallback)', async () => {
     const boom = (async () => { throw new Error('network down'); }) as unknown as typeof fetch;
     const c = new OpenAiClient({ apiKey: 'sk', fetchImpl: boom });

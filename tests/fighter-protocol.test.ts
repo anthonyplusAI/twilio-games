@@ -23,6 +23,16 @@ describe('fighter protocol', () => {
     expect(parseFighterClientMessage('{"type":"ready","loadingGeneration":2}')).toEqual({ type: 'ready', loadingGeneration: 2 });
     expect(parseFighterClientMessage('{"type":"ready","loadingGeneration":0}')).toMatchObject({ type: 'error', code: 'bad_ready' });
     expect(parseFighterClientMessage('{"type":"retry_loading","loadingGeneration":2}')).toEqual({ type: 'retry_loading', loadingGeneration: 2 });
+    expect(parseFighterClientMessage('{"type":"display_select_fighter","playerId":"f1","fighterId":"nyx"}'))
+      .toEqual({ type: 'display_select_fighter', playerId: 'f1', fighterId: 'nyx' });
+    expect(parseFighterClientMessage('{"type":"display_select_map","playerId":"f1","mapId":"void"}'))
+      .toEqual({ type: 'display_select_map', playerId: 'f1', mapId: 'void' });
+    expect(parseFighterClientMessage('{"type":"display_select_fighter","playerId":"","fighterId":"nyx"}'))
+      .toMatchObject({ type: 'error', code: 'bad_select' });
+    expect(parseFighterClientMessage('{"type":"ack_display","phase":"results","loadingGeneration":2}'))
+      .toEqual({type:'ack_display',phase:'results',loadingGeneration:2});
+    expect(parseFighterClientMessage('{"type":"ack_display","phase":"fight","loadingGeneration":0}'))
+      .toMatchObject({type:'error',code:'bad_ack'});
   });
   it('uses one authoritative timeline for every intro segment', () => {
     expect(fighterIntroStage(14)).toBe('p1');

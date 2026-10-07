@@ -30,6 +30,7 @@ describe('isAdvanceWord', () => {
   it('does not fire on unrelated speech', () => {
     expect(isAdvanceWord('Sparkmouse')).toBe(false);
     expect(isAdvanceWord('what is this?')).toBe(false);
+    expect(isAdvanceWord('start or wait')).toBe(false);
   });
 });
 
@@ -87,10 +88,10 @@ function fakeDeps(over: Partial<BattleVoiceDeps> = {}): { deps: BattleVoiceDeps;
     join: (code, name) => { log.push(`join ${code} ${name}`); return { playerId: 'p1', resumed: false }; },
     leave: (code, id) => log.push(`leave ${code} ${id}`),
     setName: (_c, _id, n) => log.push(`name ${n}`),
-    selectMonster: (_c, _id, m) => log.push(`monster ${m}`),
-    openFight: (_c, _id) => log.push('openFight'),
-    backMenu: (_c, _id) => log.push('backMenu'),
-    chooseAction: (_c, _id, a) => log.push(`action ${JSON.stringify(a)}`),
+    selectMonster: (_c, _id, m) => { log.push(`monster ${m}`); },
+    openFight: (_c, _id) => { log.push('openFight'); },
+    backMenu: (_c, _id) => { log.push('backMenu'); },
+    chooseAction: (_c, _id, a) => { log.push(`action ${JSON.stringify(a)}`); },
     advance: (_c, _id) => { log.push('advance'); return true; },
     setTimer: (fn: () => void) => { fn(); },   // synchronous in tests → paced commentary drains at once
     say: (t) => said.push(t),
@@ -109,6 +110,121 @@ const prompt = (text: string, last = true) => JSON.stringify({ type: 'prompt', v
 const dtmf = (digit: string) => JSON.stringify({ type: 'dtmf', digit });
 
 describe('BattleVoiceSession', () => {
+  it('revokes queued setup speech on barge-in and touchscreen phase changes', () => {
+    let snap = battleSnap({ phase: 'lobby', myName: null, nameConfirmed: false });
+    const lines: { text: string; isCurrent?: () => boolean }[] = [];
+    const { deps } = fakeDeps({ snapshot: () => snap, say: (text, isCurrent) => lines.push({ text, isCurrent }) });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    const relayIntro = lines.find(line => /Conversation Relay/i.test(line.text));
+    expect(relayIntro?.isCurrent?.()).toBe(true);
+
+    session.handleMessage(JSON.stringify({ type: 'interrupt', utteranceUntilInterrupt: '', durationUntilInterruptMs: 100 }));
+    expect(relayIntro?.isCurrent?.()).toBe(false);
+
+    const nextSession = new BattleVoiceSession(deps);
+    lines.length = 0;
+    nextSession.handleMessage(setup());
+    const menuIntro = lines.find(line => /Conversation Relay/i.test(line.text));
+    expect(menuIntro?.isCurrent?.()).toBe(true);
+    snap = { ...snap, phase: 'monster_select', myName: 'Ada', nameConfirmed: true };
+    nextSession.onBattleStateChanged();
+    expect(menuIntro?.isCurrent?.()).toBe(false);
+    expect(lines.some(line => /choose your own monster/i.test(line.text))).toBe(true);
+  });
+
+  it('speaks a replacement cue when a touchscreen chooses the caller’s monster', () => {
+    let snap = battleSnap({ myName: 'Ada', nameConfirmed: true, canStartBattle: false });
+    const { deps, said } = fakeDeps({ snapshot: () => snap });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    said.length = 0;
+    snap = { ...snap, myMonsterId: 'sparkmouse', myMonsterName: 'Sparkmouse' };
+    session.onBattleStateChanged();
+    expect(said.join(' ')).toMatch(/Sparkmouse.*locked|locked.*Sparkmouse/i);
+    expect(said.join(' ')).toMatch(/waiting for the other player/i);
+  });
+
+  it('revokes queued name guidance after the caller or display advances', () => {
+    let snap = battleSnap({ phase: 'lobby', myName: null, nameConfirmed: false });
+    const lines: { text: string; isCurrent?: () => boolean }[] = [];
+    const { deps } = fakeDeps({
+      snapshot: () => snap,
+      setName: (_code, _id, name) => { snap = { ...snap, myName: name, nameConfirmed: true }; },
+      say: (text, isCurrent) => lines.push({ text, isCurrent }),
+    });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    session.handleMessage(prompt('Ada'));
+    const lobbyGuidance = lines.find(line => /say next.*choose monsters/i.test(line.text));
+    expect(lobbyGuidance?.isCurrent?.()).toBe(true);
+    snap = { ...snap, phase: 'monster_select' };
+    session.onBattleStateChanged();
+    expect(lobbyGuidance?.isCurrent?.()).toBe(false);
+  });
+
+  it('revokes queued battle narration after an interrupted or newer battle generation', () => {
+    let snap = activeBattle({ generation: 7, turn: 1 });
+    const lines: { text: string; isCurrent?: () => boolean }[] = [];
+    const { deps } = fakeDeps({ snapshot: () => snap, say: (text, isCurrent) => lines.push({ text, isCurrent }) });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    lines.length = 0;
+    session.onBattlePresentation({ kind: 'event', generation: 7, eventId: 1,
+      event: { kind: 'move_used', by: 'a', moveId: 'sparkmouse.jolt', moveName: 'Thunder Jolt' } });
+    const moveLine = lines.find(line => /Thunder Jolt/.test(line.text));
+    expect(moveLine?.isCurrent?.()).toBe(true);
+    snap = activeBattle({ generation: 8, turn: 0 });
+    expect(moveLine?.isCurrent?.()).toBe(false);
+  });
+
+  it('keeps battle commentary aligned with the most recently painted event', () => {
+    const snap = activeBattle({ generation: 7, turn: 1 });
+    const lines: { text: string; isCurrent?: () => boolean }[] = [];
+    const { deps } = fakeDeps({ snapshot: () => snap, say: (text, isCurrent) => lines.push({ text, isCurrent }) });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    lines.length = 0;
+    session.onBattlePresentation({ kind: 'event', generation: 7, eventId: 1,
+      event: { kind: 'move_used', by: 'a', moveId: 'sparkmouse.jolt', moveName: 'Thunder Jolt' } });
+    const earlier = lines.find(line => /Thunder Jolt/.test(line.text));
+    expect(earlier?.isCurrent?.()).toBe(true);
+    session.onBattlePresentation({ kind: 'event', generation: 7, eventId: 2,
+      event: { kind: 'effectiveness', on: 'b', multiplier: 2, label: "It's super effective!" } });
+    expect(earlier?.isCurrent?.()).toBe(false);
+    expect(lines.at(-1)?.isCurrent?.()).toBe(true);
+  });
+
+  it('revokes a free-play result if a touchscreen begins the next game', () => {
+    let snap = activeBattle({ phase: 'results', generation: 4, winnerName: 'Ada', resultsPresented: true });
+    const lines: { text: string; isCurrent?: () => boolean }[] = [];
+    const { deps } = fakeDeps({ snapshot: () => snap, say: (text, isCurrent) => lines.push({ text, isCurrent }) });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    lines.length = 0;
+    session.onBattlePresentation({ kind: 'results', generation: 4, result: { winner: 'a', winnerName: 'Ada' } });
+    const result = lines.find(line => /wins/i.test(line.text));
+    expect(result?.isCurrent?.()).toBe(true);
+    snap = battleSnap({ phase: 'monster_select', generation: 5, myName: 'Ada' });
+    session.onBattleStateChanged();
+    expect(result?.isCurrent?.()).toBe(false);
+  });
+
+  it('keeps a painted station result deliverable during room retirement', () => {
+    const snap = activeBattle({ phase: 'results', generation: 4, winnerName: 'Ada', resultsPresented: true });
+    const lines: { text: string; isCurrent?: () => boolean }[] = [];
+    const { deps } = fakeDeps({ snapshot: () => snap, say: (text, isCurrent) => lines.push({ text, isCurrent }) });
+    const session = new BattleVoiceSession(deps);
+    session.setStationManaged(true);
+    session.handleMessage(setup());
+    lines.length = 0;
+    session.onBattlePresentation({ kind: 'results', generation: 4, result: { winner: 'a', winnerName: 'Ada' } });
+    const resultLine = lines.find(line => /results.*display.*thanks for playing/i.test(line.text));
+    expect(resultLine).toBeDefined();
+    session.handleReplaced();
+    expect(resultLine?.isCurrent?.() ?? true).toBe(true);
+  });
+
   it('binds the caller to the room on setup + greets', () => {
     const { deps, log, said } = fakeDeps();
     const s = new BattleVoiceSession(deps);
@@ -152,6 +268,52 @@ describe('BattleVoiceSession', () => {
     session.handleMessage(prompt('Ada'));
     expect(log).toContain('name Ada');
     expect(said.slice(beforeName).join(' ')).not.toMatch(/what'?s your name/i);
+  });
+
+  it('honors an externally confirmed name before interpreting the next monster choice', () => {
+    let phase: BattleVoiceSnapshot['phase'] = 'lobby';
+    let myName: string | null = null;
+    const { deps, log } = fakeDeps({
+      setName: (_code, _id, name) => { log.push(`name ${name}`); myName = name; },
+      snapshot: () => battleSnap({ phase, myName }),
+    });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    myName = 'Ada'; phase = 'monster_select';
+    session.onBattleStateChanged();
+
+    session.handleMessage(prompt('Sparkmouse'));
+
+    expect(log).toContain('monster sparkmouse');
+    expect(log).not.toContain('name Sparkmouse');
+  });
+
+  it('keeps a ready selection screen in place when the caller negates starting', () => {
+    const { deps, log } = fakeDeps({
+      snapshot: () => battleSnap({ myName: 'Ada', myMonsterId: 'sparkmouse', canStartBattle: true }),
+    });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    session.handleMessage(prompt("don't fight yet"));
+    expect(log).not.toContain('advance');
+  });
+
+  it('uses a legal semantic monster choice when the caller describes it naturally', async () => {
+    const seen: unknown[] = [];
+    const { deps, log } = fakeDeps({
+      snapshot: () => battleSnap({ myName: 'Ada' }),
+      interpret: async (request: unknown) => {
+        seen.push(request);
+        return { kind: 'action', actionId: 'select_monster', targetId: 'sparkmouse' };
+      },
+    } as unknown as Partial<BattleVoiceDeps>);
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    session.handleMessage(prompt('the tiny electric creature'));
+    await Promise.resolve(); await Promise.resolve();
+
+    expect(seen).toHaveLength(1);
+    expect(log).toContain('monster sparkmouse');
   });
 
   it('does not reinterpret a delayed duplicate name as a monster selection', () => {
@@ -369,6 +531,41 @@ describe('BattleVoiceSession', () => {
     expect(log.some(l => l.startsWith('monster '))).toBe(false);
     expect(log.some(l => l.startsWith('name '))).toBe(false);
     expect(said.join(' ')).toMatch(/what.*name|name.*challenger/i);
+  });
+
+  it.each(['not Sparkmouse', 'Sparkmouse or Embertail', 'no, not that monster'])
+    ('routes an unsafe monster choice to semantic clarification: %s',async spoken=>{
+      const requests:string[]=[];
+      const {deps,log}=fakeDeps({snapshot:()=>battleSnap({myName:'Ada'}),
+        interpret:async request=>{requests.push(request.transcript);return {kind:'clarify',reason:'ambiguous'};}});
+      const session=new BattleVoiceSession(deps);session.handleMessage(setup());
+      session.handleMessage(prompt(spoken));await Promise.resolve();
+      expect(log.some(entry=>entry.startsWith('monster '))).toBe(false);
+      expect(requests).toEqual([spoken]);
+    });
+
+  it.each([
+    {locale:undefined,spoken:'Sparkmouse or Embertail',expected:/which monster/i},
+    {locale:'pt-BR',spoken:'Sparkmouse ou Embertail',expected:/qual monstro/i},
+  ])('asks a short localized question about an ambiguous monster choice: $locale',async ({locale,spoken,expected})=>{
+    const {deps,said}=fakeDeps({snapshot:()=>battleSnap({myName:'Ada'}),
+      interpret:async()=>({kind:'clarify',reason:'ambiguous'})});
+    const session=new BattleVoiceSession(deps);session.handleMessage(setup('4821',locale));said.length=0;
+    session.handleMessage(prompt(spoken));await Promise.resolve();
+    expect(said.join(' ')).toMatch(expected);
+    expect(said.join(' ')).not.toMatch(/on your turn|na sua vez/i);
+  });
+
+  it('gives one short reply to unrelated speech without replaying the whole menu',async()=>{
+    const {deps,said}=fakeDeps({snapshot:()=>battleSnap({myName:'Ada'}),
+      interpret:async()=>({kind:'none'})});
+    const session=new BattleVoiceSession(deps);session.handleMessage(setup());said.length=0;
+    session.handleMessage(prompt('I had lunch'));await Promise.resolve();
+    expect(said).toHaveLength(1);
+    expect(said[0]).toMatch(/tell me what you want|what would you like/i);
+    session.handleMessage(prompt('I had dinner'));await Promise.resolve();
+    expect(said).toHaveLength(2);
+    expect(said.join(' ')).not.toMatch(/after everyone chooses|on your turn/i);
   });
 
   it.each([
@@ -717,7 +914,7 @@ describe('BattleVoiceSession', () => {
     expect(log.some(entry=>entry.includes('sparkmouse.jolt'))).toBe(true);
   });
 
-  it('does not reinterpret a delayed numeric Fight choice as move one', () => {
+  it('accepts a deliberately repeated number after the short duplicate-frame window', () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
@@ -731,7 +928,7 @@ describe('BattleVoiceSession', () => {
       vi.advanceTimersByTime(3_000);
       session.handleMessage(prompt('one'));
       expect(log.filter(entry => entry === 'openFight')).toHaveLength(1);
-      expect(log.some(entry => entry.startsWith('action '))).toBe(false);
+      expect(log.some(entry => entry.includes('sparkmouse.jolt'))).toBe(true);
     } finally { vi.useRealTimers(); }
   });
 
@@ -1072,6 +1269,84 @@ describe('BattleVoiceSession', () => {
     expect(line).toMatch(/Sparkmouse/i);
     expect(line).toMatch(/Embertail/i);
     expect(line).toMatch(/rematch/i);
+  });
+
+  it('waits for screen paint before announcing battle beats and the next turn', () => {
+    let snap=activeBattle({generation:1,turn:1,whoseTurn:'me'});
+    const {deps,said}=fakeDeps({snapshot:()=>snap});
+    const session=new BattleVoiceSession(deps);session.handleMessage(setup());said.length=0;
+    session.onBattleStateChanged();said.length=0;
+    snap=activeBattle({generation:1,turn:2,whoseTurn:'foe',activeSide:'b',presentationPending:true});
+    session.onBattleStateChanged();
+    expect(said.join(' ')).not.toMatch(/turn with|Thunder Jolt/i);
+    snap={...snap,presentationPending:false};
+    session.onBattlePresentation({kind:'event',generation:1,eventId:1,
+      event:{kind:'move_used',by:'a',moveId:'sparkmouse.jolt',moveName:'Thunder Jolt'}});
+    expect(said.join(' ')).toMatch(/Thunder Jolt/i);
+    expect(said.join(' ')).toMatch(/turn with|turn/i);
+  });
+
+  it('keeps the result-screen claim until the current result overlay is painted', () => {
+    let snap=activeBattle({phase:'results',generation:2,myName:'Ada',winnerName:'Ada',
+      resultsPresented:false,presentationPending:true,canRematch:true});
+    const {deps,said}=fakeDeps({snapshot:()=>snap});
+    const session=new BattleVoiceSession(deps);session.setStationManaged(true);
+    session.handleMessage(setup());said.length=0;
+    session.onBattlePresentation({kind:'event',generation:1,eventId:1,
+      event:{kind:'battle_over',winner:'a',winnerName:'Old'}});
+    expect(said).toHaveLength(0);
+    session.onBattlePresentation({kind:'event',generation:2,eventId:2,
+      event:{kind:'battle_over',winner:'a',winnerName:'Ada'}});
+    expect(said.join(' ')).toMatch(/Ada wins/i);
+    expect(said.join(' ')).not.toMatch(/results.*display/i);
+    snap={...snap,resultsPresented:true,presentationPending:false};
+    session.onBattlePresentation({kind:'results',generation:2,result:{winner:'a',winnerName:'Ada'}});
+    expect(said.join(' ')).toMatch(/results.*display.*thanks for playing/i);
+  });
+
+  it('uses conversational intent to reveal results for an impatient station caller', async () => {
+    const snap=activeBattle({phase:'results',generation:3,myName:'Ada',winnerName:'Ada',
+      resultsPresented:false,canRematch:false,presentationPending:true});
+    const {deps,log}=fakeDeps({snapshot:()=>snap,
+      continueResults:()=>{log.push('show results');return true;},
+      interpret:async request=>{
+        expect(request.actions).toEqual(expect.arrayContaining([expect.objectContaining({id:'continue_results'})]));
+        return {kind:'action',actionId:'continue_results'};
+      },
+    });
+    const session=new BattleVoiceSession(deps);session.setStationManaged(true);
+    session.handleMessage(setup());
+    session.handleMessage(prompt('Could you put the outcome up now?'));
+    await Promise.resolve();
+    expect(log).toContain('show results');
+  });
+
+  it('treats continue as a free-play rematch after the result is already visible',()=>{
+    let phase:BattleVoiceSnapshot['phase']='results';
+    const {deps,log}=fakeDeps({
+      snapshot:()=>battleSnap({phase,myName:'Ada',winnerName:'Ada',resultsPresented:true,canRematch:true}),
+      continueResults:()=>{log.push('show results');return true;},
+      advance:()=>{log.push('advance');phase='lobby';return true;},
+    });
+    const session=new BattleVoiceSession(deps);session.handleMessage(setup());
+    session.handleMessage(prompt('continue'));
+    expect(log).toContain('advance');
+    expect(log).not.toContain('show results');
+  });
+
+  it('announces display-loss recovery truthfully and allows a free-play rematch',()=>{
+    let timedOut=false;
+    let phase:BattleVoiceSnapshot['phase']='results';
+    const {deps,log,said}=fakeDeps({
+      snapshot:()=>battleSnap({phase,myName:'Ada',winnerName:'Ada',resultsPresented:false,
+        resultsPresentationTimedOut:timedOut,canRematch:timedOut,presentationPending:false}),
+      advance:()=>{log.push('advance');phase='monster_select';return true;},
+    });
+    const session=new BattleVoiceSession(deps);session.handleMessage(setup());said.length=0;
+    timedOut=true;session.onBattleStateChanged();
+    expect(said.at(-1)).toMatch(/could not confirm.*display.*Ada won/i);
+    session.handleMessage(prompt('rematch'));
+    expect(log).toContain('advance');
   });
 
   it('sends station players back to messaging and the queue without offering a rematch', () => {

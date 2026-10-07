@@ -132,6 +132,9 @@ html[data-theme="light"] :is(.vm-eyebrow,#vm-hud) img { filter:brightness(0) sat
   font-family: var(--disp); font-size: 16px; letter-spacing: .02em; cursor: pointer;
   box-shadow: 0 8px 24px rgba(239,34,58,.35); }
 .vm-btn:hover { filter: brightness(1.08); }
+.vm-btn-secondary { align-self: center; margin-top: 8px; padding: 9px 16px;
+  background: transparent; border: 1px solid var(--glass-brd-2); box-shadow: none; }
+.vm-btn-secondary:hover { border-color: var(--red); }
 .vm-btn-ghost { background: transparent; color: var(--ink); border: 1px solid var(--glass-brd-2);
   font-weight: 700; font-size: 14px; padding: 10px 18px; margin-left: 8px; box-shadow: none; }
 .vm-btn-ghost:hover { border-color: var(--red); }
@@ -159,7 +162,17 @@ html[data-theme="light"] :is(.vm-eyebrow,#vm-hud) img { filter:brightness(0) sat
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   transition: border-color .15s, transform .12s, box-shadow .15s; }
 .vm-mon:hover { transform: translateY(-3px); border-color: var(--glass-brd-2); box-shadow: 0 14px 34px rgba(0,0,0,.45); }
+.vm-mon:disabled { opacity: .5; cursor: default; }
+.vm-mon:disabled:hover { transform: none; box-shadow: none; }
 .vm-mon.sel { border-color: var(--tc, var(--red)); box-shadow: 0 0 0 1.5px var(--tc,var(--red)), 0 0 28px -4px var(--tc,var(--red)); }
+.vm-touch-picker { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 8px;
+  flex: 0 0 auto; margin: 8px auto 0; }
+.vm-touch-player { min-height: 44px; padding: 8px 16px; border: 1px solid var(--glass-brd-2);
+  border-radius: 999px; color: var(--ink); background: var(--glass); font: 700 13px var(--mono);
+  cursor: pointer; }
+.vm-touch-player.active { border-color: var(--red); background: rgba(239,34,58,.2); }
+.vm-touch-player:focus-visible, .vm-mon:focus-visible, .vm-btn:focus-visible {
+  outline: 3px solid #fff; outline-offset: 3px; }
 /* Portrait fills the tile's flexible space (min-height:0 lets it shrink); it's the give when the
    viewport is short, so a full 8-tile grid always fits. */
 .vm-mon .portrait { flex: 1 1 auto; min-height: 0; width: 100%; display: flex; align-items: center; justify-content: center;

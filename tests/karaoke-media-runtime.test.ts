@@ -156,6 +156,7 @@ function stateFor(song: KaraokeSong): KaraokeState {
     catalog: [song],
     selectedSong: song,
     selectedByPlayerId: BASE_REQUEST.playerId,
+    selectionGeneration: 1,
     loadingGeneration: BASE_REQUEST.loadingGeneration,
     serverNowMs: 1_000,
     countdown: null,

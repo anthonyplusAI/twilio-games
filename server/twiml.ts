@@ -50,7 +50,7 @@ export function twimlConnectRelay(opts: {
   ttsProvider?: string; voice?: string;
   // Spoken the instant the call connects (before the game WS binds) — a quick intro.
   welcomeGreeting?: string;
-  // Which game this call joins ('racer' | 'monsters'), passed to the WS so it routes correctly.
+  // Which game this call joins, passed to the WS so it routes correctly.
   game?: string;
   readyEntryId?: string;
   matchId?: string;
@@ -83,13 +83,13 @@ export function twimlConnectRelay(opts: {
   //  - interruptible="any": speech or keypad input cuts the TTS immediately.
   //  - reportInputDuringAgentSpeech="any": we RECEIVE both speech and DTMF while TTS plays (default
   //    is "none" as of May 2025, which would hide mid-speech commands entirely).
-  //  - interruptSensitivity="medium" + ignoreBackchannel="true": a shared party screen is noisy; don't
-  //    let background chatter / "yeah, okay" mutters falsely kill the host, but a real command does.
+  //  - high sensitivity and backchannels enabled make short "okay" / "go" interruptions work
+  //    while a caller is skipping a menu or an explanation.
   // We handle the resulting {type:"interrupt"} message on the WS (stop speaking, trim LLM history).
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect action="${esc(opts.sessionEndedUrl)}">
-    <ConversationRelay url="${esc(opts.wsUrl)}"${ttsAttrs} transcriptionProvider="Deepgram" speechModel="flux" partialPrompts="true" transcriptionLanguage="${esc(profile.transcriptionLanguage)}" ttsLanguage="${esc(profile.ttsLanguage)}" interruptible="any" reportInputDuringAgentSpeech="any" interruptSensitivity="medium" ignoreBackchannel="true" dtmfDetection="true" hints="${hints}" speechTimeout="600" eotThreshold="0.6" events="tokens-played" welcomeGreeting="${greeting}">
+    <ConversationRelay url="${esc(opts.wsUrl)}"${ttsAttrs} transcriptionProvider="Deepgram" speechModel="flux" partialPrompts="true" transcriptionLanguage="${esc(profile.transcriptionLanguage)}" ttsLanguage="${esc(profile.ttsLanguage)}" interruptible="any" welcomeGreetingInterruptible="any" reportInputDuringAgentSpeech="any" interruptSensitivity="high" ignoreBackchannel="false" dtmfDetection="true" hints="${hints}" speechTimeout="600" eotThreshold="0.6" events="tokens-played" welcomeGreeting="${greeting}">
       <Parameter name="roomCode" value="${esc(opts.roomCode)}" />${gameParam}${readyEntryParam}${matchParams}${relayTokenParam}${karaokeModeParam}${localeParams}
     </ConversationRelay>
   </Connect>

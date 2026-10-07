@@ -14,6 +14,19 @@ const acknowledgeText = (ws: WebSocket, message: Record<string, unknown>): void 
 const DISPLAY_TOKEN = 'test-standalone-display-token';
 
 describe('voice integration (fake Conversation Relay client)', () => {
+  it('rejects speech frames before Relay setup without assigning them to a game', async () => {
+    srv = new HttpServer({ port: 0, publicBaseUrl: 'http://localhost', validateSignatures: false });
+    const port = await srv.start();
+    const voice = new WebSocket(`ws://127.0.0.1:${port}/voice`);
+    await new Promise<void>((resolve, reject) => {
+      voice.once('open', resolve);
+      voice.once('error', reject);
+    });
+    const closed = new Promise<number>(resolve => voice.once('close', resolve));
+    voice.send(JSON.stringify({ type: 'prompt', voicePrompt: 'start the game', last: true }));
+    expect(await closed).toBe(1008);
+  });
+
   it('validates the Conversation Relay WebSocket handshake signature', async () => {
     const authToken='voice-websocket-auth-token';
     srv=new HttpServer({port:0,publicBaseUrl:'http://localhost',validateSignatures:true,authToken});
@@ -54,17 +67,17 @@ describe('voice integration (fake Conversation Relay client)', () => {
     closeWs(voice);
   });
 
-  it('releases a failed speech token so later guidance is not stranded', async () => {
+  it.each(['64107', '64111'])('releases a failed speech token after Relay error %s', async errorCode => {
     vi.spyOn(console,'error').mockImplementation(()=>undefined);
     srv = new HttpServer({ port:0,publicBaseUrl:'http://localhost',validateSignatures:false });
     const port=await srv.start();const voice=new WebSocket(`ws://127.0.0.1:${port}/voice`);
     const messages:Record<string,unknown>[]=[];
     voice.on('message',data=>{const message=JSON.parse(data.toString()) as Record<string,unknown>;if(message.type==='text')messages.push(message);});
     await new Promise<void>(resolve=>voice.on('open',resolve));
-    voice.send(JSON.stringify({type:'setup',callSid:'CA-tts-error',customParameters:{roomCode:'TTSERR'}}));
+    voice.send(JSON.stringify({type:'setup',callSid:`CA-tts-error-${errorCode}`,customParameters:{roomCode:'TTSERR'}}));
     try {
       await wait(50);expect(messages).toHaveLength(1);
-      voice.send(JSON.stringify({type:'error',description:'64111 TTS provider failure'}));
+      voice.send(JSON.stringify({type:'error',description:`${errorCode} Relay speech failure`}));
       await wait(750);expect(messages).toHaveLength(2);
     } finally { closeWs(voice); }
   });
@@ -239,9 +252,11 @@ describe('voice integration (fake Conversation Relay client)', () => {
       fighterDisplayToken:DISPLAY_TOKEN,
     });
     const port=await srv.start();
-    const fighter=new WebSocket(`ws://127.0.0.1:${port}/fighter`);
+    const fighter=new WebSocket(`ws://127.0.0.1:${port}/fighter?display=1`);
+    const fighterMessages:Record<string,unknown>[]=[];
+    fighter.on('message',data=>fighterMessages.push(JSON.parse(data.toString()) as Record<string,unknown>));
     await new Promise<void>((resolve,reject)=>{fighter.once('open',resolve);fighter.once('error',reject);});
-    fighter.send(JSON.stringify({type:'spectate',roomCode:'4821'}));
+    fighter.send(JSON.stringify({type:'display_auth',roomCode:'4821',token:DISPLAY_TOKEN}));
     await wait(30);
 
     const before=await fetch(`http://127.0.0.1:${port}/voice/incoming`,{
@@ -249,9 +264,10 @@ describe('voice integration (fake Conversation Relay client)', () => {
     });
     expect(await before.text()).not.toContain('<ConversationRelay');
 
-    fighter.send(JSON.stringify({type:'display_auth',roomCode:'4821',token:DISPLAY_TOKEN}));
     fighter.send(JSON.stringify({type:'spectate',roomCode:'4821'}));
-    await wait(30);
+    await vi.waitFor(()=>expect(fighterMessages).toContainEqual(expect.objectContaining({
+      type:'host_identity',roomCode:'4821',isHost:true,
+    })));
     const after=await fetch(`http://127.0.0.1:${port}/voice/incoming`,{
       method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'CallSid=CA-fighter-display&From=%2B14155550199',
     });
@@ -455,7 +471,8 @@ describe('voice integration (fake Conversation Relay client)', () => {
       voice.send(JSON.stringify({ type: 'prompt', voicePrompt: 'Ada', last: true }));
       await wait(900);
       expect(spoken.join(' ').toLowerCase()).toMatch(/controls on the screen|say left|nitro/);
-      expect(spokenMessages.some(message => message.preemptible === true)).toBe(false);
+      expect(spokenMessages.length).toBeGreaterThan(0);
+      expect(spokenMessages.every(message => message.interruptible === true && message.preemptible === true)).toBe(true);
       voice.send(JSON.stringify({ type: 'prompt', voicePrompt: 'start', last: true }));
       await wait(1_600);
       voice.send(JSON.stringify({ type: 'prompt', voicePrompt: 'one', last: true }));

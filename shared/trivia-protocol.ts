@@ -21,8 +21,10 @@ export type TriviaPhase =
   | 'category_select'
   | 'loading'
   | 'countdown'
-  | 'question_prompt' // Legacy compatibility; normal room flow publishes question directly.
-  | 'answer_cue' // Legacy compatibility; normal room flow publishes question directly.
+  | 'question_prompt'
+  | 'answer_cue'
+  | 'audio_problem'
+  | 'audio_expired'
   | 'question'
   | 'reveal'
   | 'results';
@@ -47,6 +49,17 @@ export interface TriviaPublicStanding extends TriviaPublicPlayer {
 }
 
 export type TriviaCategoryVoteCounts = Readonly<Record<TriviaRoundCategoryId, number>>;
+
+export interface TriviaCategoryVotingSeat {
+  readonly playerId: string;
+  readonly name: string;
+}
+
+export interface TriviaAudioProblem {
+  readonly questionId: string;
+  readonly questionAttemptId: number;
+  readonly recoveryDeadlineAtMs: number;
+}
 
 export interface TriviaResultPlayer {
   readonly playerId: string;
@@ -78,11 +91,15 @@ interface TriviaStateBase {
   readonly preferredLocale: SupportedLocale;
   readonly category: TriviaRoundCategoryId | null;
   readonly categoryVoteCounts: TriviaCategoryVoteCounts;
+  readonly categoryVotingSeat: TriviaCategoryVotingSeat | null;
   readonly players: readonly TriviaPublicPlayer[];
   readonly serverNowMs: number;
   readonly loadingGeneration: number;
   readonly displayReady: boolean;
   readonly questionIndex: number | null;
+  readonly questionAttemptId: number | null;
+  /** Changes when an acknowledged question or cue view must be repainted. */
+  readonly renderRevision: number;
   readonly countdownEndsAtMs: number | null;
   readonly questionPromptEndsAtMs: number | null;
   readonly answerCueEndsAtMs: number | null;
@@ -93,10 +110,11 @@ interface TriviaStateBase {
   readonly reveal: PublicTriviaReveal | null;
   readonly standings: readonly TriviaPublicStanding[] | null;
   readonly result: TriviaResult | null;
+  readonly audioProblem: TriviaAudioProblem | null;
 }
 
 export interface TriviaHiddenState extends TriviaStateBase {
-  readonly phase: 'lobby' | 'category_select' | 'loading' | 'countdown' | 'results';
+  readonly phase: 'lobby' | 'category_select' | 'loading' | 'countdown' | 'audio_expired' | 'results';
   readonly question: null;
   readonly reveal: null;
 }
@@ -119,6 +137,13 @@ export interface TriviaAnswerCueState extends TriviaStateBase {
   readonly reveal: null;
 }
 
+export interface TriviaAudioProblemState extends TriviaStateBase {
+  readonly phase: 'audio_problem';
+  readonly question: PublicTriviaQuestion;
+  readonly reveal: null;
+  readonly audioProblem: TriviaAudioProblem;
+}
+
 export interface TriviaRevealState extends TriviaStateBase {
   readonly phase: 'reveal';
   readonly question: PublicTriviaQuestion;
@@ -126,18 +151,20 @@ export interface TriviaRevealState extends TriviaStateBase {
 }
 
 /** Browser-safe state. It can never represent an answer key during an active question. */
-export type TriviaState = TriviaHiddenState | TriviaQuestionPromptState | TriviaAnswerCueState
+export type TriviaState = TriviaHiddenState | TriviaQuestionPromptState | TriviaAnswerCueState | TriviaAudioProblemState
   | TriviaQuestionState | TriviaRevealState;
 
 export type TriviaEvent =
   | { readonly type: 'player_joined'; readonly playerId: string; readonly name: string; readonly playerOrder: number; readonly atMs: number }
   | { readonly type: 'player_left'; readonly playerId: string; readonly atMs: number }
   | { readonly type: 'countdown'; readonly count: 3 | 2 | 1; readonly atMs: number }
-  | { readonly type: 'question_started'; readonly questionId: string; readonly questionIndex: number; readonly endsAtMs: number }
-  | { readonly type: 'answer_cue_started'; readonly questionId: string; readonly endsAtMs: number }
-  | { readonly type: 'answering_started'; readonly questionId: string; readonly startsAtMs: number; readonly endsAtMs: number }
-  | { readonly type: 'answer_result'; readonly playerId: string; readonly correct: boolean; readonly points: number; readonly rawScore: number }
-  | { readonly type: 'question_revealed'; readonly questionId: string; readonly atMs: number }
+  | { readonly type: 'question_started'; readonly questionId: string; readonly questionAttemptId: number; readonly questionIndex: number; readonly promptDeadlineAtMs: number }
+  | { readonly type: 'answer_cue_started'; readonly questionId: string; readonly questionAttemptId: number; readonly endsAtMs: number }
+  | { readonly type: 'answering_started'; readonly questionId: string; readonly questionAttemptId: number; readonly startsAtMs: number; readonly endsAtMs: number }
+  | { readonly type: 'answer_result'; readonly questionAttemptId: number; readonly playerId: string; readonly correct: boolean; readonly points: number; readonly rawScore: number }
+  | { readonly type: 'question_revealed'; readonly questionId: string; readonly questionAttemptId: number; readonly atMs: number }
+  | { readonly type: 'audio_problem'; readonly questionId: string; readonly questionAttemptId: number; readonly recoveryDeadlineAtMs: number; readonly atMs: number }
+  | { readonly type: 'audio_recovery_expired'; readonly questionId: string; readonly questionAttemptId: number; readonly atMs: number }
   | { readonly type: 'round_finished'; readonly standings: readonly TriviaPublicStanding[]; readonly result: TriviaResult; readonly atMs: number }
   | { readonly type: 'loading_timeout'; readonly loadingGeneration: number; readonly displayReady: boolean; readonly atMs: number };
 
@@ -148,6 +175,8 @@ export type TriviaClientMessage =
   | { type: 'display_auth'; roomCode: string; token: string }
   | { type: 'clock_sync'; clientSentAtMs: number }
   | { type: 'select_category'; category: TriviaRoundCategoryId }
+  | { type: 'display_select_category'; playerId: string; category: TriviaRoundCategoryId }
+  | { type: 'view_rendered'; questionId: string; questionAttemptId: number; phase: 'question_prompt' | 'answer_cue'; renderRevision: number }
   | { type: 'keyboard_answer'; choiceId: string }
   | { type: 'advance' }
   | { type: 'ready'; loadingGeneration: number }
@@ -183,11 +212,14 @@ export interface TriviaAuthoritativeState {
   readonly preferredLocale: SupportedLocale;
   readonly category: TriviaRoundCategoryId | null;
   readonly categoryVoteCounts?: TriviaCategoryVoteCounts;
+  readonly categoryVotingSeat?: TriviaCategoryVotingSeat | null;
   readonly players: readonly TriviaAuthoritativePlayer[];
   readonly serverNowMs: number;
   readonly loadingGeneration: number;
   readonly displayReady: boolean;
   readonly questionIndex: number | null;
+  readonly questionAttemptId?: number | null;
+  readonly renderRevision?: number;
   readonly countdownEndsAtMs: number | null;
   readonly questionPromptEndsAtMs?: number | null;
   readonly answerCueEndsAtMs?: number | null;
@@ -196,6 +228,7 @@ export interface TriviaAuthoritativeState {
   readonly revealEndsAtMs?: number | null;
   readonly currentQuestion: TriviaRoundQuestion | null;
   readonly result?: TriviaResult | null;
+  readonly audioProblem?: TriviaAudioProblem | null;
 }
 
 /**
@@ -208,7 +241,7 @@ export function projectTriviaState(state: TriviaAuthoritativeState, locale: Supp
     || state.expectedPlayerCount < TRIVIA_MIN_PLAYERS || state.expectedPlayerCount > TRIVIA_MAX_PLAYERS) {
     throw new Error('expectedPlayerCount must be from 1 to 4');
   }
-  if ((state.phase === 'question_prompt' || state.phase === 'answer_cue'
+  if ((state.phase === 'question_prompt' || state.phase === 'answer_cue' || state.phase === 'audio_problem'
     || state.phase === 'question' || state.phase === 'reveal')
     && !state.currentQuestion) {
     throw new Error(`${state.phase} requires a current question`);
@@ -245,7 +278,7 @@ export function projectTriviaState(state: TriviaAuthoritativeState, locale: Supp
         cumulativeCorrectTimeMs: player.cumulativeCorrectTimeMs,
       })))
     : null;
-  const visibleQuestion = state.phase === 'question_prompt' || state.phase === 'answer_cue'
+  const visibleQuestion = state.phase === 'question_prompt' || state.phase === 'answer_cue' || state.phase === 'audio_problem'
     || state.phase === 'question' || state.phase === 'reveal'
     ? projectPublicTriviaQuestion(state.currentQuestion!.question, locale, state.currentQuestion!.choiceOrder)
     : null;
@@ -261,11 +294,14 @@ export function projectTriviaState(state: TriviaAuthoritativeState, locale: Supp
     preferredLocale: state.preferredLocale,
     category: state.category,
     categoryVoteCounts: state.categoryVoteCounts ?? emptyCategoryVoteCounts(),
+    categoryVotingSeat: state.categoryVotingSeat ?? null,
     players,
     serverNowMs: state.serverNowMs,
     loadingGeneration: state.loadingGeneration,
     displayReady: state.displayReady,
     questionIndex: state.questionIndex,
+    questionAttemptId: state.questionAttemptId ?? null,
+    renderRevision: state.renderRevision ?? 0,
     countdownEndsAtMs: state.countdownEndsAtMs,
     questionPromptEndsAtMs: state.questionPromptEndsAtMs ?? null,
     answerCueEndsAtMs: state.answerCueEndsAtMs ?? null,
@@ -274,12 +310,17 @@ export function projectTriviaState(state: TriviaAuthoritativeState, locale: Supp
     revealEndsAtMs: state.revealEndsAtMs ?? null,
     standings,
     result: state.result ?? null,
+    audioProblem: state.audioProblem ?? null,
   };
   if (state.phase === 'question_prompt') {
     return Object.freeze({ ...base, phase: 'question_prompt', question: visibleQuestion!, reveal: null });
   }
   if (state.phase === 'answer_cue') {
     return Object.freeze({ ...base, phase: 'answer_cue', question: visibleQuestion!, reveal: null });
+  }
+  if (state.phase === 'audio_problem') {
+    return Object.freeze({ ...base, phase: 'audio_problem', question: visibleQuestion!, reveal: null,
+      audioProblem: state.audioProblem! });
   }
   if (state.phase === 'question') return Object.freeze({ ...base, phase: 'question', question: visibleQuestion!, reveal: null });
   if (state.phase === 'reveal') return Object.freeze({ ...base, phase: 'reveal', question: visibleQuestion!, reveal: reveal! });
@@ -341,6 +382,25 @@ export function parseTriviaClientMessage(raw: string): TriviaClientMessage | Tri
         return error('bad_select_category', 'valid category required');
       }
       return { type: 'select_category', category: value.category as TriviaRoundCategoryId };
+    case 'display_select_category': {
+      const playerId = opaque(value.playerId, 32);
+      if (!hasOnlyKeys(value, ['type', 'playerId', 'category']) || !playerId
+        || !TRIVIA_ROUND_CATEGORY_IDS.includes(value.category as TriviaRoundCategoryId)) {
+        return error('bad_select_category', 'valid voting seat and category required');
+      }
+      return { type: 'display_select_category', playerId, category: value.category as TriviaRoundCategoryId };
+    }
+    case 'view_rendered': {
+      const questionId = opaque(value.questionId, 128);
+      if (!hasOnlyKeys(value, ['type', 'questionId', 'questionAttemptId', 'phase', 'renderRevision'])
+        || !questionId || !nonNegativeSafeInteger(value.questionAttemptId) || value.questionAttemptId < 1
+        || (value.phase !== 'question_prompt' && value.phase !== 'answer_cue')
+        || !nonNegativeSafeInteger(value.renderRevision) || value.renderRevision < 1) {
+        return error('bad_view_rendered', 'valid current question paint required');
+      }
+      return { type: 'view_rendered', questionId, questionAttemptId: value.questionAttemptId,
+        phase: value.phase, renderRevision: value.renderRevision };
+    }
     case 'keyboard_answer':
       if (!hasOnlyKeys(value, ['type', 'choiceId'])
         || !TRIVIA_CHOICE_IDS.includes(value.choiceId as typeof TRIVIA_CHOICE_IDS[number])) {

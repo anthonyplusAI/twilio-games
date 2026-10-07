@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   TRIVIA_COUNTDOWN_MS,
   TRIVIA_FINAL_ANSWER_GRACE_MS,
+  TRIVIA_SEMANTIC_ANSWER_MAX_MS,
   TRIVIA_REVEAL_MS,
   TriviaRoom,
 } from '../server/trivia-room';
@@ -31,10 +32,29 @@ function startQuestion(room: TriviaRoom, playerId: string, now: { value: number 
   expect(room.ready(generation)).toBe(true);
   now.value += TRIVIA_COUNTDOWN_MS;
   expect(room.tick()).toBe(true);
-  expect(room.phase).toBe('question');
+  expect(room.phase).toBe('question_prompt');
+  settlePrompt(room, now);
 }
 
 function settlePrompt(room: TriviaRoom, now?: { value: number }): void {
+  if (room.phase === 'question_prompt') {
+    const state = room.state();
+    for (const player of state.players) {
+      const generation = room.beginPromptDelivery(player.playerId, state.question!.id,
+        state.questionAttemptId!);
+      if (generation !== null) expect(room.questionPromptReady(player.playerId, state.question!.id,
+        state.questionAttemptId!, generation)).toBe(true);
+    }
+  }
+  if (room.phase === 'answer_cue') {
+    const state = room.state();
+    for (const player of state.players) {
+      const generation = room.beginAnswerCueDelivery(player.playerId, state.question!.id,
+        state.questionAttemptId!);
+      if (generation !== null) expect(room.questionAnswerCueReady(player.playerId, state.question!.id,
+        state.questionAttemptId!, generation)).toBe(true);
+    }
+  }
   expect(room.phase).toBe('question');
   if (now) now.value = room.state().answeringStartsAtMs!;
 }
@@ -82,6 +102,27 @@ describe('authoritative trivia room', () => {
     expect(room.state()).toMatchObject({ automaticSetup: true, expectedPlayerCount: 2, hasExpectedPlayers: true });
     expect(room.stationFixed).toBe(true);
     expect(room.allowReplay).toBe(false);
+  });
+
+  it('focuses shared category taps in assigned seat order even when calls arrive backward', () => {
+    const room = new TriviaRoom('REVERSE-VOTES', { bank });
+    room.expectHumanPlayers(3, true, { stationFixed: true, allowReplay: false });
+    const seats = [2, 1, 0].map(index => {
+      const result = room.addPlayer(`Player ${index}`, true, index);
+      if ('error' in result) throw new Error(result.error);
+      return { index, playerId: result.playerId };
+    });
+    expect(room.advance(seats[0]!.playerId)).toBe(true);
+    const bySeat = (index: number) => seats.find(seat => seat.index === index)!.playerId;
+    expect(room.state().categoryVotingSeat?.playerId).toBe(bySeat(0));
+    expect(room.voteCategoryFromDisplay(bySeat(2), 'science')).toBe(false);
+    expect(room.voteCategoryFromDisplay(bySeat(0), 'history')).toBe(true);
+    expect(room.state().categoryVotingSeat?.playerId).toBe(bySeat(1));
+    expect(room.voteCategory(bySeat(1), 'geography')).toBe(true);
+    expect(room.state().categoryVotingSeat?.playerId).toBe(bySeat(2));
+    expect(room.voteCategoryFromDisplay(bySeat(2), 'sports')).toBe(true);
+    expect(room.state().categoryVotingSeat).toBeNull();
+    expect(room.voteCategoryFromDisplay(bySeat(0), 'science')).toBe(false);
   });
 
   it.each(['lobby', 'category_select', 'loading'] as const)(
@@ -296,7 +337,8 @@ describe('authoritative trivia room', () => {
     const standalonePlayer = joined(standalone);
     finishRound(standalone, standalonePlayer, standaloneNow);
     expect(standalone.state()).toMatchObject({ phase: 'results', automaticSetup: true });
-    expect(standalone.advance()).toBe(true);
+    expect(standalone.advance()).toBe(false);
+    expect(standalone.advance(standalonePlayer)).toBe(true);
     expect(standalone.state()).toMatchObject({ phase: 'category_select', automaticSetup: true });
 
     const stationNow = { value: 0 };
@@ -391,7 +433,7 @@ describe('authoritative trivia room', () => {
     });
   });
 
-  it('publishes the redacted question with an immediate ten-second answer window', () => {
+  it('publishes a redacted prompt and starts the ten-second window only after audible readiness', () => {
     const now = { value: 10_000 };
     const room = new TriviaRoom('CLOCK', { bank, now: () => now.value });
     const player = joined(room);
@@ -402,27 +444,36 @@ describe('authoritative trivia room', () => {
     now.value = endsAt + 500;
     room.tick();
     expect(room.state()).toMatchObject({
-      phase: 'question',
+      phase: 'question_prompt',
       countdownEndsAtMs: null,
-      questionPromptEndsAtMs: null,
       answerCueEndsAtMs: null,
-      answeringStartsAtMs: now.value,
-      questionEndsAtMs: now.value + TRIVIA_ANSWER_WINDOW_MS,
+      answeringStartsAtMs: null,
+      questionEndsAtMs: null,
     });
     const questionId = room.state().question!.id;
-    expect(room.questionPromptReady(player, questionId)).toBe(false);
-    expect(room.questionAnswerCueReady(player, questionId)).toBe(false);
+    const attemptId = room.state().questionAttemptId!;
+    expect(room.questionPromptReady(player, questionId, attemptId, 1)).toBe(false);
+    expect(room.questionAnswerCueReady(player, questionId, attemptId, 1)).toBe(false);
+    const promptDelivery = room.beginPromptDelivery(player, questionId, attemptId)!;
+    expect(room.questionPromptReady(player, questionId, attemptId, promptDelivery)).toBe(true);
+    expect(room.state().phase).toBe('answer_cue');
+    const cueDelivery = room.beginAnswerCueDelivery(player, questionId, attemptId)!;
+    expect(room.questionAnswerCueReady(player, questionId, attemptId, cueDelivery)).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'question', answeringStartsAtMs: now.value,
+      questionEndsAtMs: now.value + TRIVIA_ANSWER_WINDOW_MS });
     expect(room.drainEvents()).toEqual(expect.arrayContaining([
       { type: 'countdown', count: 3, atMs: 10_000 },
       { type: 'countdown', count: 2, atMs: 11_000 },
       { type: 'countdown', count: 1, atMs: 12_000 },
-      { type: 'question_started', questionId, questionIndex: 0, endsAtMs: now.value + 10_000 },
-      { type: 'answering_started', questionId, startsAtMs: now.value, endsAtMs: now.value + 10_000 },
+      { type: 'question_started', questionId, questionAttemptId: attemptId,
+        questionIndex: 0, promptDeadlineAtMs: now.value + 60_000 },
+      { type: 'answering_started', questionId, questionAttemptId: attemptId,
+        startsAtMs: now.value, endsAtMs: now.value + 10_000 },
     ]));
     expect(JSON.stringify(room.state())).not.toMatch(/correctChoiceId|aliases|explanation/);
   });
 
-  it('starts answering once for four callers without waiting for prompt acknowledgements', () => {
+  it('starts answering once after all four callers finish prompt and cue playback', () => {
     const now = { value: 5_000 };
     const room = new TriviaRoom('PROMPT-FOUR', { bank, now: () => now.value });
     const players = [joined(room, 'One'), joined(room, 'Two'), joined(room, 'Three'), joined(room, 'Four')];
@@ -432,19 +483,32 @@ describe('authoritative trivia room', () => {
     now.value += TRIVIA_COUNTDOWN_MS;
     room.tick();
     const questionId = room.state().question!.id;
-    const startsAtMs = room.state().answeringStartsAtMs;
-    const endsAtMs = room.state().questionEndsAtMs;
-    expect(room.phase).toBe('question');
-    expect(room.questionPromptReady(players[0]!, 'stale-question')).toBe(false);
-    expect(room.questionPromptReady(players[0]!, questionId)).toBe(false);
-    expect(room.questionPromptReady(players[3]!, questionId)).toBe(false);
-    expect(room.questionAnswerCueReady(players[0]!, 'stale-question')).toBe(false);
+    const attemptId = room.state().questionAttemptId!;
+    expect(room.phase).toBe('question_prompt');
+    expect(room.questionPromptReady(players[0]!, 'stale-question', attemptId, 1)).toBe(false);
+    const firstDelivery = room.beginPromptDelivery(players[0]!, questionId, attemptId)!;
+    expect(room.questionPromptReady(players[0]!, questionId, attemptId, firstDelivery)).toBe(true);
+    expect(room.phase).toBe('question_prompt');
+    for (const player of players.slice(1)) {
+      const delivery = room.beginPromptDelivery(player, questionId, attemptId)!;
+      expect(room.questionPromptReady(player, questionId, attemptId, delivery)).toBe(true);
+    }
+    expect(room.phase).toBe('answer_cue');
+    expect(room.questionAnswerCueReady(players[0]!, 'stale-question', attemptId, 1)).toBe(false);
+    for (const player of players.slice(0, -1)) {
+      const delivery = room.beginAnswerCueDelivery(player, questionId, attemptId)!;
+      expect(room.questionAnswerCueReady(player, questionId, attemptId, delivery)).toBe(true);
+    }
+    expect(room.phase).toBe('answer_cue');
     now.value += 321;
-    expect(room.questionAnswerCueReady(players[3]!, questionId)).toBe(false);
+    const lastCue = room.beginAnswerCueDelivery(players[3]!, questionId, attemptId)!;
+    expect(room.questionAnswerCueReady(players[3]!, questionId, attemptId, lastCue)).toBe(true);
     expect(room.phase).toBe('question');
-    expect(room.state()).toMatchObject({ answeringStartsAtMs: startsAtMs, questionEndsAtMs: endsAtMs });
+    expect(room.state()).toMatchObject({ answeringStartsAtMs: now.value,
+      questionEndsAtMs: now.value + TRIVIA_ANSWER_WINDOW_MS });
     expect(room.drainEvents().filter(event => event.type === 'answering_started')).toEqual([{
-      type: 'answering_started', questionId, startsAtMs, endsAtMs,
+      type: 'answering_started', questionId, questionAttemptId: attemptId,
+      startsAtMs: now.value, endsAtMs: now.value + TRIVIA_ANSWER_WINDOW_MS,
     }]);
   });
 
@@ -458,6 +522,7 @@ describe('authoritative trivia room', () => {
     disconnected.ready(disconnected.state().loadingGeneration);
     disconnectedNow.value += TRIVIA_COUNTDOWN_MS;
     disconnected.tick();
+    settlePrompt(disconnected, disconnectedNow);
     const published = disconnected.state();
     expect(published.phase).toBe('question');
     expect(disconnected.setPlayerConnected(second, false)).toBe(true);
@@ -550,6 +615,7 @@ describe('authoritative trivia room', () => {
     room.ready(room.state().loadingGeneration);
     now.value = TRIVIA_COUNTDOWN_MS;
     room.tick();
+    settlePrompt(room, now);
     expect(room.state()).toMatchObject({
       phase: 'question', answeringStartsAtMs: now.value,
       players: [{ answered: false, rawScore: 0 }, { answered: false, rawScore: 0 }],
@@ -576,6 +642,7 @@ describe('authoritative trivia room', () => {
     room.ready(room.state().loadingGeneration);
     now.value = TRIVIA_COUNTDOWN_MS;
     room.tick();
+    settlePrompt(room, now);
     const start = room.state().answeringStartsAtMs!;
     const correct = correctChoice(room);
     const wrong = room.state().question!.choices.find(choice => choice.id !== correct)!.id;
@@ -745,6 +812,83 @@ describe('authoritative trivia room', () => {
     stale.tick();
     settlePrompt(stale, staleNow);
     expect(stale.answerAt(stalePlayer, correctChoice(stale), true, oldStart)).toBe(false);
+  });
+
+  it('holds only a pending on-time semantic answer long enough to resolve after the normal grace', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('SEMANTIC-DEADLINE', { bank, now: () => now.value });
+    const player = joined(room);
+    startQuestion(room, player, now);
+    const state = room.state();
+    const end = state.questionEndsAtMs!;
+    const receivedAtMs = end - 100;
+    now.value = receivedAtMs;
+    const resolutionId = room.beginSemanticAnswerResolution(player, state.question!.id,
+      state.questionAttemptId!);
+    expect(resolutionId).not.toBeNull();
+
+    now.value = end + TRIVIA_FINAL_ANSWER_GRACE_MS + 1;
+    expect(room.tick()).toBe(false);
+    expect(room.state().phase).toBe('question');
+    now.value = receivedAtMs + TRIVIA_SEMANTIC_ANSWER_MAX_MS - 1;
+    expect(room.answerAt(player, correctChoice(room), true, receivedAtMs, resolutionId!)).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'reveal', players: [{ answered: true, rawScore: 1_000 }] });
+  });
+
+  it('ends a pending semantic hold after correction or its strict three-second limit', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('SEMANTIC-CANCEL', { bank, now: () => now.value });
+    const player = joined(room);
+    startQuestion(room, player, now);
+    const state = room.state();
+    const end = state.questionEndsAtMs!;
+    now.value = end - 100;
+    const oldId = room.beginSemanticAnswerResolution(player, state.question!.id, state.questionAttemptId!);
+    expect(oldId).not.toBeNull();
+    expect(room.finishSemanticAnswerResolution(player, state.question!.id, state.questionAttemptId!, oldId!))
+      .toBe(true);
+    now.value = end + TRIVIA_FINAL_ANSWER_GRACE_MS;
+    expect(room.tick()).toBe(true);
+    expect(room.state().phase).toBe('reveal');
+    expect(room.answerAt(player, correctChoice(room), true, end - 100, oldId!)).toBe(false);
+
+    const secondNow = { value: 0 };
+    const second = new TriviaRoom('SEMANTIC-EXPIRE', { bank, now: () => secondNow.value });
+    const secondPlayer = joined(second);
+    startQuestion(second, secondPlayer, secondNow);
+    const secondState = second.state();
+    secondNow.value = secondState.questionEndsAtMs! - 100;
+    const id = second.beginSemanticAnswerResolution(secondPlayer, secondState.question!.id,
+      secondState.questionAttemptId!);
+    expect(id).not.toBeNull();
+    secondNow.value += TRIVIA_SEMANTIC_ANSWER_MAX_MS;
+    expect(second.tick()).toBe(true);
+    expect(second.state().phase).toBe('reveal');
+  });
+
+  it('reserves a delayed ASR final only for its matching on-time interim choice', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('SEMANTIC-ASR-GRACE', { bank, now: () => now.value });
+    const player = joined(room);
+    startQuestion(room, player, now);
+    const state = room.state();
+    const end = state.questionEndsAtMs!;
+    const onsetAtMs = end - 200;
+    const correct = correctChoice(room);
+    const wrong = state.question!.choices.find(choice => choice.id !== correct)!.id;
+    now.value = end + 1_000;
+    expect(room.beginSemanticAnswerResolution(player, state.question!.id, state.questionAttemptId!))
+      .toBeNull();
+    const resolutionId = room.beginSemanticAnswerResolution(player, state.question!.id,
+      state.questionAttemptId!, { choiceId: correct, atMs: onsetAtMs });
+    expect(resolutionId).not.toBeNull();
+
+    now.value = end + TRIVIA_FINAL_ANSWER_GRACE_MS + 1;
+    expect(room.tick()).toBe(false);
+    now.value = end + 3_499;
+    expect(room.answerAt(player, wrong, true, onsetAtMs, resolutionId!)).toBe(false);
+    expect(room.answerAt(player, correct, true, onsetAtMs, resolutionId!)).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'reveal', players: [{ answered: true, rawScore: 1_000 }] });
   });
 
   it('resets streak on wrong/no-answer, shows reveal standings for four seconds, and always completes', () => {

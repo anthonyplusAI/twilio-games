@@ -188,18 +188,40 @@ describe('activation analytics', () => {
     now = room.state().countdownEndsAtMs!;
     room.tick();
     for (let questionIndex = 0; questionIndex < 8; questionIndex++) {
+      const prompt = room.state();
+      expect(prompt.phase).toBe('question_prompt');
+      expect(prompt.questionEndsAtMs).toBeNull();
+      for (const player of prompt.players) {
+        const delivery = room.beginPromptDelivery(player.playerId, prompt.question!.id,
+          prompt.questionAttemptId!);
+        expect(delivery).not.toBeNull();
+        expect(room.questionPromptReady(player.playerId, prompt.question!.id,
+          prompt.questionAttemptId!, delivery!)).toBe(true);
+      }
+      expect(room.state().phase).toBe('answer_cue');
+      const cue = room.state();
+      for (const player of cue.players) {
+        const delivery = room.beginAnswerCueDelivery(player.playerId, cue.question!.id,
+          cue.questionAttemptId!);
+        expect(delivery).not.toBeNull();
+        expect(room.questionAnswerCueReady(player.playerId, cue.question!.id,
+          cue.questionAttemptId!, delivery!)).toBe(true);
+      }
+      expect(room.state().phase).toBe('question');
       now = room.state().questionEndsAtMs!;
       room.tick();
+      expect(room.state().phase).toBe('reveal');
       now = room.state().revealEndsAtMs!;
       room.tick();
     }
+    expect(room.state().phase).toBe('results');
     observer.triviaState(room);
     observer.triviaState(room);
 
-    room.advance();
-    room.voteCategory(first.playerId, 'history');
-    room.voteCategory(second.playerId, 'history');
-    room.advance();
+    expect(room.advance(first.playerId)).toBe(true);
+    expect(room.voteCategory(first.playerId, 'history')).toBe(true);
+    expect(room.voteCategory(second.playerId, 'history')).toBe(true);
+    expect(room.advance()).toBe(true);
     observer.triviaState(room);
     now += 5_000;
     observer.triviaAborted(room.code);
@@ -218,6 +240,43 @@ describe('activation analytics', () => {
     expect(report.selections.maps).toEqual([]);
     const persisted = await import('node:fs/promises').then(fs => fs.readFile(file, 'utf8'));
     expect(persisted).not.toMatch(/Private Ada|Private Grace|question|answer|transcript|QUIZ|slot/i);
+  });
+
+  it('keeps one Trivia session through recoverable question audio failure', async () => {
+    const file = `data/_test-analytics-${process.pid}-${Date.now()}-trivia-audio.json`; files.push(file);
+    const today = new Date().toISOString().slice(0, 10);
+    let now = Date.parse(`${today}T12:00:00Z`);
+    const store = new AnalyticsStore(file, 'secret');
+    const observer = new AnalyticsObserver(store, () => now);
+    const room = new TriviaRoom('AUDIO', { bank: triviaBank, now: () => now, countdownMs: 1 });
+    const joined = room.addPlayer('Private Ada');
+    if ('error' in joined) throw new Error(joined.error);
+    expect(room.advance()).toBe(true);
+    expect(room.voteCategory(joined.playerId, 'science')).toBe(true);
+    expect(room.advance()).toBe(true);
+    observer.triviaState(room);
+    expect(room.ready(room.state().loadingGeneration)).toBe(true);
+    now = room.state().countdownEndsAtMs!;
+    room.tick();
+    const firstAttempt = room.state();
+    expect(firstAttempt.phase).toBe('question_prompt');
+    now += 5_000;
+    expect(room.pauseAudio(firstAttempt.question!.id, firstAttempt.questionAttemptId!)).toBe(true);
+    observer.triviaState(room);
+    expect(store.report(today, today, 'trivia').summary.sessions).toBe(0);
+
+    now += 2_000;
+    expect(room.retryQuestion(firstAttempt.question!.id, firstAttempt.questionAttemptId!)).toBe(true);
+    expect(room.state().questionAttemptId).toBe(firstAttempt.questionAttemptId! + 1);
+    observer.triviaState(room);
+    now += 1_000;
+    observer.triviaAborted(room.code);
+    observer.triviaAborted(room.code);
+    await store.flush();
+
+    expect(store.report(today, today, 'trivia').summary).toMatchObject({
+      participants: 1, sessions: 1, completed: 0, abandoned: 1, playSeconds: 8,
+    });
   });
 
   it('records Karaoke generations, song selection, completion, abandonment, and semantic setup actions', async () => {

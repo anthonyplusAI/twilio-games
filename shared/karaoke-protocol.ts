@@ -52,6 +52,8 @@ export interface KaraokeState {
   catalog: readonly KaraokeSong[];
   selectedSong: KaraokeSong | null;
   selectedByPlayerId: string | null;
+  /** Increments even when the current singer selects the same song again. */
+  selectionGeneration: number;
   loadingGeneration: number;
   /** Present on server snapshots; optional for locally-created demo/test snapshots. */
   displayReady?: boolean;

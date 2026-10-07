@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { WebSocket } from 'ws';
 import type { ArcadeApi } from '../server/arcade-api';
 import { BattleServer } from '../server/battle-server';
 import { ChessRoom } from '../server/chess-room';
@@ -16,6 +17,7 @@ import { KARAOKE_COUNTDOWN_MS } from '../shared/karaoke-protocol';
 
 let server: HttpServer | undefined;
 let directory: string | undefined;
+const DISPLAY_TOKEN = 'fighter-station-test-display-token';
 
 afterEach(async () => {
   vi.useRealTimers();
@@ -35,6 +37,7 @@ async function harness() {
     start: vi.fn(async () => {}),
     activateMessagingDelivery: vi.fn(async () => {}),
     stop: vi.fn(async () => {}),
+    requiresStationVoiceAssignment: vi.fn(() => false),
     isStationEngineRoom,
     stationEnginePhase: vi.fn((_game: string, code: string) => (
       isStationEngineRoom(code) ? 'PLAYING' : null
@@ -47,6 +50,7 @@ async function harness() {
     port: 0,
     publicBaseUrl: 'http://localhost',
     validateSignatures: false,
+    fighterDisplayToken: DISPLAY_TOKEN,
     arcadeApi,
     analyticsPath: path.join(directory, 'analytics.json'),
     manifestPath: path.join(directory, 'manifest.json'),
@@ -57,10 +61,10 @@ async function harness() {
     fighterPreviewDir: path.join(directory, 'fighter-previews'),
     clientDir: path.join(directory, 'client'),
   });
-  await server.start();
+  const port = await server.start();
   const games = server as unknown as { battle: BattleServer; chess: ChessServer; fighter: FighterServer; karaoke: KaraokeServer };
   const chessLifecycle = server as unknown as { abandonUnfinishedChessStationRoom(code: string): void };
-  return { ...games, started, completed, abandoned, isStationEngineRoom,
+  return { ...games, port, started, completed, abandoned, isStationEngineRoom,
     abandonChess: (code: string) => chessLifecycle.abandonUnfinishedChessStationRoom(code) };
 }
 
@@ -169,8 +173,10 @@ describe('station engine room lifecycle', () => {
   });
 
   it('keeps Fighter setup inert, then distinguishes abandonment from completion', async () => {
-    const { fighter, started, completed, abandoned } = await harness();
+    const { fighter, port, started, completed, abandoned, isStationEngineRoom } = await harness();
     const roomCode = 'FIGHTER-ABANDON';
+    const completeCode = 'FIGHTER-COMPLETE';
+    isStationEngineRoom.mockImplementation(code => code === roomCode || code === completeCode);
     const playerId = fighter.voiceJoin(roomCode, 'Ada')!;
 
     expect(fighter.voiceAdvance(roomCode, playerId)).toBe(true);
@@ -181,7 +187,7 @@ describe('station engine room lifecycle', () => {
     const room = fighter.findRoom(roomCode)!;
     expect(room.phase).toBe('loading');
     expect(room.ready(room.state().loadingGeneration)).toBe(true);
-    fighter.voiceCommand(roomCode, playerId, 'forward');
+    await vi.waitFor(() => expect(started).toHaveBeenCalledTimes(1));
     expect(started).toHaveBeenCalledTimes(1);
     expect(started).toHaveBeenCalledWith('fighter', roomCode);
     room.tick(FIGHTER_INTRO_SECONDS);
@@ -196,7 +202,7 @@ describe('station engine room lifecycle', () => {
     expect(room.phase).toBe('loading');
     expect(abandoned).not.toHaveBeenCalled();
     expect(room.ready(room.state().loadingGeneration)).toBe(true);
-    fighter.voiceCommand(roomCode, playerId, 'forward');
+    await vi.waitFor(() => expect(room.phase).toBe('intro'));
     expect(started).toHaveBeenCalledTimes(1);
 
     room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
@@ -208,7 +214,6 @@ describe('station engine room lifecycle', () => {
     expect(abandoned).toHaveBeenCalledTimes(1);
     expect(abandoned).toHaveBeenCalledWith('fighter', roomCode);
 
-    const completeCode = 'FIGHTER-COMPLETE';
     const completePlayer = fighter.voiceJoin(completeCode, 'Grace')!;
     fighter.voiceAdvance(completeCode, completePlayer);
     fighter.voiceSelectFighter(completeCode, completePlayer, 'nyx');
@@ -216,11 +221,23 @@ describe('station engine room lifecycle', () => {
     fighter.voiceSelectMap(completeCode, completePlayer, 'void');
     fighter.voiceAdvance(completeCode, completePlayer);
     const completeRoom = fighter.findRoom(completeCode)!;
+    const display = new WebSocket(`ws://127.0.0.1:${port}/fighter?display=1`);
+    const displayMessages: Record<string, unknown>[] = [];
+    display.on('message', data => displayMessages.push(JSON.parse(data.toString()) as Record<string, unknown>));
+    await new Promise<void>((resolve, reject) => {
+      display.once('open', resolve);
+      display.once('error', reject);
+    });
+    display.send(JSON.stringify({ type: 'display_auth', roomCode: completeCode, token: DISPLAY_TOKEN }));
+    display.send(JSON.stringify({ type: 'spectate', roomCode: completeCode }));
+    await vi.waitFor(() => expect(displayMessages).toContainEqual(expect.objectContaining({
+      type: 'host_identity', roomCode: completeCode, isHost: true,
+    })));
     completeRoom.ready(completeRoom.state().loadingGeneration);
+    await vi.waitFor(() => expect(started).toHaveBeenCalledTimes(2));
     completeRoom.tick(FIGHTER_INTRO_SECONDS);
     completeRoom.tick(6);
     fighter.voiceCommand(completeCode, completePlayer, 'forward');
-    expect(started).toHaveBeenCalledTimes(2);
 
     completeRoom.tick(1);
     const world = completeRoom.state().world!;
@@ -230,16 +247,19 @@ describe('station engine room lifecycle', () => {
     fighter.voiceCommand(completeCode, completePlayer, 'forward');
     expect(completeRoom.phase).toBe('victory');
     expect(completed).not.toHaveBeenCalled();
-    completeRoom.tick(FIGHTER_VICTORY_SECONDS - 0.1);
-    fighter.voiceCommand(completeCode, completePlayer, 'forward');
+    completeRoom.tick(FIGHTER_VICTORY_SECONDS);
+    expect(completeRoom.phase).toBe('results');
+    expect(completeRoom.resultsPresented).toBe(false);
     expect(completed).not.toHaveBeenCalled();
-    completeRoom.tick(0.1);
-    fighter.voiceCommand(completeCode, completePlayer, 'forward');
-    fighter.voiceCommand(completeCode, completePlayer, 'forward');
-    expect(completed).toHaveBeenCalledTimes(1);
+    display.send(JSON.stringify({
+      type: 'ack_display', phase: 'results', loadingGeneration: completeRoom.state().loadingGeneration,
+    }));
+    await vi.waitFor(() => expect(completed).toHaveBeenCalledTimes(1));
+    expect(completeRoom.resultsPresented).toBe(true);
     expect(completed).toHaveBeenCalledWith('fighter', completeCode, expect.any(Array));
     fighter.voiceLeave(completeCode, completePlayer);
     expect(abandoned).toHaveBeenCalledTimes(1);
+    display.close();
   });
 
   it('completes a started Monsters battle once across duplicate result callbacks', async () => {

@@ -97,7 +97,7 @@ Open **Settings > Secrets and variables > Actions > Secrets** and configure:
 | `GOOGLE_OAUTH_CLIENT_ID` | Required for Google private-access login | Stored as Container App secret `google-oauth-client-id`; Google OAuth web client ID |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | Required for Google private-access login | Stored as Container App secret `google-oauth-client-secret`; Google OAuth web client secret |
 | `ANALYTICS_ADMIN_PIN` | Required when Google is unset | 6-64 character alternative login for analytics and operator access; stored as Container App secret `analytics-admin-pin` |
-| `OPENAI_API_KEY` | No | Enables English free-form Racer and Monsters help; empty uses deterministic behavior, and Portuguese free-form OpenAI remains disabled |
+| `OPENAI_API_KEY` | Required for production | Enables bounded conversational command interpretation in all six games and both locales; local runs without it use deterministic commands |
 | `DEEPGRAM_API_KEY` | Yes | Enables direct 8 kHz inbound caller-audio lyric verification for Voice Karaoke; production fails closed without it because Karaoke is enabled by default |
 | `DUB_API_KEY` | No | Enables shortening of eligible challenge portal URLs when paired with `DUB_SHORT_DOMAIN`; empty preserves the original application URL |
 | `DUB_FOLDER_ID` | No | Optional Dub folder for created challenge links; it has no effect without an enabled Dub shortener |
@@ -142,7 +142,7 @@ Open **Settings > Secrets and variables > Actions > Variables** and configure as
 | `TWILIO_MESSAGING_SERVICE_SID` | Required for WhatsApp Phone CTA and out-of-session notices | Messaging Service SID containing the approved WhatsApp sender |
 | `ARCADE_OUTBOUND_MESSAGING_ENABLED` | No | Set to literal `true` only after REST credentials, senders, callbacks, and templates are ready; defaults off. The operator console reports whether proactive delivery is effectively enabled separately from inbound onboarding. |
 | `TWILIO_WHATSAPP_CONTENT_SID_STATION_{ADMITTED,OVERFLOW,CALL_NOW,RESULTS,NEXT_GAME}_{EN_US,PT_BR}` | Call-now required for Phone CTA; others required out of session | Ten approved Content SIDs covering five station notice kinds in English and Brazilian Portuguese |
-| `CR_TTS_VOICE` | No | ElevenLabs voice ID for Conversation Relay TTS; empty uses the Relay default |
+| `CR_TTS_VOICE` | No | English ElevenLabs voice ID for all six games; deployment pins `xp3gDg85YgFcWpnNVlIu` |
 | `CR_TTS_VOICE_PT_BR` | No | Optional Brazilian Portuguese ElevenLabs voice ID; empty uses Relay's `pt-BR` default |
 | `DEFAULT_LOCALE` | No | Fallback when the dialed number and selected display do not identify a locale; defaults to `en-US` |
 | `OPENAI_MODEL` | No | OpenAI model name; empty defaults to `gpt-4o-mini` |

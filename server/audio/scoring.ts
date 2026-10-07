@@ -1,4 +1,5 @@
 import type { AudioFrameObservation } from './frame-analyzer';
+import { lyricSimilarity } from './lyric-similarity';
 
 export const KARAOKE_TIMING_SCORE_WEIGHT = 0.5;
 export const KARAOKE_LYRIC_SCORE_WEIGHT = 0.3;
@@ -356,21 +357,26 @@ export class KaraokeScoreAccumulator {
       const recognizedMidpoint = (recognized.songStartMs + recognized.songEndMs) / 2;
       let bestIndex = -1;
       let bestDistance = Number.POSITIVE_INFINITY;
+      let bestSimilarity = 0;
+      let secondSimilarity = 0;
       for (let index = nextWordIndex; index < this.words.length; index += 1) {
         const expected = this.words[index]!;
         if (expected.startMs - this.options.lyricAlignmentToleranceMs > recognized.songEndMs) break;
         if (expected.endMs + this.options.lyricAlignmentToleranceMs < recognized.songStartMs) continue;
-        if (normalizeKaraokeLyricWord(expected.text, this.options.locale) !== normalizedRecognized) continue;
+        const similarity = lyricSimilarity(expected.text, normalizedRecognized, this.options.locale);
+        if (similarity === 0 || (similarity < 1 && recognized.confidence < 0.8)) continue;
         const distance = Math.abs(recognizedMidpoint - (expected.startMs + expected.endMs) / 2);
-        if (distance < bestDistance) {
+        if (similarity > bestSimilarity || (similarity === bestSimilarity && distance < bestDistance)) {
+          secondSimilarity = bestSimilarity;
           bestIndex = index;
+          bestSimilarity = similarity;
           bestDistance = distance;
-        }
+        } else secondSimilarity = Math.max(secondSimilarity, similarity);
       }
-      if (bestIndex < 0) continue;
+      if (bestIndex < 0 || (bestSimilarity < 1 && bestSimilarity - secondSimilarity < 0.05)) continue;
       matches.push(Object.freeze({
         wordIndex: bestIndex,
-        score: recognized.confidence,
+        score: recognized.confidence * bestSimilarity,
         source: recognized.source,
         sourceStartMs: recognized.sourceStartMs,
         sourceEndMs: recognized.sourceEndMs,

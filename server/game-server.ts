@@ -5,7 +5,7 @@ import { RoomManager } from './room-manager';
 import { Room, type RoomConfig } from './room';
 import { STEP } from '../shared/constants';
 import { INTENTS } from '../shared/types';
-import type { ClientMessage, ServerMessage, GameEvent, Phase } from '../shared/types';
+import type { ClientMessage, ServerMessage, GameEvent, Phase, MenuTouchState } from '../shared/types';
 import { DEFAULT_LOCALE, isSupportedLocale, type SupportedLocale } from '../shared/i18n/locales';
 
 type ParseResult = ClientMessage | { type: 'error'; code: string; message: string };
@@ -40,6 +40,29 @@ export function parseClientMessage(raw: string): ParseResult {
       return { type: 'select_map', map: obj.map };
     case 'advance': return { type: 'advance' };
     case 'back':    return { type: 'back' };
+    case 'display_select_car':
+      if (typeof obj.roomCode !== 'string' || obj.expectedPhase !== 'car_select'
+        || typeof obj.forPlayerId !== 'string' || !/^p\d+$/.test(obj.forPlayerId)
+        || !Number.isInteger(obj.carIndex)) return err('bad_display_action', 'invalid car selection');
+      return { type: 'display_select_car', roomCode: obj.roomCode,
+        expectedPhase: 'car_select', forPlayerId: obj.forPlayerId, carIndex: obj.carIndex };
+    case 'display_select_map':
+      if (typeof obj.roomCode !== 'string' || obj.expectedPhase !== 'map_select'
+        || typeof obj.forPlayerId !== 'string' || !/^p\d+$/.test(obj.forPlayerId)
+        || typeof obj.map !== 'string') return err('bad_display_action', 'invalid map selection');
+      return { type: 'display_select_map', roomCode: obj.roomCode,
+        expectedPhase: 'map_select', forPlayerId: obj.forPlayerId, map: obj.map };
+    case 'display_advance':
+      if (typeof obj.roomCode !== 'string'
+        || !['lobby', 'car_select', 'map_select', 'results'].includes(obj.expectedPhase)
+        || (obj.forPlayerId !== undefined && (typeof obj.forPlayerId !== 'string'
+          || !/^p\d+$/.test(obj.forPlayerId)))) return err('bad_display_action', 'invalid advance');
+      return { type: 'display_advance', roomCode: obj.roomCode, expectedPhase: obj.expectedPhase,
+        ...(obj.forPlayerId ? { forPlayerId: obj.forPlayerId } : {}) };
+    case 'display_back':
+      if (typeof obj.roomCode !== 'string'
+        || !['car_select', 'map_select'].includes(obj.expectedPhase)) return err('bad_display_action', 'invalid back');
+      return { type: 'display_back', roomCode: obj.roomCode, expectedPhase: obj.expectedPhase };
     default:        return err('unknown_type', `unknown type ${obj.type}`);
   }
 }
@@ -184,6 +207,7 @@ export class GameServer {
         const room = this.room(msg.roomCode);
         const res = room.addPlayer(msg.name, msg.color);
         if ('error' in res) return this.send(conn, { type: 'error', code: res.error, message: res.error });
+        this.releasePreviousBinding(conn, msg.roomCode);
         conn.roomCode = msg.roomCode; conn.playerId = res.playerId;
         this.send(conn, { type: 'joined', playerId: res.playerId, lane: res.lane, roomCode: msg.roomCode });
         if(['countdown','racing'].includes(room.phase))this.send(conn,anyItems(room));
@@ -244,6 +268,53 @@ export class GameServer {
         }
         break;
       }
+      case 'display_select_car': {
+        const room = this.displayRoomFor(conn, msg.roomCode, msg.expectedPhase);
+        if (!room) break;
+        if (room.touchSelectionTarget() !== msg.forPlayerId) {
+          this.pushLobby(room.code); break;
+        }
+        const before = room.phase;
+        if (!room.selectCar(msg.forPlayerId, msg.carIndex, true)) break;
+        const who = room.lobbyPlayers().find(player => player.playerId === msg.forPlayerId);
+        this.emitEvent(room.code, { kind: 'car_picked', playerId: msg.forPlayerId,
+          name: who?.name ?? 'Racer', car: room.carName(msg.carIndex) });
+        this.publishSetupMutation(room, before);
+        break;
+      }
+      case 'display_select_map': {
+        const room = this.displayRoomFor(conn, msg.roomCode, msg.expectedPhase);
+        if (!room) break;
+        if (room.touchSelectionTarget() !== msg.forPlayerId) {
+          this.pushLobby(room.code); break;
+        }
+        const before = room.phase;
+        if (!room.selectMap(msg.map, msg.forPlayerId, true)) break;
+        this.emitEvent(room.code, { kind: 'map_picked', map: msg.map, playerId: msg.forPlayerId });
+        this.publishSetupMutation(room, before);
+        break;
+      }
+      case 'display_advance': {
+        const room = this.displayRoomFor(conn, msg.roomCode, msg.expectedPhase);
+        if (!room) break;
+        if (this.stationResultsLocked(room)) break;
+        const first = room.lobbyPlayers()[0]?.playerId;
+        if (msg.forPlayerId !== first) {
+          // A display may advance a standalone results screen when only next-round callers remain.
+          if (first || msg.forPlayerId) { this.pushLobby(room.code); break; }
+        }
+        const before = room.phase;
+        if (!room.advance(msg.forPlayerId)) { this.pushLobby(room.code); break; }
+        this.publishSetupMutation(room, before);
+        break;
+      }
+      case 'display_back': {
+        const room = this.displayRoomFor(conn, msg.roomCode, msg.expectedPhase);
+        if (!room || room.usesStationSetup) break;
+        room.back();
+        this.pushLobby(room.code);
+        break;
+      }
       case 'advance': {
         const room = conn.roomCode ? this.rooms.find(conn.roomCode) : undefined;
         if (room) {
@@ -295,13 +366,16 @@ export class GameServer {
         if (stationDisplay && (!this.displayToken || msg.displayToken !== this.displayToken)) {
           return this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'bad_display_auth' });
         }
+        const room = this.room(msg.roomCode);
+        if (conn.roomCode !== msg.roomCode || conn.playerId || conn.stationDisplay !== stationDisplay) {
+          this.releasePreviousBinding(conn, msg.roomCode);
+        }
         conn.stationDisplay = stationDisplay;
         conn.hostAuthorized = !stationDisplay || msg.displayToken === this.displayToken;
         if (this.displayToken && msg.displayToken === this.displayToken) this.onDisplayAuthenticated?.(conn.ws);
-        const room = this.room(msg.roomCode);
         conn.roomCode = msg.roomCode;   // no playerId: receives broadcasts, occupies no slot
         this.pushLobby(msg.roomCode);   // send the display the current select/lobby state immediately
-        {const room=this.rooms.find(msg.roomCode);if(room&&['countdown','racing'].includes(room.phase))this.send(conn,anyItems(room));}
+        if (['countdown', 'racing'].includes(room.phase)) this.send(conn, anyItems(room));
         break;
       }
       case 'leave': {
@@ -310,7 +384,22 @@ export class GameServer {
         if (conn.roomCode && conn.playerId) {
           const room=this.rooms.find(conn.roomCode);if(room){const before=room.phase;room.removePlayer(conn.playerId);this.reportAbandonedIfReset(room);this.publishSetupMutation(room,before);}
           conn.playerId = undefined;
+          conn.hostAuthorized = false;
+          conn.stationDisplay = false;
           this.reapRoomIfEmpty(conn.roomCode);
+        } else if (conn.roomCode) {
+          // A display leaving its room is no longer an eligible standalone voice destination.
+          const roomCode = conn.roomCode;
+          if (conn.stationDisplay) {
+            const room = this.rooms.find(roomCode);
+            if (room?.phase === 'countdown' && this.stationRendererReady.get(room) === conn.ws) {
+              this.stationRendererReady.delete(room);
+            }
+          }
+          conn.roomCode = undefined;
+          conn.hostAuthorized = false;
+          conn.stationDisplay = false;
+          this.reapRoomIfEmpty(roomCode);
         }
         break;
       }
@@ -361,7 +450,8 @@ export class GameServer {
   voiceSelectMap(roomCode:string,map:string,voterId?:string,allowRevision=false):boolean {
     const room=this.rooms.find(roomCode);if(!room)return false;const before=room.phase;
     if(!room.selectMap(map,voterId,allowRevision))return false;
-    this.emitEvent(roomCode,{kind:'map_picked',map,...(voterId?{playerId:voterId}:{})});
+    this.emitEvent(roomCode,{kind:'map_picked',map,
+      ...(voterId?{playerId:voterId,spokenReplyPlayerId:voterId}:{})});
     this.publishSetupMutation(room,before,voterId);
     return true;
   }
@@ -421,6 +511,30 @@ export class GameServer {
     return !this.allowBrowserPlayer(room.code) && ['results', 'finished'].includes(room.phase);
   }
 
+  /** A display tap is bound to the exact room and screen it saw. The caller seat is checked
+   * separately against the room's current selector target before changing any game state. */
+  private displayRoomFor(conn: Conn, roomCode: string, expectedPhase: Phase): Room | null {
+    if (!conn.hostAuthorized || conn.playerId || !conn.roomCode || conn.roomCode !== roomCode) {
+      this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'bad_display_auth' });
+      return null;
+    }
+    const room = this.rooms.find(roomCode);
+    if (!room || room.phase !== expectedPhase) {
+      if (room) this.pushLobby(roomCode);
+      return null;
+    }
+    return room;
+  }
+
+  private menuTouchState(room: Room): MenuTouchState {
+    const advancePlayerId = room.lobbyPlayers()[0]?.playerId ?? null;
+    return {
+      activePlayerId: room.touchSelectionTarget(), advancePlayerId,
+      canAdvance: !this.stationResultsLocked(room) && room.canAdvance(advancePlayerId ?? undefined),
+      canBack: !room.usesStationSetup && (room.phase === 'car_select' || room.phase === 'map_select'),
+    };
+  }
+
   /** Test seam: advance one room's simulation by `dt` (drives the same stepRoom path the loop uses),
    *  so the racing→results→leaderboard reporting can be verified deterministically without real time. */
   stepRoomForTest(room: Room, dt: number): void { this.stepRoom(room, dt); }
@@ -436,6 +550,35 @@ export class GameServer {
   /** Live WS connections (displays + device players). Used by the voice router to auto-join a caller
    *  to whichever game currently has an open display. */
   get connectionCount(): number { return this.conns.size; }
+
+  /** A standalone screen must have accepted spectate for this exact room and still be connected. */
+  hasStandaloneDisplay(ws: WebSocket, roomCode: string): boolean {
+    if (!this.allowBrowserPlayer(roomCode) || !this.rooms.find(roomCode)) return false;
+    return [...this.conns].some(conn => conn.ws === ws && conn.roomCode === roomCode
+      && !conn.playerId && !conn.stationDisplay && conn.hostAuthorized === true
+      && conn.ws.readyState === WebSocket.OPEN);
+  }
+
+  /** Switching one socket's room or role must release its old roster/display binding first. */
+  private releasePreviousBinding(conn: Conn, retainingRoomCode: string): void {
+    const previousCode = conn.roomCode;
+    if (!previousCode) return;
+    const room = this.rooms.find(previousCode);
+    if (conn.stationDisplay && room?.phase === 'countdown'
+      && this.stationRendererReady.get(room) === conn.ws) this.stationRendererReady.delete(room);
+    const previousPlayerId = conn.playerId;
+    conn.roomCode = undefined;
+    conn.playerId = undefined;
+    conn.stationDisplay = false;
+    conn.hostAuthorized = false;
+    if (room && previousPlayerId) {
+      const before = room.phase;
+      room.removePlayer(previousPlayerId);
+      this.reportAbandonedIfReset(room);
+      this.publishSetupMutation(room, before);
+    }
+    if (previousCode !== retainingRoomCode) this.reapRoomIfEmpty(previousCode);
+  }
 
   preferredLocale(roomCode?: string, fallback: SupportedLocale = DEFAULT_LOCALE): SupportedLocale {
     const matching = [...this.conns].filter(conn => (!roomCode || conn.roomCode === roomCode) && conn.locale);
@@ -540,16 +683,18 @@ export class GameServer {
   private preRaceMessage(room: Room): ServerMessage {
     const phase = room.phase;
     if (phase === 'results') {
-      return { type: 'results', roomCode: room.code, map: room.selectedMap, results: room.results() };
+      return { type: 'results', roomCode: room.code, map: room.selectedMap,
+        results: room.results(), touch: this.menuTouchState(room) };
     }
     if (phase === 'car_select' || phase === 'map_select') {
       const votes = room.mapVotes();
       return { type: 'select_state', roomCode: room.code, phase, players: room.lobbyPlayers(),
         maps: room.mapChoices, selectedMap: room.selectedMap,
-        mapVotes: votes.counts, mapTie: votes.tie };
+        mapVotes: votes.counts, mapTie: votes.tie, touch: this.menuTouchState(room) };
     }
     // lobby
-    return { type: 'lobby', roomCode: room.code, players: room.lobbyPlayers(), phase };
+    return { type: 'lobby', roomCode: room.code, players: room.lobbyPlayers(),
+      phase, touch: this.menuTouchState(room) };
   }
 
   private broadcastAll(): void {

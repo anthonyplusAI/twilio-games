@@ -100,7 +100,7 @@ flowchart LR
 - `assets/` contains runtime 3D assets, manifests, map catalogs, previews, and attribution records.
 - `tools/` contains asset inspection, optimization, fixture, and browser smoke-test utilities.
 
-One `/voice` WebSocket serves all games. In station mode, persisted admission selects the exact game, room, launch generation, player identity, participant index, and expected participant count. In standalone mode, routing requires a connected `display=1` screen for an enabled game and chooses the most recently connected eligible display. It returns localized unavailable TwiML when no eligible display is open; it never claims Voice Racer as a default.
+One `/voice` WebSocket serves all games. In station mode, persisted admission selects the exact game, room, launch generation, player identity, participant index, and expected participant count. In standalone mode, routing requires exactly one enabled game with a connected `display=1` screen actually joined to the call's room. With no eligible display or more than one different eligible game display, the call receives localized unavailable TwiML instead of joining the wrong game.
 
 ## Game Flow
 
@@ -128,7 +128,7 @@ flowchart TD
   Mode -->|off with standalone Voice enabled| Select[Select a game and open its display in room 4821]
   Select --> Open[Keep an eligible display=1 WebSocket open]
   Open --> Incoming[Call POST /voice/incoming]
-  Incoming --> Route[Route to the most recently connected eligible display]
+  Incoming --> Route[Route to the single eligible game display]
   Route --> Racer[Voice Racer standalone flow]
   Route --> Monsters[Voice Monsters standalone flow]
   Route --> Fighter[Voice Fighter standalone flow]
@@ -137,9 +137,9 @@ flowchart TD
   Route --> Chess[Voice Chess caller versus computer flow]
 ```
 
-During an active station event, incoming calls route directly to each admitted caller's assigned game room without asking for a room code. Each caller controls one stable engine slot and makes only their own car, monster, fighter, song, track, arena, category, Trivia answer, or Chess move choices. Voice Karaoke admits one singer and requires both display-audio readiness and an authenticated Media Stream before its countdown. Voice Trivia admits 1-4 callers; Racer, Monsters, and Fighter admit one or two, and Monsters and Fighter add an AI opponent for solo play. Voice Chess admits one caller against the computer. In Standalone Play, Setup exposes the same persisted game order as the home-screen display order; the first three enabled games appear on page one, with Karaoke fourth, Trivia fifth, and Chess sixth on page two by default.
+During an active station event, incoming calls route directly to each admitted caller's assigned game room without asking for a room code. Each caller controls one stable engine slot by voice; anyone at the shared screen may tap current menus and selectors, but live racing, attacks, trivia answers, and chess moves remain voice or keypad actions. Voice Karaoke admits one singer and requires both display-audio readiness and an authenticated Media Stream before its countdown. Voice Trivia admits 1-4 callers; Racer, Monsters, and Fighter admit one or two, and Monsters and Fighter add an AI opponent for solo play. Voice Chess admits one caller against the computer. In Standalone Play, Setup exposes the same persisted game order as the home-screen display order; the first three enabled games appear on page one, with Karaoke fourth, Trivia fifth, and Chess sixth on page two by default.
 
-When station mode is `off`, the home page becomes the standalone launcher. Standalone calls use room `4821` by default, but they still require an eligible open shared display. `/voice/join` remains a legacy alias that accepts posted DTMF digits as a room code. Mode-off deployments with standalone Voice disabled, and standalone calls without an eligible display, receive localized Say-and-Hangup TwiML.
+When station mode is `off`, the home page becomes the standalone launcher. Standalone calls use room `4821` by default, but they still require an eligible open shared display. `/voice/join` remains a legacy alias that accepts posted DTMF digits as a room code; non-default Trivia and Chess rooms require a room-authenticated display, which the stock standalone pages do not provision. Mode-off deployments with standalone Voice disabled, and standalone calls without an eligible display, receive localized Say-and-Hangup TwiML.
 
 ### Voice Karaoke
 
@@ -174,7 +174,7 @@ Deepgram bills against the selected project's credits. Review its balance and **
 
 ### Voice Trivia
 
-Voice Trivia is a no-AI, server-authoritative quiz with 1-4 caller capacity. Station matches assign 1-4 callers; the default standalone voice route creates a one-caller roster. Trivia is enabled in fresh settings, appears fifth in the default standalone order, and keeps stable station and Messaging option `5` even when games are disabled or reordered. Standalone uses <http://localhost:5173/trivia.html?display=1&room=4821> and same-origin `/trivia?display=1`; station launches use `/trivia.html` with the generated room plus `station`, `match`, and `launchGeneration` parameters, then authenticate the same `/trivia` WebSocket with the paired display capability.
+Voice Trivia is a server-authoritative quiz with 1-4 caller capacity. Questions, answers, timing, and scores remain deterministic; the optional semantic voice interpreter only maps conversational speech to a currently valid choice. Station matches assign 1-4 callers; the default standalone voice route creates a one-caller roster. Trivia is enabled in fresh settings, appears fifth in the default standalone order, and keeps stable station and Messaging option `5` even when games are disabled or reordered. Standalone uses <http://localhost:5173/trivia.html?display=1&room=4821> and same-origin `/trivia?display=1`; station launches use `/trivia.html` with the generated room plus `station`, `match`, and `launchGeneration` parameters, then authenticate the same `/trivia` WebSocket with the paired display capability.
 
 The standalone Trivia lobby shows a QR code for the configured locale's call number, plus a tappable number. Station launches use the separate station join QR instead.
 
@@ -183,8 +183,8 @@ The caller flow is:
 1. Each caller joins through `/voice`. Standalone asks for a first name; station play reuses the registered first name unless it is missing.
 2. After all 1-4 expected callers connect and confirm names, the room enters `category_select`. Each caller casts or revises one vote among General Knowledge, Science, Geography, History, Entertainment, Sports, Technology, Twilio, and the Mixed round mode. A unique plurality wins; a tied plurality or no votes falls back to Mixed.
 3. `loading` snapshots eight questions and shuffled choices from the current server bank. The authoritative display must signal readiness for that loading generation within 30 seconds, then a three-second `countdown` runs.
-4. After the countdown and each reveal, the room publishes the redacted question directly in `question`. The shared 10-second window starts at that publication timestamp; Conversation Relay immediately cancels stale previous-phase speech and begins reading the question and numbered choices. TTS playback and `tokensPlayed` acknowledgements never gate or shift the timer.
-5. Answer as soon as the question appears, including while Relay is still speaking. Prefer `one` through `four` or keypad DTMF `1`-`4`; cardinal and ordinal words, bounded natural phrases, safe exact letter names, explicitly marked `A`-`D` variants, and exact/carrier-wrapped answer text or aliases also work. Common homophones such as `be`, `see`, `the`, and `de` require an explicit marker such as `answer`, `letter`, or `option`; incidental, negated, and multi-choice mentions are rejected. The first valid final answer locks even when wrong. A matching interim transcript records only its onset for speed scoring, including across the same utterance's Relay interrupt notification, and that on-time onset may receive its final frame during the 1.5-second transport grace. An unanswered reconnect replays the current numbered question with remaining-time guidance without changing shared timestamps; a locked reconnect does not replay it.
+4. After the countdown and each reveal, the room publishes a redacted `question_prompt` state. The authenticated display acknowledges the painted question, then each phone reads the question and four choices. After current callers finish or deliberately skip their prompt and answer cue, the room opens the same shared 10-second answer window. Twilio documents a `tokens-played` event subscription, but its WebSocket message guide does not specify the playback acknowledgement payload; normal completion therefore also supports a conservative speech-duration estimate. A Relay error pauses the round in `audio_problem`, where an operator can replay the same question.
+5. Callers can interrupt the prompt and answer early, including by keypad DTMF `1`-`4`; early choices are held for the current question and cannot select a future one. Cardinal and ordinal words, conversational answer phrases, safe letter names, and answer text or aliases are accepted when unambiguous. Negated, incidental, and multi-choice mentions are rejected. The first valid final answer locks even when wrong. A final recognition frame during the 1.5-second transport grace can count a clear answer begun before the deadline; semantic interpretation has at most three seconds to resolve that same choice. A late or changed choice cannot borrow the earlier onset. An unanswered reconnect gets current-question guidance without resetting the shared clock; a locked reconnect does not replay it.
 6. When all players lock or the deadline settles, the four-second `reveal` discloses the correct choice, explanation, raw points, and standings. After eight questions, `results` shows raw and normalized scores, correct count, best streak, and final rank. Winner, tie, and personal phone result lines narrate the same normalized leaderboard scores shown prominently on the final display.
 
 A category round selects two easy, four medium, and two hard questions. Mixed selects one question from each of the eight content categories with the same overall difficulty distribution. Correct answers earn 1,300 raw points before 3 seconds, 1,200 from 3 to under 6 seconds, 1,100 from 6 to under 9 seconds, and 1,000 from 9 through 10 seconds. Consecutive correct answers add 100 points per answer after the first, capped at 500 per answer; a wrong answer or timeout resets the streak. The maximum raw score is 12,900, and the leaderboard score is `round(raw * 100000 / 12900)`, capped by construction at 100,000.
@@ -276,8 +276,8 @@ Standalone keyboard controls:
 | Voice Monsters | `1`-`4` choose root actions or moves, `0` returns from the move menu, `Enter` advances |
 | Voice Fighter | `A` back, `D` forward, `W` or Space jump, `J` punch, `K` kick, `L` block; number keys select cards |
 | Voice Karaoke | `P` toggles the hidden local test singer, `1`-`4` select songs or hit lanes, and `Enter` advances setup |
-| Voice Trivia | None; the shared display is read-only and answers come from caller speech or DTMF |
-| Voice Chess | None; the shared display is read-only and moves come from caller speech or DTMF confirmation |
+| Voice Trivia | Category selector buttons can be tapped; answers come from caller speech or DTMF |
+| Voice Chess | A standalone replay selector can be tapped after a game; moves come from caller speech or DTMF confirmation |
 
 To test a browser player instead of a spectator, omit `display=1` and add a name where supported, for example <http://localhost:5173/play.html?room=4821&name=Ada> or <http://localhost:5173/monsters.html?room=4821&name=Ada>. Voice Fighter joins a local player from its shared display with `P`.
 
@@ -325,10 +325,10 @@ The application runs locally without Twilio, OpenAI, or Deepgram credentials. Co
 | `TWILIO_VALIDATE_SIGNATURES` | Explicitly enables or disables webhook signature validation | Enabled when an Auth Token is set or `NODE_ENV=production` |
 | `GAME_PHONE_NUMBER` | Legacy Voice fallback used for both locales only while neither operator-configured locale number exists | Placeholder or unavailable state when unset |
 | `VOICE_RELAY_TOKEN` | Dedicated bearer token for Conversation Relay setup frames | Required and separate from `TWILIO_AUTH_TOKEN` in production |
-| `CR_TTS_VOICE` | ElevenLabs voice ID used by Conversation Relay talk-back | Relay default voice |
+| `CR_TTS_VOICE` | English ElevenLabs voice ID used by every game's Conversation Relay talk-back | `xp3gDg85YgFcWpnNVlIu` |
 | `CR_TTS_VOICE_PT_BR` | Optional Brazilian Portuguese ElevenLabs voice ID | Relay's `pt-BR` default voice |
 | `DEFAULT_LOCALE` | Call locale when no localized game display is connected | `en-US` |
-| `OPENAI_API_KEY` | Enables conversational hosting for Voice Racer and Voice Monsters | Conversational host disabled when unset; deterministic and scripted flows remain |
+| `OPENAI_API_KEY` | Enables phase-bound semantic interpretation of conversational commands in all six games | Required by deployment; local runs without it retain deterministic commands |
 | `OPENAI_MODEL` | OpenAI model used by the optional host | Server default |
 | `DEEPGRAM_API_KEY` | Opens the direct Nova-3 streaming lyric recognizer for Voice Karaoke | Optional for local acoustic fallback; required by production startup and deployment |
 | `KARAOKE_CALIBRATION_OFFSET_MS` | Signed measured caller/carrier offset applied to authoritative Media Stream scoring | `0`; integer from `-5000` to `5000` |

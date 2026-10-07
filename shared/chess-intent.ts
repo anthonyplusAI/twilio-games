@@ -22,7 +22,7 @@ export type ChessIntent =
 
 const PIECE_WORDS: ReadonlyArray<readonly [ChessPieceType, readonly string[]]> = [
   ['p', ['pawn', 'peao']],
-  ['n', ['knight', 'horse', 'cavalo']],
+  ['n', ['knight', 'night', 'horse', 'cavalo']],
   ['b', ['bishop', 'bispo']],
   ['r', ['rook', 'castle piece', 'torre']],
   ['q', ['queen', 'rainha', 'dama']],
@@ -35,7 +35,17 @@ const RANK_WORDS: ReadonlyArray<readonly [string, string]> = [
   ['um', '1'], ['uma', '1'], ['dois', '2'], ['duas', '2'],
   ['tres', '3'], ['quatro', '4'], ['cinco', '5'], ['seis', '6'],
   ['sete', '7'], ['oito', '8'],
+  // Relay may transcribe a spoken coordinate as an ordinary word. These are only
+  // interpreted as ranks when they follow a file letter in spokenSquares().
+  ['too', '2'], ['to', '2'], ['for', '4'], ['ate', '8'],
 ];
+
+const FILE_WORDS: Readonly<Record<string, string>> = {
+  a: 'a', ay: 'a', b: 'b', bee: 'b', be: 'b', c: 'c', see: 'c', sea: 'c',
+  d: 'd', dee: 'd', e: 'e', ee: 'e', f: 'f', eff: 'f', g: 'g', gee: 'g', ge: 'g',
+  h: 'h', aitch: 'h',
+};
+const RANK_BY_WORD = new Map(RANK_WORDS);
 
 function findPiece(text: string): ChessPieceType | undefined {
   const padded = ` ${text} `;
@@ -50,20 +60,29 @@ function findPiece(text: string): ChessPieceType | undefined {
 }
 
 function spokenSquares(text: string): ChessSquare[] {
-  const numbered = RANK_WORDS.reduce(
-    (current, [word, digit]) => current.replace(new RegExp(`\\b${word}\\b`, 'g'), digit), text,
-  );
-  return [...numbered.matchAll(/\b([a-h])\s*([1-8])\b/g)].map(match => `${match[1]}${match[2]}` as ChessSquare);
+  const tokens = text.split(/\s+/).filter(Boolean);
+  const squares: ChessSquare[] = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index]!;
+    if (/^[a-h][1-8]$/.test(token)) { squares.push(token as ChessSquare); continue; }
+    const file = FILE_WORDS[token];
+    const next = tokens[index + 1];
+    const rank = next && (/^[1-8]$/.test(next) ? next : RANK_BY_WORD.get(next));
+    if (file && rank) { squares.push(`${file}${rank}` as ChessSquare); index++; }
+  }
+  return squares;
 }
 
 export function parseChessIntent(spoken: string, locale: SupportedLocale = 'en-US'): ChessIntent {
   const text = normalizeForMatching(spoken, locale).replace(/[-']/g, ' ').trim();
   if (!text) return { kind: 'unknown' };
 
-  if (/^(?:confirm|confirm move|yes|yes confirm|make the move|do it|confirmar|confirma|confirmo|sim|pode jogar)$/.test(text)) {
+  if (/^(?:confirm|confirm move|yes|yes confirm|make the move|do it|confirmar|confirma|confirmo|sim|pode jogar)$/.test(text)
+    || /^(?:yes|yeah|yep|sim)\b.*\b(?:confirm|make|do|play|go ahead|confirma|confirmar|joga|jogar)\b/.test(text)) {
     return { kind: 'confirm' };
   }
-  if (/^(?:cancel|cancel move|no|no cancel|never mind|nevermind|forget it|cancelar|cancela|nao|nao quero|deixa pra la)$/.test(text)) {
+  if (/^(?:cancel|cancel move|no|no cancel|never mind|nevermind|forget it|cancelar|cancela|nao|nao quero|deixa pra la)$/.test(text)
+    || /^(?:actually |please )?(?:cancel|cancela|cancelar)\b.*\b(?:that|move|one|isso|jogada|lance)$/.test(text)) {
     return { kind: 'cancel' };
   }
   if (/^(?:play again|new game|restart|restart game|another game|jogar de novo|jogue de novo|nova partida|novo jogo|recomecar)$/.test(text)) {
@@ -72,6 +91,33 @@ export function parseChessIntent(spoken: string, locale: SupportedLocale = 'en-U
   if (/^(?:help|how do i play|what can i say|ajuda|como jogar|o que posso dizer)$/.test(text)) {
     return { kind: 'help' };
   }
+
+  // A self-correction replaces the earlier destination. Retain an explicit source
+  // and piece only when the replacement did not name its own piece/source.
+  const corrections = [...text.matchAll(/\b(?:no|actually|sorry|nao|corrigindo|quer dizer|i mean|i meant|na verdade)\b/g)]
+    .reverse().filter(match => match.index > 0);
+  for (const correction of corrections) {
+    const before = text.slice(0, correction.index);
+    const after = text.slice(correction.index! + correction[0].length).trim();
+    const revised = parseChessIntent(after, locale);
+    if (revised.kind === 'move' && revised.query.to) {
+      const previousPiece = findPiece(before);
+      const previousSquares = spokenSquares(before);
+      if (!previousSquares.length) continue;
+      return { kind: 'move', query: {
+        ...revised.query,
+        ...(revised.query.piece || !previousPiece ? {} : { piece: previousPiece }),
+        ...(revised.query.from || revised.query.piece || previousSquares.length < 2
+          || !/\b(?:from|de|da casa|do quadrado)\b/.test(before) ? {} : { from: previousSquares[0] }),
+      } };
+    }
+    if (revised.kind !== 'unknown' && revised.kind !== 'move'
+      && parseChessIntent(before, locale).kind !== 'unknown') return revised;
+  }
+
+  if (/^(?:what|how|why|where|when|if|could i|should i|can i|tell me|explain|could you|would you|do you|i want to know|i wonder|o que|como|qual|se eu|posso|devo|eu quero saber|me explique|explique)\b/.test(text)
+    || /\b(?:wonder if|whether|quero saber se)\b/.test(text)
+    || /\b(?:do not|don t|dont|not|never|nao|sem)\b/.test(text)) return { kind: 'unknown' };
 
   if (/\b(?:castle|castling|roque)\b/.test(text) || /^o o(?: o)?$/.test(text)) {
     const side: ChessCastleSide | null = /\b(?:queenside|queen side|long|grande|lado da dama)\b|^o o o$/.test(text)
@@ -96,7 +142,7 @@ export function parseChessIntent(spoken: string, locale: SupportedLocale = 'en-U
     return { kind: 'unknown' };
   }
   if (squares.length === 0 && piece) return { kind: 'select', piece };
-  if (squares.length === 1 && /\b(?:from|de|da casa|do quadrado)\s+[a-h]\s*[1-8]\b/.test(moveText)
+  if (squares.length === 1 && /\b(?:from|de|da casa|do quadrado)\b/.test(moveText)
     && !/\b(?:to|para|pra|em|on)\b/.test(moveText)) {
     return { kind: 'select', from: squares[0], ...(piece ? { piece } : {}) };
   }

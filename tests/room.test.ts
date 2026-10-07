@@ -70,6 +70,26 @@ describe('Room', () => {
     expect(room.mapVotes().counts).toEqual({'Silver Lake':1,Drift:1});
   });
 
+  it('identifies the next caller seat for shared-screen car and track taps', () => {
+    room = new Room('TOUCH', 1, { carCount: 3, maps: ['Silver Lake', 'Drift'] });
+    room.expectHumanPlayers(2);
+    const first = room.addPlayer('Ada', undefined, 0) as { playerId: string };
+    const second = room.addPlayer('Rex', undefined, 1) as { playerId: string };
+    expect(room.touchSelectionTarget()).toBeNull();
+    room.advance(first.playerId);
+    expect(room.touchSelectionTarget()).toBe(first.playerId);
+    room.selectCar(first.playerId, 1);
+    expect(room.touchSelectionTarget()).toBe(second.playerId);
+    room.selectCar(second.playerId, 2);
+    expect(room.touchSelectionTarget()).toBeNull();
+    room.advance(first.playerId);
+    expect(room.touchSelectionTarget()).toBe(first.playerId);
+    room.selectMap('Drift', first.playerId);
+    expect(room.touchSelectionTarget()).toBe(second.playerId);
+    room.selectMap('Silver Lake', second.playerId);
+    expect(room.touchSelectionTarget()).toBeNull();
+  });
+
   it('lets either station player advance after both personal choices are complete', () => {
     room.expectHumanPlayers(2);
     const b=room.addPlayer('Rex',undefined,1) as {playerId:string};
@@ -246,6 +266,28 @@ describe('Room — Smash-style pre-race flow', () => {
     expect(r[0]!.finishT).toBeGreaterThan(0);
   });
 
+  it('keeps the finished scoreboard visible after the last caller hangs up until a new round is ready', () => {
+    room = new Room('RESULT-HOLD', 1, { carCount: 1, maps: ['Silver Lake'] });
+    const first = room.addPlayer('Ada') as { playerId: string };
+    room.start();
+    for (let i = 0; i < 60 * 120 && room.phase !== 'results'; i++) room.tick(STEP);
+    expect(room.phase).toBe('results');
+    const standings = room.results();
+
+    room.removePlayer(first.playerId);
+    expect(room.phase).toBe('results');
+    expect(room.results()).toEqual(standings);
+    expect(room.canAdvance()).toBe(false);
+
+    const next = room.addPlayer('Bo') as { playerId: string };
+    expect(room.isWaitingForNextRound(next.playerId)).toBe(true);
+    expect(room.canAdvance()).toBe(true);
+    expect(room.canAdvance(next.playerId)).toBe(true);
+    expect(room.advance(next.playerId)).toBe(true);
+    expect(room.phase).toBe('lobby');
+    expect(room.lobbyPlayers().map(player => player.name)).toEqual(['Bo']);
+  });
+
   it('advance() from results plays again — fresh car_select with the same players, cleared picks', () => {
     room.addPlayer('Ada'); room.advance(); const pid = room.lobbyPlayers()[0]!.playerId;
     room.selectCar(pid, 9); room.advance(); room.selectMap('Silver Lake'); room.advance();
@@ -262,9 +304,35 @@ describe('Room — Smash-style pre-race flow', () => {
     room.advance(); room.selectMap('Silver Lake'); room.advance();
     for (let i = 0; i < 60 * 120 && room.phase !== 'results'; i++) room.tick(STEP);
     expect(room.phase).toBe('results');
-    room.addPlayer('NewGuy');
+    const result = room.results();
+    const waiting = room.addPlayer('NewGuy');
+    if ('error' in waiting) throw new Error(waiting.error);
+    expect(room.phase).toBe('results');
+    expect(room.results()).toEqual(result);
+    expect(room.isWaitingForNextRound(waiting.playerId)).toBe(true);
+    expect(room.advance(waiting.playerId)).toBe(false);
+    expect(room.phase).toBe('results');
+    expect(room.advance(room.lobbyPlayers()[0]!.playerId)).toBe(true);
     expect(room.phase).toBe('lobby');
+    expect(room.isWaitingForNextRound(waiting.playerId)).toBe(false);
+    expect(room.lobbyPlayers().map(p => p.name)).toEqual(['Ada', 'NewGuy']);
     expect(room.lobbyPlayers().every(p => p.carIndex === null)).toBe(true);
+  });
+
+  it('does not clear a full room result when another caller tries to join', () => {
+    room = new Room('FULL-RESULT', 1, { carCount: 2, maps: ['Silver Lake'] });
+    const first = room.addPlayer('Ada') as { playerId: string };
+    const second = room.addPlayer('Bo') as { playerId: string };
+    room.advance(); room.selectCar(first.playerId, 0); room.selectCar(second.playerId, 1);
+    room.advance(); room.selectMap('Silver Lake', first.playerId); room.selectMap('Silver Lake', second.playerId);
+    room.advance();
+    for (let i = 0; i < 60 * 120 && room.phase !== 'results'; i++) room.tick(STEP);
+    const result = room.results();
+    expect(room.phase).toBe('results');
+
+    expect(room.addPlayer('Late')).toEqual({ error: 'room_full' });
+    expect(room.phase).toBe('results');
+    expect(room.results()).toEqual(result);
   });
 
   it('configure() sets car/map choices while keeping the roster', () => {

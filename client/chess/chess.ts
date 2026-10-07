@@ -38,6 +38,7 @@ const resultOverlay = element<HTMLDivElement>('result-overlay');
 const resultTitle = element<HTMLElement>('result-title');
 const resultDetail = element<HTMLParagraphElement>('result-detail');
 const resultKicker = element<HTMLSpanElement>('result-kicker');
+const resultReplay = element<HTMLButtonElement>('result-replay');
 const liveAnnouncer = element<HTMLDivElement>('live-announcer');
 const page = new URL(location.href);
 const params = page.searchParams;
@@ -98,6 +99,11 @@ music.switchContext('chess');
 renderMusicButton();
 setTimeout(renderMusicButton, 120);
 musicButton.addEventListener('click', () => void toggleMusic());
+resultReplay.addEventListener('click', () => {
+  if (connectionState !== 'connected' || latestState?.phase !== 'finished'
+    || latestState.canReplayOnDisplay !== true) return;
+  connection?.replay(latestState.gameId);
+});
 addEventListener('pointerdown', event => {
   if ((event.target as Element | null)?.closest?.('#music-button')) return;
   void unlockMusic();
@@ -287,6 +293,7 @@ function renderConnection(): void {
         ? isPortuguese ? 'Desconectado' : 'Disconnected'
         : isPortuguese ? 'Conectando' : 'Connecting';
   connectionStatus.querySelector('span')!.textContent = label;
+  resultReplay.disabled = connectionState !== 'connected';
 }
 
 function renderStatus(): void {
@@ -428,6 +435,8 @@ function renderResult(state: ChessState): void {
     ? isPortuguese ? 'Empate' : 'Draw'
     : humanWon ? isPortuguese ? 'Vitória' : 'Victory' : isPortuguese ? 'Derrota' : 'Defeat';
   resultDetail.textContent = resultSummary(state.result, state.humanColor);
+  resultReplay.hidden = state.canReplayOnDisplay !== true || stationLaunchRequested || stationDisplay.active;
+  resultReplay.disabled = connectionState !== 'connected';
   resultOverlay.hidden = false;
   stationDisplay.markEngineResultsReady();
   if (lastResultKey !== key) {
@@ -520,6 +529,7 @@ function localizeStaticCopy(): void {
   lastCaption.textContent = 'As peças aguardam o primeiro comando.';
   resultKicker.textContent = 'Duelo encerrado';
   resultTitle.textContent = 'Vitória';
+  resultReplay.textContent = 'Jogar de novo';
   element<HTMLElement>('fallback-explanation').textContent = 'Os gráficos 3D não estão disponíveis. A posição atual aparece abaixo.';
   accessibleBoard.setAttribute('aria-label', 'Tabuleiro de xadrez ao vivo');
 }

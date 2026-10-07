@@ -20,6 +20,118 @@ function connectCollect(port: number): Promise<{ ws: WebSocket; msgs: Record<str
 const send = (ws: WebSocket, m: unknown) => ws.send(JSON.stringify(m));
 
 describe('BattleServer', () => {
+  it('recognizes only a live, room-bound and authorized standalone display',async()=>{
+    server=new BattleServer({port:0,displayToken:'display-token'});
+    server.setBrowserPlayerAdmission(code=>code!=='PAID');
+    let serverSideDisplay:WebSocket|undefined;
+    server.setOnDisplayAuthenticated(ws=>{
+      if(!serverSideDisplay){serverSideDisplay=ws;expect(server.hasStandaloneDisplay(ws,'PAID')).toBe(false);}
+    });
+    const port=await server.start();
+    const display=await connectCollect(port);
+    expect(server.hasStandaloneDisplay(display.ws,'PAID')).toBe(false);
+    send(display.ws,{type:'spectate',roomCode:'PAID',displayToken:'wrong'});await wait(20);
+    expect(server.hasStandaloneDisplay(display.ws,'PAID')).toBe(false);
+    send(display.ws,{type:'spectate',roomCode:'PAID',displayToken:'display-token'});await wait(20);
+    expect(serverSideDisplay).toBeDefined();
+    expect(server.hasStandaloneDisplay(serverSideDisplay!,'PAID')).toBe(false);
+    expect(server.hasStandaloneDisplay(serverSideDisplay!,'OTHER')).toBe(false);
+    send(display.ws,{type:'spectate',roomCode:'FREE'});await wait(20);
+    expect(server.hasStandaloneDisplay(serverSideDisplay!,'FREE')).toBe(true);
+    send(display.ws,{type:'leave'});await wait(20);
+    expect(server.hasStandaloneDisplay(serverSideDisplay!,'FREE')).toBe(false);
+    send(display.ws,{type:'spectate',roomCode:'FREE'});await wait(20);
+    expect(server.hasStandaloneDisplay(serverSideDisplay!,'FREE')).toBe(true);
+    send(display.ws,{type:'spectate',roomCode:'OTHER'});await wait(20);
+    expect(server.hasStandaloneDisplay(serverSideDisplay!,'FREE')).toBe(false);
+    expect(server.hasStandaloneDisplay(serverSideDisplay!,'OTHER')).toBe(true);
+    display.ws.close();await new Promise<void>(resolve=>display.ws.once('close',()=>resolve()));
+    expect(server.hasStandaloneDisplay(serverSideDisplay!,'OTHER')).toBe(false);
+  });
+
+  it('lets the authenticated station display select each caller’s monster and use setup menus', async () => {
+    server=new BattleServer({port:0,displayToken:'touch-token'});
+    server.setBrowserPlayerAdmission(code=>code!=='TOUCH');
+    const port=await server.start();
+    const first=server.voiceJoin('TOUCH','Ada','a',2)!;
+    const second=server.voiceJoin('TOUCH','Bo','b',2)!;
+    const display=await connectCollect(port);
+    send(display.ws,{type:'spectate',roomCode:'TOUCH',displayToken:'touch-token'});await wait(20);
+    send(display.ws,{type:'advance'});await wait(20);
+    expect(server.findRoom('TOUCH')?.phase).toBe('monster_select');
+    send(display.ws,{type:'display_select_monster',playerId:first,monsterId:'embertail'});
+    send(display.ws,{type:'display_select_monster',playerId:second,monsterId:'thornling'});
+    await wait(20);
+    expect(server.findRoom('TOUCH')?.lobbyPlayers()).toEqual(expect.arrayContaining([
+      expect.objectContaining({playerId:first,monsterId:'embertail'}),
+      expect.objectContaining({playerId:second,monsterId:'thornling'}),
+    ]));
+    send(display.ws,{type:'back'});await wait(20);
+    expect(server.findRoom('TOUCH')?.phase).toBe('lobby');
+    display.ws.close();
+  });
+
+  it('publishes only authenticated current-generation battle event and result paint receipts', async () => {
+    server=new BattleServer({port:0});const port=await server.start();
+    const playerId=server.voiceJoin('PAINT','Ada')!;
+    const display=await connectCollect(port);
+    send(display.ws,{type:'spectate',roomCode:'PAINT'});await wait(20);
+    const presentations:unknown[]=[];
+    server.setOnPresentation((_code,presentation)=>presentations.push(presentation));
+    server.voiceAdvance('PAINT',playerId);
+    server.voiceSelectMonster('PAINT',playerId,'embertail');
+    server.voiceAdvance('PAINT',playerId);
+    const openingMove=server.findRoom('PAINT')!.snapshot()!.a.moves[0]!.id;
+    expect(server.voiceChooseAction('PAINT',playerId,{kind:'fight',moveId:openingMove})).toBe(true);
+    await wait(20);
+    const room=server.findRoom('PAINT')!;
+    const battleStateIndex=display.msgs.findIndex(message=>message.type==='battle_state'
+      &&message.phase==='battle'&&message.generation===room.generation);
+    const openingEventIndex=display.msgs.findIndex(message=>message.type==='battle_events'
+      &&message.generation===room.generation);
+    // The browser needs the new generation before it can accept its first event frame.
+    expect(battleStateIndex).toBeLessThan(openingEventIndex);
+    const eventFrame=display.msgs.find(message=>message.type==='battle_events')!;
+    expect(eventFrame).toMatchObject({generation:room.generation});
+    expect(eventFrame.eventIds).toEqual(expect.arrayContaining([expect.any(Number)]));
+    send(display.ws,{type:'ack_event',generation:room.generation+1,eventId:(eventFrame.eventIds as number[])[0]});
+    await wait(20);expect(presentations).toHaveLength(0);
+    send(display.ws,{type:'ack_event',generation:room.generation,eventId:(eventFrame.eventIds as number[])[0]});
+    await wait(20);expect(presentations).toContainEqual(expect.objectContaining({kind:'event',generation:room.generation}));
+
+    for(let index=0;index<100&&room.phase==='battle';index++){
+      const snap=room.snapshot()!;room.chooseMove(playerId,snap.a.moves[1]!.id);
+      if(room.aiPending())room.resolveAiTurn();
+    }
+    expect(room.phase).toBe('results');
+    expect(server.voiceContinueResults('PAINT','stale')).toBe(false);
+    expect(server.voiceContinueResults('PAINT',playerId)).toBe(true);
+    await wait(20);
+    expect(display.msgs).toContainEqual(expect.objectContaining({type:'show_results',generation:room.generation}));
+    send(display.ws,{type:'ack_results',generation:room.generation+1});await wait(20);
+    expect(room.resultsPresented).toBe(false);
+    send(display.ws,{type:'ack_results',generation:room.generation});await wait(20);
+    expect(room.resultsPresented).toBe(true);
+    expect(presentations).toContainEqual(expect.objectContaining({kind:'results',generation:room.generation}));
+    display.ws.close();
+  });
+  it('reports voice setup and menu mutations from the authoritative room result', () => {
+    server = new BattleServer({});
+    const id = server.voiceJoin('VOICE', 'Ada')!;
+    expect(server.voiceBackSetup('VOICE', id)).toBe(false);
+    expect(server.voiceAdvance('VOICE', id)).toBe(true);
+    expect(server.voiceSelectMonster('VOICE', id, 'missing')).toBe(false);
+    expect(server.voiceSelectMonster('VOICE', id, 'sparkmouse')).toBe(true);
+    expect(server.voiceBackSetup('VOICE', id)).toBe(true);
+    expect(server.findRoom('VOICE')?.phase).toBe('lobby');
+    expect(server.voiceAdvance('VOICE', id)).toBe(true);
+    expect(server.voiceSelectMonster('VOICE', id, 'sparkmouse')).toBe(true);
+    expect(server.voiceAdvance('VOICE', id)).toBe(true);
+    expect(server.voiceOpenFight('VOICE', 'missing')).toBe(false);
+    expect(server.voiceOpenFight('VOICE', id)).toBe(true);
+    expect(server.voiceBackMenu('VOICE', id)).toBe(true);
+  });
+
   it('does not advance a paid station battle out of results', async () => {
     server=new BattleServer({port:0,displayToken:'paid-station-display-token'});
     server.setBrowserPlayerAdmission(code=>code!=='PAID');

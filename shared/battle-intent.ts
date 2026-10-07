@@ -35,17 +35,23 @@ export function parseMoveNumber(spoken: string, locale: SupportedLocale = DEFAUL
 
 /** Fuzzy-match a spoken phrase to a move NAME: exact → substring (either way) → shared significant
  *  word. Returns the index or -1. */
-function fuzzyName(spoken: string, names: string[], locale: SupportedLocale): number {
+function fuzzyName(spoken: string, names: string[][], locale: SupportedLocale): number {
   const q = normalizeForMatching(spoken, locale);
   if (!q) return -1;
-  const normalizedNames = names.map(name => normalizeForMatching(name, locale));
-  let idx = normalizedNames.findIndex(name => name === q);
-  if (idx >= 0) return idx;
-  idx = normalizedNames.findIndex(name => name.includes(q) || q.includes(name));
-  if (idx >= 0) return idx;
-  // shared significant word (>2 chars) — e.g. "jolt" → "Thunder Jolt", "zap them" → "Static Zap"
+  const normalizedNames = names.map(aliases => aliases.map(alias => normalizeForMatching(alias, locale)).filter(Boolean));
+  const exact = normalizedNames.flatMap((aliases, index) => aliases.includes(q) ? [index] : []);
+  if (exact.length === 1) return exact[0]!;
+  if (exact.length > 1) return -1;
+  // A complete name is safe inside an imperative ("use Thunder Jolt"). Partial fragments
+  // are accepted only when they identify exactly one of the current monster's moves.
+  const fullName = normalizedNames.flatMap((aliases, index) =>
+    aliases.some(alias => alias.length > 2 && ` ${q} `.includes(` ${alias} `)) ? [index] : []);
+  if (fullName.length === 1) return fullName[0]!;
+  if (fullName.length > 1) return -1;
   const qWords = new Set(q.split(/\s+/).filter(w => w.length > 2));
-  return normalizedNames.findIndex(name => name.split(/\s+/).some(w => qWords.has(w)));
+  const partial = normalizedNames.flatMap((aliases, index) =>
+    aliases.some(alias => alias.split(/\s+/).some(word => qWords.has(word))) ? [index] : []);
+  return partial.length === 1 ? partial[0]! : -1;
 }
 
 /** Match a spoken utterance to a move index (0-based) among `names` (the active monster's 4 move
@@ -53,7 +59,7 @@ function fuzzyName(spoken: string, names: string[], locale: SupportedLocale): nu
 export function matchMove(spoken: string, names: string[], locale: SupportedLocale = DEFAULT_LOCALE): number {
   const num = parseMoveNumber(spoken, locale);
   if (num !== null) return (num >= 1 && num <= names.length) ? num - 1 : -1;
-  return fuzzyName(spoken, names, locale);
+  return fuzzyName(spoken, names.map(name => [name]), locale);
 }
 
 // ── the two-level command menu, by voice ───────────────────────────────────────────────────────────
@@ -67,7 +73,7 @@ const COMMAND_WORDS: Record<SupportedLocale, {
     guard: ['guard', 'block', 'brace', 'defend', 'shield'],
     item: ['item', 'potion', 'heal', 'bag', 'medicine'],
     taunt: ['taunt', 'mock', 'provoke', 'jeer', 'insult'],
-    fight: ['fight', 'fights', 'attack', 'flight', 'five', 'right'],
+    fight: ['fight', 'fights', 'attack'],
     back: ['back', 'cancel', 'return', 'never mind', 'undo'],
   },
   'pt-BR': {
@@ -120,8 +126,9 @@ export type BattleNav = { kind: 'openFight' } | { kind: 'back' };
  *  Keyword wins over an incidental fuzzy name hit; a NUMBER's meaning is level-dependent (see above). */
 export function matchBattleAction(spoken: string, ctx: BattleMenuCtx, locale: SupportedLocale = DEFAULT_LOCALE):
   BattleAction | BattleNav | null {
+  if (unsafeActionUtterance(spoken, locale)) return null;
   const words = COMMAND_WORDS[locale];
-  const names = ctx.moves.map(move => localizedMoveAliases(move.id, move.name).join(' '));
+  const names = ctx.moves.map(move => localizedMoveAliases(move.id, move.name));
   const asMove = (i: number): BattleAction | null =>
     (i >= 0 && i < ctx.moves.length) ? { kind: 'fight', moveId: ctx.moves[i]!.id } : null;
   const namedMove = (): BattleAction | null => asMove(fuzzyName(spoken, names, locale));
@@ -136,12 +143,12 @@ export function matchBattleAction(spoken: string, ctx: BattleMenuCtx, locale: Su
   if (saysAny(spoken, words.item, locale)) return item();          // null when out of potions
   if (saysAny(spoken, words.taunt, locale)) return { kind: 'taunt' };
   if (saysAny(spoken, words.fight, locale)) {
-    const number = parseMoveNumber(spoken, locale);
+    const number = numericChoiceUtterance(spoken, locale) ? parseMoveNumber(spoken, locale) : null;
     return number === null ? namedMove() ?? { kind: 'openFight' } : asMove(number - 1);
   }
 
   // 3. A NUMBER — its meaning depends on the level.
-  const num = parseMoveNumber(spoken, locale);
+  const num = numericChoiceUtterance(spoken, locale) ? parseMoveNumber(spoken, locale) : null;
   if (num !== null) {
     if (ctx.level === 'fight') return asMove(num - 1);     // fight submenu: pick a move slot
     switch (num) {                                          // root: pick a root action
@@ -156,4 +163,23 @@ export function matchBattleAction(spoken: string, ctx: BattleMenuCtx, locale: Su
   // 4. A move NAME is unambiguous and can be spoken directly from either menu level.
   // Content names remain their canonical English names and are valid aliases in every locale.
   return namedMove();
+}
+
+/** Questions, negation and corrections need conversational interpretation before spending a turn. */
+function unsafeActionUtterance(spoken: string, locale: SupportedLocale): boolean {
+  const q = normalizeForMatching(spoken, locale);
+  if (q === 'never mind' || q === 'nevermind') return false;
+  if (spoken.includes('?')) return true;
+  return locale === 'pt-BR'
+    ? /\b(nao|nunca|nem|talvez|devo|posso|qual|como|porque|por que|ou)\b/.test(q)
+    : /\b(don't|dont|do not|not|never|no|maybe|should|could|would|can i|what|which|how|why|instead|actually|or)\b/.test(q);
+}
+
+/** A bare menu number is actionable; an incidental count in a question or status remark is not. */
+function numericChoiceUtterance(spoken: string, locale: SupportedLocale): boolean {
+  const q = normalizeForMatching(spoken, locale);
+  if (!q || /\b(have|has|left|remaining|potions?|turns?|seconds|tenho|restam?|pocoes|segundos)\b/.test(q)) return false;
+  return locale === 'pt-BR'
+    ? /^(?:(?:eu )?(?:quero|escolho|prefiro|escolher|usar|use|lutar|atacar|ataque|golpe|numero|opcao|a|o|um|uma|me de|de)\s+)*(?:\d|um|uma|dois|duas|tres|quatro|primeir[oa]|segund[oa]|terceir[oa]|quart[oa])(?:\s+(?:golpe|monstro|opcao|vez))?$/.test(q)
+    : /^(?:(?:i want|i'd like|i would like|i'll take|i will take|give me|choose|pick|use|fight|attack|move|number|option|the|a)\s+)*(?:\d(?:st|nd|rd|th)?|one|two|three|four|first|second|third|fourth)(?:\s+(?:one|move|monster|option))?$/.test(q);
 }

@@ -60,6 +60,12 @@ html[data-theme="dark"] .station-call-card strong { color:#FD7685; }
 .selection-panel h1 { flex:none; margin:3px 0 3px; font-size:clamp(30px,5vh,56px); }
 .selection-panel > p { flex:none; margin:0 auto 8px; }
 .selection-panel > .flow-kicker,.selection-panel > .flow-actions,.selection-panel > .flow-hint { flex:none; }
+.touch-player-picker { display:flex; align-items:center; justify-content:center; gap:14px; flex:none; min-height:36px; margin:0 auto 4px; }
+.touch-player-picker p { margin:0; color:var(--theme-text); font-size:11px; font-weight:700; text-transform:uppercase; }
+.touch-player-options { display:flex; gap:6px; }
+.touch-player-options button { min-height:36px; padding:6px 12px; border:1px solid var(--theme-border-strong); border-radius:6px; background:var(--vf-card); color:var(--theme-text); font-size:11px; font-weight:700; cursor:pointer; }
+.touch-player-options button.active { border-color:#ef223a; background:#ef223a; color:#fff; }
+.touch-player-options button:focus-visible { outline:3px solid #fff; outline-offset:2px; }
 .select-grid { flex:1 1 auto; min-height:0; display:grid; gap:8px; width:100%; margin:6px auto 8px; }
 .select-grid.map-grid { grid-template-columns:repeat(5,minmax(0,1fr)); grid-template-rows:1fr; max-width:1240px; }
 .select-grid.fighter-grid { grid-template-columns:repeat(6,minmax(0,1fr)); grid-template-rows:repeat(2,minmax(0,1fr)); max-width:1240px; }
@@ -138,11 +144,11 @@ body[data-phase="fight"] #music-toggle-container,body[data-phase="victory"] #mus
 .deck-title span { color: #ff455e; font-size: 9px; font-weight: 700; letter-spacing: .16em; }
 .deck-title small { color: #707686; font-size: 8px; letter-spacing: .08em; }
 .commands { display: grid; grid-template-columns: repeat(6, 1fr); gap: 7px; }
-.commands button { position: relative; min-height: 50px; border: 1px solid rgba(255,255,255,.13); border-radius: 2px; color: #d5d8e0; background: rgba(255,255,255,.035); cursor: pointer; text-transform: uppercase; transition: .15s ease; }
-.commands button:hover:not(:disabled), .commands button.active { border-color: #fff; color: #fff; background: rgba(255,255,255,.1); transform: translateY(-2px); }
-.commands button:disabled { opacity:.4; cursor:not-allowed; }
-.commands button.attack { border-bottom-color: #ef223a; }
-.commands button b { font-size: 12px; }
+.commands [data-command] { position: relative; display:flex; align-items:center; justify-content:center; min-height: 50px; border: 1px solid rgba(255,255,255,.13); border-radius: 2px; color: #d5d8e0; background: rgba(255,255,255,.035); text-transform: uppercase; transition: .15s ease; pointer-events:none; user-select:none; }
+.commands [data-command].active { border-color: #fff; color: #fff; background: rgba(255,255,255,.1); transform: translateY(-2px); }
+.commands [data-command].inactive { opacity:.4; }
+.commands [data-command].attack { border-bottom-color: #ef223a; }
+.commands [data-command] b { font-size: 12px; }
 .commands kbd { position: absolute; top: 5px; right: 7px; color: #777d8d; font: 9px TwilioText, sans-serif; }
 
 .fight-call { position: fixed; z-index: 4; top: 46%; left: 50%; transform: translate(-50%,-50%) skew(-7deg); color: #fff; font: clamp(65px,12vw,150px)/.75 TwilioDisplay, sans-serif; letter-spacing: -.04em; text-transform: uppercase; text-shadow: 8px 8px 0 #ef223a; opacity: 0; pointer-events: none; }
@@ -248,8 +254,8 @@ body.shake #arena { animation: shake .2s linear; }
   body[data-phase="fight"] .deck-title span { font-size:clamp(12px,1.3vw,14px); }
   body[data-phase="fight"] .deck-title small { font-size:clamp(10px,1.1vw,12px);line-height:1.2;text-align:right; }
   body[data-phase="fight"] .commands { grid-template-columns:repeat(3,minmax(0,1fr));gap:9px; }
-  body[data-phase="fight"] .commands button { min-height:clamp(68px,7vw,80px); }
-  body[data-phase="fight"] .commands button b { font-size:clamp(18px,2.2vw,24px);line-height:1.05; }
+  body[data-phase="fight"] .commands [data-command] { min-height:clamp(68px,7vw,80px); }
+  body[data-phase="fight"] .commands [data-command] b { font-size:clamp(18px,2.2vw,24px);line-height:1.05; }
 }
 
 @media (max-width: 720px) {
@@ -273,11 +279,11 @@ body.shake #arena { animation: shake .2s linear; }
   .command-deck { right: 8px; bottom: 8px; left: 8px; }
   .deck-title small { display: none; }
   .commands { gap: 3px; }
-  .commands button { min-height: 46px; }
-  .commands button b { font-size: 9px; }
+  .commands [data-command] { min-height: 46px; }
+  .commands [data-command] b { font-size: 9px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior:auto !important; transition-duration:.01ms !important; animation-duration:.01ms !important; animation-iteration-count:1 !important; }
-  .select-card:hover:not(:disabled), .select-card.selected, .commands button:hover:not(:disabled) { transform:none; }
+  .select-card:hover:not(:disabled), .select-card.selected { transform:none; }
 }

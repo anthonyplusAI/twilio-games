@@ -16,6 +16,7 @@ function state(phase: FighterState['phase'], generation = 4): FighterState {
       { playerId: 'one', name: 'One', side: 'p1', fighterId: 'nyx', isAi: false },
       { playerId: 'two', name: 'Two', side: 'p2', fighterId: 'wraith', isAi: false },
     ], world: null, intro: null, countdown: null, result: null,
+    hudPresented:false,resultsPresented:false,
   };
 }
 

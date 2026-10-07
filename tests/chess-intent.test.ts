@@ -53,6 +53,52 @@ describe('Voice Chess intent', () => {
     expect(parseChessIntent('E4', 'en-US')).toMatchObject({ kind: 'move', query: { to: 'e4' } });
   });
 
+  it('recovers common spoken-square transcription variants without guessing the piece', () => {
+    expect(parseChessIntent('night to eff three')).toMatchObject({
+      kind: 'move', query: { piece: 'n', to: 'f3' },
+    });
+    expect(parseChessIntent('pawn from ee too to ee for')).toMatchObject({
+      kind: 'move', query: { piece: 'p', from: 'e2', to: 'e4' },
+    });
+    expect(parseChessIntent('cavalo para ge tres', 'pt-BR')).toMatchObject({
+      kind: 'move', query: { piece: 'n', to: 'g3' },
+    });
+  });
+
+  it('keeps only the corrected destination in a spoken move', () => {
+    expect(parseChessIntent('knight to F3, no, H3')).toMatchObject({
+      kind: 'move', query: { piece: 'n', to: 'h3' },
+    });
+    expect(parseChessIntent('cavalo de G1 para F3, não, H3', 'pt-BR')).toMatchObject({
+      kind: 'move', query: { piece: 'n', from: 'g1', to: 'h3' },
+    });
+    expect(parseChessIntent("I didn't mean queen to H5; I mean bishop to C4")).toMatchObject({
+      kind: 'move', query: { piece: 'b', to: 'c4' },
+    });
+    expect(parseChessIntent('cavalo para F3, quer dizer H3', 'pt-BR')).toMatchObject({
+      kind: 'move', query: { piece: 'n', to: 'h3' },
+    });
+    expect(parseChessIntent('knight to F3, actually bishop to C4')).toMatchObject({
+      kind: 'move', query: { piece: 'b', to: 'c4' },
+    });
+  });
+
+  it('does not turn negated or hypothetical move talk into a proposal', () => {
+    expect(parseChessIntent("don't move the knight to F3")).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('not knight to F3, bishop to C4')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('What if I moved my queen to H5?')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('não faça roque', 'pt-BR')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('Tell me how castling works')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('I wonder if I can castle kingside')).toEqual({ kind: 'unknown' });
+  });
+
+  it('accepts natural confirmation and cancellation responses', () => {
+    expect(parseChessIntent('yes, go ahead and make that move')).toEqual({ kind: 'confirm' });
+    expect(parseChessIntent('actually cancel that')).toEqual({ kind: 'cancel' });
+    expect(parseChessIntent('sim, confirma essa jogada', 'pt-BR')).toEqual({ kind: 'confirm' });
+    expect(parseChessIntent('confirm, no, cancel')).toEqual({ kind: 'cancel' });
+  });
+
   it('describes a lost piece and check in the caller language', () => {
     const move = {
       actor: 'computer' as const, color: 'b' as const, piece: 'r' as const,

@@ -126,7 +126,8 @@ export class AnalyticsObserver {
       && state.category !== null
       && (state.phase === 'loading' || state.phase === 'countdown'
         || state.phase === 'question_prompt' || state.phase === 'answer_cue'
-        || state.phase === 'question' || state.phase === 'reveal');
+        || state.phase === 'question' || state.phase === 'reveal'
+        || state.phase === 'audio_problem');
     if (live && (!active || active.key !== generation)) {
       if (active) this.finish('trivia', room.code, active, false);
       this.triviaActive.set(room.code, {

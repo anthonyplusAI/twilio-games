@@ -11,7 +11,6 @@ export class FighterConnection {
   private backoff = 500;
   private generation = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private outbound: unknown[] = [];
   private identity: { type: 'join'; roomCode: string; name: string; sessionId: string; locale?: SupportedLocale } | { type: 'spectate'; roomCode: string; locale?: SupportedLocale } | null = null;
   private displayAuth: { roomCode: string; token: string } | null = null;
   private displayAuthSupported = false;
@@ -24,6 +23,7 @@ export class FighterConnection {
   private errorCb?: (code: string, message: string) => void;
   private connectionCb?: (state: FighterConnectionState) => void;
   private hostCb?: (isHost: boolean) => void;
+  private showResultsCb?: (loadingGeneration: number) => void;
   private pendingReleaseSessionId: string | null = null;
   private loadingGeneration = 0;
 
@@ -55,6 +55,7 @@ export class FighterConnection {
       else if (message.type === 'fighter_roster') this.rosterCb?.(message.fighters, message.maps);
       else if (message.type === 'joined') this.joinedCb?.(message.playerId);
       else if (message.type === 'host_identity') { this.loadingGeneration = message.loadingGeneration; this.hostCb?.(message.isHost); }
+      else if (message.type === 'show_results') this.showResultsCb?.(message.loadingGeneration);
       else if (message.type === 'error') this.errorCb?.(message.code, message.message);
     };
     ws.onclose = event => {
@@ -69,7 +70,6 @@ export class FighterConnection {
   private sendNow(ws: WebSocket, value: unknown): void { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(value)); }
   private send(value: unknown): void {
     if (this.ws.readyState === WebSocket.OPEN) this.sendNow(this.ws, value);
-    else if (!this.closed) this.outbound.push(value);
   }
   private sendDisplayAuth(ws: WebSocket, generation: number): void {
     if (!this.displayAuthSupported || !this.displayAuth || this.displayAuthSentGeneration === generation) return;
@@ -80,8 +80,6 @@ export class FighterConnection {
     if (this.sessionSentGeneration === generation) return;
     this.sendDisplayAuth(ws, generation);
     if (this.identity) this.sendNow(ws, this.identity);
-    const queued = this.outbound.splice(0);
-    for (const value of queued) this.sendNow(ws, value);
     this.sessionSentGeneration = generation;
   }
   join(roomCode: string, name: string): void {
@@ -93,12 +91,14 @@ export class FighterConnection {
     this.displayAuth = token ? { roomCode, token } : null;
     if (this.displayAuth) this.sendDisplayAuth(this.ws, this.generation);
   }
-  leave(roomCode: string): void {
+  leave(roomCode: string, keepWatching = true): void {
     const sessionId = this.identity?.type === 'join' ? this.identity.sessionId : undefined;
     this.identity = { type: 'spectate', roomCode, ...(this.locale ? { locale: this.locale } : {}) };
-    this.outbound = [];
     clearSessionId(roomCode);
-    if (this.ws.readyState === WebSocket.OPEN) this.sendNow(this.ws, { type: 'leave', ...(sessionId ? { sessionId } : {}) });
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.sendNow(this.ws, { type: 'leave', ...(sessionId ? { sessionId } : {}) });
+      if (keepWatching) this.sendNow(this.ws, this.identity);
+    }
     else this.pendingReleaseSessionId = sessionId ?? null;
   }
   leaveAndClose(roomCode: string): void {
@@ -108,12 +108,22 @@ export class FighterConnection {
       const sent = navigator.sendBeacon?.('/api/fighter/leave', new Blob([body], { type: 'application/json' })) ?? false;
       if (!sent) void fetch('/api/fighter/leave', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, keepalive: true }).catch(() => {});
     }
-    this.leave(roomCode); this.closed = true;
+    this.leave(roomCode,false); this.closed = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     setTimeout(() => { try { this.ws.close(); } catch {} }, 40);
   }
   selectFighter(fighterId: string): void { this.send({ type: 'select_fighter', fighterId }); }
   selectMap(mapId: string): void { this.send({ type: 'select_map', mapId }); }
+  displaySelectFighter(playerId: string, fighterId: string): void {
+    this.send({ type: 'display_select_fighter', playerId, fighterId });
+  }
+  displaySelectMap(playerId: string, mapId: string): void {
+    this.send({ type: 'display_select_map', playerId, mapId });
+  }
+  /** A paint receipt belongs to the current socket; never replay it after reconnect. */
+  ackDisplay(phase:'fight'|'results',loadingGeneration:number):void{
+    this.sendNow(this.ws,{type:'ack_display',phase,loadingGeneration});
+  }
   command(command: FighterCommand): void { this.send({ type: 'command', command }); }
   advance(): void { this.send({ type: 'advance' }); }
   ready(): void { if (this.loadingGeneration) this.send({ type: 'ready', loadingGeneration: this.loadingGeneration }); }
@@ -125,6 +135,7 @@ export class FighterConnection {
   onJoined(cb: (id: string) => void): void { this.joinedCb = cb; }
   onError(cb: (code: string, message: string) => void): void { this.errorCb = cb; }
   onHostIdentity(cb: (isHost: boolean) => void): void { this.hostCb = cb; }
+  onShowResults(cb: (loadingGeneration: number) => void): void { this.showResultsCb = cb; }
   onConnectionState(cb: (state: FighterConnectionState) => void): void {
     this.connectionCb = cb;
     cb(this.ws?.readyState === WebSocket.OPEN ? 'connected' : this.closed ? 'closed' : this.generation > 1 ? 'reconnecting' : 'connecting');

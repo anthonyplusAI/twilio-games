@@ -55,6 +55,24 @@ const ctx = (over: Partial<BattleMenuCtx> = {}): BattleMenuCtx => ({
 });
 
 describe('matchBattleAction — ROOT keywords', () => {
+  it('does not turn acknowledgements, negation, or questions into irreversible actions', () => {
+    for (const spoken of ['right', 'five', "don't fight yet", 'do not use a potion', 'should I guard?', 'I have two potions left', 'guard or attack']) {
+      expect(matchBattleAction(spoken, ctx())).toBeNull();
+    }
+    for (const spoken of ['não lute ainda', 'não use poção', 'devo defender?']) {
+      expect(matchBattleAction(spoken, ctx(), 'pt-BR')).toBeNull();
+    }
+  });
+
+  it('does not choose an arbitrary move when a spoken fragment matches multiple moves', () => {
+    const ambiguous = ctx({ moves: [
+      { id: 'first', name: 'Thunder Jolt' },
+      { id: 'second', name: 'Thunder Wave' },
+      { id: 'third', name: 'Static Zap' },
+    ] });
+    expect(matchBattleAction('thunder', ambiguous)).toBeNull();
+  });
+
   it('accepts a Portuguese move in the same utterance as fight', () => {
     const localized = { moves: [
       { id: 'sparkmouse.jolt', name: 'Choque Trovejante' },
@@ -69,8 +87,8 @@ describe('matchBattleAction — ROOT keywords', () => {
     expect(matchBattleAction('fight', ctx())).toEqual({ kind: 'openFight' });
     expect(matchBattleAction('attack!', ctx())).toEqual({ kind: 'openFight' });
     expect(matchBattleAction('let me fight', ctx())).toEqual({ kind: 'openFight' });
-    expect(matchBattleAction('flight', ctx())).toEqual({ kind: 'openFight' });
-    expect(matchBattleAction('five', ctx())).toEqual({ kind: 'openFight' });
+    expect(matchBattleAction('flight', ctx())).toBeNull();
+    expect(matchBattleAction('five', ctx())).toBeNull();
     expect(matchBattleAction('luta', ctx(), 'pt-BR')).toEqual({ kind: 'openFight' });
     expect(matchBattleAction('batalhar', ctx(), 'pt-BR')).toEqual({ kind: 'openFight' });
     expect(matchBattleAction('combater', ctx(), 'pt-BR')).toEqual({ kind: 'openFight' });

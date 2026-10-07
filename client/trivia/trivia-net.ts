@@ -160,6 +160,13 @@ export class TriviaConnection {
   }
 
   selectCategory(category: TriviaRoundCategoryId): void { this.send({ type: 'select_category', category }); }
+  displaySelectCategory(playerId: string, category: TriviaRoundCategoryId): void {
+    this.send({ type: 'display_select_category', playerId, category });
+  }
+  viewRendered(questionId: string, questionAttemptId: number,
+    phase: 'question_prompt' | 'answer_cue', renderRevision: number): void {
+    this.send({ type: 'view_rendered', questionId, questionAttemptId, phase, renderRevision });
+  }
   advance(): void { this.send({ type: 'advance' }); }
   keyboardAnswer(choiceId: string): void { this.send({ type: 'keyboard_answer', choiceId }); }
 

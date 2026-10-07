@@ -46,6 +46,10 @@ if (validateSignatures && !authToken) {
 if (process.env.NODE_ENV === 'production' && !deepgramApiKey) {
   throw new Error('DEEPGRAM_API_KEY is required in production while Voice Karaoke is enabled');
 }
+const openaiApiKey = (process.env.OPENAI_API_KEY ?? '').trim();
+if (process.env.NODE_ENV === 'production' && (!openaiApiKey || openaiApiKey === 'disabled')) {
+  throw new Error('OPENAI_API_KEY is required in production for conversational voice commands');
+}
 
 // When EDITOR_TOKEN is set, /api writes (manifest + maps) require it — gate the editor on a public
 // deploy. Unset (local dev) leaves writes open so the editor works with zero setup.
