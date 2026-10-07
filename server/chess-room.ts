@@ -4,7 +4,7 @@ import { DEFAULT_LOCALE, type SupportedLocale } from '../shared/i18n/locales';
 import { normalizeForMatching } from '../shared/i18n/translate';
 import type {
   ChessColor, ChessCommandResult, ChessEvent, ChessFeedback, ChessFeedbackCode,
-  ChessMovePreview, ChessMoveRecord, ChessPendingMove, ChessPieceType,
+  ChessHint, ChessMovePreview, ChessMoveRecord, ChessPendingMove, ChessPieceType,
   ChessResult, ChessSelection, ChessSquare, ChessState, ChessFile,
 } from '../shared/chess-protocol';
 
@@ -34,6 +34,7 @@ const SEARCH_INFINITY = 1_000_000;
 const AI_MAX_CANDIDATES = 5;
 const AI_MAX_CENTIPAWN_LOSS = 180;
 const AI_SELECTION_TEMPERATURE = 65;
+const MAX_HINTS = 3;
 
 function opposite(color: ChessColor): ChessColor { return color === 'w' ? 'b' : 'w'; }
 function boundedInteger(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
@@ -57,6 +58,8 @@ export class ChessRoom {
   private plyValue = 0;
   private selectionValue: ChessSelection | null = null;
   private pendingValue: ChessPendingMove | null = null;
+  private hintsRemainingValue = MAX_HINTS;
+  private hintValue: ChessHint | null = null;
   private lastMoveValue: ChessMoveRecord | null = null;
   private resultValue: ChessResult | null = null;
   private feedbackValue: ChessFeedback | null = null;
@@ -117,6 +120,8 @@ export class ChessRoom {
       ply: this.plyValue,
       selection: this.selectionValue ? { ...this.selectionValue } : null,
       pendingMove: this.pendingValue ? { ...this.pendingValue } : null,
+      hintsRemaining: this.hintsRemainingValue,
+      hint: this.hintValue ? { ...this.hintValue } : null,
       lastMove: this.lastMoveValue ? { ...this.lastMoveValue } : null,
       result: this.resultValue ? { ...this.resultValue } : null,
       feedback: this.feedbackValue ? { ...this.feedbackValue } : null,
@@ -155,12 +160,13 @@ export class ChessRoom {
     switch (intent.kind) {
       case 'confirm': return this.confirmMove(undefined, locale);
       case 'cancel': return this.cancelMove(locale);
+      case 'hint': return this.requestHint(locale);
       case 'select': return this.selectPiece(intent, locale);
       case 'move': return this.selectSpokenSource(text, intent.query, locale)
         ?? this.proposeQuery(intent.query, locale);
       case 'help': return this.respond('help', inLanguage(locale,
-        'Say a piece and destination; I infer a unique legal source. If several fit, add its square or file. You can pause before the destination. Confirm or cancel my proposal. Say castle for castling.',
-        'Diga a peça e o destino; encontrarei a origem legal se for única. Se houver mais de uma, diga a casa ou coluna. Você pode pausar antes do destino. Confirme ou cancele minha proposta. Diga roque para fazer roque.'));
+        'Say a piece and destination; I infer a unique legal source. If several fit, add its square or file. You can pause before the destination. Confirm or cancel my proposal. Say castle for castling, or ask for a hint. You have three hints per game.',
+        'Diga a peça e o destino; encontrarei a origem legal se for única. Se houver mais de uma, diga a casa ou coluna. Você pode pausar antes do destino. Confirme ou cancele minha proposta. Diga roque, ou peça uma dica. Você tem três dicas por partida.'));
       default: return this.respond('unknown', inLanguage(locale,
         'I did not catch a chess move. Say a piece and destination square, or say help.',
         'Não entendi a jogada. Diga a peça e a casa de destino, ou diga ajuda.'));
@@ -207,6 +213,38 @@ export class ChessRoom {
     return this.respond('cancelled', inLanguage(locale, 'Move cancelled. The pieces stay put.', 'Jogada cancelada. As peças ficam no lugar.'));
   }
 
+  private requestHint(locale: SupportedLocale): ChessCommandResult {
+    const guard = this.guardHumanAction(locale);
+    if (guard) return guard;
+    if (this.pendingValue) return this.respond('hint_unavailable', inLanguage(locale,
+      'Confirm or cancel the proposed move before asking for a hint.',
+      'Confirme ou cancele a jogada proposta antes de pedir uma dica.'));
+    if (this.hintValue?.revision === this.revisionValue) return this.respond('hint', this.hintLine(this.hintValue, locale));
+    if (this.hintsRemainingValue === 0) return this.respond('hint_limit', inLanguage(locale,
+      'You have used all three hints for this game. It is still your move.',
+      'Você já usou as três dicas desta partida. Ainda é sua vez.'));
+    const move = this.chooseHintMove();
+    if (!move) return this.respond('hint_unavailable', inLanguage(locale,
+      'There is no legal move to suggest right now.', 'Não há jogada legal para sugerir agora.'));
+    this.hintsRemainingValue--;
+    this.hintValue = { from: move.from, to: move.to, piece: move.piece, san: move.san, revision: this.revisionValue };
+    return this.respond('hint', this.hintLine(this.hintValue, locale));
+  }
+
+  private hintLine(hint: ChessHint, locale: SupportedLocale): string {
+    const names: Record<ChessPieceType, string> = locale === 'pt-BR'
+      ? { p: 'peão', n: 'cavalo', b: 'bispo', r: 'torre', q: 'dama', k: 'rei' }
+      : { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen', k: 'king' };
+    const used = MAX_HINTS - this.hintsRemainingValue;
+    const castle = hint.san === 'O-O' ? 'king' : hint.san === 'O-O-O' ? 'queen' : null;
+    if (castle) return inLanguage(locale,
+      `Hint ${used} of ${MAX_HINTS}: try castling ${castle === 'king' ? 'kingside' : 'queenside'}. The move is yours to choose.`,
+      `Dica ${used} de ${MAX_HINTS}: tente o roque ${castle === 'king' ? 'pequeno' : 'grande'}. Você decide a jogada.`);
+    return inLanguage(locale,
+      `Hint ${used} of ${MAX_HINTS}: try your ${names[hint.piece]} from ${hint.from.toUpperCase()} to ${hint.to.toUpperCase()}. The move is yours to choose.`,
+      `Dica ${used} de ${MAX_HINTS}: tente mover seu ${names[hint.piece]} de ${hint.from.toUpperCase()} para ${hint.to.toUpperCase()}. Você decide a jogada.`);
+  }
+
   /** Call separately after publishing the human move. Expected revision rejects stale timers. */
   playComputerMove(expectedRevision?: number): ChessMoveRecord | null {
     if (!this.playerConnectedValue || (expectedRevision !== undefined && expectedRevision !== this.revisionValue)) return null;
@@ -222,6 +260,8 @@ export class ChessRoom {
     this.humanColorValue = this.random() < 0.5 ? 'w' : 'b';
     this.selectionValue = null;
     this.pendingValue = null;
+    this.hintsRemainingValue = MAX_HINTS;
+    this.hintValue = null;
     this.lastMoveValue = null;
     this.resultValue = null;
     this.feedbackValue = null;
@@ -379,6 +419,7 @@ export class ChessRoom {
   private commitMove(move: Move, actor: 'human' | 'computer'): ChessMoveRecord {
     const applied = this.chess.move({ from: move.from, to: move.to, ...(move.promotion ? { promotion: move.promotion } : {}) });
     this.revisionValue += 1;
+    this.hintValue = null;
     this.plyValue += 1;
     this.resultValue = this.detectResult();
     const record: ChessMoveRecord = {
@@ -408,15 +449,34 @@ export class ChessRoom {
   }
 
   private chooseComputerMove(): Move | null {
+    const ranked = this.rankLegalMoves(this.aiDepth, this.aiNodeBudget, this.aiTimeBudgetMs);
+    if (!ranked) return null;
+    if (!ranked.scoredMoves) return ranked.ordered[0]!;
+    return this.chooseApproachableMove(ranked.completedDepth === 1
+      ? this.accountForImmediateRecaptures(ranked.scoredMoves) : ranked.scoredMoves);
+  }
+
+  /** Hints use the best bounded-search move, without the rival's forgiving random variation. */
+  private chooseHintMove(): Move | null {
+    const ranked = this.rankLegalMoves(Math.min(this.aiDepth, 2),
+      Math.min(this.aiNodeBudget, 1_200), Math.min(this.aiTimeBudgetMs, 250));
+    if (!ranked) return null;
+    if (!ranked.scoredMoves) return ranked.ordered[0]!;
+    return (ranked.completedDepth === 1
+      ? this.accountForImmediateRecaptures(ranked.scoredMoves) : ranked.scoredMoves)[0]!.move;
+  }
+
+  private rankLegalMoves(depthLimit: number, nodeLimit: number, timeLimitMs: number):
+    { ordered: Move[]; scoredMoves: { move: Move; score: number }[] | null; completedDepth: number } | null {
     const legal = this.chess.moves({ verbose: true });
     if (!legal.length) return null;
     let ordered = this.orderMoves(legal);
     let scoredMoves: { move: Move; score: number }[] | null = null;
     let completedDepth = 0;
-    const budget = { nodes: 0, limit: this.aiNodeBudget, deadline: Date.now() + this.aiTimeBudgetMs };
+    const budget = { nodes: 0, limit: nodeLimit, deadline: Date.now() + timeLimitMs };
     // Keep the best *completed* iteration. If a deeper search exhausts its budget,
     // the board is fully undone and the earlier legal answer is still available.
-    for (let depth = 1; depth <= this.aiDepth; depth++) {
+    for (let depth = 1; depth <= depthLimit; depth++) {
       const roundScores: { move: Move; score: number }[] = [];
       let completed = true;
       for (const move of ordered) {
@@ -437,9 +497,7 @@ export class ChessRoom {
       ordered = roundScores.map(entry => entry.move);
       if (Math.abs(roundScores[0]!.score) >= MATE_SCORE - 20) break;
     }
-    if (!scoredMoves) return ordered[0]!;
-    return this.chooseApproachableMove(completedDepth === 1
-      ? this.accountForImmediateRecaptures(scoredMoves) : scoredMoves);
+    return { ordered, scoredMoves, completedDepth };
   }
 
   /** When two plies cannot finish, avoid the worst one-move piece drops. */

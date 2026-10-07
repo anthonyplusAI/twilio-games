@@ -761,8 +761,9 @@ export class TriviaVoiceSession {
         ? { choiceId: validOnset.choiceId, atMs: validOnset.atMs }
         : validSpeechOnset ? { atMs: snapshot.questionEndsAtMs } : undefined
       : undefined;
-    if (activeClock && snapshot.questionEndsAtMs !== null
-      && receivedAtMs > snapshot.questionEndsAtMs && !lateOnset) {
+    const beyondPublishedDeadline = activeClock && snapshot.questionEndsAtMs !== null
+      && receivedAtMs > snapshot.questionEndsAtMs && !lateOnset;
+    if (beyondPublishedDeadline && snapshot.phase === 'question') {
       void this.speak(this.text('voice.answerTooLate'), this.questionGuard(scope!, ['answer_cue', 'question']));
       return;
     }
@@ -770,6 +771,14 @@ export class TriviaVoiceSession {
       ? this.deps.beginAnswerResolution(this.code!, this.playerId!, question.id,
         snapshot.questionAttemptId, lateOnset)
       : null;
+    // Choice speech may legitimately outlast the initial published deadline.
+    // While its cue is still playing, only the authoritative room can decide
+    // whether to extend that deadline for this caller.
+    if (beyondPublishedDeadline && snapshot.phase === 'answer_cue'
+      && !informationOnly && resolutionId === null) {
+      void this.speak(this.text('voice.answerTooLate'), this.questionGuard(scope!, ['answer_cue', 'question']));
+      return;
+    }
     if (resolutionId !== null && question && snapshot.questionAttemptId !== null) {
       this.semanticResolution = {
         code: this.code!, playerId: this.playerId!, questionId: question.id,
@@ -924,7 +933,7 @@ export class TriviaVoiceSession {
       || !snapshot.question?.choices.some(choice => choice.id === choiceId)
       || snapshot.answeringStartsAtMs === null || snapshot.questionEndsAtMs === null) return;
     if (answeredAtMs < snapshot.answeringStartsAtMs) return;
-    if (answeredAtMs > snapshot.questionEndsAtMs) {
+    if (answeredAtMs > snapshot.questionEndsAtMs && snapshot.phase !== 'answer_cue') {
       void this.speak(this.text('voice.answerTooLate'), this.questionGuard(questionKey, ['answer_cue', 'question']));
       return;
     }

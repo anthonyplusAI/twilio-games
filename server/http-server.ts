@@ -99,7 +99,7 @@ import {
   parseKaraokeVenueConfig,
   type KaraokeVenueConfig,
 } from '../shared/karaoke-venue';
-import type { PlayableArcadeGame } from '../shared/arcade-games';
+import { PLAYABLE_ARCADE_GAMES, type PlayableArcadeGame } from '../shared/arcade-games';
 import { RACER_MESSAGES } from '../shared/i18n/racer';
 import { MONSTERS_MESSAGES } from '../shared/i18n/monsters';
 import { createTranslator, normalizeForMatching } from '../shared/i18n/translate';
@@ -141,11 +141,27 @@ const VOICE_UNAVAILABLE_MESSAGES: Record<SupportedLocale, string> = {
   'en-US': 'Twilio Games voice play is unavailable right now. Please ask booth staff for help. Goodbye.',
   'pt-BR': 'Os jogos por voz do Twilio Games não estão disponíveis agora. Peça ajuda à equipe. Até logo.',
 };
+/** Twilio's incoming-call webhook can arrive between a game page opening and its display joining,
+ * or while the previous page's socket is closing. */
+const STANDALONE_VOICE_ROUTE_HANDOFF_MS = 2_000;
+const STANDALONE_VOICE_ROUTE_SETTLE_MS = 200;
+// Only a validated same-tab game-page navigation gets this longer wait. Keep it
+// below Twilio's 15-second call-webhook limit, with room for network/response time.
+const STANDALONE_VOICE_ROUTE_NAVIGATION_HANDOFF_MS = 10_000;
+const STANDALONE_NAVIGATION_INTENT_TTL_MS = 30_000;
+const STANDALONE_NAVIGATION_INTENT_LIMIT = 128;
+const DISPLAY_SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function runtimeFighterMaps(maps: FighterMapEntry[]): FighterMapEntry[] {
   return maps.map(map => {
-    if (map.id !== 'rain' || !map.file) return map;
+    if (map.id !== 'rain') return map;
+    // Existing deployments keep a valid editable live manifest, so a bundled
+    // manifest update alone would leave the old, nearly black Rain preview live.
+    const preview = map.preview?.startsWith('/assets/fighters/previews/rain.png')
+      ? '/assets/fighters/previews/rain.svg' : map.preview;
+    if (!map.file) return { ...map, preview };
     const { file: _file, ...procedural } = map;
+    procedural.preview = preview;
     return procedural;
   });
 }
@@ -238,6 +254,9 @@ interface ChessVoiceCallBinding {
   leaveTimer: ReturnType<typeof setTimeout> | null;
 }
 type MountedVoiceGame = 'racer' | 'battle' | 'fighter' | 'karaoke' | 'trivia' | 'chess';
+const STANDALONE_GAME_PAGES = new Map<string, MountedVoiceGame>(PLAYABLE_ARCADE_GAMES.map(game => [
+  game.route, game.id === 'monsters' ? 'battle' : game.id,
+]));
 
 export class HttpServer {
   private server: http.Server;
@@ -344,6 +363,15 @@ export class HttpServer {
   }>();
   private voiceReconnectAttempts = new Map<string, number>();
   private standaloneDisplays = new Map<MountedVoiceGame,Map<WebSocket,number>>();
+  private standaloneDisplayOrder = 0;
+  private readonly standaloneDisplayCandidates = new Map<WebSocket, {
+    game: MountedVoiceGame; order: number; acceptedRoomCode: string | null;
+  }>();
+  private readonly standaloneDisplaySessions = new WeakMap<WebSocket, string>();
+  private readonly standaloneNavigationIntents = new Map<string, {
+    game: MountedVoiceGame; roomCode: string; expiresAtMs: number;
+  }>();
+  private readonly standaloneVoiceRouteWaiters = new Set<() => void>();
   private readonly standaloneTriviaDisplayCandidates = new WeakSet<WebSocket>();
   private readonly standaloneChessDisplayCandidates = new WeakSet<WebSocket>();
   private readonly authenticatedTriviaDisplays = new WeakSet<WebSocket>();
@@ -701,14 +729,34 @@ export class HttpServer {
       }));
       this.persistRaceResults(room.selectedMap, persistedResults, room.code);
       this.analyticsObserver.raceFinished(room);
-      this.arcadeApi?.stationEngineCompleted('racer', room.code, room.results().map(result => ({
+      const stationResults = room.results().map(result => ({
         enginePlayerId: result.playerId,
         rank: result.place,
         completed: result.finished && result.finishT > 0,
         won: result.finishT > 0 ? result.place === 1 : false,
         score: null,
         durationSeconds: result.finishT > 0 ? result.finishT : null,
-      })));
+      }));
+      const sessions = [...(this.voiceAdapters.get(room.code) ?? [])];
+      if (sessions.length && this.arcadeApi?.stationEnginePhase('racer', room.code)) {
+        // GameServer fans out race_over before this callback, so each caller has
+        // already queued their placement, leaderboard rank, and Relay explanation.
+        // Let that recap finish before the station starts its RESULTS hold.
+        let timeoutId: ReturnType<typeof setTimeout> | null = null;
+        const timedOut = new Promise<void>(resolve => {
+          timeoutId = setTimeout(resolve, RACER_STATION_RESULT_SPEECH_TIMEOUT_MS);
+          timeoutId.unref?.();
+        });
+        void Promise.race([
+          Promise.allSettled(sessions.map(session => session.whenSpeechSettled())),
+          timedOut,
+        ]).then(() => {
+          if (timeoutId) clearTimeout(timeoutId);
+          if (this.game.findRoom(room.code) !== room || room.phase !== 'results'
+            || this.arcadeApi?.stationEnginePhase('racer', room.code) === null) return;
+          this.arcadeApi?.stationEngineCompleted('racer', room.code, stationResults);
+        });
+      } else this.arcadeApi?.stationEngineCompleted('racer', room.code, stationResults);
     });
     // Fan a room's game events out to any voice callers in it (greeting/countdown/go/finish talk-back).
     this.game.setOnRoomEvents((roomCode, events) => {
@@ -860,6 +908,39 @@ export class HttpServer {
       const standaloneDisplay = this.standaloneVoiceEnabled
         && displayValues.length === 1 && displayValues[0] === '1'
         && !(this.arcadeApi?.requiresStationVoiceAssignment() ?? false);
+      const displaySessionValues = requestUrl.searchParams.getAll('displaySessionId');
+      const displaySessionId = standaloneDisplay && displaySessionValues.length === 1
+        && DISPLAY_SESSION_ID_PATTERN.test(displaySessionValues[0] ?? '')
+        ? displaySessionValues[0] : null;
+      const rememberDisplaySession = (game: MountedVoiceGame, ws: WebSocket) => {
+        if (displaySessionId) this.standaloneDisplaySessions.set(ws, displaySessionId);
+        const candidate = { game, order: ++this.standaloneDisplayOrder, acceptedRoomCode: null as string | null };
+        this.standaloneDisplayCandidates.set(ws, candidate);
+        ws.on('message', data => {
+          let message: { type?: unknown; roomCode?: unknown };
+          try { message = JSON.parse(data.toString()) as typeof message; }
+          catch { return; }
+          if (message.type !== 'spectate' || typeof message.roomCode !== 'string') return;
+          const code = message.roomCode.trim().toUpperCase();
+          // Game-server message handlers validate spectate. Observe only its accepted binding,
+          // never the untrusted client frame, after the current WS event finishes dispatching.
+          queueMicrotask(() => {
+            if (this.standaloneDisplayCandidates.get(ws) !== candidate
+              || !this.hasAcceptedStandaloneDisplay(game, ws, code)) return;
+            candidate.acceptedRoomCode = code;
+            const intent = displaySessionId ? this.standaloneNavigationIntents.get(displaySessionId) : null;
+            if (intent?.game === game && intent.roomCode === code) {
+              this.standaloneNavigationIntents.delete(displaySessionId!);
+            }
+            this.notifyStandaloneVoiceRouteWaiters();
+          });
+        });
+        ws.once('close', () => {
+          this.standaloneDisplayCandidates.delete(ws);
+          this.notifyStandaloneVoiceRouteWaiters();
+        });
+        this.notifyStandaloneVoiceRouteWaiters();
+      };
       if ((path === '/karaoke' || path === '/trivia' || path === '/chess')
         && req.headers.origin !== new URL(this.publicBaseUrl).origin) {
         socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
@@ -889,19 +970,31 @@ export class HttpServer {
         this.voiceWss.handleUpgrade(req, socket, head, (ws) => this.onVoiceConnection(ws));
       } else if (path === '/game') {
         this.game.handleUpgrade(req, socket, head, ws => {
-          if (standaloneDisplay) this.registerStandaloneDisplay('racer', ws);
+          if (standaloneDisplay) {
+            rememberDisplaySession('racer', ws);
+            this.registerStandaloneDisplay('racer', ws);
+          }
         });
       } else if (path === '/battle') {
         this.battle.handleUpgrade(req, socket, head, ws => {
-          if (standaloneDisplay) this.registerStandaloneDisplay('battle', ws);
+          if (standaloneDisplay) {
+            rememberDisplaySession('battle', ws);
+            this.registerStandaloneDisplay('battle', ws);
+          }
         });
       } else if (path === '/fighter') {
         this.fighter.handleUpgrade(req, socket, head, ws => {
-          if (standaloneDisplay) this.registerStandaloneDisplay('fighter', ws);
+          if (standaloneDisplay) {
+            rememberDisplaySession('fighter', ws);
+            this.registerStandaloneDisplay('fighter', ws);
+          }
         });
       } else if (path === '/karaoke') {
         this.karaoke.handleUpgrade(req, socket, head, ws => {
-          if (standaloneDisplay) this.registerStandaloneDisplay('karaoke', ws);
+          if (standaloneDisplay) {
+            rememberDisplaySession('karaoke', ws);
+            this.registerStandaloneDisplay('karaoke', ws);
+          }
         });
       } else if (path === '/trivia') {
         if (this.pendingTriviaDisplays.size >= TRIVIA_PENDING_CONNECTION_LIMIT) {
@@ -916,12 +1009,18 @@ export class HttpServer {
           return;
         }
         this.trivia.handleUpgrade(req, socket, head, ws => {
-          if (standaloneDisplay) this.standaloneTriviaDisplayCandidates.add(ws);
+          if (standaloneDisplay) {
+            rememberDisplaySession('trivia', ws);
+            this.standaloneTriviaDisplayCandidates.add(ws);
+          }
           this.trackPendingTriviaDisplay(ws);
         });
       } else if (path === '/chess') {
         this.chess.handleUpgrade(req, socket, head, ws => {
-          if (standaloneDisplay) this.standaloneChessDisplayCandidates.add(ws);
+          if (standaloneDisplay) {
+            rememberDisplaySession('chess', ws);
+            this.standaloneChessDisplayCandidates.add(ws);
+          }
         });
       } else if (path === '/karaoke-media') {
         this.karaokeMedia.handleUpgrade(req, socket, head);
@@ -952,6 +1051,32 @@ export class HttpServer {
     if (phase && recoveryPhases.includes(phase)) return;
     this.activeStationEngines.delete(key);
     if (phase && completedPhases.includes(phase)) {
+      if (game === 'chess') {
+        const sessions = [...(this.chessVoice.get(roomCode) ?? [])];
+        const room = this.chess.findRoom(roomCode);
+        if (sessions.length && room) {
+          const gameId = room.state().gameId;
+          // The finished board is already on screen. Start the station's RESULTS
+          // hold only after Relay has played the checkmate and technology recap,
+          // so a short configured results window cannot replace the board mid-cue.
+          let timeoutId: ReturnType<typeof setTimeout> | null = null;
+          const timedOut = new Promise<void>(resolve => {
+            timeoutId = setTimeout(resolve, CHESS_STATION_RESULT_SPEECH_TIMEOUT_MS);
+            timeoutId.unref?.();
+          });
+          void Promise.race([
+            Promise.allSettled(sessions.map(session => session.whenSpeechSettled())),
+            timedOut,
+          ]).then(() => {
+            if (timeoutId) clearTimeout(timeoutId);
+            if (this.chess.findRoom(roomCode) !== room || room.state().gameId !== gameId
+              || room.state().phase !== 'finished'
+              || this.arcadeApi?.stationEnginePhase('chess', roomCode) === null) return;
+            this.arcadeApi?.stationEngineCompleted(game, roomCode, results);
+          });
+          return;
+        }
+      }
       this.arcadeApi?.stationEngineCompleted(game, roomCode, results);
     } else {
       this.arcadeApi?.stationEngineAbandoned(game, roomCode);
@@ -1843,8 +1968,8 @@ export class HttpServer {
     ws.on('error', () => settleRelayPlayback(ws));
   }
 
-  /** An explicit game parameter wins. A call with no game may infer its target only when one
-   *  eligible standalone screen is open; two open screens are ambiguous even if one opened later. */
+  /** An explicit game parameter wins. Without one, a same-tab display handoff may select the
+   * newest accepted screen; distinct display sessions remain ambiguous. */
   private pickVoiceGame(firstFrame: string): MountedVoiceGame | null {
     let roomCode = DEFAULT_ROOM;
     try {
@@ -1858,34 +1983,100 @@ export class HttpServer {
       if (g === 'chess') return 'chess';
       if (g === 'racer' || g === 'race') return 'racer';
     } catch { /* fall through to auto-detect */ }
-    const live = this.eligibleStandaloneVoiceGames(roomCode);
-    return live.length > 1 ? null : live[0] ?? 'racer';
+    return this.recentVoiceGame(roomCode) ?? (this.eligibleStandaloneVoiceConnections(roomCode).length ? null : 'racer');
   }
 
   private recentVoiceGame(roomCode: string = DEFAULT_ROOM): MountedVoiceGame|null {
-    const live = this.eligibleStandaloneVoiceGames(roomCode);
-    return live.length === 1 ? live[0] ?? null : null;
+    const live = this.eligibleStandaloneVoiceConnections(roomCode);
+    if (!live.length) return null;
+    if (live.every(candidate => candidate.game === live[0]!.game)) return live[0]!.game;
+    // A browser tab can briefly leave its previous game's socket open (or even half-open on
+    // spotty Wi-Fi). A shared session ID indicates one tab; select only
+    // the newest *accepted* display. Cross-game overlaps from distinct tabs or legacy clients
+    // still fail closed.
+    const sessionId = live[0]!.sessionId;
+    if (!sessionId || live.some(candidate => candidate.sessionId !== sessionId)) return null;
+    return live.reduce((latest, candidate) => candidate.order > latest.order ? candidate : latest).game;
   }
 
-  private eligibleStandaloneVoiceGames(roomCode: string = DEFAULT_ROOM): MountedVoiceGame[] {
-    const live: MountedVoiceGame[] = [];
+  private hasNewerUnboundStandaloneDisplay(roomCode: string): boolean {
+    const accepted = this.eligibleStandaloneVoiceConnections(roomCode);
+    if (!accepted.length) return false;
+    const routedGame = this.recentVoiceGame(roomCode);
+    const newestAccepted = Math.max(...accepted.map(candidate => candidate.order));
+    const acceptedSessions = new Set(accepted.map(candidate => candidate.sessionId));
+    return [...this.standaloneDisplayCandidates].some(([ws, candidate]) => {
+      const configuredGame = candidate.game === 'battle' ? 'monsters' : candidate.game;
+      return ws.readyState === WebSocket.OPEN && candidate.order > newestAccepted
+        && candidate.game !== routedGame
+        && acceptedSessions.has(this.standaloneDisplaySessions.get(ws) ?? null)
+        && (candidate.acceptedRoomCode === null || candidate.acceptedRoomCode === roomCode)
+        && this.arcadeApi?.standaloneGameEnabled?.(configuredGame) !== false;
+    });
+  }
+
+  /** A successful game-page GET can precede its WebSocket by more than the short call settle
+   * window. A lone intent can also keep the call waiting while no display is bound. An intent
+   * extends the wait but never chooses the game: only accepted spectate can do that. */
+  private pendingStandaloneNavigationSession(roomCode: string): string | null {
+    const accepted = this.eligibleStandaloneVoiceConnections(roomCode);
+    const now = Date.now();
+    if (!accepted.length) {
+      let sessionId: string | null = null;
+      for (const [id, intent] of this.standaloneNavigationIntents) {
+        if (intent.expiresAtMs <= now) {
+          this.standaloneNavigationIntents.delete(id);
+          continue;
+        }
+        const configuredGame = intent.game === 'battle' ? 'monsters' : intent.game;
+        if (intent.roomCode !== roomCode
+          || this.arcadeApi?.standaloneGameEnabled?.(configuredGame) === false) continue;
+        if (sessionId !== null) return null;
+        sessionId = id;
+      }
+      return sessionId;
+    }
+    const sessionId = accepted[0]?.sessionId;
+    if (!sessionId || accepted.some(candidate => candidate.sessionId !== sessionId)) return null;
+    const intent = this.standaloneNavigationIntents.get(sessionId);
+    if (!intent) return null;
+    if (intent.expiresAtMs <= now) {
+      this.standaloneNavigationIntents.delete(sessionId);
+      return null;
+    }
+    if (intent.roomCode !== roomCode) return null;
+    const configuredGame = intent.game === 'battle' ? 'monsters' : intent.game;
+    if (this.arcadeApi?.standaloneGameEnabled?.(configuredGame) === false) return null;
+    const newestAccepted = accepted.reduce((latest, candidate) => candidate.order > latest.order ? candidate : latest);
+    return newestAccepted.game !== intent.game ? sessionId : null;
+  }
+
+  private hasAcceptedStandaloneDisplay(game: MountedVoiceGame, ws: WebSocket,
+    roomCode: string): boolean {
+    switch (game) {
+      case 'racer': return this.game.hasStandaloneDisplay(ws, roomCode);
+      case 'battle': return this.battle.hasStandaloneDisplay(ws, roomCode);
+      case 'fighter': return this.fighter.hasStandaloneDisplay(ws, roomCode);
+      case 'karaoke': return this.karaoke.hasStandaloneDisplay(ws, roomCode);
+      case 'trivia': return this.trivia.hasStandaloneDisplay(ws, roomCode);
+      case 'chess': return this.chess.hasStandaloneDisplay(ws, roomCode);
+      default: return assertNever(game);
+    }
+  }
+
+  private eligibleStandaloneVoiceConnections(roomCode: string = DEFAULT_ROOM): Array<{
+    game: MountedVoiceGame; order: number; sessionId: string | null;
+  }> {
+    const live: Array<{ game: MountedVoiceGame; order: number; sessionId: string | null }> = [];
     for(const [game,connections] of this.standaloneDisplays){
       const configuredGame=game==='battle'?'monsters':game;
       if(this.arcadeApi?.standaloneGameEnabled?.(configuredGame)===false)continue;
-      const bound = [...connections.keys()].some(ws => {
-        if (ws.readyState !== WebSocket.OPEN) return false;
-        switch (game) {
-          case 'racer': return this.game.hasStandaloneDisplay(ws, roomCode);
-          case 'battle': return this.battle.hasStandaloneDisplay(ws, roomCode);
-          case 'fighter': return this.fighter.hasStandaloneDisplay(ws, roomCode);
-          case 'karaoke': return this.karaoke.hasStandaloneDisplay(ws, roomCode);
-          case 'trivia': return this.trivia.hasStandaloneDisplay(ws, roomCode);
-          case 'chess': return this.chess.hasStandaloneDisplay(ws, roomCode);
-          default: return assertNever(game);
+      for (const [ws, order] of connections) {
+        if (ws.readyState !== WebSocket.OPEN) continue;
+        if (this.hasAcceptedStandaloneDisplay(game, ws, roomCode)) {
+          live.push({ game, order, sessionId: this.standaloneDisplaySessions.get(ws) ?? null });
         }
-      });
-      if (!bound) continue;
-      live.push(game);
+      }
     }
     return live;
   }
@@ -1894,8 +2085,111 @@ export class HttpServer {
     let connections=this.standaloneDisplays.get(game);
     if(!connections){connections=new Map();this.standaloneDisplays.set(game,connections);}
     const firstRegistration = !connections.has(ws);
-    connections.set(ws,Date.now());
-    if (firstRegistration) ws.once('close',()=>{connections!.delete(ws);if(!connections!.size)this.standaloneDisplays.delete(game);});
+    if (firstRegistration) connections.set(ws,
+      this.standaloneDisplayCandidates.get(ws)?.order ?? ++this.standaloneDisplayOrder);
+    if (firstRegistration) {
+      // Server-side spectate validation runs in another WS message listener. Recheck after it has
+      // accepted the display rather than assuming an upgraded socket is ready to receive calls.
+      ws.on('message', () => queueMicrotask(() => this.notifyStandaloneVoiceRouteWaiters()));
+      ws.once('close',()=>{
+        connections!.delete(ws);
+        if(!connections!.size)this.standaloneDisplays.delete(game);
+        this.notifyStandaloneVoiceRouteWaiters();
+      });
+    }
+    this.notifyStandaloneVoiceRouteWaiters();
+  }
+
+  private notifyStandaloneVoiceRouteWaiters(): void {
+    for (const waiter of this.standaloneVoiceRouteWaiters) waiter();
+  }
+
+  private noteStandaloneNavigationIntent(pageGame: MountedVoiceGame, req: http.IncomingMessage): void {
+    if (!this.standaloneVoiceEnabled || (this.arcadeApi?.requiresStationVoiceAssignment() ?? false)) return;
+    const configuredGame = pageGame === 'battle' ? 'monsters' : pageGame;
+    if (this.arcadeApi?.standaloneGameEnabled?.(configuredGame) === false) return;
+    const query = new URL(req.url ?? '/', 'http://localhost').searchParams;
+    const display = query.getAll('display');
+    const sessions = query.getAll('displaySessionId');
+    const rooms = query.getAll('room');
+    if (display.length !== 1 || display[0] !== '1' || sessions.length !== 1
+      || !DISPLAY_SESSION_ID_PATTERN.test(sessions[0] ?? '') || rooms.length !== 1) return;
+    const roomCode = rooms[0]!.trim().toUpperCase();
+    if (!/^[A-Z0-9-]{1,32}$/.test(roomCode)) return;
+    const now = Date.now();
+    for (const [id, intent] of this.standaloneNavigationIntents) {
+      if (intent.expiresAtMs <= now) this.standaloneNavigationIntents.delete(id);
+    }
+    const sessionId = sessions[0]!;
+    this.standaloneNavigationIntents.delete(sessionId);
+    this.standaloneNavigationIntents.set(sessionId, {
+      game: pageGame, roomCode, expiresAtMs: now + STANDALONE_NAVIGATION_INTENT_TTL_MS,
+    });
+    while (this.standaloneNavigationIntents.size > STANDALONE_NAVIGATION_INTENT_LIMIT) {
+      this.standaloneNavigationIntents.delete(this.standaloneNavigationIntents.keys().next().value!);
+    }
+    this.notifyStandaloneVoiceRouteWaiters();
+  }
+
+  /** Wait for the display binding itself, not for a guessed game or a second phone-call retry.
+   * A short settle window lets a new page's WebSocket arrive just after the phone webhook;
+   * persistent multi-screen ambiguity still fails closed after the handoff deadline. */
+  private waitForStandaloneVoiceGame(roomCode: string): Promise<MountedVoiceGame | null> {
+    const initial = this.recentVoiceGame(roomCode);
+    return new Promise(resolve => {
+      let completed = false;
+      let settled = !initial;
+      let expectedNavigationSession: string | null = null;
+      let settleTimer: ReturnType<typeof setTimeout> | null = null;
+      let timeout: ReturnType<typeof setTimeout>;
+      const startedAtMs = Date.now();
+      const done = (game: MountedVoiceGame | null) => {
+        if (completed) return;
+        completed = true;
+        clearTimeout(timeout);
+        if (settleTimer) clearTimeout(settleTimer);
+        this.standaloneVoiceRouteWaiters.delete(check);
+        resolve(game);
+      };
+      const gameForExpectedSession = (): MountedVoiceGame | null => {
+        const game = this.recentVoiceGame(roomCode);
+        if (!game || !expectedNavigationSession) return game;
+        const accepted = this.eligibleStandaloneVoiceConnections(roomCode);
+        return accepted.length && accepted.every(candidate => candidate.sessionId === expectedNavigationSession)
+          ? game : null;
+      };
+      const check = () => {
+        const pendingNavigationSession = this.pendingStandaloneNavigationSession(roomCode);
+        if (pendingNavigationSession) expectedNavigationSession ??= pendingNavigationSession;
+        const game = gameForExpectedSession();
+        if (!settled && game === initial) return;
+        if (game && !this.hasNewerUnboundStandaloneDisplay(roomCode)
+          && !pendingNavigationSession) done(game);
+      };
+      const onDeadline = () => {
+        const pendingNavigationSession = this.pendingStandaloneNavigationSession(roomCode);
+        if (pendingNavigationSession) expectedNavigationSession ??= pendingNavigationSession;
+        const game = gameForExpectedSession();
+        if (game && !this.hasNewerUnboundStandaloneDisplay(roomCode)
+          && !pendingNavigationSession) {
+          done(game);
+          return;
+        }
+        const elapsedMs = Date.now() - startedAtMs;
+        if (expectedNavigationSession && elapsedMs < STANDALONE_VOICE_ROUTE_NAVIGATION_HANDOFF_MS) {
+          timeout = setTimeout(onDeadline, STANDALONE_VOICE_ROUTE_NAVIGATION_HANDOFF_MS - elapsedMs);
+          return;
+        }
+        done(null);
+      };
+      timeout = setTimeout(onDeadline, STANDALONE_VOICE_ROUTE_HANDOFF_MS);
+      if (!settled) settleTimer = setTimeout(() => {
+        settled = true;
+        check();
+      }, STANDALONE_VOICE_ROUTE_SETTLE_MS);
+      this.standaloneVoiceRouteWaiters.add(check);
+      check();
+    });
   }
 
   private trackPendingTriviaDisplay(ws: WebSocket): void {
@@ -1982,9 +2276,9 @@ export class HttpServer {
     if (game === 'chess') {
       const commands = locale === 'pt-BR'
         ? ['xadrez', 'peão', 'cavalo', 'bispo', 'torre', 'rainha', 'rei', 'para', 'de', 'capturar',
-          'roque', 'promover', 'confirmar', 'sim', 'cancelar', 'não', 'ajuda', 'jogar novamente']
+          'roque', 'promover', 'confirmar', 'sim', 'cancelar', 'não', 'ajuda', 'dica', 'jogar novamente']
         : ['chess', 'pawn', 'knight', 'bishop', 'rook', 'queen', 'king', 'to', 'from', 'takes',
-          'castle', 'promote', 'confirm', 'yes', 'cancel', 'no', 'help', 'play again'];
+          'castle', 'promote', 'confirm', 'yes', 'cancel', 'no', 'help', 'hint', 'play again'];
       const files = 'ABCDEFGH'.split('');
       const squares = files.flatMap(file => Array.from({ length: 8 }, (_, index) => `${file.toLowerCase()}${index + 1}`));
       // A caller may identify a piece by file instead of its full starting
@@ -2042,6 +2336,7 @@ export class HttpServer {
         if (!isCurrent()) return Promise.resolve({ kind: 'none' as const });
         const actions: VoiceInterpretAction[] = context.readOnlyInquiry ? [] : [
           { id: 'help', description: 'Explain the current chess controls' },
+          { id: 'hint', description: 'Recommend one legal move without playing it, at most three hints per game' },
         ];
         if (!context.readOnlyInquiry && context.legalMoves.length) actions.push({
           id: 'propose_move', description: 'Propose a legal chess move; confirmation is still required',
@@ -3362,7 +3657,7 @@ export class HttpServer {
       const board=rank&&count?`Você está em ${ordinal(rank,locale)} de ${count} na classificação.`
         :context.allTimeBest?`${context.allTimeBest.name} lidera a classificação com ${time(context.allTimeBest.time)} segundos.`
           :'A classificação está na tela.';
-      const technology='O Twilio Conversation Relay transformou seus comandos falados de direção e turbo nesta corrida na tela.';
+      const technology='O Twilio Conversation Relay transcreveu os comandos da sua chamada; nosso servidor guiou o carro nesta tela e devolveu este resultado por voz.';
       return `${race} ${board} ${technology}${context.stationManaged
         ? ' Para correr novamente, veja nas mensagens as instruções sobre moedas.'
         : ' Quer correr de novo?'}`;
@@ -3373,7 +3668,7 @@ export class HttpServer {
     const board=rank&&count?`You rank ${ordinal(rank,locale)} of ${count} on the leaderboard.`
       :context.allTimeBest?`${context.allTimeBest.name} leads the leaderboard at ${time(context.allTimeBest.time)} seconds.`
         :'The leaderboard is on the display.';
-    const technology='Twilio Conversation Relay turned your spoken steering and boosts into this race on screen.';
+    const technology='Twilio Conversation Relay transcribed your phone commands; our game server steered the car on this screen and sent this spoken result back.';
     return `${race} ${board} ${technology}${context.stationManaged
       ? ' For another race, check your messages for game coin instructions.'
       : ' Want another race?'}`;
@@ -4057,8 +4352,12 @@ export class HttpServer {
       // Station assignment is authoritative; connection recency remains only for non-Arcade play.
       const voiceGame = stationRoute
         ? stationRoute.game === 'monsters' ? 'battle' : stationRoute.game
-        : this.recentVoiceGame(roomCode);
-      if(!voiceGame){res.writeHead(200,VOICE_XML_HEADERS).end(unavailableXml);return;}
+        : await this.waitForStandaloneVoiceGame(roomCode);
+      if(!voiceGame){
+        console.warn(`[voice] no unambiguous standalone display for room=${roomCode}`);
+        res.writeHead(200,VOICE_XML_HEADERS).end(unavailableXml);
+        return;
+      }
       const voiceLocale = dialedLocale ?? this.recentVoiceLocale(voiceGame, roomCode);
       const callSid = (params['CallSid'] ?? '').trim();
       const accountSid = (params['AccountSid'] ?? '').trim();
@@ -4894,6 +5193,8 @@ export class HttpServer {
     try {
       if (!(await stat(full)).isFile()) { res.writeHead(404).end('not found'); return; }
     } catch { res.writeHead(404).end('not found'); return; }
+    const pageGame = STANDALONE_GAME_PAGES.get(rel);
+    if (pageGame && req.method === 'GET') this.noteStandaloneNavigationIntent(pageGame, req);
     // HTML must NOT cache (so a redeploy is seen immediately); hashed /assets/* JS is handled by
     // serveAsset's immutable cache. Other static files (brand/fonts) get a short cache.
     const isHtml = file.endsWith('.html');
@@ -5060,6 +5361,8 @@ export class HttpServer {
       this.karaokeFailureLocales.clear();
       this.activeStationEngines.clear();
       this.standaloneDisplays.clear();
+      this.standaloneDisplayCandidates.clear();
+      this.standaloneNavigationIntents.clear();
       this.publicTriviaDisplays.clear();
       for (const timer of this.pendingTriviaDisplays.values()) clearTimeout(timer);
       this.pendingTriviaDisplays.clear();
@@ -5096,9 +5399,14 @@ export class HttpServer {
 const RELAY_END_GRACE_MS = 750;
 const RELAY_END_TIMEOUT_MS = 90_000;
 const RELAY_SPEECH_SETTLE_TIMEOUT_MS = 10_000;
+const CHESS_STATION_RESULT_SPEECH_TIMEOUT_MS = 30_000;
+const RACER_STATION_RESULT_SPEECH_TIMEOUT_MS = 40_000;
 type RelaySpeechOutcome = 'played' | 'estimated' | 'interrupted' | 'failed';
 type RelayPlayback = {
   token: string;
+  normalizedLastToken: string;
+  normalizedFullCue: string;
+  markerlessUnique: boolean;
   generation: number;
   isCurrent?: () => boolean;
   settle: (outcome?: RelaySpeechOutcome) => void;
@@ -5108,6 +5416,7 @@ type RelayQueue = {
   tail: Promise<void>;
   generation: number;
   tokenSequence: number;
+  recentNormalizedLastTokens: string[];
   pendingPlayback: RelayPlayback | null;
   ending: boolean;
   ended: boolean;
@@ -5134,7 +5443,9 @@ function sendRelayHandoff(ws: WebSocket, handoff: KaraokeVoiceEndHandoff): boole
 function relayQueue(ws: WebSocket): RelayQueue {
   let queue = relayQueues.get(ws);
   if (!queue) {
-    queue = { tail: Promise.resolve(), generation: 0, tokenSequence: 0, pendingPlayback: null, ending: false, ended:false, endGraceScheduled:false, endTimer: null };
+    queue = { tail: Promise.resolve(), generation: 0, tokenSequence: 0,
+      recentNormalizedLastTokens: [], pendingPlayback: null, ending: false, ended:false,
+      endGraceScheduled:false, endTimer: null };
     relayQueues.set(ws, queue);
   }
   return queue;
@@ -5168,8 +5479,17 @@ export function sendRelayTextOutcome(ws: WebSocket, text: string, locale: Suppor
     const wireTokens = chunks.map((chunk, index) =>
       `${index === 0 ? '' : ' '}${relaySpeechMarkup(chunk, locale)}`
       + (index === chunks.length - 1 ? marker : ''));
+    const normalizedLastToken = normalizeRelayPlaybackText(wireTokens.at(-1)!);
+    const normalizedFullCue = normalizeRelayPlaybackText(wireTokens.join(''));
+    const markerlessUnique = Boolean(normalizedLastToken)
+      && !queue.recentNormalizedLastTokens.includes(normalizedLastToken);
+    if (normalizedLastToken) {
+      queue.recentNormalizedLastTokens.push(normalizedLastToken);
+      if (queue.recentNormalizedLastTokens.length > 32) queue.recentNormalizedLastTokens.shift();
+    }
     const played = waitForRelayPlayback(queue, wireTokens.at(-1)!, generation,
-      relayEstimatedSpeechMs(chunks.join(' '), locale), isCurrent);
+      relayEstimatedSpeechMs(chunks.join(' '), locale), isCurrent,
+      normalizedLastToken, normalizedFullCue, markerlessUnique);
     const playback = queue.pendingPlayback;
     for (let index = 0; index < wireTokens.length; index++) {
       if (generation !== queue.generation) break;
@@ -5211,11 +5531,28 @@ export function handleRelayPlaybackEvent(ws: WebSocket, raw: string): boolean {
   const queue = relayQueues.get(ws);
   if (!queue) return true;
   const playedText = typeof info.value === 'string' ? info.value : '';
-  if (queue.pendingPlayback && playedText.endsWith(queue.pendingPlayback.token)) {
-    queue.pendingPlayback.settle('played');
+  const pending = queue.pendingPlayback;
+  if (pending && playedText.endsWith(pending.token)) {
+    pending.settle('played');
+  } else if (pending?.markerlessUnique) {
+    // Twilio may report the words actually played rather than echoing invisible cue markers or
+    // phoneme markup. Accept only the exact current cue or its final chunk. An older,
+    // longer receipt can end with the new cue's final chunk and must not release it.
+    const normalized = normalizeRelayPlaybackText(playedText);
+    if (normalized && (normalized === pending.normalizedLastToken
+      || normalized === pending.normalizedFullCue)) {
+      pending.settle('played');
+    }
   }
   maybeEndRelay(ws, queue);
   return true;
+}
+
+function normalizeRelayPlaybackText(value: string): string {
+  return value.replace(/<[^>]*>/g, ' ')
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
+    .normalize('NFKC').toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 }
 
 function relayEstimatedSpeechMs(text: string, locale: SupportedLocale): number {
@@ -5230,7 +5567,8 @@ function relayEstimatedSpeechMs(text: string, locale: SupportedLocale): number {
 
 function waitForRelayPlayback(queue: RelayQueue, token: string, generation: number,
   estimatedMs: number,
-  isCurrent?: () => boolean): Promise<RelaySpeechOutcome> {
+  isCurrent?: () => boolean, normalizedLastToken = '', normalizedFullCue = '',
+  markerlessUnique = false): Promise<RelaySpeechOutcome> {
   return new Promise(resolve => {
     let settled = false;
     const settle = (outcome: RelaySpeechOutcome = 'failed') => {
@@ -5242,7 +5580,8 @@ function waitForRelayPlayback(queue: RelayQueue, token: string, generation: numb
     };
     const timer = setTimeout(() => settle('estimated'), estimatedMs);
     timer.unref?.();
-    queue.pendingPlayback = { token, generation, isCurrent, settle, timer };
+    queue.pendingPlayback = { token, normalizedLastToken, normalizedFullCue,
+      markerlessUnique, generation, isCurrent, settle, timer };
   });
 }
 

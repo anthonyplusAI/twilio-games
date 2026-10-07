@@ -44,6 +44,7 @@ html[data-theme="dark"] .game-home { border-color:#72809E;color:#FFFFFF;backgrou
 
 #trivia-stage { position:absolute;z-index:2;inset:76px 0 0;overflow:auto; }
 .scene { position:relative;width:100%;min-height:100%;padding:clamp(26px,4.8vw,74px);animation:scene-in .36s cubic-bezier(.2,.8,.2,1) both; }
+.question-scene:is([data-view="answer_cue"],[data-view="question"]) { animation:none; }
 .scene-kicker { display:flex;align-items:center;gap:9px;margin-bottom:13px;color:#B10F23;font:400 11px/1.4 'Twilio Sans Mono',monospace;letter-spacing:.12em;text-transform:uppercase; }
 html[data-theme="dark"] .scene-kicker { color:#FD7685; }
 .scene-kicker img { width:27px;height:27px; }

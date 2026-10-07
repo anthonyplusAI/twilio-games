@@ -8,7 +8,7 @@
 // re-mounting on every ~state push (the "win modal keeps popping up" bug).
 import { BattleConnection, type BattleStateMsg } from './battle-net';
 import { BattleRenderer, type UiPhase, type MenuMove } from './battle-renderer';
-import { ArenaBackground } from './arena-background';
+import { ArenaBackground, ArenaPreload } from './arena-background';
 import { AmbientFx } from './ambient-fx';
 import { battleControlsLegendHtml } from './battle-controls-legend';
 import { drawMonsterSprite, typeColor } from './monster-sprite';
@@ -123,11 +123,14 @@ function buildCollage(): void {
 }
 
 const conn = new BattleConnection(wsUrl, locale);
-// The 3D spinning arena sits BEHIND the GB battle canvas (both live in #stage). Created first so its
-// canvas is under the renderer's. Loaded lazily when a battle actually starts (no 3D cost in menus).
-const arena = new ArenaBackground(stageEl);
-let arenaLoaded = false;
+// Prepare the one authored arena during the join flow. The request/decode has a deadline and never
+// delays the lobby or battle; the WebGL canvas itself is created only when a battle first appears.
+const arenaPreload = new ArenaPreload();
+void arenaPreload.start();
+let arena: ArenaBackground | null = null;
+let arenaUnavailable = false;
 const renderer = new BattleRenderer(stageEl, locale);
+addEventListener('pagehide', () => { arenaPreload.dispose(); arena?.dispose(); }, { once: true });
 
 let roster: RosterEntry[] = [];
 let myId: string | null = null;
@@ -269,13 +272,14 @@ conn.onState((incoming) => {
   }
   // Leaving results (rematch / reset) drops any pending continue-hold so it can't strand the stage.
   if (m.phase !== 'results') awaitingContinue = false;
-  // First time we enter a battle, spin up the 3D arena behind the GB overlay (lazy — no 3D in menus).
-  // Pull the editor-authored config from /api/arena; fall back to sensible defaults on any failure.
-  if (m.phase === 'battle' && !arenaLoaded) {
-    arenaLoaded = true;
-    fetch('/api/arena').then(r => r.ok ? r.json() : null).then((cfg) => {
-      arena.load(cfg && typeof cfg === 'object' ? cfg : { file: 'arena.glb', spinSpeed: 0.18 });
-    }).catch(() => arena.load({ file: 'arena.glb', spinSpeed: 0.18 }));
+  // The first battle adds the canvas under the GB renderer; later battles reuse that scene. If a
+  // battle ends before preparation finishes, its stale install is skipped and a rematch can claim it.
+  if (m.phase === 'battle' && prevPhase !== 'battle' && !arenaUnavailable) {
+    if (!arena) {
+      try { arena = new ArenaBackground(stageEl); }
+      catch { arenaUnavailable = true; } // The CSS stage + procedural monster art still play.
+    }
+    if (arena) void arena.loadPreloaded(arenaPreload);
   }
   paintBattle();
   renderOverlay();
@@ -504,6 +508,8 @@ function renderOverlay(): void {
   document.body.classList.toggle('vm-showing-results', phase === 'results' && !inBattle);
   const stageWasHidden = stageEl.style.display === 'none';
   stageEl.style.display = inBattle ? '' : 'none';
+  arena?.setActive(inBattle);
+  if (!inBattle) arena?.cancelPendingLoad();
   if (inBattle && stageWasHidden) requestAnimationFrame(() => dispatchEvent(new Event('resize')));
   // The monster collage backs the MENU overlays only (hidden during a battle, where the arena owns it).
   buildCollage();

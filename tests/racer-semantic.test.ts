@@ -29,9 +29,11 @@ function fixture(reply: LlmClient['respond']) {
 describe('Racer current-screen semantic fallback', () => {
   it.each([
     { locale: 'en-US' as const, placement: /You placed 2nd.*leaderboard/i,
+      technology: /transcribed your phone commands.*game server steered.*spoken result/i,
       nextStep: /For another race, check your messages for game coin instructions\./i,
       standalone: /Want another race\?/i },
     { locale: 'pt-BR' as const, placement: /Você ficou em 2º.*classificação/i,
+      technology: /transcreveu os comandos da sua chamada.*servidor guiou.*resultado por voz/i,
       nextStep: /Para correr novamente, veja nas mensagens as instruções sobre moedas\./i,
       standalone: /Quer correr de novo\?/i },
   ])('gives $locale station racers a coin-based replay step after their result', row => {
@@ -45,6 +47,7 @@ describe('Racer current-screen semantic fallback', () => {
     const station = http.racerResultsRecap(resultContext, row.locale);
     expect(station).toMatch(row.placement);
     expect(station).toMatch(/Twilio Conversation Relay/i);
+    expect(station).toMatch(row.technology);
     expect(station).toMatch(row.nextStep);
     expect(station).not.toMatch(row.standalone);
 

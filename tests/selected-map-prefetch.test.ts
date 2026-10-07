@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { SelectedMapPrefetch } from '../client/selected-map-prefetch';
+import { SelectedMapPrefetch, SELECTED_MAP_PREFETCH_TIMEOUT_MS } from '../client/selected-map-prefetch';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -76,6 +76,88 @@ describe('SelectedMapPrefetch', () => {
     pending.resolve(world);
 
     expect(await selection).toBeNull();
-    expect(dispose).toHaveBeenCalledExactlyOnceWith(world);
+    await vi.waitFor(() => expect(dispose).toHaveBeenCalledExactlyOnceWith(world));
+  });
+
+  it('retries a failed selected map after a short cooldown without hammering each menu update', async () => {
+    vi.useFakeTimers();
+    try {
+      const world = { name: 'Silver Lake' };
+      const load = vi.fn().mockResolvedValueOnce(null).mockResolvedValueOnce(world);
+      const prefetch = new SelectedMapPrefetch(load, vi.fn());
+
+      prefetch.start('Silver Lake');
+      await vi.waitFor(() => expect(prefetch.isLoading).toBe(false));
+      prefetch.start('Silver Lake');
+      expect(load).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      prefetch.start('Silver Lake');
+      expect(await prefetch.take('Silver Lake')).toBe(world);
+      expect(load).toHaveBeenCalledTimes(2);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('keeps a slow voted map download alive and reuses its scene at race start', async () => {
+    vi.useFakeTimers();
+    try {
+      const world = { name: 'Silver Lake' };
+      const load = vi.fn((_name: string, signal: AbortSignal) => new Promise<typeof world | null>(resolve => {
+        const timer = setTimeout(() => resolve(world), 9_500);
+        signal.addEventListener('abort', () => {
+          clearTimeout(timer);
+          resolve(null);
+        }, { once: true });
+      }));
+      const dispose = vi.fn();
+      const prefetch = new SelectedMapPrefetch(load, dispose);
+
+      prefetch.start('Silver Lake');
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(9_500);
+
+      expect(prefetch.peekReady('Silver Lake')).toBe(world);
+      prefetch.start('Silver Lake'); // another menu update must keep the decoded scene
+      expect(await prefetch.take('Silver Lake')).toBe(world);
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(dispose).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('settles a half-open vote prefetch, disposes a late scene, and retries after cooldown', async () => {
+    vi.useFakeTimers();
+    try {
+      const halfOpen = deferred<{ name: string } | null>();
+      const stale = { name: 'stale scene' };
+      const ready = { name: 'ready scene' };
+      const signals: AbortSignal[] = [];
+      const load = vi.fn((_name: string, signal: AbortSignal) => {
+        signals.push(signal);
+        return signals.length === 1 ? halfOpen.promise : Promise.resolve(ready);
+      });
+      const dispose = vi.fn();
+      const prefetch = new SelectedMapPrefetch(load, dispose);
+
+      prefetch.start('Silver Lake');
+      await Promise.resolve();
+      const selection = prefetch.take('Silver Lake');
+      await vi.advanceTimersByTimeAsync(SELECTED_MAP_PREFETCH_TIMEOUT_MS);
+
+      expect(signals[0]?.aborted).toBe(true);
+      expect(prefetch.isLoading).toBe(false);
+      await expect(selection).resolves.toBeNull();
+      prefetch.start('Silver Lake');
+      expect(load).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+      prefetch.start('Silver Lake');
+      await expect(prefetch.take('Silver Lake')).resolves.toBe(ready);
+      expect(load).toHaveBeenCalledTimes(2);
+
+      halfOpen.resolve(stale);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(dispose).toHaveBeenCalledExactlyOnceWith(stale);
+    } finally { vi.useRealTimers(); }
   });
 });

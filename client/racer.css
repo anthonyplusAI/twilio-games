@@ -55,9 +55,9 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); c
 .split-player-card span { display: block; color: var(--ink-dim); font-family: var(--mono); font-size: 10px; letter-spacing: .15em; text-transform: uppercase; }
 .split-player-card strong { display: block; overflow: hidden; color: var(--ink); font-family: var(--disp); font-size: 20px; line-height: 1.1; text-overflow: ellipsis; white-space: nowrap; }
 
-/* ───────── Boot veil (covers scene assembly; fades out when attract is ready) ───────── */
+/* ───────── Boot veil (covers scene assembly behind the immediately usable menus) ───────── */
 #veil {
-  position: fixed; inset: 0; z-index: 200; display: flex; flex-direction: column;
+  position: fixed; inset: 0; z-index: 40; display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 14px;
   background: radial-gradient(120% 90% at 50% 35%, #0c1738 0%, var(--bg) 60%, #00081c 100%);
   transition: opacity .6s ease; opacity: 1;

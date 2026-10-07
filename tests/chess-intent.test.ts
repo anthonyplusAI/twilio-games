@@ -2,6 +2,32 @@ import { describe, expect, it } from 'vitest';
 import { describeChessMove, parseChessIntent } from '../shared/chess-intent';
 
 describe('Voice Chess intent', () => {
+  it('accepts natural confirmation replies without treating reservations as approval', () => {
+    for (const speech of ['yes please', 'sure', 'okay', 'go ahead', 'sounds right', 'that is the move', 'sim pode jogar', 'claro']) {
+      expect(parseChessIntent(speech)).toEqual({ kind: 'confirm' });
+    }
+    for (const speech of ['yes but wait', 'sure, what happens next?', 'okay do not move', 'is that right?']) {
+      expect(parseChessIntent(speech)).not.toEqual({ kind: 'confirm' });
+    }
+  });
+
+  it('understands direct requests for a move suggestion in both languages', () => {
+    for (const speech of ['hint', 'hint please', 'please a hint', 'can I get a hint?', 'could we have a hint?',
+      'give me a hint', 'give me a hint please', 'can you suggest a move?',
+      'could you give me a hint?', 'Could you recommend a good move?', 'Which move would you recommend?',
+      'what should I play?', "What's a good move?", 'What is a good move here?',
+      'what do you suggest?', 'any tips?', 'help me choose a move', 'Please help me choose a move']) {
+      expect(parseChessIntent(speech, 'en-US')).toEqual({ kind: 'hint' });
+    }
+    for (const speech of ['dica', 'dica por favor', 'alguma dica?', 'me dê uma dica', 'me dá uma dica',
+      'posso pedir uma dica?', 'qual jogada devo fazer?', 'o que você sugere?']) {
+      expect(parseChessIntent(speech, 'pt-BR')).toEqual({ kind: 'hint' });
+    }
+    expect(parseChessIntent('How many hints do I have left?')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('Can I get a hint count?')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('Could you explain what a good move is?')).toEqual({ kind: 'unknown' });
+  });
+
   it('extracts a named piece and destination from English speech', () => {
     expect(parseChessIntent('Knight to E six', 'en-US')).toMatchObject({
       kind: 'move', query: { piece: 'n', to: 'e6' },

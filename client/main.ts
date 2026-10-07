@@ -172,6 +172,10 @@ const isGarage = new URLSearchParams(location.search).get('garage') === '1';
 
 let started = false;
 let raceLive = false;
+let votedMapName: string | null = null;
+let entryPreparationPending = true;
+let entryMapName: string | null = null;
+let entryMapLoad: Promise<boolean> | null = null;
 let countdownSoundPlayed = false;  // Track if countdown sound has been played this race
 let lastLobbyPlayerCount = 0;     // Track player count to detect new joins
 // Shared screen only: whether the operator has opted IN to also play on this keyboard (P toggle).
@@ -184,6 +188,13 @@ let flowMaps: string[] = [];
 let typedDigits = '';
 let typedPhase: 'car_select' | 'map_select' | null = null;   // the phase when accumulation STARTED
 let typedTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Warm one likely track first during QR/name entry, then stream car templates as capacity opens.
+ * A chosen track or selected car gets priority over the optional 3D catalog. */
+function scheduleOptionalAssetDownloads(): void {
+  assets.setOptionalDownloadsPaused((entryPreparationPending && flowPhase === 'lobby') || raceLive
+    || flowPhase === 'map_select' || flowPhase === 'results' || votedMapName !== null);
+}
 
 /** Keyboard digit input → select_car / select_map by number (stands in for SMS car/map picks).
  *  Multi-digit aware (e.g. "15"): accumulates briefly, then commits on a short pause. The pick is
@@ -293,12 +304,14 @@ conn.onItems((items, map) => {
   cancelPendingRaceSnapshot();
   activeMapPreviewController?.abort();
   activeMapPreviewController = null;
+  if (entryMapLoad && map && map !== entryMapName) abandonEntryMapLoad();
   const generation = ++racePreparationGeneration;
   raceAssetPrioritized = false;
   // Every shared display warms the chosen scene before showing a countdown. The standalone server
   // now holds its countdown for this same readiness receipt, so slow scenery cannot snap into a
   // race that has already begun.
   raceSceneReady = false; raceLive = true; latestRaceSnapshot = null; buffer.clear(); stopAttract();
+  scheduleOptionalAssetDownloads();
   veilLifted = false; veilEl.classList.remove('hide');
   void prepareRaceScene(items, map ?? urlMap, generation);
 });
@@ -315,6 +328,7 @@ conn.onSnapshot((s) => {
     resolveRaceSnapshot = null; cancelRaceSnapshot = null; resolve(s);
   }
   raceLive = true; flowPhase = 'other';
+  scheduleOptionalAssetDownloads();
   if (s.phase === 'racing' && !started) {
     getMusicManager().switchContext('racer');
   }
@@ -329,6 +343,8 @@ conn.onSnapshot((s) => {
 conn.onLobby((m) => {
   leaveResults();
   selectedMapPrefetch.clear();
+  votedMapName = null;
+  assets.prioritizeCarIndexes(m.players.flatMap(player => player.carIndex === null ? [] : [player.carIndex]));
   stationEngineStateReady = true; maybeMarkStationReady();
   if (raceLive) {
     racePreparationGeneration += 1; cancelPendingRaceSnapshot(); latestRaceSnapshot = null; buffer.clear(); raceLive = false;
@@ -336,6 +352,7 @@ conn.onLobby((m) => {
     liftVeil();
   }
   flowPhase = 'lobby'; big.textContent = '';
+  scheduleOptionalAssetDownloads();
   getMusicManager().switchContext('lobby');
   // Play select sound when a new player joins
   if (m.players.length > lastLobbyPlayerCount && lastLobbyPlayerCount > 0) {
@@ -355,22 +372,31 @@ conn.onSelectState((m) => {
     liftVeil();
   }
   raceLive = false; big.textContent = '';
+  votedMapName = m.phase === 'map_select' ? m.selectedMap : null;
+  // The entry backdrop is itself an early load of the first likely track. Keep it if the vote
+  // chose that track; otherwise release its network request and any cosmetic preview immediately.
+  if (votedMapName && entryMapLoad && votedMapName !== entryMapName) abandonEntryMapLoad();
+  if (votedMapName && activeMapPreviewController) activeMapPreviewController.abort();
   // Begin the chosen GLB download/decode while everyone is still voting. A later vote replaces
   // the pending world, so the race can use the actual map without spending its whole load budget.
-  selectedMapPrefetch.start(m.phase === 'map_select' && m.selectedMap !== loadedMap
-    ? m.selectedMap : null);
+  // If the entry backdrop is already loading this same track, reuse that work instead.
+  selectedMapPrefetch.start(votedMapName && votedMapName !== loadedMap && votedMapName !== entryMapName
+    ? votedMapName : null);
   screens.setMenuTouch(m.roomCode, m.touch);
   if (m.phase === 'car_select') { flowPhase = 'car_select'; screens.renderCarSelect(m.players); }
   else if (m.phase === 'map_select') { flowPhase = 'map_select'; flowMaps = m.maps; screens.renderMapSelect(m.maps, m.selectedMap, m.players, { counts: m.mapVotes ?? {}, tie: m.mapTie ?? false }); }
+  scheduleOptionalAssetDownloads();
   startAttract();
 });
 conn.onResults((m) => {
   selectedMapPrefetch.clear();
+  votedMapName = null;
   racePreparationGeneration += 1; cancelPendingRaceSnapshot();
   if (raceLive) invalidateLevelLoad();
   stationDisplay.markEngineResultsReady();
   stationEngineStateReady = true; maybeMarkStationReady();
   raceLive = false; raceSceneReady = !stationDisplay.active; flowPhase = 'results'; big.textContent = '';
+  scheduleOptionalAssetDownloads();
   getMusicManager().switchContext('leaderboard');
   startAttract();
   // A race's standings and room identify its result. Broadcasts for that result share one request;
@@ -445,6 +471,15 @@ function invalidateLevelLoad(): number {
   return levelLoadGeneration;
 }
 
+function abandonEntryMapLoad(): void {
+  if (!entryMapLoad) return;
+  invalidateLevelLoad();
+  // Another vote may arrive before the aborted request settles. It must not mistake this old
+  // backdrop request for reusable selected-map work.
+  entryMapLoad = null;
+  entryMapName = null;
+}
+
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string, onTimeout?: () => void): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { onTimeout?.(); reject(new Error(`${label} timed out`)); }, timeoutMs);
@@ -470,12 +505,16 @@ async function applyLevel(mapName: string | null | undefined, deadlineSignal?: A
   if (deadlineSignal?.aborted) controller.abort();
   let gantryOffsets: { start?: GantryOffset; finish?: GantryOffset } = {};
   let applied = false;
+  let uninstalledWorld: NonNullable<Awaited<ReturnType<typeof loadMapWorld>>> | null = null;
   try {
     if (controller.signal.aborted) return false;
-    // A fully decoded vote selection already has its catalog entry. Reuse it if the internet
-    // drops between voting and the start signal; a second network request is unnecessary.
-    const cachedConfig = raceLive ? selectedMapPrefetch.peekReady(mapName)?.config : null;
-    let maps = cachedConfig ? { [mapName]: cachedConfig }
+    // Await the one chosen-map prefetch FIRST. Its scene and catalog entry transfer together, so
+    // race start does not wait for a second catalog request on an unstable link. The scene remains
+    // ours to dispose until the renderer installs it, including if a later deadline aborts.
+    const prefetched = raceLive ? await selectedMapPrefetch.take(mapName, controller.signal) : null;
+    uninstalledWorld = prefetched?.world ?? null;
+    if (controller.signal.aborted || generation !== levelLoadGeneration) return false;
+    let maps = prefetched ? { [mapName]: prefetched.config }
       : await withTimeout(fetchMaps(controller.signal), RACER_CONFIG_TIMEOUT_MS, 'map catalog', () => controller.abort());
     if (controller.signal.aborted || generation !== levelLoadGeneration) return false;
     // The map catalog can briefly fail on a spotty connection. One quick retry prevents an empty
@@ -483,25 +522,21 @@ async function applyLevel(mapName: string | null | undefined, deadlineSignal?: A
     if (!maps[mapName]) {
       await new Promise(resolve => setTimeout(resolve, 350));
       if (controller.signal.aborted || generation !== levelLoadGeneration) return false;
-      const newlyReady = raceLive ? selectedMapPrefetch.peekReady(mapName)?.config : null;
-      maps = newlyReady ? { [mapName]: newlyReady }
-        : await withTimeout(fetchMaps(controller.signal), RACER_CONFIG_TIMEOUT_MS, 'map catalog retry', () => controller.abort());
+      maps = await withTimeout(fetchMaps(controller.signal), RACER_CONFIG_TIMEOUT_MS, 'map catalog retry', () => controller.abort());
     }
     const cfg = maps[mapName];
     if (!cfg) throw new Error(`map ${mapName} is unavailable`);
     if (cfg) {
       // Normalize the saved config into a full level (fills defaults; optional lighting/effects/props).
       const level = mergeLevel(cfg);
-      const prefetched = raceLive ? await selectedMapPrefetch.take(mapName, controller.signal) : null;
       const world = prefetched?.world ?? (stationDisplay.active
         ? await withTimeout(loadMapWorld(cfg, controller.signal), RACER_MAP_TIMEOUT_MS, `map ${mapName}`, () => controller.abort())
         : await withTimeout(loadMapWorld(cfg, controller.signal), RACER_STANDALONE_MAP_TIMEOUT_MS, `map ${mapName}`, () => controller.abort()));
-      if (controller.signal.aborted || generation !== levelLoadGeneration) {
-        if (world) disposeMapWorld(world);
-        return false;
-      }
+      uninstalledWorld = world;
+      if (controller.signal.aborted || generation !== levelLoadGeneration) return false;
       if (!world) throw new Error(`map ${mapName} failed to load`);
       renderer.setMapWorld(world);
+      uninstalledWorld = null; // renderer now owns the scene
       // Race stays in canonical sim space; the map's saved transform places the scenery.
       applyTrackTransform(renderer.getTrackGroup(), CANONICAL_TRACK);
       // Render-only curved path: cars/items/camera follow the curve; the sim stays straight.
@@ -527,6 +562,7 @@ async function applyLevel(mapName: string | null | undefined, deadlineSignal?: A
     renderer.setCarScale(() => 1); renderer.setItemScale(() => 1); void renderer.setProps([]);
     loadedMap = null;
   } finally {
+    if (uninstalledWorld) disposeMapWorld(uninstalledWorld);
     deadlineSignal?.removeEventListener('abort', abortForDeadline);
     if (levelLoadController === controller) levelLoadController = null;
   }
@@ -560,12 +596,24 @@ async function loadRaceLevelWithinBudget(mapName: string | null | undefined, gen
   if (generation !== racePreparationGeneration) return false;
   if (!mapName) { selectedMapPrefetch.clear(); resetToGeneratedRaceScene(); return true; }
   if (mapName === loadedMap) { selectedMapPrefetch.clear(); invalidateLevelLoad(); return true; }
+  const budgetMs = stationDisplay.active ? RACER_STATION_SCENE_BUDGET_MS : RACER_STANDALONE_SCENE_BUDGET_MS;
+  const startedAt = performance.now();
+  // A fast caller can start while the QR-screen backdrop is still decoding. If they chose that
+  // same map, keep its in-flight work rather than aborting and fetching the identical GLB again.
+  if (entryMapName === mapName && entryMapLoad) {
+    try { await withTimeout(entryMapLoad, budgetMs, 'entry map', () => invalidateLevelLoad()); }
+    catch { /* use any remaining scene budget for the selected-map retry below */ }
+    if (generation !== racePreparationGeneration) return false;
+    if (loadedMap === mapName) { selectedMapPrefetch.clear(); return true; }
+  }
+  const remainingMs = Math.max(0, budgetMs - (performance.now() - startedAt));
   resetToGeneratedRaceScene();
+  if (remainingMs < 100) return true;
   const budgetController = new AbortController();
   try {
     const applied = await withTimeout(
       applyLevel(mapName, budgetController.signal),
-      stationDisplay.active ? RACER_STATION_SCENE_BUDGET_MS : RACER_STANDALONE_SCENE_BUDGET_MS,
+      remainingMs,
       'race map',
       () => budgetController.abort(),
     );
@@ -633,7 +681,9 @@ async function loadAssetsInBackground(): Promise<void> {
   // Portrait captures run independently from the backdrop. A slow map or prop must not leave the car
   // grid spinning, and a live station race pauses this cosmetic work instead of cancelling it.
   const capturesMayStart = new Promise<void>(resolve => setTimeout(resolve, 1500));
-  const canCapture = () => !raceLive && !selectedMapPrefetch.isLoading;
+  const canCapture = () => !raceLive && flowPhase !== 'results' && !selectedMapPrefetch.isLoading;
+  const canRenderMapPreview = (name: string) => canCapture() && !entryPreparationPending
+    && votedMapName === null && (name === loadedMap || flowPhase === 'map_select');
   void (async () => {
     await capturesMayStart;
     await renderCarThumbnailsAsync(assets, (i, url) => screens.setCarThumb(i, url), 256, canCapture);
@@ -649,36 +699,45 @@ async function loadAssetsInBackground(): Promise<void> {
   try {
     let bg = urlMap;
     if (!bg) { try { bg = Object.keys(await fetchMaps())[0] ?? null; } catch { bg = null; } }
-    if (!raceLive) await applyLevel(bg);
+    if (bg && !raceLive && votedMapName === null) {
+      entryMapName = bg;
+      const load = applyLevel(bg);
+      entryMapLoad = load;
+      try { await load; }
+      finally {
+        if (entryMapLoad === load) { entryMapLoad = null; entryMapName = null; }
+      }
+    }
   } catch { /* keep generated track */ }
+  finally { entryPreparationPending = false; scheduleOptionalAssetDownloads(); }
   // Models + map are loaded → NOW the attract demo can show real cars on the real track. If a menu
   // already asked for it (wantAttract), kick it off; otherwise startAttract() will once a screen needs it.
   assetsReady = true;
   maybeMarkStationReady();
   if (wantAttract) reallyStartAttract();
 
-  // Map previews LAST (heaviest — full scenery GLBs): render each authored map's 3D world to a tile
-  // image so the map-select screen shows what the track looks like, not a blank card. Pace each one
-  // to main-thread idle so a big scenery render can't hitch the attract demo.
+  // Map previews LAST (heaviest — full scenery GLBs). At entry, capture only the already loaded
+  // likely backdrop; defer other maps until the selector is open, and stop as soon as a vote chooses
+  // the actual race map. This avoids downloading every 3D track while a caller is joining by QR.
   try {
     const maps = await fetchMaps();
     const previews: Record<string, string> = {};
-    for (const [name, cfg] of Object.entries(maps)) {
+    const entries = Object.entries(maps).sort(([a], [b]) => Number(b === loadedMap) - Number(a === loadedMap));
+    for (const [name, cfg] of entries) {
       let url = '';
       let cancelled = false;
       do {
-        while (!canCapture()) await new Promise(resolve => setTimeout(resolve, 250));
+        while (!canRenderMapPreview(name)) await new Promise(resolve => setTimeout(resolve, 250));
         await whenIdle();
-        while (!canCapture()) await new Promise(resolve => setTimeout(resolve, 250));
+        while (!canRenderMapPreview(name)) await new Promise(resolve => setTimeout(resolve, 250));
         const controller = new AbortController();
         activeMapPreviewController = controller;
         try { url = await renderMapThumbnail(cfg, 480, controller.signal); }
         finally { if (activeMapPreviewController === controller) activeMapPreviewController = null; }
         cancelled = controller.signal.aborted;
       } while (cancelled); // a race interrupted this preview; retry after returning to the menu
-      if (url) previews[name] = url;
+      if (url) { previews[name] = url; screens.setMapPreviews({ ...previews }); }
     }
-    screens.setMapPreviews(previews);
   } catch { /* tiles fall back to the placeholder */ }
 }
 
@@ -759,6 +818,7 @@ function boot() {
 
   // Heavy asset work happens in the BACKGROUND (off the critical path). The lobby is already up;
   // the race only needs these once someone starts, and the car grid fills in progressively.
+  scheduleOptionalAssetDownloads();
   void loadAssetsInBackground();
 
   let lastPowerActive: Set<string> = new Set();  // Track which cars have active power for SFX

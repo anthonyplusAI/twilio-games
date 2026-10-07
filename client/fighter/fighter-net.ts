@@ -2,6 +2,7 @@ import type { FighterCommand, FighterEvent } from '../../shared/fighter-world';
 import type { FighterMapEntry, FighterRosterEntry } from '../../shared/fighter-roster';
 import type { FighterServerMessage, FighterState } from '../../shared/fighter-protocol';
 import type { SupportedLocale } from '../../shared/i18n/locales';
+import { withDisplaySession } from '../display-session';
 
 export type FighterConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'closed';
 
@@ -30,7 +31,7 @@ export class FighterConnection {
   constructor(private url: string, private locale?: SupportedLocale) { this.connect(); }
   private connect(): void {
     const generation = ++this.generation;
-    const ws = this.ws = new WebSocket(this.url);
+    const ws = this.ws = new WebSocket(withDisplaySession(this.url));
     this.connectionCb?.(generation === 1 ? 'connecting' : 'reconnecting');
     ws.onopen = () => {
       if (generation !== this.generation || this.closed) return;

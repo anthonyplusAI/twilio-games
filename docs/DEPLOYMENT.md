@@ -133,7 +133,7 @@ The deployed specification currently sets these variables:
 | `ARCADE_SIGNING_SECRET` | Container App secret populated from the matching GitHub secret | Root key for signed player sessions and challenge claims; ignored while station mode is `off` |
 | `ARCADE_DISPLAY_TOKEN` | Container App secret populated from the matching GitHub secret | Server-held kiosk capability for station launch and display-ready acknowledgement; use at least 16 random characters |
 | `ARCADE_STATE_PATH` | Literal `/app/data/arcade-state.json` | Schema-versioned player, economy, station, identity, outbox, and audit state on Azure Files |
-| `ARCADE_STANDALONE_VOICE_ENABLED` | Literal `true` | Permits standalone routing only when exactly one eligible game display is open; zero or multiple different game displays receive unavailable TwiML |
+| `ARCADE_STANDALONE_VOICE_ENABLED` | Literal `true` | Permits standalone calls to route to an accepted game display. A same-tab game switch can keep the old socket briefly; unrelated displays remain ambiguous and fail closed. |
 | `GAME_PHONE_NUMBER` | GitHub repository variable | Legacy fallback used only when an operator has not configured locale-specific voice numbers |
 | Runtime `channels.voiceNumbers` | Twilio Games operator settings | Public `en-US` and `pt-BR` voice numbers used by lobbies and call-now notices; changing one also requires reapproving the matching WhatsApp Phone CTA template and updating its Content SID |
 | `TWILIO_WHATSAPP_NUMBER` | GitHub repository variable | Approved WhatsApp sender used by the localized `/join` chooser; empty hides WhatsApp |
@@ -312,7 +312,7 @@ curl --fail http://localhost:8099/healthz
 
 The synthetic Deepgram value is only for startup validation. Do not place a Karaoke call during this local check.
 
-In production, Twilio signature validation defaults on and the deployment requires `TWILIO_AUTH_TOKEN`. Outside production it defaults off unless a Twilio token is present or `TWILIO_VALIDATE_SIGNATURES=true`. Without the primary token, SMS, WhatsApp, TAC, and messaging-status webhooks fail with status 500; Voice requests can still validate with `TWILIO_PT_AUTH_TOKEN`. The deployed `ARCADE_STANDALONE_VOICE_ENABLED=true` setting permits routing only with exactly one eligible game display; absent or ambiguous displays receive unavailable TwiML.
+In production, Twilio signature validation defaults on and the deployment requires `TWILIO_AUTH_TOKEN`. Outside production it defaults off unless a Twilio token is present or `TWILIO_VALIDATE_SIGNATURES=true`. Without the primary token, SMS, WhatsApp, TAC, and messaging-status webhooks fail with status 500; Voice requests can still validate with `TWILIO_PT_AUTH_TOKEN`. The deployed `ARCADE_STANDALONE_VOICE_ENABLED=true` setting routes calls in standalone mode to an accepted display in the requested room. During navigation within one browser tab, the new game's page and accepted display binding let the server wait briefly and choose the new game even if the old socket lingers. The display-session identifier is a routing hint, not an authentication credential. A missing display, a failed new binding, or different tabs showing different games still fail closed with unavailable TwiML. Station mode uses its own match assignment instead of standalone display routing.
 
 ## Rollback
 

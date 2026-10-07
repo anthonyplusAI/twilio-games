@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
@@ -342,6 +342,445 @@ describe('Arcade Voice routing', () => {
     display.close();
   });
 
+  it('routes a call made while a newly selected standalone game display is still connecting', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const response = incomingCall(port, { callSid: 'CA-switching-games' });
+    await new Promise(resolve => setTimeout(resolve, 40));
+
+    const display = new WebSocket(`ws://127.0.0.1:${port}/game?display=1`);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        display.once('open', resolve);
+        display.once('error', reject);
+      });
+      const bound = new Promise<void>(resolve => display.on('message', data => {
+        const message = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+        if (message.type === 'lobby' && message.roomCode === '4821') resolve();
+      }));
+      display.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+      await bound;
+      const xml = await (await response).text();
+      expect(xml).toContain('<ConversationRelay');
+      expect(xml).toContain('<Parameter name="game" value="racer"');
+    } finally {
+      display.close();
+    }
+  });
+
+  it('waits for an old display to close during a fast game switch before choosing the new game', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const connectDisplay = async (path: 'game' | 'battle', stateType: string) => {
+      const display = new WebSocket(`ws://127.0.0.1:${port}/${path}?display=1`);
+      await new Promise<void>((resolve, reject) => {
+        display.once('open', resolve);
+        display.once('error', reject);
+      });
+      const bound = new Promise<void>(resolve => display.on('message', data => {
+        const state = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+        if (state.type === stateType && state.roomCode === '4821') resolve();
+      }));
+      display.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+      await bound;
+      return display;
+    };
+    const oldDisplay = await connectDisplay('game', 'lobby');
+    const newDisplay = await connectDisplay('battle', 'battle_state');
+    try {
+      const response = incomingCall(port, { callSid: 'CA-fast-switch' });
+      await new Promise(resolve => setTimeout(resolve, 40));
+      oldDisplay.close();
+      await new Promise<void>(resolve => oldDisplay.once('close', () => resolve()));
+      const xml = await (await response).text();
+      expect(xml).toContain('<ConversationRelay');
+      expect(xml).toContain('<Parameter name="game" value="monsters"');
+    } finally {
+      oldDisplay.close();
+      newDisplay.close();
+    }
+  });
+
+  it('routes to the newer validated game when an earlier socket from the same tab stays open past handoff', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const displaySessionId = '11111111-1111-4111-8111-111111111111';
+    const connectDisplay = async (gamePath: 'game' | 'battle', stateType: string) => {
+      const display = new WebSocket(
+        `ws://127.0.0.1:${port}/${gamePath}?display=1&displaySessionId=${displaySessionId}`,
+      );
+      await new Promise<void>((resolve, reject) => {
+        display.once('open', resolve);
+        display.once('error', reject);
+      });
+      const bound = new Promise<void>(resolve => display.on('message', data => {
+        const state = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+        if (state.type === stateType && state.roomCode === '4821') resolve();
+      }));
+      display.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+      await bound;
+      return display;
+    };
+    const oldDisplay = await connectDisplay('game', 'lobby');
+    const newDisplay = await connectDisplay('battle', 'battle_state');
+    try {
+      await new Promise(resolve => setTimeout(resolve, 2_100));
+      expect(oldDisplay.readyState).toBe(WebSocket.OPEN);
+      const xml = await (await incomingCall(port, { callSid: 'CA-same-tab-stale-display' })).text();
+      expect(xml).toContain('<ConversationRelay');
+      expect(xml).toContain('<Parameter name="game" value="monsters"');
+    } finally {
+      oldDisplay.close();
+      newDisplay.close();
+    }
+  }, 10_000);
+
+  it('lets a newly selected game connect just after the call webhook instead of routing the old page', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const displaySessionId = '11111111-1111-4111-8111-111111111111';
+    const connectDisplay = async (gamePath: 'game' | 'battle', stateType: string,
+      spectateDelayMs = 0) => {
+      const display = new WebSocket(
+        `ws://127.0.0.1:${port}/${gamePath}?display=1&displaySessionId=${displaySessionId}`,
+      );
+      await new Promise<void>((resolve, reject) => {
+        display.once('open', resolve);
+        display.once('error', reject);
+      });
+      const bound = new Promise<void>(resolve => display.on('message', data => {
+        const state = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+        if (state.type === stateType && state.roomCode === '4821') resolve();
+      }));
+      if (spectateDelayMs) await new Promise(resolve => setTimeout(resolve, spectateDelayMs));
+      display.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+      await bound;
+      return display;
+    };
+    const oldDisplay = await connectDisplay('game', 'lobby');
+    let newDisplay: WebSocket | null = null;
+    try {
+      const response = incomingCall(port, { callSid: 'CA-transition-before-new-socket' });
+      await new Promise(resolve => setTimeout(resolve, 40));
+      // The new socket is open quickly, but loading its page delays the accepted spectate.
+      newDisplay = await connectDisplay('battle', 'battle_state', 300);
+      const xml = await (await response).text();
+      expect(xml).toContain('<Parameter name="game" value="monsters"');
+    } finally {
+      oldDisplay.close();
+      newDisplay?.close();
+    }
+  });
+
+  it.each([
+    ['500 ms with the previous socket open', 500, false],
+    ['2,500 ms with the previous socket open', 2_500, false],
+    ['2,500 ms after the previous socket closes', 2_500, true],
+    ['6,500 ms while the next page finishes loading', 6_500, false],
+  ] as const)('honors a game-page navigation after %s', async (_description, bundleDelayMs, closeOldBeforeCall) => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const id = '11111111-1111-4111-8111-111111111111';
+    await mkdir(path.join(directory!, 'client'), { recursive: true });
+    await writeFile(path.join(directory!, 'client', 'monsters.html'), '<!doctype html><title>Monsters</title>');
+    const old = new WebSocket(`ws://127.0.0.1:${port}/game?display=1&displaySessionId=${id}`);
+    await new Promise<void>((resolve, reject) => {
+      old.once('open', resolve);
+      old.once('error', reject);
+    });
+    const oldBound = new Promise<void>(resolve => old.on('message', data => {
+      const frame = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+      if (frame.type === 'lobby' && frame.roomCode === '4821') resolve();
+    }));
+    old.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+    await oldBound;
+
+    let next: WebSocket | null = null;
+    try {
+      const page = await fetch(`http://127.0.0.1:${port}/monsters.html?display=1&room=4821&displaySessionId=${id}`);
+      expect(page.status).toBe(200);
+      if (closeOldBeforeCall) {
+        await new Promise<void>(resolve => {
+          old.once('close', () => resolve());
+          old.close();
+        });
+      }
+      const call = incomingCall(port, { callSid: 'CA-slow-next-bundle' });
+      await new Promise(resolve => setTimeout(resolve, bundleDelayMs));
+
+      next = new WebSocket(`ws://127.0.0.1:${port}/battle?display=1&displaySessionId=${id}`);
+      await new Promise<void>((resolve, reject) => {
+        next!.once('open', resolve);
+        next!.once('error', reject);
+      });
+      const nextBound = new Promise<void>(resolve => next!.on('message', data => {
+        const frame = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+        if (frame.type === 'battle_state' && frame.roomCode === '4821') resolve();
+      }));
+      next.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+      await nextBound;
+      expect((server as unknown as { standaloneNavigationIntents: Map<string, unknown> })
+        .standaloneNavigationIntents.has(id)).toBe(false);
+      const xml = await (await call).text();
+      expect(xml).toContain('<Parameter name="game" value="monsters"');
+    } finally {
+      old.close();
+      next?.close();
+    }
+  }, 15_000);
+
+  it('does not commit a navigated game until the new display accepts spectate', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const id = '11111111-1111-4111-8111-111111111111';
+    await mkdir(path.join(directory!, 'client'), { recursive: true });
+    await writeFile(path.join(directory!, 'client', 'monsters.html'), '<!doctype html><title>Monsters</title>');
+    const old = new WebSocket(`ws://127.0.0.1:${port}/game?display=1&displaySessionId=${id}`);
+    await new Promise<void>((resolve, reject) => {
+      old.once('open', resolve);
+      old.once('error', reject);
+    });
+    const oldBound = new Promise<void>(resolve => old.on('message', data => {
+      const frame = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+      if (frame.type === 'lobby' && frame.roomCode === '4821') resolve();
+    }));
+    old.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+    await oldBound;
+    try {
+      const page = await fetch(`http://127.0.0.1:${port}/monsters.html?display=1&room=4821&displaySessionId=${id}`);
+      expect(page.status).toBe(200);
+      const startedAtMs = Date.now();
+      const xml = await (await incomingCall(port, { callSid: 'CA-new-page-not-ready' })).text();
+      expect(Date.now() - startedAtMs).toBeGreaterThanOrEqual(4_500);
+      expect(xml).toContain('voice play is unavailable');
+      expect(xml).not.toContain('<ConversationRelay');
+    } finally {
+      old.close();
+    }
+  }, 15_000);
+
+  it('does not let a different tab\'s game-page navigation block the active display', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    await mkdir(path.join(directory!, 'client'), { recursive: true });
+    await writeFile(path.join(directory!, 'client', 'monsters.html'), '<!doctype html><title>Monsters</title>');
+    const currentId = '11111111-1111-4111-8111-111111111111';
+    const otherId = '22222222-2222-4222-8222-222222222222';
+    const display = new WebSocket(`ws://127.0.0.1:${port}/game?display=1&displaySessionId=${currentId}`);
+    await new Promise<void>((resolve, reject) => {
+      display.once('open', resolve);
+      display.once('error', reject);
+    });
+    const bound = new Promise<void>(resolve => display.on('message', data => {
+      const frame = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+      if (frame.type === 'lobby' && frame.roomCode === '4821') resolve();
+    }));
+    display.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+    await bound;
+    try {
+      const page = await fetch(`http://127.0.0.1:${port}/monsters.html?display=1&room=4821&displaySessionId=${otherId}`);
+      expect(page.status).toBe(200);
+      const xml = await (await incomingCall(port, { callSid: 'CA-other-tab-navigation' })).text();
+      expect(xml).toContain('<Parameter name="game" value="racer"');
+    } finally {
+      display.close();
+    }
+  });
+
+  it('does not let a same-game reconnect awaiting spectate block a valid game route', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const id = '11111111-1111-4111-8111-111111111111';
+    const old = new WebSocket(`ws://127.0.0.1:${port}/game?display=1&displaySessionId=${id}`);
+    await new Promise<void>((resolve, reject) => {
+      old.once('open', resolve);
+      old.once('error', reject);
+    });
+    const bound = new Promise<void>(resolve => old.on('message', data => {
+      const frame = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+      if (frame.type === 'lobby' && frame.roomCode === '4821') resolve();
+    }));
+    old.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+    await bound;
+    const reconnecting = new WebSocket(`ws://127.0.0.1:${port}/game?display=1&displaySessionId=${id}`);
+    await new Promise<void>((resolve, reject) => {
+      reconnecting.once('open', resolve);
+      reconnecting.once('error', reject);
+    });
+    try {
+      const xml = await (await incomingCall(port, { callSid: 'CA-same-game-reconnect' })).text();
+      expect(xml).toContain('<Parameter name="game" value="racer"');
+    } finally {
+      old.close();
+      reconnecting.close();
+    }
+  });
+
+  it.each([
+    ['fighter', 'fighter_state'],
+    ['karaoke', 'karaoke_state'],
+    ['chess', 'chess_state'],
+    ['trivia', 'trivia_state'],
+  ] as const)('routes from Racer to an accepted %s display in the same tab', async (gamePath, stateType) => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const displaySessionId = '11111111-1111-4111-8111-111111111111';
+    const racer = new WebSocket(
+      `ws://127.0.0.1:${port}/game?display=1&displaySessionId=${displaySessionId}`,
+    );
+    await new Promise<void>((resolve, reject) => {
+      racer.once('open', resolve);
+      racer.once('error', reject);
+    });
+    const racerBound = new Promise<void>(resolve => racer.on('message', data => {
+      const frame = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+      if (frame.type === 'lobby' && frame.roomCode === '4821') resolve();
+    }));
+    racer.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+    await racerBound;
+
+    const next = new WebSocket(
+      `ws://127.0.0.1:${port}/${gamePath}?display=1&displaySessionId=${displaySessionId}`,
+      { headers: { Origin: 'http://localhost' } },
+    );
+    try {
+      await new Promise<void>((resolve, reject) => {
+        next.once('open', resolve);
+        next.once('error', reject);
+      });
+      const nextBound = new Promise<void>(resolve => next.on('message', data => {
+        const frame = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+        if (frame.type === stateType && frame.roomCode === '4821') resolve();
+      }));
+      next.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+      await nextBound;
+      const xml = await (await incomingCall(port, { callSid: `CA-switch-${gamePath}` })).text();
+      expect(xml).toContain(`<Parameter name="game" value="${gamePath}"`);
+    } finally {
+      racer.close();
+      next.close();
+    }
+  });
+
+  it('does not route to a newer same-tab socket until its spectate is accepted', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const displaySessionId = '11111111-1111-4111-8111-111111111111';
+    const racer = new WebSocket(
+      `ws://127.0.0.1:${port}/game?display=1&displaySessionId=${displaySessionId}`,
+    );
+    await new Promise<void>((resolve, reject) => {
+      racer.once('open', resolve);
+      racer.once('error', reject);
+    });
+    const racerBound = new Promise<void>(resolve => racer.on('message', data => {
+      const frame = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+      if (frame.type === 'lobby' && frame.roomCode === '4821') resolve();
+    }));
+    racer.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+    await racerBound;
+    const next = new WebSocket(
+      `ws://127.0.0.1:${port}/battle?display=1&displaySessionId=${displaySessionId}`,
+    );
+    try {
+      await new Promise<void>((resolve, reject) => {
+        next.once('open', resolve);
+        next.once('error', reject);
+      });
+      const xml = await (await incomingCall(port, { callSid: 'CA-unbound-new-display' })).text();
+      expect(xml).toContain('voice play is unavailable');
+      expect(xml).not.toContain('<ConversationRelay');
+    } finally {
+      racer.close();
+      next.close();
+    }
+  }, 10_000);
+
+  it('does not let an unbound different-tab socket delay the active game', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const racer = new WebSocket(
+      `ws://127.0.0.1:${port}/game?display=1&displaySessionId=11111111-1111-4111-8111-111111111111`,
+    );
+    await new Promise<void>((resolve, reject) => {
+      racer.once('open', resolve);
+      racer.once('error', reject);
+    });
+    const racerBound = new Promise<void>(resolve => racer.on('message', data => {
+      const frame = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+      if (frame.type === 'lobby' && frame.roomCode === '4821') resolve();
+    }));
+    racer.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+    await racerBound;
+    const unrelated = new WebSocket(
+      `ws://127.0.0.1:${port}/battle?display=1&displaySessionId=22222222-2222-4222-8222-222222222222`,
+    );
+    try {
+      await new Promise<void>((resolve, reject) => {
+        unrelated.once('open', resolve);
+        unrelated.once('error', reject);
+      });
+      const xml = await (await incomingCall(port, { callSid: 'CA-unrelated-unbound' })).text();
+      expect(xml).toContain('<Parameter name="game" value="racer"');
+    } finally {
+      racer.close();
+      unrelated.close();
+    }
+  }, 10_000);
+
+  it('does not block the default-room call because a newer display accepted a different room', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const racer = new WebSocket('ws://127.0.0.1:' + port + '/game?display=1');
+    await new Promise<void>((resolve, reject) => {
+      racer.once('open', resolve);
+      racer.once('error', reject);
+    });
+    const racerBound = new Promise<void>(resolve => racer.on('message', data => {
+      const frame = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+      if (frame.type === 'lobby' && frame.roomCode === '4821') resolve();
+    }));
+    racer.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+    await racerBound;
+
+    const otherRoom = new WebSocket('ws://127.0.0.1:' + port + '/battle?display=1');
+    try {
+      await new Promise<void>((resolve, reject) => {
+        otherRoom.once('open', resolve);
+        otherRoom.once('error', reject);
+      });
+      const otherBound = new Promise<void>(resolve => otherRoom.on('message', data => {
+        const frame = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+        if (frame.type === 'battle_state' && frame.roomCode === 'OTHER') resolve();
+      }));
+      otherRoom.send(JSON.stringify({ type: 'spectate', roomCode: 'OTHER' }));
+      await otherBound;
+      const xml = await (await incomingCall(port, { callSid: 'CA-other-room-display' })).text();
+      expect(xml).toContain('<Parameter name="game" value="racer"');
+    } finally {
+      racer.close();
+      otherRoom.close();
+    }
+  }, 10_000);
+
+  it('keeps different display sessions ambiguous even after the handoff window', async () => {
+    const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
+    const connectDisplay = async (gamePath: 'game' | 'battle', stateType: string, displaySessionId: string) => {
+      const display = new WebSocket(
+        `ws://127.0.0.1:${port}/${gamePath}?display=1&displaySessionId=${displaySessionId}`,
+      );
+      await new Promise<void>((resolve, reject) => {
+        display.once('open', resolve);
+        display.once('error', reject);
+      });
+      const bound = new Promise<void>(resolve => display.on('message', data => {
+        const state = JSON.parse(data.toString()) as { type?: string; roomCode?: string };
+        if (state.type === stateType && state.roomCode === '4821') resolve();
+      }));
+      display.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+      await bound;
+      return display;
+    };
+    const racer = await connectDisplay('game', 'lobby', '11111111-1111-4111-8111-111111111111');
+    const monsters = await connectDisplay('battle', 'battle_state', '22222222-2222-4222-8222-222222222222');
+    try {
+      const xml = await (await incomingCall(port, { callSid: 'CA-distinct-displays' })).text();
+      expect(xml).toContain('voice play is unavailable');
+      expect(xml).not.toContain('<ConversationRelay');
+    } finally {
+      racer.close();
+      monsters.close();
+    }
+  }, 10_000);
+
   it('routes a standalone call to the active Voice Chess display', async () => {
     const { port } = await harness({ active: false, standaloneVoiceEnabled: true });
     const display = new WebSocket(`ws://127.0.0.1:${port}/chess?display=1`, {
@@ -670,6 +1109,7 @@ describe('Arcade Voice routing', () => {
     expect(terms.length).toBeLessThanOrEqual(100);
     expect(new Set(terms.map(term => term.toLowerCase())).size).toBe(terms.length);
     expect(terms).toEqual(expect.arrayContaining(['a1', 'b1', 'c3', 'h8']));
+    expect(terms).toContain(locale === 'pt-BR' ? 'dica' : 'hint');
     expect(terms).toEqual(expect.arrayContaining(locale === 'pt-BR'
       ? ['coluna B', 'na coluna B'] : ['B file', 'on B']));
   });

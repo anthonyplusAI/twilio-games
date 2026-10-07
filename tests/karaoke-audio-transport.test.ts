@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { KaraokeSong } from '../shared/karaoke';
 import { EN_US_ORIGINAL_DEVELOPMENT_SONG, NEVER_GONNA_GIVE_YOU_UP } from '../shared/karaoke-songs';
-import { KaraokeAudioTransport, karaokeBackingPlan } from '../client/karaoke/karaoke-audio';
+import {
+  KaraokeAudioTransport,
+  KaraokeSelectedSongPreloader,
+  karaokeBackingPlan,
+} from '../client/karaoke/karaoke-audio';
 
 describe('Voice Karaoke procedural backing arrangement', () => {
   it('builds the same complete arrangement for the same immutable song', () => {
@@ -64,7 +68,10 @@ class FakeAudioContext extends EventTarget {
   }
 
   async decodeAudioData(): Promise<AudioBuffer> { return {} as AudioBuffer; }
-  createBuffer(): AudioBuffer { return {} as AudioBuffer; }
+  createBuffer(channels: number, length: number): AudioBuffer {
+    const data = Array.from({ length: channels }, () => new Float32Array(length));
+    return { getChannelData: (channel: number) => data[channel]! } as AudioBuffer;
+  }
   getOutputTimestamp(): AudioTimestamp {
     return this.outputTimestamp ?? { contextTime: Number.NaN, performanceTime: Number.NaN };
   }
@@ -123,8 +130,145 @@ describe('KaraokeAudioTransport browser state', () => {
   it('fetches and decodes the licensed excerpt from its root-relative catalog URL', async () => {
     const transport = new KaraokeAudioTransport();
     await transport.preload(NEVER_GONNA_GIVE_YOU_UP);
-    expect(fetch).toHaveBeenCalledWith('/audio/karaoke/classic-instrumental-45s.mp3?v=20260827-sync-2', { credentials: 'same-origin' });
+    expect(fetch).toHaveBeenCalledWith(
+      '/audio/karaoke/classic-instrumental-45s.mp3?v=20260827-sync-2',
+      { credentials: 'same-origin', signal: expect.any(AbortSignal) },
+    );
     expect(transport.isReady(NEVER_GONNA_GIVE_YOU_UP)).toBe(true);
+    transport.dispose();
+  });
+
+  it('shares a selection request with loading and replays its current progress', async () => {
+    let resolveBytes!: (bytes: ArrayBuffer) => void;
+    const bytes = new Promise<ArrayBuffer>(resolve => { resolveBytes = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, arrayBuffer: () => bytes })));
+    const transport = new KaraokeAudioTransport();
+    const early = transport.preload(remoteSong);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+
+    const progress: number[] = [];
+    const loading = transport.preload(remoteSong, value => progress.push(value));
+    expect(progress).toEqual([.08]);
+    resolveBytes(new ArrayBuffer(8));
+    await Promise.all([early, loading]);
+
+    expect(progress).toEqual([.08, .62, .96, 1]);
+    await transport.preload(remoteSong);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(transport.isReady(remoteSong)).toBe(true);
+    transport.dispose();
+  });
+
+  it('keeps loading attached when the optional selection consumer is canceled', async () => {
+    let resolveBytes!: (bytes: ArrayBuffer) => void;
+    const bytes = new Promise<ArrayBuffer>(resolve => { resolveBytes = resolve; });
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, arrayBuffer: () => bytes })));
+    const transport = new KaraokeAudioTransport();
+    const controller = new AbortController();
+    const early = transport.preload(remoteSong, undefined, controller.signal);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    const loading = transport.preload(remoteSong);
+
+    controller.abort();
+    await expect(early).rejects.toMatchObject({ name: 'AbortError' });
+    expect((vi.mocked(fetch).mock.calls[0]![1] as RequestInit).signal?.aborted).toBe(false);
+    resolveBytes(new ArrayBuffer(8));
+    await loading;
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(transport.isReady(remoteSong)).toBe(true);
+    transport.dispose();
+  });
+
+  it('lets a changed selection cancel stale work without caching its late result', async () => {
+    let resolveFirst!: (response: Response) => void;
+    let resolveSecond!: (response: Response) => void;
+    const firstResponse = new Promise<Response>(resolve => { resolveFirst = resolve; });
+    const secondResponse = new Promise<Response>(resolve => { resolveSecond = resolve; });
+    vi.stubGlobal('fetch', vi.fn()
+      .mockReturnValueOnce(firstResponse)
+      .mockReturnValueOnce(secondResponse));
+    const transport = new KaraokeAudioTransport();
+    const controller = new AbortController();
+    const first = transport.preload(remoteSong, undefined, controller.signal);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+
+    controller.abort();
+    await expect(first).rejects.toMatchObject({ name: 'AbortError' });
+    const second = transport.preload(remoteSong);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+    resolveFirst({ ok: true, arrayBuffer: async () => new ArrayBuffer(8) } as Response);
+    await Promise.resolve();
+    expect(transport.isReady(remoteSong)).toBe(false);
+    resolveSecond({ ok: true, arrayBuffer: async () => new ArrayBuffer(8) } as Response);
+    await second;
+    expect(transport.isReady(remoteSong)).toBe(true);
+    transport.dispose();
+  });
+
+  it('starts a fresh request after loading times out to the same selected song', async () => {
+    const fetchMock = vi.fn((_url: string, _init?: RequestInit) => new Promise<Response>(() => {}));
+    vi.stubGlobal('fetch', fetchMock);
+    const transport = new KaraokeAudioTransport();
+    const selected = new KaraokeSelectedSongPreloader(transport);
+    selected.update('song_select', remoteSong);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    const firstSignal = (fetchMock.mock.calls[0]![1] as RequestInit).signal!;
+
+    selected.update('loading', remoteSong);
+    const loadingController = new AbortController();
+    const loading = transport.preload(remoteSong, undefined, loadingController.signal);
+    loadingController.abort();
+    selected.update('song_select', remoteSong);
+    await expect(loading).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(firstSignal.aborted).toBe(true);
+
+    const retryController = new AbortController();
+    const retry = transport.preload(remoteSong, undefined, retryController.signal);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    retryController.abort();
+    selected.dispose();
+    await expect(retry).rejects.toMatchObject({ name: 'AbortError' });
+    transport.dispose();
+  });
+
+  it('bounds an optional menu preload without restarting on repeated broadcasts', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn((_url: string, _init?: RequestInit) => new Promise<Response>(() => {}));
+      vi.stubGlobal('fetch', fetchMock);
+      const transport = new KaraokeAudioTransport();
+      const selected = new KaraokeSelectedSongPreloader(transport, 25);
+      selected.update('song_select', remoteSong);
+      await Promise.resolve();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const firstSignal = (fetchMock.mock.calls[0]![1] as RequestInit).signal!;
+
+      await vi.advanceTimersByTimeAsync(25);
+      expect(firstSignal.aborted).toBe(true);
+      selected.update('song_select', remoteSong);
+      await Promise.resolve();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      const loadingController = new AbortController();
+      const loading = transport.preload(remoteSong, undefined, loadingController.signal);
+      await Promise.resolve();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      loadingController.abort();
+      await expect(loading).rejects.toMatchObject({ name: 'AbortError' });
+      selected.dispose();
+      transport.dispose();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('keeps procedural preloading asynchronous so the selection menu can paint', async () => {
+    class LowRateAudioContext extends FakeAudioContext { sampleRate = 1_000; }
+    vi.stubGlobal('window', { AudioContext: LowRateAudioContext });
+    const transport = new KaraokeAudioTransport();
+    const preload = transport.preload(EN_US_ORIGINAL_DEVELOPMENT_SONG);
+    expect(transport.isReady(EN_US_ORIGINAL_DEVELOPMENT_SONG)).toBe(false);
+    await preload;
+    expect(transport.isReady(EN_US_ORIGINAL_DEVELOPMENT_SONG)).toBe(true);
     transport.dispose();
   });
 
@@ -218,5 +362,34 @@ describe('KaraokeAudioTransport browser state', () => {
     context.outputTimestamp = { contextTime: 99.9, performanceTime: 1_000 };
     expect(transport.timeline(100_000)).toMatchObject({ rawTimeMs: 45_000, presentationTimeMs: 45_000 });
     transport.dispose();
+  });
+});
+
+describe('Karaoke selected-song preloading', () => {
+  it('starts only for the selected song, deduplicates broadcasts, and preserves loading work', () => {
+    const preload = vi.fn((_song: KaraokeSong, _progress?: (progress: number) => void, _signal?: AbortSignal) =>
+      new Promise<void>(() => {}));
+    const selected = new KaraokeSelectedSongPreloader({ preload });
+    const otherSong = { ...remoteSong, id: 'second-song', audioUrl: '/second.wav' };
+
+    selected.update('lobby', remoteSong);
+    selected.update('song_select', null);
+    expect(preload).not.toHaveBeenCalled();
+
+    selected.update('song_select', remoteSong);
+    selected.update('song_select', remoteSong);
+    expect(preload).toHaveBeenCalledTimes(1);
+    const firstSignal = preload.mock.calls[0]![2]!;
+
+    selected.update('song_select', otherSong);
+    expect(firstSignal.aborted).toBe(true);
+    expect(preload).toHaveBeenCalledTimes(2);
+    const secondSignal = preload.mock.calls[1]![2]!;
+    selected.update('loading', otherSong);
+    expect(secondSignal.aborted).toBe(false);
+    expect(preload).toHaveBeenCalledTimes(2);
+
+    selected.update('results', otherSong);
+    expect(secondSignal.aborted).toBe(true);
   });
 });

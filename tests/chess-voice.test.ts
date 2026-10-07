@@ -11,7 +11,7 @@ function state(overrides: Partial<ChessState> = {}): ChessState {
     roomCode: '4821', gameId: 1, phase: 'playing', playerConnected: true,
     humanColor: 'w', computerColor: 'b', turn: 'w', fen: START_FEN, pieces: [],
     revision: 0, ply: 0, selection: null, pendingMove: null, lastMove: null,
-    result: null, feedback: null, ...overrides,
+    result: null, feedback: null, hintsRemaining: 3, hint: null, ...overrides,
   };
 }
 
@@ -80,6 +80,133 @@ const computerCapture: ChessMoveRecord = {
 };
 
 describe('ChessVoiceSession', () => {
+  it('treats a spoken hint request as an action even when phrased as a question', () => {
+    const room = new ChessRoom('4821', { humanColor: 'w' });
+    const game = liveRoomHarness(room);
+    game.prompt('Can you give me a hint?');
+    expect(game.commands).toEqual(['Can you give me a hint?']);
+    expect(room.state().hintsRemaining).toBe(2);
+    expect(game.spoken.at(-1)).toMatch(/hint.*from.*to/i);
+  });
+
+  it('handles polite hint requests immediately when semantic interpretation is unavailable', () => {
+    const room = new ChessRoom('4821', { humanColor: 'w' });
+    const game = liveRoomHarness(room);
+    game.prompt('Can I get a hint?');
+    expect(room.state().hintsRemaining).toBe(2);
+    expect(game.spoken.at(-1)).toMatch(/hint.*from.*to/i);
+    game.prompt('hint please');
+    expect(game.spoken.at(-1)).toMatch(/hint.*from.*to/i);
+    expect(room.state().hintsRemaining).toBe(2); // Same-position reminder is free.
+  });
+
+  it('queues the station checkmate recap before the room completion callback snapshots speech', async () => {
+    const room = new ChessRoom('4821', { humanColor: 'w',
+      initialFen: '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1' });
+    room.setPlayerConnected(true);
+    const queued: Array<{ text: string; guard: (() => boolean) | undefined; release: () => void }> = [];
+    let retirement: Promise<void> | null = null;
+    let retirementSettled = false;
+    let session!: ChessVoiceSession;
+    session = new ChessVoiceSession({
+      bind: () => ({ playerId: 'c1', resumed: false }), leave: () => {},
+      command: (_code, _sid, utterance, locale) => {
+        const result = room.handleVoiceCommand(utterance, locale);
+        session.onRoomEvents(room.drainEvents()); // ChessServer.flush, before pushState.
+        if (room.phase === 'finished') {
+          retirement = session.whenSpeechSettled(); // Station lifecycle callback.
+          void retirement.then(() => { retirementSettled = true; });
+        }
+        return result;
+      },
+      restart: () => false, snapshot: () => room.state(),
+      say: (line, guard) => {
+        if (!/Checkmate!/i.test(line)) return Promise.resolve(true);
+        return new Promise<boolean>(resolve => queued.push({ text: line, guard, release: () => resolve(true) }));
+      },
+    });
+    session.setStationManaged(true);
+    session.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-station-mate',
+      customParameters: { roomCode: '4821' } }));
+    session.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'queen to G7', last: true }));
+    session.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'confirm', last: true }));
+
+    expect(room.state().phase).toBe('finished');
+    expect(queued).toHaveLength(1);
+    expect(queued[0]!.text).toMatch(/queen.*G seven.*Checkmate!.*Twilio Conversation Relay/i);
+    expect(queued[0]!.guard?.()).toBe(true);
+    expect(retirement).not.toBeNull();
+    await Promise.resolve();
+    expect(retirementSettled).toBe(false);
+    queued[0]!.release();
+    await retirement;
+    expect(retirementSettled).toBe(true);
+  });
+
+  it('answers hint allowance questions without spending a hint or needing the interpreter', () => {
+    const room = new ChessRoom('4821', { humanColor: 'w' });
+    const game = liveRoomHarness(room);
+    game.prompt('How many hints do I have left?');
+    expect(game.spoken.at(-1)).toMatch(/3 hints left/i);
+    expect(game.commands).toEqual([]);
+    game.prompt('Can I get a hint?');
+    expect(room.state().hintsRemaining).toBe(2);
+    game.prompt('Do I have any hints remaining?');
+    expect(game.spoken.at(-1)).toMatch(/2 hints left/i);
+    expect(game.commands).toEqual(['Can I get a hint?']);
+  });
+
+  it('answers Portuguese hint allowance questions from the room state', () => {
+    const room = new ChessRoom('4821', { humanColor: 'w' });
+    const game = liveRoomHarness(room, 'pt-BR');
+    game.prompt('Quantas dicas ainda tenho?');
+    expect(game.spoken.at(-1)).toMatch(/3 dicas restantes/i);
+    expect(game.commands).toEqual([]);
+  });
+
+  it('lets the grounded interpreter route an open-ended suggestion to the authoritative hint budget', async () => {
+    const room = new ChessRoom('4821', { humanColor: 'w' });
+    const game = liveRoomHarness(room, 'en-US', async context => {
+      expect(context.readOnlyInquiry).toBe(false);
+      return { kind: 'action', actionId: 'hint' };
+    });
+    game.prompt('I am stuck, pick out a safe plan for me');
+    await game.session.whenSpeechSettled();
+    expect(game.commands).toEqual(['hint']);
+    expect(room.state().hintsRemaining).toBe(2);
+    expect(room.state().pendingMove).toBeNull();
+  });
+
+  it('treats recommendation questions as actions while keeping hint counts read-only', async () => {
+    const room = new ChessRoom('4821', { humanColor: 'w' });
+    const game = liveRoomHarness(room, 'en-US', async context => {
+      return context.readOnlyInquiry
+        ? { kind: 'answer', factId: 'hints_remaining' }
+        : { kind: 'action', actionId: 'hint' };
+    });
+    game.prompt('How many hints do I have left?');
+    await game.session.whenSpeechSettled();
+    expect(room.state().hintsRemaining).toBe(3);
+    expect(game.spoken.at(-1)).toMatch(/3 hints left/i);
+    game.prompt('Could you explain what a good move is?');
+    await game.session.whenSpeechSettled();
+    expect(room.state().hintsRemaining).toBe(3);
+    game.prompt('Which move would you recommend here?');
+    await game.session.whenSpeechSettled();
+    expect(room.state().hintsRemaining).toBe(2);
+    game.prompt('What is the best move now?');
+    await game.session.whenSpeechSettled();
+    expect(room.state().hintsRemaining).toBe(2);
+    game.prompt('Could you help me choose?');
+    await game.session.whenSpeechSettled();
+    expect(room.state().hintsRemaining).toBe(2);
+    expect(game.commands).toEqual([
+      'Which move would you recommend here?',
+      'What is the best move now?',
+      'hint',
+    ]);
+  });
+
   it('starts the board without a setup menu and announces the assigned side', () => {
     const game = harness(state({ humanColor: 'b', computerColor: 'w', turn: 'b', ply: 1, lastMove: {
       ...computerCapture, color: 'w', piece: 'p', from: 'e2', to: 'e4', san: 'e4',
@@ -570,13 +697,13 @@ describe('ChessVoiceSession', () => {
 
   it.each([
     { locale: 'en-US', station: false, outcome: /you won the wizard duel/i,
-      technology: /Twilio Conversation Relay.*spoken moves.*board/i, next: /say play again/i },
+      technology: /Twilio Conversation Relay.*spoken moves.*pieces on screen.*result over your call/i, next: /say play again/i },
     { locale: 'en-US', station: true, outcome: /you won the wizard duel/i,
-      technology: /Twilio Conversation Relay.*spoken moves.*board/i, next: /station will prepare/i },
+      technology: /Twilio Conversation Relay.*spoken moves.*pieces on screen.*result over your call/i, next: /station will prepare/i },
     { locale: 'pt-BR', station: false, outcome: /você venceu o duelo de magos/i,
-      technology: /Twilio Conversation Relay.*lances falados.*tabuleiro/i, next: /diga jogar de novo/i },
+      technology: /Twilio Conversation Relay.*lances pelo telefone.*peças na tela.*resultado na chamada/i, next: /diga jogar de novo/i },
     { locale: 'pt-BR', station: true, outcome: /você venceu o duelo de magos/i,
-      technology: /Twilio Conversation Relay.*lances falados.*tabuleiro/i, next: /estação prepara/i },
+      technology: /Twilio Conversation Relay.*lances pelo telefone.*peças na tela.*resultado na chamada/i, next: /estação prepara/i },
   ])('explains $locale Chess voice technology after the result in station=$station', row => {
     const finished = state({ phase: 'finished', result: { reason: 'checkmate', winner: 'w' } });
     const game = harness(finished, row.station, false, row.locale);

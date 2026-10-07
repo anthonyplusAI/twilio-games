@@ -7,10 +7,14 @@ import type { ArcadeApi } from '../server/arcade-api';
 import { BattleServer } from '../server/battle-server';
 import { ChessRoom } from '../server/chess-room';
 import { ChessServer } from '../server/chess-server';
+import { ChessVoiceSession } from '../server/chess-voice';
 import { FighterServer } from '../server/fighter-server';
 import { FIGHTER_VICTORY_SECONDS } from '../server/fighter-room';
+import { GameServer } from '../server/game-server';
 import { HttpServer } from '../server/http-server';
 import { KaraokeServer } from '../server/karaoke-server';
+import { Room } from '../server/room';
+import type { ConversationRelayAdapter } from '../server/conversation-relay';
 import { FIGHTER_INTRO_SECONDS } from '../shared/fighter-protocol';
 import { NEVER_GONNA_GIVE_YOU_UP } from '../shared/karaoke-songs';
 import { KARAOKE_COUNTDOWN_MS } from '../shared/karaoke-protocol';
@@ -62,7 +66,8 @@ async function harness() {
     clientDir: path.join(directory, 'client'),
   });
   const port = await server.start();
-  const games = server as unknown as { battle: BattleServer; chess: ChessServer; fighter: FighterServer; karaoke: KaraokeServer };
+  const games = server as unknown as { battle: BattleServer; chess: ChessServer; fighter: FighterServer;
+    game: GameServer; karaoke: KaraokeServer };
   const chessLifecycle = server as unknown as { abandonUnfinishedChessStationRoom(code: string): void };
   return { ...games, port, started, completed, abandoned, isStationEngineRoom,
     abandonChess: (code: string) => chessLifecycle.abandonUnfinishedChessStationRoom(code) };
@@ -77,6 +82,63 @@ function seedChessRoom(chess: ChessServer, code: string, fen?: string): ChessRoo
 }
 
 describe('station engine room lifecycle', () => {
+  it('starts the Racer results hold after the caller’s queued finish recap settles', async () => {
+    const { game, completed, isStationEngineRoom } = await harness();
+    const code = 'RACER-RECAP';
+    isStationEngineRoom.mockImplementation(roomCode => roomCode === code);
+    const room = game.getOrCreateRoom(code);
+    // This test invokes the finish callback directly; suppress the game loop's
+    // separate once-only report for the same synthetic room.
+    (game as unknown as { reported: WeakSet<Room> }).reported.add(room);
+    (room as unknown as { _phase: string })._phase = 'results';
+    let releaseRecap!: () => void;
+    const recapPlayed = new Promise<void>(resolve => { releaseRecap = resolve; });
+    (server as unknown as { voiceAdapters: Map<string, Set<ConversationRelayAdapter>> })
+      .voiceAdapters.set(code, new Set([{ whenSpeechSettled: () => recapPlayed } as ConversationRelayAdapter]));
+    const finish = (game as unknown as { onRaceFinished: ((room: Room) => void) | null }).onRaceFinished;
+    expect(finish).not.toBeNull();
+    finish!(room);
+
+    expect(completed).not.toHaveBeenCalled();
+    releaseRecap();
+    await vi.waitFor(() => expect(completed).toHaveBeenCalledExactlyOnceWith('racer', code, []));
+  });
+
+  it('holds the finished Chess board until its phone recap has played', async () => {
+    const { chess, completed, isStationEngineRoom } = await harness();
+    const code = 'CHESS-RECAP';
+    isStationEngineRoom.mockImplementation(roomCode => roomCode === code);
+    const room = seedChessRoom(chess, code, '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1');
+    let releaseRecap!: () => void;
+    const recapPlayed = new Promise<boolean>(resolve => {
+      releaseRecap = () => resolve(true);
+    });
+    const session = new ChessVoiceSession({
+      bind: (roomCode, name, callSid, locale) => chess.voiceJoin(roomCode, name, callSid, locale, true),
+      leave: (roomCode, _playerId, callSid) => chess.voiceLeave(roomCode, callSid),
+      command: (roomCode, callSid, utterance, locale) => chess.voiceCommand(roomCode, callSid, utterance, locale),
+      restart: (roomCode, callSid) => chess.voiceRestart(roomCode, callSid),
+      snapshot: roomCode => chess.findRoom(roomCode)?.state() ?? null,
+      say: line => /Checkmate!/.test(line) ? recapPlayed : Promise.resolve(true),
+    });
+    session.setStationManaged(true);
+    (server as unknown as { chessVoice: Map<string, Set<ChessVoiceSession>> })
+      .chessVoice.set(code, new Set([session]));
+    session.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-chess-recap',
+      customParameters: { roomCode: code } }));
+    for (const voicePrompt of ['queen to G7', 'confirm']) {
+      session.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt, last: true }));
+    }
+
+    expect(room.state().phase).toBe('finished');
+    expect(completed).not.toHaveBeenCalled();
+    releaseRecap();
+    await vi.waitFor(() => expect(completed).toHaveBeenCalledExactlyOnceWith('chess', code, [{
+      enginePlayerId: 'c1', rank: 1, completed: true, won: true,
+      score: null, durationSeconds: null,
+    }]));
+  });
+
   it.each([
     { name: 'win', code: 'CHESS-WIN', fen: '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1', move: 'queen to G7', won: true },
     { name: 'draw', code: 'CHESS-DRAW', fen: '4k3/8/8/8/8/8/7p/4K3 w - - 99 50', move: 'king from E1 to D1', won: null },

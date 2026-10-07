@@ -246,6 +246,12 @@ describe('Voice Chess display transport', () => {
     expect(chess.voiceLegalMoves('MAGE', 'CA-other', 'en-US')).toEqual([]);
     expect(chess.voiceLegalMoves('MAGE', 'CA-chess', 'en-US'))
       .toContainEqual(expect.objectContaining({ id: 'e2e4' }));
+    const hint = chess.voiceCommand('MAGE', 'CA-chess', 'hint', 'en-US');
+    expect(hint?.code).toBe('hint');
+    expect(hint?.state).toMatchObject({ fen: openingFen, hintsRemaining: 2,
+      hint: { revision: 0 } });
+    await waitFor(frame => frame.type === 'chess_state' && frame.hintsRemaining === 2
+      && frame.hint?.revision === 0);
     const proposed = chess.voiceCommand('MAGE', 'CA-chess', 'pawn from E two to E four', 'en-US');
     expect(proposed?.code).toBe('proposed');
     expect(proposed?.state.fen).toBe(openingFen);

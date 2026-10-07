@@ -29,6 +29,17 @@ describe('fighter map API', () => {
       body: JSON.stringify([{ id: 'rain', name: 'Rain', blurb: 'Rain arena', color: '#6c8cff', bounds: [-10, 10], file: 'rain.glb' }]) });
     expect(update.status).toBe(200);
     expect(await update.json()).toEqual([{ id: 'rain', name: 'Rain', blurb: 'Rain arena', color: '#6c8cff', bounds: [-10, 10] }]);
+
+    const legacyPreview = await fetch(`${base}/api/fighter-maps`, { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify([{ id: 'rain', name: 'Rain', blurb: 'Rain arena', color: '#6c8cff',
+        bounds: [-10, 10], file: 'rain.glb',
+        preview: '/assets/fighters/previews/rain.png?v=1783789470649' }]),
+    });
+    expect(legacyPreview.status).toBe(200);
+    expect(await legacyPreview.json()).toEqual([{ id: 'rain', name: 'Rain',
+      blurb: 'Rain arena', color: '#6c8cff', bounds: [-10, 10],
+      preview: '/assets/fighters/previews/rain.svg' }]);
   });
 
   it('validates preview uploads and serves persistent PNG files', async () => {

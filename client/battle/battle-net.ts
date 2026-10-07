@@ -4,6 +4,7 @@
 import type { BattleServerMessage, RosterEntry, BattleLobbyPlayer } from '../../shared/battle-protocol';
 import type { BattleSnapshot, BattleEvent, BattleAction } from '../../shared/battle-world';
 import type { SupportedLocale } from '../../shared/i18n/locales';
+import { withDisplaySession } from '../display-session';
 
 export interface BattleStateMsg {
   roomCode: string; phase: string; players: BattleLobbyPlayer[];
@@ -42,7 +43,7 @@ export class BattleConnection {
     this.eventGeneration = null;
     this.deliveredEventIds.clear();
     this.futureEventFrames = [];
-    this.ws = new WebSocket(this.url);
+    this.ws = new WebSocket(withDisplaySession(this.url));
     this.ws.onmessage = (ev) => {
       const m = JSON.parse(ev.data) as BattleServerMessage;
       if (m.type === 'roster') this.onRosterCb?.(m.monsters);

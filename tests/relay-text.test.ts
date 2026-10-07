@@ -67,6 +67,71 @@ describe('relayTextChunks', () => {
     expect(sent.map(message => message.token.replace(/[\u200B\u2060]/g, '')).join('')).toBe(prompt);
   });
 
+  it('accepts a playback receipt after Relay strips the invisible cue marker and SSML', async () => {
+    const sent: Array<{ token: string }> = [];
+    const socket = { OPEN: 1, readyState: 1,
+      send(value: string, callback?: (error?: Error) => void) {
+        sent.push(JSON.parse(value)); callback?.();
+      },
+    } as unknown as WebSocket;
+    const delivery = sendRelayTextOutcome(socket, 'Twilio Conversation Relay speaks your answer.');
+    await nextTurn();
+    const spoken = sent.at(-1)!.token
+      .replace(/<phoneme[^>]*>(.*?)<\/phoneme>/g, '$1')
+      .replace(/[\u200B\u2060]/g, '');
+    handleRelayPlaybackEvent(socket, JSON.stringify({ type: 'info', name: 'tokensPlayed', value: spoken }));
+    expect(await Promise.race([delivery, nextTurn().then(() => 'still pending')])).toBe('played');
+  });
+
+  it('does not mistake an unmarked late receipt for a repeated new cue', async () => {
+    const sent: Array<{ token: string }> = [];
+    const socket = { OPEN: 1, readyState: 1,
+      send(value: string, callback?: (error?: Error) => void) {
+        sent.push(JSON.parse(value)); callback?.();
+      },
+    } as unknown as WebSocket;
+    const first = sendRelayTextOutcome(socket, 'Please choose a track.');
+    await nextTurn();
+    const oldToken = sent[0]!.token;
+    handleRelayPlaybackEvent(socket, JSON.stringify({ type: 'info', name: 'tokensPlayed', value: oldToken }));
+    expect(await first).toBe('played');
+
+    const second = sendRelayTextOutcome(socket, 'Please choose a track.');
+    await nextTurn();
+    const oldWithoutMarker = oldToken.replace(/[\u200B\u2060]/g, '');
+    handleRelayPlaybackEvent(socket, JSON.stringify({ type: 'info', name: 'tokensPlayed', value: oldWithoutMarker }));
+    expect(await Promise.race([second, nextTurn().then(() => 'still pending')])).toBe('still pending');
+    handleRelayPlaybackEvent(socket, JSON.stringify({ type: 'info', name: 'tokensPlayed', value: sent[1]!.token }));
+    expect(await second).toBe('played');
+  });
+
+  it('does not settle a new multi-chunk cue from a longer old receipt with the same ending', async () => {
+    const sent: Array<{ token: string }> = [];
+    const socket = { OPEN: 1, readyState: 1,
+      send(value: string, callback?: (error?: Error) => void) {
+        sent.push(JSON.parse(value)); callback?.();
+      },
+    } as unknown as WebSocket;
+    const first = sendRelayTextOutcome(socket, 'Please choose a track.');
+    await nextTurn();
+    const oldToken = sent[0]!.token;
+    handleRelayPlaybackEvent(socket, JSON.stringify({ type: 'info', name: 'tokensPlayed', value: oldToken }));
+    expect(await first).toBe('played');
+
+    const second = sendRelayTextOutcome(socket, `${'Q'.repeat(500)} Choose a track.`);
+    await nextTurn();
+    expect(sent).toHaveLength(3);
+    const oldWithoutMarker = oldToken.replace(/[\u200B\u2060]/g, '');
+    handleRelayPlaybackEvent(socket, JSON.stringify({
+      type: 'info', name: 'tokensPlayed', value: oldWithoutMarker,
+    }));
+    expect(await Promise.race([second, nextTurn().then(() => 'still pending')])).toBe('still pending');
+    handleRelayPlaybackEvent(socket, JSON.stringify({
+      type: 'info', name: 'tokensPlayed', value: sent.at(-1)!.token,
+    }));
+    expect(await second).toBe('played');
+  });
+
   it('finishes ordinary speech after a duration estimate when Relay sends no playback event', async () => {
     vi.useFakeTimers();
     const sent: string[] = [];

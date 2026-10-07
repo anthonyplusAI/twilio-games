@@ -212,9 +212,20 @@ describe('voice integration (fake Conversation Relay client)', () => {
       for(let i=0;i<2000&&room.phase!=='results';i++)game.stepRoomForTest(room,0.1);
       expect(room.phase).toBe('results');
 
+      // The finish itself must speak the factual placement and leaderboard; an extra caller
+      // prompt must never be required to coax the result out of the agent.
+      await vi.waitFor(() => {
+        expect(spoken.join(' ')).toMatch(/won first place.*seconds/i);
+        expect(spoken.join(' ')).toMatch(/rank .* on the leaderboard/i);
+        expect(spoken.join(' ')).toMatch(/Conversation Relay transcribed your phone commands/i);
+        expect(spoken.join(' ')).toMatch(/Twilio/i);
+        expect(spoken.join(' ')).toMatch(/game server steered the car on this screen/i);
+      }, { timeout: 2_000 });
+      const resultSpeech = spoken.join(' ');
+
       voice.send(JSON.stringify({type:'prompt',voicePrompt:'go now',last:false}));
       voice.send(JSON.stringify({type:'prompt',voicePrompt:'go now please',last:true}));
-      await wait(5000);
+      await wait(200);
 
       expect(room.phase).toBe('results');
       const resultsIndex=displayMessages.findIndex(message=>message.type==='results');
@@ -223,6 +234,7 @@ describe('voice integration (fake Conversation Relay client)', () => {
       expect(spoken.join(' ')).toMatch(/won first place.*seconds/i);
       expect(spoken.join(' ')).toMatch(/rank .* on the leaderboard/i);
       expect(spoken.join(' ')).not.toMatch(/choose a car/i);
+      expect(spoken.join(' ')).toBe(resultSpeech);
 
       voice.send(JSON.stringify({type:'prompt',voicePrompt:'go again',last:true}));
       await wait(100);

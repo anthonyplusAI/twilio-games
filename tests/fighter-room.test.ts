@@ -32,8 +32,12 @@ describe('fighter room', () => {
     expect(room.advance()).toBe(true);
     expect(room.selectFighter(joined.playerId, 'nyx')).toBe(true);
     expect(room.advance()).toBe(true);
+    const warmedRival = room.state().aiFighterId;
+    expect(warmedRival).toBeTruthy();
+    expect(warmedRival).not.toBe('nyx');
     expect(room.selectMap(joined.playerId,'void')).toBe(true);
     expect(room.advance()).toBe(true);
+    expect(room.state().aiFighterId).toBe(warmedRival);
     expect(room.phase).toBe('loading');
     expect(room.ready(room.state().loadingGeneration)).toBe(true);
     expect(room.phase).toBe('intro');
@@ -46,6 +50,31 @@ describe('fighter room', () => {
     expect(room.phase).toBe('fight');
     expect(room.lobbyPlayers()).toHaveLength(2);
     expect(room.lobbyPlayers()[1]?.isAi).toBe(true);
+    expect(room.lobbyPlayers()[1]?.fighterId).toBe(warmedRival);
+  });
+  it('keeps the solo rival across loading retry but clears it when fighter selection reopens', () => {
+    const room = new FighterRoom('WARMUP', 1);
+    const joined = room.addPlayer('Ada'); if ('error' in joined) throw new Error(joined.error);
+    room.advance(); room.selectFighter(joined.playerId, 'nyx'); room.advance();
+    const rival = room.state().aiFighterId;
+    expect(rival).toBeTruthy();
+    room.selectMap(joined.playerId, 'void'); room.advance();
+    expect(room.back()).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'map_select', aiFighterId: rival });
+    expect(room.back()).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'fighter_select', aiFighterId: null });
+  });
+  it('chooses a solo rival when a second standalone caller leaves during arena selection', () => {
+    const room = new FighterRoom('DROP-WARMUP', 1);
+    const first = room.addPlayer('Ada'), second = room.addPlayer('Bo');
+    if ('error' in first || 'error' in second) throw new Error('join failed');
+    room.advance(); room.selectFighter(first.playerId, 'nyx'); room.selectFighter(second.playerId, 'wraith');
+    room.advance();
+    expect(room.state().aiFighterId).toBeNull();
+    room.removePlayer(second.playerId);
+    expect(room.state().phase).toBe('map_select');
+    expect(room.state().aiFighterId).toBeTruthy();
+    expect(room.state().aiFighterId).not.toBe('nyx');
   });
   it('refreshes the loading generation and timeout budget for an authenticated retry', () => {
     const room = new FighterRoom('RETRY', 1);

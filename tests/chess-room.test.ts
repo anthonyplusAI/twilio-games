@@ -8,6 +8,42 @@ function whiteRoom(fen?: string): ChessRoom {
 }
 
 describe('Voice Chess room', () => {
+  it('recommends an actual legal move, keeps the board unchanged, and reuses a hint on the same position', () => {
+    const room = whiteRoom();
+    const before = room.state();
+    const first = room.handleVoiceCommand('hint');
+    expect(first.code).toBe('hint');
+    expect(first.message).toMatch(/hint.*from.*to/i);
+    expect(room.state()).toMatchObject({ fen: before.fen, ply: before.ply, revision: before.revision,
+      hintsRemaining: 2, hint: { revision: before.revision } });
+    const recommended = room.state().hint!;
+    expect(room.legalVoiceMoves().some(move => move.id.startsWith(`${recommended.from}${recommended.to}`))).toBe(true);
+    expect(room.handleVoiceCommand('give me a hint').code).toBe('hint');
+    expect(room.state()).toMatchObject({ hintsRemaining: 2, hint: recommended });
+    expect(room.handleVoiceCommand('pawn from E2 to E4').code).toBe('proposed');
+    expect(room.handleVoiceCommand('hint').code).toBe('hint_unavailable');
+    expect(room.state().hintsRemaining).toBe(2);
+    expect(room.handleVoiceCommand('confirm').code).toBe('confirmed');
+    expect(room.handleVoiceCommand('hint').code).toBe('not_your_turn');
+    expect(room.state().hintsRemaining).toBe(2);
+  });
+
+  it('limits hints to three distinct turns, clears the visual cue after a move, and replenishes on replay', () => {
+    const room = whiteRoom();
+    for (let used = 1; used <= 3; used++) {
+      expect(room.handleVoiceCommand('hint').code).toBe('hint');
+      expect(room.state().hintsRemaining).toBe(3 - used);
+      const move = room.legalVoiceMoves()[0]!;
+      expect(room.handleVoiceCommand(`${move.id.slice(0, 2)} to ${move.id.slice(2, 4)}`).code).toBe('proposed');
+      expect(room.handleVoiceCommand('yes please').code).toBe('confirmed');
+      expect(room.state().hint).toBeNull();
+      room.playComputerMove(room.state().revision);
+    }
+    expect(room.handleVoiceCommand('hint').code).toBe('hint_limit');
+    room.reset();
+    expect(room.state()).toMatchObject({ hintsRemaining: 3, hint: null });
+  });
+
   it('assigns a random side and makes the opening move when the human is black', () => {
     const white = new ChessRoom('WHITE', { random: () => 0.1 });
     const black = new ChessRoom('BLACK', { random: () => 0.9, aiDepth: 1 });

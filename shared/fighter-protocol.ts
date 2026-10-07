@@ -16,6 +16,8 @@ export interface FighterLobbyPlayer {
 }
 export interface FighterState {
   roomCode: string; phase: FighterPhase; players: FighterLobbyPlayer[];
+  /** Solo rival chosen during arena setup so its real model can load before the fight. */
+  aiFighterId: string | null;
   selectedMap: string | null; mapVotesByPlayerId:Record<string,string>; world: FighterWorld | null;
   expectedPlayerCount: number; hasExpectedPlayers: boolean;
   automaticSetup:boolean;
