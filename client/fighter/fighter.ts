@@ -6,7 +6,7 @@ import { FighterActorLoadCoordinator, fighterActorLoadContext, type FighterActor
 import { FIGHTERS, FIGHTER_ASSET_VERSION, loadAnimationSources, preferProceduralFighterAssets } from './fighter-assets';
 import { FighterAtmosphere, fighterAtmosphereSpec, type FighterAtmosphereSpec } from './fighter-atmosphere';
 import { FighterConnection, type FighterConnectionState } from './fighter-net';
-import { isInteractiveShortcutTarget, resolveNumericSelection } from './fighter-client-utils';
+import { fighterResultActionState, isInteractiveShortcutTarget, resolveNumericSelection } from './fighter-client-utils';
 import { frameStaticPortraitArena, proceduralFallbackCamera, responsiveVerticalFov, shouldUseLivePortraitArena } from './fighter-camera';
 import { getSoundEffectsManager } from '../sound-effects';
 import { getMusicManager } from '../music-manager';
@@ -25,6 +25,7 @@ import { FIGHTER_MESSAGES, type FighterMessageKey } from '../../shared/i18n/figh
 import { createTranslator } from '../../shared/i18n/translate';
 import { fighterName as translatedFighterName } from '../../shared/i18n/content';
 import { createStationDisplay } from '../station-display';
+import { resultTechHtml } from '../result-tech';
 import { watchVoiceNumber } from '../station-client';
 import QRCode from 'qrcode';
 
@@ -60,6 +61,8 @@ const voiceCommand = $('voice-command'), voiceFeed = document.querySelector('.vo
 const p1Health = $('p1-health'), p2Health = $('p2-health');
 const p1Meter = p1Health.parentElement!, p2Meter = p2Health.parentElement!;
 const result = $('result'), resultTitle = $('result-title'), rematch = $('rematch');
+const resultChampion = $('result-champion'), resultExit = $<HTMLAnchorElement>('result-exit');
+const resultStationNext = $('result-station-next'), resultActionStatus = $('result-action-status'), resultTechSlot = $('result-tech-slot');
 const fightCall = $('fight-call'), errorBox = $('error');
 const connectionStatus = $('connection-status');
 const p1FighterName = $('p1-fighter-name'), p2FighterName = $('p2-fighter-name');
@@ -70,6 +73,7 @@ injectFullscreenToggle('music-toggle-container', {
   enter: commonText('fullscreen.enter'), exit: commonText('fullscreen.exit'),
 });
 const stationDisplay = createStationDisplay();
+resultTechSlot.innerHTML = resultTechHtml('fighter', locale, { stationManaged: stationDisplay.active });
 
 const pageUrl = new URL(location.href);
 if (pageUrl.searchParams.has('hostToken')) {
@@ -184,6 +188,7 @@ connection.onHostIdentity(host => {
   if(isHost!==host){presentationEpoch++;pendingFightReceipt='';pendingResultReceipt='';
     if(host){sentFightReceipt='';sentResultReceipt='';}}
   isHost = host; lastOverlayKey = ''; renderFlow();
+  syncResultActions();
   scheduleFightReceipt();
   scheduleResultReceipt();
 });
@@ -198,6 +203,7 @@ connection.onConnectionState(status => {
     readySentFor = '';
     if (readyTimer) { clearTimeout(readyTimer); readyTimer = null; }
   }
+  syncResultActions();
 });
 connection.onState(next => {
   if (forcedResultGeneration !== null && next.loadingGeneration > forcedResultGeneration) forcedResultGeneration = null;
@@ -817,6 +823,16 @@ function toggleLocalPlayer(): void { if (stationDisplay.active) return; if (play
 function announce(text: string): void { voiceCommand.textContent = text.replace('-', ' '); voiceFeed.classList.remove('heard'); void (voiceFeed as HTMLElement).offsetWidth; voiceFeed.classList.add('heard'); }
 function flashButton(command: FighterCommand): void { const button = commandButtons.find(item => item.dataset.command === command); button?.classList.add('active'); setTimeout(() => button?.classList.remove('active'), 220); }
 function showImpact(text: string, defender: FighterId): void { document.body.classList.remove('shake'); void document.body.offsetWidth; document.body.classList.add('shake'); const element = document.createElement('div'); element.className = 'impact'; element.style.left = defender === 'p1' ? '39%' : '61%'; element.textContent = text; document.body.appendChild(element); setTimeout(() => element.remove(), 600); }
+function syncResultActions(): void {
+  const action = fighterResultActionState(stationDisplay.active, isHost, fighterConnectionState, state?.phase);
+  rematch.hidden = action !== 'rematch';
+  resultExit.hidden = action === 'station';
+  resultStationNext.hidden = action !== 'station';
+  resultActionStatus.hidden = action !== 'viewer' && action !== 'reconnecting';
+  resultActionStatus.textContent = action === 'reconnecting' ? t('result.reconnecting')
+    : action === 'viewer' ? t('result.hostOnly') : '';
+  if (rematch.hidden && document.activeElement === rematch && !resultExit.hidden) resultExit.focus();
+}
 function showResult(winner: FighterId): void {
   if(state?.phase!=='results'||state.result?.winner!==winner)return;
   if (resultTimer) clearTimeout(resultTimer);
@@ -827,10 +843,17 @@ function showResult(winner: FighterId): void {
     return;
   }
   const player = state?.players.find(row => row.side === winner); const fighter = roster.find(row => row.id === player?.fighterId);
-  rematch.hidden = stationDisplay.active;
-  resultTitle.textContent = t('result.wins', { name: fighter ? localizedFighterName(fighter) : winner }); result.hidden = false; setFightControlsEnabled(false);
+  const wasHidden = result.hidden;
+  syncResultActions();
+  result.classList.toggle('station-result', stationDisplay.active);
+  resultTitle.textContent = t('result.wins', { name: state.result?.winnerName ?? player?.name ?? winner });
+  resultChampion.textContent = fighter ? t('result.champion', { fighter: localizedFighterName(fighter) }) : '';
+  result.hidden = false; setFightControlsEnabled(false);
   scheduleResultReceipt();
-  if (!stationDisplay.active && !result.contains(document.activeElement)) requestAnimationFrame(() => rematch.focus());
+  if (wasHidden && !stationDisplay.active) requestAnimationFrame(() => {
+    if (result.hidden || result.contains(document.activeElement)) return;
+    (rematch.hidden ? resultExit : rematch).focus();
+  });
 }
 function scheduleResultReceipt():void{
   if(!state||state.phase!=='results'||!state.result||result.hidden||!loading.classList.contains('done'))return;
@@ -1153,8 +1176,10 @@ function localizeStaticUi(): void {
     if (label) label.textContent = commandLabel(command);
   }
   fightCall.textContent = t('fight.call');
-  $('result-kicker').textContent = t('result.knockout'); resultTitle.textContent = t('result.wins', { name: 'Nyx' });
-  rematch.textContent = t('result.rematch'); const exit = result.querySelector('a'); if (exit) exit.textContent = t('result.exit');
+  $('result-kicker').textContent = t('result.knockout'); resultTitle.textContent = t('result.wins', { name: t('hud.playerOne') });
+  rematch.textContent = t('result.rematch'); resultExit.textContent = t('result.exit');
+  resultStationNext.textContent = t('result.stationNext');
+  syncResultActions();
   loadingLabel.textContent = t('loading.combatSystem'); loadingFill.parentElement?.setAttribute('aria-label', t('loading.combatSystem'));
   const lockStyle = document.createElement('style');
   lockStyle.textContent = `.select-card.selected::after{content:${JSON.stringify(t('select.locked'))}}`;
@@ -1262,7 +1287,10 @@ addEventListener('keydown', event => {
   const key = event.key.toLowerCase(), command = keyCommands[key]; let handled = false;
   if (state?.phase === 'fight' && command) { connection.command(command); handled = true; }
   else if (key === 'p') { toggleLocalPlayer(); handled = true; }
-  else if (key === 'enter' && isHost && (state?.phase !== 'results' || !stationDisplay.active)) { connection.advance(); handled = true; }
+  else if (key === 'enter' && isHost && fighterConnectionState === 'connected'
+    && (state?.phase !== 'results' || fighterResultActionState(stationDisplay.active, isHost, fighterConnectionState, state?.phase) === 'rematch')) {
+    connection.advance(); handled = true;
+  }
   else if (key === 'backspace' && isHost) { connection.back(); handled = true; }
   else if (/^\d$/.test(key) && (state?.phase === 'fighter_select' || state?.phase === 'map_select')) { handleNumericSelection(key); handled = true; }
   if (handled) event.preventDefault();
@@ -1294,10 +1322,12 @@ addEventListener('resize', () => {
   if (config && !customMapStatic) applyCameraFraming(config);
   else updateCameraProjection();
 });
-rematch.addEventListener('click', () => { if (!stationDisplay.active) connection.advance(); });
+rematch.addEventListener('click', () => {
+  if (fighterResultActionState(stationDisplay.active, isHost, fighterConnectionState, state?.phase) === 'rematch') connection.advance();
+});
 for (const link of document.querySelectorAll<HTMLAnchorElement>('.game-home, #result a[href="/"]')) {
   link.addEventListener('click', event => {
-    if (stationDisplay.active) return;
+    if (stationDisplay.active) { event.preventDefault(); return; }
     event.preventDefault(); connection.leaveAndClose(roomCode); setTimeout(() => { location.href = '/'; }, 60);
   });
 }

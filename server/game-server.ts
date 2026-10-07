@@ -322,6 +322,10 @@ export class GameServer {
             this.send(conn, { type: 'error', code: 'station_requeue_required', message: 'station_requeue_required' });
             break;
           }
+          if (!conn.playerId) {
+            this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'bad_display_auth' });
+            break;
+          }
           const before = room.phase;
           room.advance(conn.playerId);
           const after = room.phase;
@@ -526,11 +530,17 @@ export class GameServer {
     return room;
   }
 
-  private menuTouchState(room: Room): MenuTouchState {
+  private menuTouchState(room: Room, viewer?: Conn): MenuTouchState {
     const advancePlayerId = room.lobbyPlayers()[0]?.playerId ?? null;
+    // The display may advance for the active racers. A caller who joined while
+    // their results are showing is waiting for the next round, so its own
+    // Replay control must reflect its actual authority rather than the
+    // display's (otherwise the tap looks enabled but the room rejects it).
+    const replayActor = room.phase === 'results' && viewer?.playerId
+      ? viewer.playerId : advancePlayerId ?? undefined;
     return {
       activePlayerId: room.touchSelectionTarget(), advancePlayerId,
-      canAdvance: !this.stationResultsLocked(room) && room.canAdvance(advancePlayerId ?? undefined),
+      canAdvance: !this.stationResultsLocked(room) && room.canAdvance(replayActor),
       canBack: !room.usesStationSetup && (room.phase === 'car_select' || room.phase === 'map_select'),
     };
   }
@@ -680,21 +690,21 @@ export class GameServer {
   }
 
   /** The right out-of-race message for a room's current phase (roster / car+map select / results). */
-  private preRaceMessage(room: Room): ServerMessage {
+  private preRaceMessage(room: Room, viewer?: Conn): ServerMessage {
     const phase = room.phase;
     if (phase === 'results') {
       return { type: 'results', roomCode: room.code, map: room.selectedMap,
-        results: room.results(), touch: this.menuTouchState(room) };
+        results: room.results(), touch: this.menuTouchState(room, viewer) };
     }
     if (phase === 'car_select' || phase === 'map_select') {
       const votes = room.mapVotes();
       return { type: 'select_state', roomCode: room.code, phase, players: room.lobbyPlayers(),
         maps: room.mapChoices, selectedMap: room.selectedMap,
-        mapVotes: votes.counts, mapTie: votes.tie, touch: this.menuTouchState(room) };
+        mapVotes: votes.counts, mapTie: votes.tie, touch: this.menuTouchState(room, viewer) };
     }
     // lobby
     return { type: 'lobby', roomCode: room.code, players: room.lobbyPlayers(),
-      phase, touch: this.menuTouchState(room) };
+      phase, touch: this.menuTouchState(room, viewer) };
   }
 
   private broadcastAll(): void {
@@ -705,7 +715,7 @@ export class GameServer {
       // A room is EITHER pre/post-race (roster/select/results) OR racing per tick — send one kind.
       if (GameServer.isPreOrPost(room.phase)) {
         // Keep menus/results near 2Hz even when the live-race snapshot rate changes.
-        if (tick % this.lobbyBroadcastEvery === 0) this.send(c, this.preRaceMessage(room));
+        if (tick % this.lobbyBroadcastEvery === 0) this.send(c, this.preRaceMessage(room, c));
         continue;
       }
       const snap = room.snapshot(); if (!snap) continue;
@@ -728,8 +738,7 @@ export class GameServer {
   private pushLobby(roomCode: string): void {
     const room = this.rooms.find(roomCode);
     if (!room || !GameServer.isPreOrPost(room.phase)) return;
-    const msg = this.preRaceMessage(room);
-    for (const c of this.conns) if (c.roomCode === roomCode) this.send(c, msg);
+    for (const c of this.conns) if (c.roomCode === roomCode) this.send(c, this.preRaceMessage(room, c));
   }
 
   /** Broadcast the items list (with the chosen map) to EVERY connection in a room at race start, so

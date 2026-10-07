@@ -69,19 +69,24 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--chess-ruby);outline
 .move-note p{margin:0;color:#aebbd0;font-size:12px;line-height:1.4}
 .event-banner{position:absolute;z-index:6;top:24%;left:50%;width:max-content;max-width:90%;transform:translateX(-50%);pointer-events:none;color:#fff;font:800 clamp(26px,4vw,56px)/.92 "Twilio Sans Display",sans-serif;letter-spacing:.02em;text-align:center;text-shadow:0 0 18px var(--chess-ruby),0 3px 32px rgba(0,0,0,.9);opacity:0}
 .event-banner.show{animation:eventCall 1.2s ease-out both}
-.result-overlay{position:absolute;z-index:8;inset:0;display:grid;place-items:center;padding:24px;background:radial-gradient(ellipse at center,rgba(6,14,29,.32),rgba(2,7,19,.84));pointer-events:none}
-.result-card{text-align:center;text-shadow:0 3px 24px #000;animation:resultEnter .6s cubic-bezier(.16,.8,.2,1) both}
-.result-mark{display:block;margin-bottom:5px;color:var(--chess-brass);font-size:35px;text-shadow:0 0 25px var(--chess-brass)}
-.result-card>span:not(.result-mark){display:block;color:var(--chess-brass);font:13px "Twilio Sans Mono",monospace;letter-spacing:.06em}
-.result-card strong{display:block;margin:10px 0;font:800 clamp(64px,11vw,150px)/.78 "Twilio Sans Display",sans-serif;letter-spacing:.02em;text-transform:uppercase}
-.result-card p{margin:18px auto 0;max-width:38ch;color:#e6e1d6;font-size:clamp(14px,1.5vw,19px);line-height:1.4}
-.result-replay{pointer-events:auto;min-height:48px;margin:23px auto 0;padding:11px 26px;border:1px solid var(--chess-brass);border-radius:10px;background:rgba(12,25,48,.9);color:#fff;font:800 17px "Twilio Sans Display",sans-serif;cursor:pointer;touch-action:manipulation;box-shadow:0 0 24px rgba(235,190,106,.24)}
-.result-replay:hover:not(:disabled){background:rgba(34,51,77,.96);box-shadow:0 0 34px rgba(235,190,106,.45)}
-.result-replay:focus-visible{outline:3px solid #fff;outline-offset:3px}
+.result-overlay{position:absolute;z-index:8;inset:0;display:flex;justify-content:center;align-items:flex-start;padding:clamp(12px,2.5vw,28px);overflow-y:auto;overscroll-behavior:contain;background:radial-gradient(ellipse at center,rgba(6,14,29,.55),rgba(2,7,19,.9));pointer-events:auto}
+.result-card{width:min(790px,100%);min-width:0;margin:auto 0;padding:clamp(20px,2.8vw,36px);border:1px solid rgba(209,170,113,.55);border-top:4px solid var(--chess-ruby);border-radius:16px;background:linear-gradient(145deg,rgba(10,23,47,.98),rgba(4,11,27,.98));box-shadow:0 26px 70px rgba(0,0,0,.55);text-align:center;animation:resultEnter .6s cubic-bezier(.16,.8,.2,1) both}
+.result-mark{display:block;margin-bottom:3px;color:var(--chess-brass);font-size:28px;line-height:1;text-shadow:0 0 25px var(--chess-brass)}
+.result-card>span:not(.result-mark){display:block;color:var(--chess-brass);font:12px "Twilio Sans Mono",monospace;letter-spacing:.1em;text-transform:uppercase}
+#result-title{display:block;margin:10px 0 0;font:800 clamp(54px,8vw,100px)/.84 "Twilio Sans Display",sans-serif;letter-spacing:.02em;text-transform:uppercase}
+.result-card>p{margin:14px auto 0;max-width:44ch;color:#e6e1d6;font-size:clamp(14px,1.5vw,18px);line-height:1.4}
+.result-actions{position:sticky;z-index:2;bottom:0;display:flex;flex-wrap:wrap;align-items:center;justify-content:center;gap:10px;margin:20px 0 0;padding:9px;border:1px solid rgba(209,170,113,.32);border-radius:12px;background:rgba(8,20,43,.96);box-shadow:0 12px 32px rgba(0,0,0,.38);backdrop-filter:blur(14px)}
+.result-replay,.result-exit{display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:11px 25px;border:1px solid var(--chess-brass);border-radius:9px;background:rgba(28,46,74,.98);color:#fff;font:800 16px "Twilio Sans Display",sans-serif;text-decoration:none;cursor:pointer;touch-action:manipulation}
+.result-replay{background:#9d2639;border-color:#ff8795}
+.result-replay:hover:not(:disabled),.result-exit:hover{background:rgba(60,75,104,.98);box-shadow:0 0 25px rgba(235,190,106,.28)}
+.result-replay:focus-visible,.result-exit:focus-visible{outline:3px solid #fff;outline-offset:3px}
 .result-replay:disabled{opacity:.55;cursor:not-allowed}
-.result-overlay[data-result="loss"] .result-card strong{color:#ff6376;text-shadow:0 0 38px rgba(239,48,73,.47),0 3px 24px #000}
-.result-overlay[data-result="win"] .result-card strong{color:#f7e3b8;text-shadow:0 0 45px rgba(255,201,110,.45),0 3px 24px #000}
-.result-overlay[data-result="draw"] .result-card strong{color:#d4e1f0}
+.result-station-note{width:100%;margin:0;color:#e6e1d6;font-size:14px;line-height:1.4}
+#result-tech-slot{text-shadow:none}
+#result-tech-slot .result-tech{margin-top:18px}
+.result-overlay[data-result="loss"] #result-title{color:#ff6376;text-shadow:0 0 38px rgba(239,48,73,.47),0 3px 24px #000}
+.result-overlay[data-result="win"] #result-title{color:#f7e3b8;text-shadow:0 0 45px rgba(255,201,110,.45),0 3px 24px #000}
+.result-overlay[data-result="draw"] #result-title{color:#d4e1f0}
 .fallback-board{position:absolute;z-index:3;top:112px;left:20px;right:20px;text-align:center}
 .fallback-explanation{display:inline-block;max-width:42ch;padding:7px 13px;border:1px solid rgba(209,170,113,.5);border-radius:4px;background:rgba(5,15,33,.88);text-align:center;color:#f9e6c8;font:700 11px "Twilio Sans Mono",monospace;letter-spacing:.06em;text-transform:uppercase}
 .fallback-explanation{margin:0 auto}
@@ -108,6 +113,12 @@ body[data-renderer="fallback"] .scene-vignette{display:none}
 
 @media(max-width:1000px){.duel-labels{top:88px;left:30px;right:30px}.status-deck{width:290px}.move-note{width:230px}.call-card{width:210px;padding:14px}.call-card-qr-frame{width:144px;height:144px}body[data-renderer="fallback"] .accessible-board{top:48.5%;width:min(50vh,34vw);height:min(50vh,34vw)}}
 @media(max-width:720px){
+  .result-overlay{padding:10px 10px 14px}
+  .result-card{padding:18px 12px}
+  #result-title{font-size:clamp(45px,12vw,72px)}
+  .result-actions{margin-top:15px}
+  .result-replay,.result-exit{flex:1;min-width:120px;padding:10px 12px;font-size:14px}
+  #result-tech-slot .result-tech{margin-top:14px}
   .topbar{padding:max(15px,env(safe-area-inset-top)) max(14px,env(safe-area-inset-right)) 10px max(14px,env(safe-area-inset-left));gap:8px}
   .game-brand{gap:8px}.game-brand img{width:30px;height:30px}.brand-title strong{font-size:21px}.brand-title span{font-size:9px}
   .top-controls{gap:5px}.icon-button{min-width:32px;width:32px;height:32px;padding:0}.icon-button svg{width:16px;height:16px}

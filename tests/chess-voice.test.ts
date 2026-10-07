@@ -440,6 +440,79 @@ describe('ChessVoiceSession', () => {
     expect(game.spoken.at(-1)).toMatch(/confirm or cancel/i);
   });
 
+  it.each([
+    { spoken: 'Move my bishop to C3?', fen: '4k3/4p3/8/8/8/8/1B6/4K3 w - - 0 1', from: 'b2' },
+    { spoken: 'Knight on B to C3?', fen: '4k3/4p3/8/8/8/8/4N3/1N2K3 w - - 0 1', from: 'b1' },
+  ])('treats a punctuated direct request as a move proposal: $spoken', ({ spoken, fen, from }) => {
+    const room = new ChessRoom('4821', { humanColor: 'w', initialFen: fen });
+    const game = liveRoomHarness(room);
+    game.prompt(spoken);
+    expect(game.commands).toEqual([spoken]);
+    expect(room.state().pendingMove).toMatchObject({ from, to: 'c3' });
+    expect(room.state().ply).toBe(0);
+  });
+
+  it.each(['Can my bishop move to C3?', 'Can my bishop move to C3', 'What if I move my bishop to C3?'])
+    ('keeps a legality question read-only even when it names a valid move: %s', async spoken => {
+      const room = new ChessRoom('4821', {
+        humanColor: 'w', initialFen: '4k3/4p3/8/8/8/8/1B6/4K3 w - - 0 1',
+      });
+      const game = liveRoomHarness(room, 'en-US', async context => {
+        expect(context.readOnlyInquiry).toBe(true);
+        return { kind: 'action', actionId: 'propose_move', targetId: 'b2c3' };
+      });
+      game.prompt(spoken);
+      await game.session.whenSpeechSettled();
+      expect(game.commands).toEqual([]);
+      expect(room.state().pendingMove).toBeNull();
+    });
+
+  it('lets the semantic interpreter recover a misheard direct request without committing it', async () => {
+    const room = new ChessRoom('4821', {
+      humanColor: 'w', initialFen: '4k3/4p3/8/8/8/8/8/1N2K3 w - - 0 1',
+    });
+    const interpret = vi.fn(async (context: ChessVoiceInterpretContext) => {
+      expect(context.readOnlyInquiry).toBe(false);
+      return { kind: 'action' as const, actionId: 'propose_move', targetId: 'b1c3' };
+    });
+    const game = liveRoomHarness(room, 'en-US', interpret);
+    game.prompt('Could you move my nite to C3?');
+    await game.session.whenSpeechSettled();
+    expect(interpret).toHaveBeenCalledOnce();
+    expect(room.state().pendingMove).toMatchObject({ from: 'b1', to: 'c3' });
+    expect(room.state().ply).toBe(0);
+  });
+
+  it.each([
+    {
+      spoken: 'Move the knight on B to C3',
+      fen: '4k3/4p3/8/8/8/8/4N3/1N2K3 w - - 0 1', from: 'b1', to: 'c3',
+    },
+    {
+      spoken: 'Could you please move my knight on the B file to C3?',
+      fen: '4k3/4p3/8/8/8/8/4N3/1N2K3 w - - 0 1', from: 'b1', to: 'c3',
+    },
+    {
+      spoken: 'Move my bishop to C3',
+      fen: '4k3/4p3/8/8/8/8/1B6/4K3 w - - 0 1', from: 'b2', to: 'c3',
+    },
+    {
+      spoken: 'I only have one bishop left; could you move it to C3?',
+      fen: '4k3/4p3/8/8/8/8/1B6/4K3 w - - 0 1', from: 'b2', to: 'c3',
+    },
+  ])('proposes "$spoken" from the current board without waiting for a model', ({ spoken, fen, from, to }) => {
+    const room = new ChessRoom('4821', { humanColor: 'w', initialFen: fen });
+    const interpret = vi.fn(async () => ({ kind: 'none' as const }));
+    const game = liveRoomHarness(room, 'en-US', interpret);
+    game.prompt(spoken);
+    expect(interpret).not.toHaveBeenCalled();
+    expect(room.state().pendingMove).toMatchObject({ from, to });
+    expect(room.state().ply).toBe(0);
+    expect(game.spoken.at(-1)).toMatch(/confirm or cancel/i);
+    game.prompt('confirm');
+    expect(room.state().lastMove).toMatchObject({ actor: 'human', from, to });
+  });
+
   it('speaks Portuguese castling and piece facts from the same legal board', () => {
     const room = new ChessRoom('4821', {
       humanColor: 'w', initialFen: 'r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1',

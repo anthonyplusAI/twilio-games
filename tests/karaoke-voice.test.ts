@@ -639,6 +639,31 @@ describe('KaraokeVoiceSession', () => {
     game.stateChanged();
     expect(game.handoffs).toHaveLength(2);
   });
+
+  it('speaks the new song menu to the connected caller after a shared-display replay', () => {
+    const game = karaokeVoiceGame('en-US');
+    const singer = game.connect('CA-TOUCH-REPLAY');
+    singer.prompt('Ada');
+    expect(game.room.selectSong(singer.playerId, KARAOKE_RUNTIME_SONGS[0]!.id)).toBe(true);
+    game.stateChanged();
+    singer.prompt('start');
+    const generation = game.room.state().loadingGeneration;
+    expect(game.room.ready(generation)).toBe(true);
+    expect(game.room.mediaReady(singer.playerId, game.room.state().selectedSong!.id,
+      generation, KARAOKE_COUNTDOWN_MS)).toBe(true);
+    game.setNow(KARAOKE_COUNTDOWN_MS + KARAOKE_SONG_DURATION_MS);
+    game.room.tick();
+    expect(game.room.finalizeMediaScore(singer.playerId, 1_000,
+      finalHits(game.room.state().selectedSong!, 1_000))).toBe(true);
+    game.stateChanged();
+    const spokenBeforeTouch = singer.spoken.length;
+
+    expect(game.room.advance(singer.playerId)).toBe(true);
+    game.stateChanged();
+    expect(game.room.phase).toBe('song_select');
+    expect(singer.spoken.slice(spokenBeforeTouch).join(' ')).toMatch(/Available songs/i);
+    expect(singer.spoken.slice(spokenBeforeTouch).join(' ')).not.toMatch(/first name|Score 1,000/i);
+  });
 });
 
 describe('matchKaraokeSong', () => {

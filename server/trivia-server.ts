@@ -468,7 +468,8 @@ export class TriviaServer {
         if (!isHost) this.rejectAuthority(conn);
         else if (this.requiresDisplayAuth(room.code) && room.phase === 'results') {
           this.send(conn, { type: 'error', code: 'station_requeue_required', message: 'Join the queue again to play again.' });
-        } else if (!room.advance(conn.playerId)) {
+        } else if (!room.advance(conn.playerId ?? (room.phase === 'results' && conn.display
+          ? room.state().players[0]?.playerId : undefined))) {
           this.send(conn, { type: 'error', code: 'not_ready', message: 'Complete the current step first.' });
         }
         break;

@@ -34,6 +34,22 @@ const portugueseChoices: readonly TriviaVoiceChoice[] = [
 ];
 
 describe('TriviaVoiceSession setup and categories', () => {
+  it('speaks the new category menu after a shared-display replay changes results', async () => {
+    const game = harness(resultState([resultPlayer('t1', 'Ada', 2_600, 2, 1)]),
+      'en-US', { resumed: true });
+    game.setup();
+    await game.session.whenSpeechSettled();
+    const spokenBeforeTouch = game.spoken.length;
+
+    game.setState({ phase: 'category_select', result: null, categoryVoteCounts: emptyVotes(), myCategoryVote: null });
+    game.session.onStateChanged();
+    await game.session.whenSpeechSettled();
+    expect(game.spoken.slice(spokenBeforeTouch).map(line => line.text).join(' '))
+      .toMatch(/Choose a category.*1, General Knowledge/i);
+    expect(game.spoken.slice(spokenBeforeTouch).map(line => line.text).join(' '))
+      .not.toMatch(/wins with a leaderboard score/i);
+  });
+
   it('retires the technology introduction when the visible menu changes', () => {
     const game = harness(baseState({ expectedPlayerCount: 2, hasExpectedPlayers: false }));
     game.setup();

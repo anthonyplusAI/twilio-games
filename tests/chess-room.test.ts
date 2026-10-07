@@ -81,6 +81,76 @@ describe('Voice Chess room', () => {
     expect(room.state().pendingMove).toMatchObject({ from: 'f3', to: 'e5' });
   });
 
+  it('resolves conversational piece and destination requests only when one legal source fits', () => {
+    const unique = whiteRoom('4k3/p7/8/8/8/8/1B6/4K3 w - - 0 1');
+    const startFen = unique.state().fen;
+    expect(unique.handleVoiceCommand('move my bishop to C3').code).toBe('proposed');
+    expect(unique.state()).toMatchObject({ fen: startFen, pendingMove: { from: 'b2', to: 'c3', piece: 'b' } });
+
+    const ambiguous = whiteRoom('4k3/p7/8/8/8/8/1B1B4/4K3 w - - 0 1');
+    const answer = ambiguous.handleVoiceCommand('move my bishop to C3');
+    expect(answer.code).toBe('ambiguous');
+    expect(answer.candidates?.map(move => move.from).sort()).toEqual(['b2', 'd2']);
+    expect(ambiguous.state().pendingMove).toBeNull();
+  });
+
+  it('uses file and column hints against the live board without bypassing confirmation', () => {
+    const room = whiteRoom('4k3/p7/8/8/8/8/8/1N1NK3 w - - 0 1');
+    const startFen = room.state().fen;
+    for (const speech of ['move the knight on B to C3', 'B-file knight to C3', 'knight B to C3', 'knight from column B to C3']) {
+      expect(room.handleVoiceCommand(speech).code).toBe('proposed');
+      expect(room.state()).toMatchObject({ fen: startFen, pendingMove: { from: 'b1', to: 'c3', piece: 'n' } });
+      expect(room.handleVoiceCommand('cancel').code).toBe('cancelled');
+    }
+    expect(room.handleVoiceCommand('cavalo da coluna B para C3', 'pt-BR').code).toBe('proposed');
+    expect(room.state()).toMatchObject({ fen: startFen, pendingMove: { from: 'b1', to: 'c3', piece: 'n' } });
+  });
+
+  it('resolves a file-only piece selection now and accepts the destination after a pause', () => {
+    vi.useFakeTimers();
+    try {
+      const room = whiteRoom('4k3/p7/8/8/8/8/8/1N1NK3 w - - 0 1');
+      const startFen = room.state().fen;
+      expect(room.handleVoiceCommand('move the knight on B').code).toBe('selected');
+      expect(room.state().selection).toEqual({ from: 'b1', piece: 'n' });
+      vi.advanceTimersByTime(120_000);
+      expect(room.handleVoiceCommand('to C3').code).toBe('proposed');
+      expect(room.state()).toMatchObject({ fen: startFen, pendingMove: { from: 'b1', to: 'c3' } });
+      expect(room.handleVoiceCommand('cancel').code).toBe('cancelled');
+      expect(room.handleVoiceCommand('B-file knight').code).toBe('selected');
+      expect(room.state().selection).toEqual({ from: 'b1', piece: 'n' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clarifies a file-only reference when two own pieces of that type are on the file', () => {
+    const room = whiteRoom('4k3/p7/8/8/8/1N6/8/1N2K3 w - - 0 1');
+    const answer = room.handleVoiceCommand('move the knight on B');
+    expect(answer.code).toBe('ambiguous');
+    expect(answer.message).toMatch(/B1.*B3|B3.*B1/);
+    expect(room.state().selection).toBeNull();
+    expect(room.state().pendingMove).toBeNull();
+  });
+
+  it('lets a newly named file override an earlier selected source', () => {
+    const room = whiteRoom('4k3/p7/8/8/8/8/4N3/1N2K3 w - - 0 1');
+    expect(room.handleVoiceCommand('knight on B').code).toBe('selected');
+    expect(room.state().selection).toEqual({ from: 'b1', piece: 'n' });
+    expect(room.handleVoiceCommand('the E-file knight to C3').code).toBe('proposed');
+    expect(room.state().pendingMove).toMatchObject({ from: 'e2', to: 'c3', piece: 'n' });
+    expect(room.state().selection).toBeNull();
+  });
+
+  it('rejects a source file with no matching legal move instead of choosing another piece', () => {
+    const room = whiteRoom('4k3/p7/8/8/8/8/8/3NK3 w - - 0 1');
+    const startFen = room.state().fen;
+    expect(room.handleVoiceCommand('knight to C3').code).toBe('proposed');
+    expect(room.handleVoiceCommand('knight on B to C3').code).toBe('illegal');
+    expect(room.state()).toMatchObject({ fen: startFen, pendingMove: null });
+    expect(room.handleVoiceCommand('confirm').code).toBe('no_pending');
+  });
+
   it('accepts two-step selection of a piece and target square', () => {
     const room = whiteRoom();
     expect(room.handleVoiceCommand('select E2').code).toBe('selected');

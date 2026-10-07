@@ -1,3 +1,20 @@
+import type { FighterConnectionState } from './fighter-net';
+
+export type FighterResultActionState = 'station' | 'rematch' | 'viewer' | 'reconnecting' | 'unavailable';
+
+/** Match the visible result action to the authority held by this browser socket. */
+export function fighterResultActionState(
+  stationManaged: boolean,
+  isHost: boolean,
+  connection: FighterConnectionState,
+  phase: string | undefined,
+): FighterResultActionState {
+  if (stationManaged) return 'station';
+  if (phase !== 'results') return 'unavailable';
+  if (connection !== 'connected') return 'reconnecting';
+  return isHost ? 'rematch' : 'viewer';
+}
+
 export interface NumericSelection {
   buffer: string;
   selection: number | null;

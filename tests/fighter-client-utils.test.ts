@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { isInteractiveShortcutTarget, resolveNumericSelection } from '../client/fighter/fighter-client-utils';
+import { fighterResultActionState, isInteractiveShortcutTarget, resolveNumericSelection } from '../client/fighter/fighter-client-utils';
 
 describe('fighter client shortcuts', () => {
+  it('offers result Rematch only to a connected standalone host display', () => {
+    expect(fighterResultActionState(false, true, 'connected', 'results')).toBe('rematch');
+    expect(fighterResultActionState(false, false, 'connected', 'results')).toBe('viewer');
+    expect(fighterResultActionState(false, true, 'reconnecting', 'results')).toBe('reconnecting');
+    expect(fighterResultActionState(false, true, 'closed', 'results')).toBe('reconnecting');
+    expect(fighterResultActionState(true, true, 'connected', 'results')).toBe('station');
+    expect(fighterResultActionState(false, true, 'connected', 'fight')).toBe('unavailable');
+  });
   it('allows all twelve fighters to be selected numerically', () => {
     expect(resolveNumericSelection('', '1', 12)).toMatchObject({ buffer: '1', waiting: true });
     expect(resolveNumericSelection('1', '0', 12).selection).toBe(10);

@@ -658,6 +658,22 @@ describe('Arcade Voice routing', () => {
     expect(terms).toEqual(expect.arrayContaining(rosterEntries().map(monster => monsterName(locale, monster.id))));
   });
 
+  it.each(['en-US', 'pt-BR'] as const)('hints spoken Chess files as well as squares (%s)', async locale => {
+    const roomCode = 'EVENT-CHESS-HINTS';
+    const { port } = await harness({
+      active: true, stationRoomCode: roomCode, stationPhase: 'PLAYING',
+      route: stationChessRoute(roomCode), locale,
+    });
+    const xml = await (await incomingCall(port, { callSid: `CA-chess-hints-${locale}` })).text();
+    expect(xml).toContain('<ConversationRelay');
+    const terms = / hints="([^"]*)"/.exec(xml)?.[1]?.split(', ').filter(Boolean) ?? [];
+    expect(terms.length).toBeLessThanOrEqual(100);
+    expect(new Set(terms.map(term => term.toLowerCase())).size).toBe(terms.length);
+    expect(terms).toEqual(expect.arrayContaining(['a1', 'b1', 'c3', 'h8']));
+    expect(terms).toEqual(expect.arrayContaining(locale === 'pt-BR'
+      ? ['coluna B', 'na coluna B'] : ['B file', 'on B']));
+  });
+
   it('routes an admitted Karaoke station call with setup mode and song-title hints', async () => {
     const route: NonNullable<StationVoiceRoute> = {
       game: 'karaoke', roomCode: 'KARAOKE-ROOM', matchId: 'karaoke-match', launchGeneration: 2,

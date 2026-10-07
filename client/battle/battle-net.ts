@@ -31,6 +31,7 @@ export class BattleConnection {
   private onEventsCb?: (e: BattleEvent[], eventIds: number[], generation: number) => void;
   private onShowResultsCb?: (generation: number) => void;
   private onConnectedCb?: () => void;
+  private onDisconnectedCb?: () => void;
   private onJoinedCb?: (playerId: string) => void;
   private onErrorCb?: (code: string, message: string) => void;
 
@@ -73,6 +74,7 @@ export class BattleConnection {
       if (this.identity) this.rawSend(this.identity);
     };
     this.ws.onclose = (ev) => {
+      this.onDisconnectedCb?.();
       if (ev.code === 4001) { this.closed = true; return; }
       if (!this.closed) this.scheduleReconnect();
     };
@@ -138,6 +140,7 @@ export class BattleConnection {
   onEvents(cb: (e: BattleEvent[], eventIds: number[], generation: number) => void) { this.onEventsCb = cb; }
   onShowResults(cb: (generation: number) => void) { this.onShowResultsCb = cb; }
   onConnected(cb: () => void) { this.onConnectedCb = cb; }
+  onDisconnected(cb: () => void) { this.onDisconnectedCb = cb; }
   onJoined(cb: (playerId: string) => void) { this.onJoinedCb = cb; }
   onError(cb: (code: string, message: string) => void) { this.onErrorCb = cb; }
 

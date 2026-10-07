@@ -53,7 +53,7 @@ describe('Voice Chess analytics API', () => {
         customParameters: { game: 'chess', roomCode: '4821', locale: 'en-US' } }));
       await vi.waitFor(() => expect(spoken.join(' ')).toContain('Welcome to Voice Chess'), { timeout: 2_000 });
       voice.send(JSON.stringify({ type: 'prompt', voicePrompt: 'help', last: true }));
-      await vi.waitFor(() => expect(spoken.join(' ')).toMatch(/Name a piece or its starting square.*say the destination/i), { timeout: 2_000 });
+      await vi.waitFor(() => expect(spoken.join(' ')).toMatch(/Say a piece and destination.*infer a unique legal source/i), { timeout: 2_000 });
       const ended = await fetch(`${base}/voice/session-ended`, { method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ CallSid: callSid, SessionStatus: 'completed', CallStatus: 'completed' }) });

@@ -151,6 +151,64 @@ describe('BattleServer', () => {
     expect(display.msgs).toContainEqual(expect.objectContaining({type:'error',code:'station_requeue_required'}));
     display.ws.close();
   });
+
+  it('offers result rematch only to a finished participant or the elected standalone display', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const participant = await connectCollect(port);
+    send(participant.ws, { type: 'join', roomCode: 'RESULT-AUTH', name: 'Ada' });
+    await wait(20);
+    const original = participant.msgs.find(message => message.type === 'joined')?.playerId as string;
+    expect(original).toBeTruthy();
+    const leader = await connectCollect(port);
+    send(leader.ws, { type: 'spectate', roomCode: 'RESULT-AUTH' });
+    await wait(20);
+    const secondary = await connectCollect(port);
+    send(secondary.ws, { type: 'spectate', roomCode: 'RESULT-AUTH' });
+    await wait(20);
+
+    const room = server.findRoom('RESULT-AUTH')!;
+    room.advance(original);
+    room.selectMonster(original, 'embertail');
+    room.advance(original);
+    for (let index = 0; index < 100 && room.phase === 'battle'; index++) {
+      const snap = room.snapshot()!;
+      room.chooseMove(original, snap.a.moves[1]!.id);
+      if (room.aiPending()) room.resolveAiTurn();
+    }
+    expect(room.phase).toBe('results');
+    room.acknowledgeResultsPresented(room.generation);
+
+    const late = await connectCollect(port);
+    send(late.ws, { type: 'join', roomCode: 'RESULT-AUTH', name: 'Late' });
+    await wait(30);
+    const lastResult = (messages: Record<string, unknown>[]) => messages
+      .filter(message => message.type === 'battle_state' && message.phase === 'results').at(-1);
+    expect(lastResult(participant.msgs)?.canRematch).toBe(true);
+    expect(lastResult(leader.msgs)?.canRematch).toBe(true);
+    expect(lastResult(secondary.msgs)?.canRematch).toBe(false);
+    expect(lastResult(late.msgs)?.canRematch).toBe(false);
+    expect(server.voiceAdvance('RESULT-AUTH')).toBe(false);
+    expect(room.phase).toBe('results');
+
+    send(secondary.ws, { type: 'advance' });
+    send(late.ws, { type: 'advance' });
+    await wait(30);
+    expect(secondary.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'forbidden' }));
+    expect(late.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'not_ready' }));
+    expect(room.phase).toBe('results');
+    const observedPhases: string[] = [];
+    server.setOnRoomState(code => {
+      const current = server.findRoom(code);
+      if (code === 'RESULT-AUTH' && current) observedPhases.push(current.phase);
+    });
+    send(leader.ws, { type: 'advance' });
+    await wait(30);
+    expect(room.phase).toBe('monster_select');
+    expect(observedPhases.at(-1)).toBe('monster_select');
+    expect(leader.msgs).toContainEqual(expect.objectContaining({ type: 'battle_state', phase: 'monster_select' }));
+    participant.ws.close(); leader.ws.close(); secondary.ws.close(); late.ws.close();
+  });
   it('sends the roster on connect', async () => {
     server = new BattleServer({ port: 0 });
     const port = await server.start();

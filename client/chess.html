@@ -42,7 +42,7 @@
 
     <section class="status-deck" aria-labelledby="status-title">
       <div class="status-heading"><span id="turn-icon" class="turn-icon" aria-hidden="true">✦</span><span id="turn-label">Voice channel</span></div>
-      <h1 id="status-title">Opening the chamber</h1>
+      <h1 id="status-title" tabindex="-1">Opening the chamber</h1>
       <p id="status-detail">Preparing your chess board.</p>
       <div id="move-prompt" class="move-prompt">Say a piece and square on your call, then confirm the move.</div>
       <div class="camera-hint"><span id="camera-hint-pointer" class="camera-hint-pointer">Drag to rotate · right-drag to pan · scroll to zoom · double-click to reset</span><span id="camera-hint-touch" class="camera-hint-touch">One finger rotates · two fingers pan or zoom</span></div>
@@ -70,12 +70,17 @@
 
     <div id="event-banner" class="event-banner" aria-hidden="true"></div>
     <div id="result-overlay" class="result-overlay" hidden>
-      <div class="result-card" role="status" aria-live="assertive">
+      <div id="result-card" class="result-card" role="region" aria-labelledby="result-title">
         <span class="result-mark" aria-hidden="true">✦</span>
         <span id="result-kicker">Duel complete</span>
-        <strong id="result-title">Victory</strong>
+        <h1 id="result-title" tabindex="-1">Victory</h1>
         <p id="result-detail"></p>
-        <button id="result-replay" class="result-replay" type="button" hidden>Play again</button>
+        <div class="result-actions">
+          <button id="result-replay" class="result-replay" type="button" hidden>Play again</button>
+          <a id="result-exit" class="result-exit" href="/">Exit to games</a>
+          <p id="result-station-note" class="result-station-note" hidden></p>
+        </div>
+        <div id="result-tech-slot"></div>
       </div>
     </div>
 

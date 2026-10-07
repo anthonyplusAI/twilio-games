@@ -1,5 +1,5 @@
 import { parseCrMessage } from './conversation-relay';
-import { parseChessIntent, describeChessMove } from '../shared/chess-intent';
+import { parseChessIntent, describeChessMove, type ChessIntent } from '../shared/chess-intent';
 import type { ChessCommandResult, ChessEvent, ChessPieceType, ChessSquare, ChessState } from '../shared/chess-protocol';
 import { DEFAULT_LOCALE, resolveLocale, type SupportedLocale } from '../shared/i18n/locales';
 import { formatList, normalizeForMatching } from '../shared/i18n/translate';
@@ -153,13 +153,13 @@ export class ChessVoiceSession {
   private handleFinalPrompt(spoken: string): void {
     if (!this.roomCode || !this.callSid || !spoken.trim()) return;
     this.turnEpoch++;
+    const intent = parseChessIntent(spoken, this.commandLocale);
     // Chess questions are read-only, even if they name a legal move or Relay
     // transcribes the question without its final question mark.
-    if (isReadOnlyChessInquiry(spoken, this.commandLocale)) {
+    if (isReadOnlyChessInquiry(spoken, this.commandLocale, intent)) {
       this.requestSemanticTurn(spoken, true);
       return;
     }
-    const intent = parseChessIntent(spoken, this.commandLocale);
     if (intent.kind === 'reset') {
       this.handleReset();
       return;
@@ -508,15 +508,18 @@ function legalMoveFacts(state: ChessState, choices: readonly ChessVoiceMoveChoic
   return facts;
 }
 
-function isReadOnlyChessInquiry(spoken: string, locale: SupportedLocale): boolean {
+function isReadOnlyChessInquiry(spoken: string, locale: SupportedLocale, intent: ChessIntent): boolean {
   const text = normalizeForMatching(spoken, locale);
-  // A polite command phrased as a request remains actionable. The player will
-  // still have to confirm any move it proposes.
-  if (/^(?:please )?(?:can|could|would|will) you (?:please )?(?:move|play|castle|make|put|send|push)\b/.test(text)
-    || /^(?:por favor )?(?:voce pode|pode) (?:por favor )?(?:mover|jogar|fazer o roque)\b/.test(text)) return false;
-  return spoken.includes('?')
-    || /^(?:can i|could i|may i|should i|would i|do i|does my|did i|am i|is|are|where|which|what|how|why|when|if|tell me|explain|can you tell|could you tell|would you tell|posso|poderia eu|devo|eu posso|e possivel|isso e|esta|estao|onde|para onde|quais|qual|como|por que|se eu|me diga|me explique)\b/.test(text)
-    || /\b(?:wonder if|wondering if|want to know if|whether|quero saber se|queria saber se|me pergunto se)\b/.test(text);
+  // Read-only framing wins even if a later clause happens to contain an
+  // imperative ("What if I move...?"). Relay punctuation alone is not an
+  // inquiry: "Move my bishop to C3?" still needs a fast, confirmation-gated
+  // proposal, and a prefaced "could you move" request may need the semantic
+  // interpreter to recover a misheard piece name.
+  if (/^(?:can i|could i|may i|should i|would i|do i|does my|did i|am i|can my|could my|would my|is|are|where|which|what|how|why|when|if|tell me|explain|(?:can|could|would) you (?:please )?(?:tell|show|explain)|posso|poderia eu|devo|eu posso|e possivel|isso e|esta|estao|onde|para onde|quais|qual|como|por que|se eu|me diga|me explique)\b/.test(text)
+    || /\b(?:wonder if|wondering if|want to know if|whether|quero saber se|queria saber se|me pergunto se)\b/.test(text)) return true;
+  if (/\b(?:can|could|would|will) you (?:please )?(?:move|play|castle|make|put|send|push)\b/.test(text)
+    || /\b(?:voce pode|pode) (?:por favor )?(?:mover|jogar|fazer o roque)\b/.test(text)) return false;
+  return intent.kind === 'unknown' && spoken.includes('?');
 }
 
 const SPOKEN_RANKS: Readonly<Record<string, string>> = {

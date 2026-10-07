@@ -703,7 +703,18 @@ describe('TriviaServer authority and lifecycle', () => {
       standaloneRoom.tick();
     }
     expect(standaloneRoom.phase).toBe('results');
-    expect(trivia!.voiceAdvance('SOLO-REPLAY', standalone)).toBe(true);
+    const standaloneDisplay = await connect(port);
+    send(standaloneDisplay, { type: 'spectate', roomCode: 'SOLO-REPLAY' });
+    await waitFor(standaloneDisplay, message => message.type === 'host_identity' && message.isHost === true);
+    const nonhostDisplay = await connect(port);
+    send(nonhostDisplay, { type: 'spectate', roomCode: 'SOLO-REPLAY' });
+    await waitFor(nonhostDisplay, message => message.type === 'host_identity' && message.isHost === false);
+    send(nonhostDisplay, { type: 'advance' });
+    await waitFor(nonhostDisplay, message => message.type === 'error' && message.code === 'forbidden');
+    expect(standaloneRoom.phase).toBe('results');
+    send(standaloneDisplay, { type: 'advance' });
+    await waitFor(standaloneDisplay, message => message.type === 'trivia_state'
+      && message.phase === 'category_select');
     expect(standaloneRoom.phase).toBe('category_select');
     expect(port).toBeGreaterThan(0);
   });

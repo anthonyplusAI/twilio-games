@@ -9,9 +9,45 @@ interface FullscreenGameShellOptions {
 
 export function createFullscreenGameShell(options: FullscreenGameShellOptions = {}): FullscreenGameShell {
   let frame: HTMLIFrameElement | null = null;
+  const observedDocuments = new WeakSet<Document>();
+
+  const homeDestination = (href: string): URL | null => {
+    const destination = new URL(href, location.href);
+    return destination.origin === location.origin && ['/', '/index.html'].includes(destination.pathname)
+      ? destination
+      : null;
+  };
+
+  const handleGameClick = (event: MouseEvent): void => {
+    if (event.defaultPrevented || event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    // The click originated in an iframe, so its Element belongs to another realm.
+    const target = event.target as Element | null;
+    const anchor = typeof target?.closest === 'function' ? target.closest<HTMLAnchorElement>('a[href]') : null;
+    const destination = anchor ? homeDestination(anchor.href) : null;
+    if (!destination) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    location.assign(destination.href);
+  };
 
   const handleLoad = (): void => {
     if (!frame) return;
+    try {
+      const childUrl = frame.contentWindow?.location.href;
+      const destination = childUrl ? homeDestination(childUrl) : null;
+      if (destination) {
+        location.assign(destination.href);
+        return;
+      }
+      const childDocument = frame.contentDocument;
+      if (childDocument && !observedDocuments.has(childDocument)) {
+        // Let game handlers send their explicit leave/cleanup messages first.
+        childDocument.addEventListener('click', handleGameClick);
+        observedDocuments.add(childDocument);
+      }
+    } catch {
+      // An unexpected cross-origin page cannot be inspected by the shell.
+    }
     frame.contentWindow?.focus();
   };
 

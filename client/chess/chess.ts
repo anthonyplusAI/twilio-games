@@ -1,14 +1,17 @@
 import QRCode from 'qrcode';
 import { DEFAULT_ROOM } from '../../shared/constants';
 import type { ChessColor, ChessEvent, ChessMoveRecord, ChessPiecePlacement,
-  ChessPieceType, ChessResult, ChessState } from '../../shared/chess-protocol';
+  ChessPieceType, ChessState } from '../../shared/chess-protocol';
 import { locale } from '../i18n';
+import { resultTechHtml } from '../result-tech';
 import { createStationDisplay } from '../station-display';
 import { rejectDisplayToken, watchVoiceNumber } from '../station-client';
 import { wireFullscreenToggle } from '../fullscreen-toggle';
 import { getMusicManager } from '../music-manager';
 import type { ChessBoardScene } from './chess-board';
 import { ChessConnection, chessWebSocketUrl, type ChessConnectionState } from './chess-net';
+import { createChessResultDialog } from './chess-result-dialog';
+import { chessResultPresentation, resultSummary } from './chess-result-view';
 
 const element = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 const app = element<HTMLDivElement>('app');
@@ -35,18 +38,27 @@ const humanLabel = element<HTMLSpanElement>('human-label');
 const computerLabel = element<HTMLSpanElement>('computer-label');
 const eventBanner = element<HTMLDivElement>('event-banner');
 const resultOverlay = element<HTMLDivElement>('result-overlay');
+const resultCard = element<HTMLDivElement>('result-card');
 const resultTitle = element<HTMLElement>('result-title');
 const resultDetail = element<HTMLParagraphElement>('result-detail');
 const resultKicker = element<HTMLSpanElement>('result-kicker');
 const resultReplay = element<HTMLButtonElement>('result-replay');
+const resultExit = element<HTMLAnchorElement>('result-exit');
+const resultStationNote = element<HTMLParagraphElement>('result-station-note');
+const resultTechSlot = element<HTMLDivElement>('result-tech-slot');
 const liveAnnouncer = element<HTMLDivElement>('live-announcer');
 const page = new URL(location.href);
 const params = page.searchParams;
 const roomCode = params.get('room') || DEFAULT_ROOM;
 const stationLaunchRequested = params.has('station') || params.has('match') || params.has('launchGeneration');
 const stationDisplay = createStationDisplay();
+const stationManaged = stationLaunchRequested || stationDisplay.active;
 const isPortuguese = locale === 'pt-BR';
 const music = getMusicManager();
+const resultDialog = createChessResultDialog({
+  root: app, overlay: resultOverlay, card: resultCard, title: resultTitle,
+  replay: resultReplay, exit: resultExit, announcer: liveAnnouncer, statusTitle,
+}, stationManaged);
 
 let board: ChessBoardScene | null = null;
 let connection: ChessConnection | null = null;
@@ -72,6 +84,7 @@ const boardQueue: ChessState[] = [];
 document.documentElement.lang = locale;
 document.title = isPortuguese ? 'Xadrez por Voz · Twilio Games' : 'Voice Chess · Twilio Games';
 localizeStaticCopy();
+resultTechSlot.innerHTML = resultTechHtml('chess', locale, { stationManaged });
 const stopVoiceNumberUpdates = stationLaunchRequested || stationDisplay.active ? null
   : watchVoiceNumber(locale, number => {
     const nextNumber = number.trim();
@@ -101,10 +114,11 @@ renderMusicButton();
 setTimeout(renderMusicButton, 120);
 musicButton.addEventListener('click', () => void toggleMusic());
 resultReplay.addEventListener('click', () => {
-  if (connectionState !== 'connected' || latestState?.phase !== 'finished'
+  if (stationManaged || connectionState !== 'connected' || latestState?.phase !== 'finished'
     || latestState.canReplayOnDisplay !== true) return;
   connection?.replay(latestState.gameId);
 });
+resultOverlay.addEventListener('keydown', event => resultDialog.trapTab(event));
 addEventListener('pointerdown', event => {
   if ((event.target as Element | null)?.closest?.('#music-button')) return;
   void unlockMusic();
@@ -358,7 +372,7 @@ function renderStatus(): void {
       : 'Say “confirm” on your call, or “cancel” to choose another move.';
   } else if (state.phase === 'finished') {
     title = isPortuguese ? 'Duelo encerrado' : 'Duel complete';
-    detail = resultSummary(state.result, state.humanColor);
+    detail = resultSummary(state.result, state.humanColor, locale);
     label = isPortuguese ? 'Resultado final' : 'Final result';
     hint = isPortuguese ? 'O tabuleiro mostra a posição final.' : 'The board shows the final position.';
   } else if (state.turn === state.humanColor) {
@@ -448,25 +462,36 @@ function renderMoveNote(): void {
 function renderResult(state: ChessState): void {
   if (state.phase !== 'finished' || !state.result) {
     resultOverlay.hidden = true;
+    resultDialog.hide();
     lastResultKey = '';
     return;
   }
   const key = `${state.gameId}:${state.ply}:${state.result.reason}`;
   const humanWon = state.result.winner === null ? null : state.result.winner === state.humanColor;
-  resultOverlay.dataset.result = humanWon === null ? 'draw' : humanWon ? 'win' : 'loss';
-  resultKicker.textContent = isPortuguese ? 'Duelo encerrado' : 'Duel complete';
-  resultTitle.textContent = humanWon === null
-    ? isPortuguese ? 'Empate' : 'Draw'
-    : humanWon ? isPortuguese ? 'Vitória' : 'Victory' : isPortuguese ? 'Derrota' : 'Defeat';
-  resultDetail.textContent = resultSummary(state.result, state.humanColor);
-  resultReplay.hidden = state.canReplayOnDisplay !== true || stationLaunchRequested || stationDisplay.active;
+  const presentation = chessResultPresentation(state.result, state.humanColor, locale, {
+    canReplayOnDisplay: state.canReplayOnDisplay === true,
+    stationManaged,
+  });
+  resultOverlay.dataset.result = presentation.outcome;
+  resultKicker.textContent = presentation.kicker;
+  resultTitle.textContent = presentation.title;
+  resultDetail.textContent = presentation.detail;
+  resultReplay.textContent = presentation.replayLabel;
+  resultReplay.hidden = !presentation.showReplay;
   resultReplay.disabled = connectionState !== 'connected';
+  resultExit.textContent = presentation.exitLabel;
+  resultExit.hidden = !presentation.showExit;
+  resultStationNote.textContent = presentation.stationNextRound;
+  resultStationNote.hidden = !stationManaged;
+  const newlyVisible = resultOverlay.hidden;
   resultOverlay.hidden = false;
+  if (newlyVisible) resultDialog.show();
   stationDisplay.markEngineResultsReady();
   if (lastResultKey !== key) {
     lastResultKey = key;
+    resultOverlay.scrollTop = 0;
     board?.showResult(humanWon);
-    liveAnnouncer.textContent = `${resultTitle.textContent}. ${resultDetail.textContent}`;
+    liveAnnouncer.textContent = stationManaged ? `${resultTitle.textContent}. ${resultDetail.textContent}` : '';
   }
 }
 
@@ -564,6 +589,7 @@ function localizeStaticCopy(): void {
   resultKicker.textContent = 'Duelo encerrado';
   resultTitle.textContent = 'Vitória';
   resultReplay.textContent = 'Jogar de novo';
+  resultExit.textContent = 'Voltar aos jogos';
   element<HTMLElement>('fallback-explanation').textContent = 'Tabuleiro ao vivo · modo 2D';
   accessibleBoard.setAttribute('aria-label', 'Tabuleiro de xadrez ao vivo');
 }
@@ -590,26 +616,6 @@ function moveCaption(move: ChessMoveRecord): string {
   return isPortuguese
     ? `${actor ? 'Você moveu' : 'O Arquimago moveu'} ${pieceName(move.piece)} para ${to}${promotion}.${check}`
     : `${actor ? 'You moved' : 'The Archmage moved'} ${pieceName(move.piece)} to ${to}${promotion}.${check}`;
-}
-
-function resultSummary(result: ChessResult | null, humanColor: ChessColor): string {
-  if (!result) return isPortuguese ? 'A posição final está no tabuleiro.' : 'The final position is on the board.';
-  if (result.winner === null) {
-    const reason: Record<ChessResult['reason'], string> = isPortuguese
-      ? { checkmate: 'Xeque-mate', stalemate: 'Afogamento', threefold_repetition: 'Repetição de posição',
-          fifty_move: 'Regra dos cinquenta lances', insufficient_material: 'Material insuficiente', draw: 'Empate' }
-      : { checkmate: 'Checkmate', stalemate: 'Stalemate', threefold_repetition: 'Threefold repetition',
-          fifty_move: 'Fifty-move rule', insufficient_material: 'Insufficient material', draw: 'Draw' };
-    return isPortuguese ? `Empate por ${reason[result.reason].toLowerCase()}.`
-      : `A draw by ${reason[result.reason].toLowerCase()}.`;
-  }
-  const humanWon = result.winner === humanColor;
-  if (result.reason === 'checkmate') return isPortuguese
-    ? humanWon ? 'Você deu xeque-mate no Arquimago.' : 'O Arquimago deu xeque-mate.'
-    : humanWon ? 'You checkmated the Archmage.' : 'The Archmage delivered checkmate.';
-  return isPortuguese
-    ? humanWon ? 'Você venceu o duelo.' : 'O Arquimago venceu o duelo.'
-    : humanWon ? 'You won the duel.' : 'The Archmage won the duel.';
 }
 
 async function toggleMusic(): Promise<void> {

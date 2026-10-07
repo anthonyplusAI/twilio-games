@@ -228,6 +228,7 @@ describe('BattleVoiceSession', () => {
     snap = battleSnap({ phase: 'monster_select', generation: 5, myName: 'Ada' });
     session.onBattleStateChanged();
     expect(result?.isCurrent?.()).toBe(false);
+    expect(lines.some(line => /choose your own monster/i.test(line.text))).toBe(true);
   });
 
   it('keeps a painted station result deliverable during room retirement', () => {

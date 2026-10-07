@@ -40,11 +40,13 @@ import {
   resolveKaraokeWebSocketUrl,
 } from './karaoke-client-utils';
 import { karaokeCopy, karaokeSongCredit } from './karaoke-copy';
+import { karaokeResultAnnouncement, renderKaraokeLeaderboardRowsHtml, renderKaraokeResultsHtml } from './karaoke-results-view';
 import { KaraokeConnection, type KaraokeConnectionState } from './karaoke-net';
 import { KaraokeStage } from './karaoke-stage';
 
 const element = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 const flowOverlay = element('flow-overlay');
+const resultAnnouncer = element('result-announcer');
 const connectionStatus = element('connection-status');
 const audioRecovery = element<HTMLButtonElement>('audio-recovery');
 const stageLoading = element('stage-loading');
@@ -105,6 +107,7 @@ let flowMessage = '';
 let phoneNumber = copy.phoneFallback;
 let phoneQr = '';
 let lastFlowKey = '';
+let lastAnnouncedResultKey = '';
 let preparationKey = '';
 let preparedGeneration = 0;
 let readySentGeneration = 0;
@@ -476,6 +479,15 @@ function renderFlow(force = false): void {
   ]);
   if (!force && flowKey === lastFlowKey) return;
   lastFlowKey = flowKey;
+  flowOverlay.setAttribute('aria-live', state?.phase === 'results' && !displayPairingRequired ? 'off' : 'polite');
+  if (state?.phase !== 'results' || displayPairingRequired) resultAnnouncer.textContent = '';
+  const previousResult = flowOverlay.querySelector<HTMLElement>('.results-panel');
+  const previousResultScroll = previousResult && state?.phase === 'results' ? flowOverlay.scrollTop : null;
+  const activeResultElement = previousResult && document.activeElement
+    && previousResult.contains(document.activeElement) ? document.activeElement as HTMLElement : null;
+  const focusId = activeResultElement?.id ?? '';
+  const focusHref = activeResultElement?.tagName === 'A'
+    ? activeResultElement.getAttribute('href') : null;
   if (displayPairingRequired) {
     flowOverlay.innerHTML = `<section class="flow-panel compact loading-card">${kicker()}<h1>${escapeHtml(copy.displayAuthTitle)}</h1><p>${escapeHtml(copy.displayAuthBody)}</p><div class="flow-actions"><a class="primary-action" href="/operator">${escapeHtml(copy.displayAuthAction)}</a></div></section>`;
     return;
@@ -508,6 +520,16 @@ function renderFlow(force = false): void {
   else renderResults();
   appendFlowError();
   wireFlowControls();
+  if (previousResultScroll !== null && state.phase === 'results') {
+    flowOverlay.scrollTop = previousResultScroll;
+    const nextResult = flowOverlay.querySelector<HTMLElement>('.results-panel');
+    const nextFocus = focusId
+      ? [...(nextResult?.querySelectorAll<HTMLElement>('[id]') ?? [])].find(node => node.id === focusId)
+      : focusHref
+        ? [...(nextResult?.querySelectorAll<HTMLAnchorElement>('a[href]') ?? [])].find(node => node.getAttribute('href') === focusHref)
+        : null;
+    nextFocus?.focus({ preventScroll: true });
+  }
 }
 
 function renderLobby(): void {
@@ -537,14 +559,38 @@ function renderLoading(): void {
 
 function renderResults(): void {
   const result = state!.result;
-  const song = state!.selectedSong;
-  const songResult = song
-    ? `<span class="result-song"><b>${escapeHtml(song.title)}</b><small>${escapeHtml(karaokeSongCredit(song))}</small></span>`
-    : '';
-  const boardRows = leaderboardEntries.length
-    ? leaderboardEntries.map((entry, index) => `<div class="karaoke-board-row"><span>${index + 1}</span><strong>${escapeHtml(entry.name)}</strong><small>${escapeHtml(copy.bestCombo)} ${entry.bestCombo}x</small><b>${formatScore(entry.score)}</b></div>`).join('')
-    : `<p class="karaoke-board-empty">${escapeHtml(leaderboardLoading ? copy.leaderboardLoading : copy.noRecords)}</p>`;
-  flowOverlay.innerHTML = `<section class="flow-panel results-panel">${kicker()}<h1>${escapeHtml(copy.results)}</h1><p>${escapeHtml(result?.name ?? state!.singer?.name ?? copy.appTitle)}</p><div class="results-grid"><div class="flow-card result-card"><div class="result-score">${formatScore(result?.score ?? state!.score)}</div><div class="result-meta"><span>${escapeHtml(copy.bestCombo)} <b>${result?.bestCombo ?? state!.bestCombo}x</b></span>${songResult}</div><div class="flow-actions">${isHost && !stationDisplay.active ? `<button id="advance-flow" class="primary-action">${escapeHtml(copy.again)}</button>` : ''}<a class="secondary-action" href="/">${escapeHtml(copy.exit)}</a></div></div><section class="flow-card karaoke-board" aria-label="${escapeHtml(copy.leaderboard)}"><h2>${escapeHtml(copy.leaderboard)}</h2>${song ? `<p>${escapeHtml(song.title)}</p>` : ''}<div class="karaoke-board-list">${boardRows}</div></section></div></section>`;
+  const stationManaged = stationDisplay.active || stationLaunchRequested;
+  const view = {
+    locale,
+    singerName: result?.name ?? state!.singer?.name ?? copy.appTitle,
+    score: result?.score ?? state!.score,
+    bestCombo: result?.bestCombo ?? state!.bestCombo,
+    song: state!.selectedSong,
+    leaderboardEntries,
+    leaderboardLoading,
+    canReplayOnDisplay: isHost && connectionState === 'connected'
+      && Boolean(state!.singer?.nameConfirmed) && !stationManaged,
+    stationManaged,
+    guideMode,
+  };
+  flowOverlay.innerHTML = renderKaraokeResultsHtml(view);
+  if (result) {
+    const resultKey = `${state!.roomCode}:${result.generation}:${result.completedAtMs}`;
+    if (resultKey !== lastAnnouncedResultKey) {
+      lastAnnouncedResultKey = resultKey;
+      resultAnnouncer.textContent = karaokeResultAnnouncement(view);
+    }
+  }
+}
+
+function patchLeaderboardRows(): void {
+  if (state?.phase !== 'results') return;
+  const board = flowOverlay.querySelector<HTMLElement>('.karaoke-board-list');
+  if (!board) return;
+  const scrollTop = board.scrollTop;
+  board.innerHTML = renderKaraokeLeaderboardRowsHtml(leaderboardEntries, leaderboardLoading, locale);
+  board.setAttribute('aria-busy', String(leaderboardLoading));
+  board.scrollTop = scrollTop;
 }
 
 function updateLeaderboard(next: KaraokeState): void {
@@ -565,13 +611,13 @@ function updateLeaderboard(next: KaraokeState): void {
       if (leaderboardKey !== key) return;
       leaderboardEntries = Array.isArray(payload.entries) ? payload.entries : [];
       leaderboardLoading = false;
-      renderFlow(true);
+      patchLeaderboardRows();
     })
     .catch(() => {
       if (leaderboardKey !== key) return;
       leaderboardEntries = [];
       leaderboardLoading = false;
-      renderFlow(true);
+      patchLeaderboardRows();
     });
 }
 
@@ -584,6 +630,8 @@ function wireFlowControls(): void {
     });
   }
   element('advance-flow')?.addEventListener('click', () => {
+    if (!isHost || connectionState !== 'connected'
+      || (state?.phase === 'results' && (stationDisplay.active || stationLaunchRequested))) return;
     connection?.advance();
   });
   element('leave-mic')?.addEventListener('click', () => {

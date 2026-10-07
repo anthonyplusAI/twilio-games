@@ -181,7 +181,8 @@ stage.addEventListener('click', event => {
     return;
   }
   const replay = (event.target as Element | null)?.closest?.('#trivia-replay');
-  if (!replay || !isHost || stationDisplay.active || stationLaunchRequested) return;
+  if (!replay || !isHost || connectionState !== 'connected' || state?.phase !== 'results'
+    || stationMode || !state.players.length) return;
   connection?.advance();
 });
 
@@ -314,6 +315,18 @@ function displayReadinessContext(loading: TriviaState): string {
 }
 
 function render(): void {
+  const previousResult = stage.querySelector<HTMLElement>('.results-scene[data-result-id]');
+  const sameResult = state?.phase === 'results'
+    && previousResult?.dataset.resultId === (state.result?.resultId ?? 'pending');
+  const previousScroll = sameResult ? { stage: stage.scrollTop, result: previousResult.scrollTop } : null;
+  const previousOpenDetails = sameResult
+    ? [...previousResult.querySelectorAll<HTMLDetailsElement>('details')].map(details => details.open) : [];
+  const activeResultElement = sameResult && document.activeElement
+    && previousResult.contains(document.activeElement) ? document.activeElement as HTMLElement : null;
+  const focusId = activeResultElement?.id ?? '';
+  const focusHref = activeResultElement?.tagName === 'A'
+    ? activeResultElement.getAttribute('href') : null;
+  const focusWasSummary = activeResultElement?.tagName === 'SUMMARY';
   const view = renderTriviaView(state, {
     locale,
     roomCode,
@@ -322,13 +335,29 @@ function render(): void {
     answerResults,
     error: stageError,
     pairingRequired,
-    canReplay: isHost && !stationDisplay.active && !stationLaunchRequested,
+    canReplay: isHost && connectionState === 'connected' && !stationMode && Boolean(state?.players.length),
     isHost,
     pendingCategoryVoteSeat,
     stationMode,
     callEntry: stationMode ? undefined : { number: callNumber, qrCode: callQrCode, loading: callQrLoading },
   });
   stage.innerHTML = view.html;
+  if (previousScroll) {
+    stage.scrollTop = previousScroll.stage;
+    const currentResult = stage.querySelector<HTMLElement>('.results-scene[data-result-id]');
+    if (currentResult) {
+      currentResult.scrollTop = previousScroll.result;
+      currentResult.querySelectorAll<HTMLDetailsElement>('details').forEach((details, index) => {
+        details.open = previousOpenDetails[index] ?? false;
+      });
+      const nextFocus = focusId
+        ? [...currentResult.querySelectorAll<HTMLElement>('[id]')].find(node => node.id === focusId)
+        : focusHref
+          ? [...currentResult.querySelectorAll<HTMLAnchorElement>('a[href]')].find(node => node.getAttribute('href') === focusHref)
+          : focusWasSummary ? currentResult.querySelector<HTMLElement>('summary') : null;
+      nextFocus?.focus({ preventScroll: true });
+    }
+  }
   maybeAcknowledgeQuestionPaint();
   stage.setAttribute('aria-busy', String(!state || state.phase === 'loading'));
   if (state?.phase === 'countdown' && state.countdownEndsAtMs !== null) {

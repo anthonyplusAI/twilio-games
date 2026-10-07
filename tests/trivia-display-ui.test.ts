@@ -235,6 +235,44 @@ describe('Voice Trivia display DOM projection', () => {
     expect(portuguese.html).toContain('Sair');
   });
 
+  it('keeps standalone result actions, standings, and the technology explanation in that order', () => {
+    const result = renderTriviaView(state({
+      phase: 'results',
+      result: {
+        resultId: 'order-check', generation: 2, category: 'technology', contentRevision: 'rev-1', completedAtMs: 40_000,
+        players: [
+          { playerId: 'p1', name: 'Ada', playerOrder: 0, rank: 1, rawScore: 1_300, normalizedScore: 10_078, correctCount: 1, bestStreak: 1, cumulativeCorrectTimeMs: 1_500 },
+          { playerId: 'p2', name: 'Grace', playerOrder: 1, rank: 2, rawScore: 0, normalizedScore: 0, correctCount: 0, bestStreak: 0, cumulativeCorrectTimeMs: 0 },
+        ],
+      },
+    }), { ...context, canReplay: true });
+    expect(result.html).toContain('id="trivia-replay"');
+    expect(result.html).toContain('id="trivia-exit"');
+    expect(result.html).toContain('class="final-board"');
+    expect(result.html).toContain('class="result-tech');
+    expect(result.html.indexOf('id="trivia-replay"')).toBeLessThan(result.html.indexOf('class="result-tech'));
+    expect(result.html.indexOf('class="final-board"')).toBeLessThan(result.html.indexOf('class="result-tech'));
+  });
+
+  it('shows station results and a rejoin instruction without controls that navigate the shared display', () => {
+    const result = renderTriviaView(state({
+      phase: 'results',
+      result: {
+        resultId: 'station-check', generation: 2, category: 'technology', contentRevision: 'rev-1', completedAtMs: 40_000,
+        players: [
+          { playerId: 'p1', name: 'Ada', playerOrder: 0, rank: 1, rawScore: 1_300, normalizedScore: 10_078, correctCount: 1, bestStreak: 1, cumulativeCorrectTimeMs: 1_500 },
+        ],
+      },
+    }), { ...context, stationMode: true, canReplay: true });
+    expect(result.html).toContain('Ada');
+    expect(result.html).toContain('Final standings');
+    expect(result.html).toMatch(/rejoin/i);
+    expect(result.html).toContain('class="result-tech');
+    expect(result.html).not.toContain('id="trivia-replay"');
+    expect(result.html).not.toContain('id="trivia-exit"');
+    expect(result.html).not.toContain('href="/"');
+  });
+
   it('makes only the named current category voting seat touchable', () => {
     const categories = renderTriviaView(state({
       phase: 'category_select', categoryVotingSeat: { playerId: 'p2', name: 'Grace' },

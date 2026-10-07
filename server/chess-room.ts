@@ -5,7 +5,7 @@ import { normalizeForMatching } from '../shared/i18n/translate';
 import type {
   ChessColor, ChessCommandResult, ChessEvent, ChessFeedback, ChessFeedbackCode,
   ChessMovePreview, ChessMoveRecord, ChessPendingMove, ChessPieceType,
-  ChessResult, ChessSelection, ChessSquare, ChessState,
+  ChessResult, ChessSelection, ChessSquare, ChessState, ChessFile,
 } from '../shared/chess-protocol';
 
 export interface ChessRoomOptions {
@@ -159,8 +159,8 @@ export class ChessRoom {
       case 'move': return this.selectSpokenSource(text, intent.query, locale)
         ?? this.proposeQuery(intent.query, locale);
       case 'help': return this.respond('help', inLanguage(locale,
-        'Name a piece or its starting square, then take your time and say the destination. Say confirm or cancel after I repeat the move. To castle, say castle; if both sides are open, name kingside or queenside.',
-        'Diga uma peça ou a casa inicial e pense com calma antes de dizer o destino. Depois da minha repetição, diga confirmar ou cancelar. Para fazer roque, diga roque; se ambos os lados estiverem livres, diga pequeno ou grande.'));
+        'Say a piece and destination; I infer a unique legal source. If several fit, add its square or file. You can pause before the destination. Confirm or cancel my proposal. Say castle for castling.',
+        'Diga a peça e o destino; encontrarei a origem legal se for única. Se houver mais de uma, diga a casa ou coluna. Você pode pausar antes do destino. Confirme ou cancele minha proposta. Diga roque para fazer roque.'));
       default: return this.respond('unknown', inLanguage(locale,
         'I did not catch a chess move. Say a piece and destination square, or say help.',
         'Não entendi a jogada. Diga a peça e a casa de destino, ou diga ajuda.'));
@@ -230,9 +230,26 @@ export class ChessRoom {
     return this.state();
   }
 
-  private selectPiece(intent: { piece?: ChessPieceType; from?: ChessSquare }, locale: SupportedLocale): ChessCommandResult {
+  private selectPiece(intent: { piece?: ChessPieceType; from?: ChessSquare; fromFile?: ChessFile }, locale: SupportedLocale): ChessCommandResult {
     const guard = this.guardHumanAction(locale);
     if (guard) return guard;
+    if (intent.from && intent.fromFile && intent.from[0] !== intent.fromFile) {
+      return this.respond('illegal', inLanguage(locale,
+        'That starting square is on a different file. Please say the square again.',
+        'Essa casa inicial fica em outra coluna. Diga a casa novamente.'));
+    }
+    if (intent.fromFile && !intent.from) {
+      const starts = [...new Set(this.chess.moves({ verbose: true })
+        .filter(move => move.from[0] === intent.fromFile && (!intent.piece || move.piece === intent.piece))
+        .map(move => move.from))];
+      if (starts.length === 0) return this.respond('illegal', inLanguage(locale,
+        `No legal move starts from the ${intent.fromFile.toUpperCase()} file for that piece.`,
+        `Não há jogada legal dessa peça na coluna ${intent.fromFile.toUpperCase()}.`));
+      if (starts.length > 1) return this.respond('ambiguous', inLanguage(locale,
+        `Which piece on the ${intent.fromFile.toUpperCase()} file? Say its starting square: ${starts.map(square => square.toUpperCase()).join(', ')}.`,
+        `Qual peça na coluna ${intent.fromFile.toUpperCase()}? Diga a casa inicial: ${starts.map(square => square.toUpperCase()).join(', ')}.`));
+      intent = { ...intent, from: starts[0] };
+    }
     if (intent.from) {
       const piece = this.chess.get(intent.from);
       if (!piece || piece.color !== this.humanColorValue || (intent.piece && intent.piece !== piece.type)) {
@@ -253,7 +270,7 @@ export class ChessRoom {
 
   /** A bare "pawn E2" names the pawn already on E2, not an impossible move onto itself. */
   private selectSpokenSource(text: string, query: ChessMoveQuery, locale: SupportedLocale): ChessCommandResult | null {
-    if (!query.to || query.from || query.castle !== undefined || query.captureOnly || query.promotion) return null;
+    if (!query.to || query.from || query.fromFile || query.castle !== undefined || query.captureOnly || query.promotion) return null;
     const normalized = normalizeForMatching(text, locale);
     if (/\b(?:to|toward|towards|into|onto|para|pra)\b/.test(normalized)) return null;
     const occupant = this.chess.get(query.to);
@@ -266,7 +283,10 @@ export class ChessRoom {
     const guard = this.guardHumanAction(locale);
     if (guard) return guard;
     this.pendingValue = null;
-    const effective: ChessMoveQuery = { ...(this.selectionValue ?? {}), ...query };
+    const replacesSelection = Boolean(query.from || query.fromFile || query.castle !== undefined
+      || (query.piece && this.selectionValue?.piece && query.piece !== this.selectionValue.piece));
+    const effective: ChessMoveQuery = { ...(replacesSelection ? {} : this.selectionValue ?? {}), ...query };
+    if (replacesSelection) this.clearSelection();
     let candidates = this.chess.moves({ verbose: true }).filter(move => {
       if (effective.castle !== undefined) {
         return effective.castle === null
@@ -275,6 +295,7 @@ export class ChessRoom {
       }
       return (!effective.piece || move.piece === effective.piece)
         && (!effective.from || move.from === effective.from)
+        && (!effective.fromFile || move.from[0] === effective.fromFile)
         && (!effective.to || move.to === effective.to)
         && (!effective.captureOnly || move.isCapture() || move.isEnPassant())
         && (!effective.promotion || move.promotion === effective.promotion);

@@ -389,7 +389,8 @@ export class KaraokeServer {
           this.send(conn, { type: 'error', code: 'station_requeue_required', message: 'Join the queue again to sing again.' });
         } else if (room.phase === 'song_select' && !conn.playerId) {
           this.send(conn, { type: 'error', code: 'not_ready', message: 'The singer must say Start on their phone.' });
-        } else if (!room.advance(conn.playerId)) {
+        } else if (!room.advance(conn.playerId ?? (room.phase === 'results' && conn.display
+          ? room.state().singer?.playerId : undefined))) {
           this.send(conn, { type: 'error', code: 'not_ready', message: 'Complete the current step first.' });
         }
         break;

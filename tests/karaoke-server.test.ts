@@ -4,7 +4,7 @@ import { WebSocket } from 'ws';
 import { KaraokeServer, KARAOKE_RECONNECT_GRACE_MS } from '../server/karaoke-server';
 import { KaraokeRoom } from '../server/karaoke-room';
 import { NEVER_GONNA_GIVE_YOU_UP, PT_BR_ORIGINAL_DEVELOPMENT_SONG } from '../shared/karaoke-songs';
-import { parseKaraokeSong } from '../shared/karaoke';
+import { KARAOKE_SONG_DURATION_MS, parseKaraokeSong } from '../shared/karaoke';
 import { KARAOKE_COUNTDOWN_MS } from '../shared/karaoke-protocol';
 
 type Message = Record<string, unknown>;
@@ -60,6 +60,34 @@ async function waitFor(client: Client, predicate: (message: Message) => boolean,
     await new Promise(resolve => setTimeout(resolve, 5));
   }
   throw new Error(`message not received: ${JSON.stringify(client.messages)}`);
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 1_500): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  throw new Error('condition not reached');
+}
+
+async function finishVoiceRound(code: string, singer: string, display: Client, now: { value: number }): Promise<void> {
+  expect(karaoke!.voiceAdvance(code, singer)).toBe(true);
+  expect(karaoke!.voiceSelectSong(code, singer, NEVER_GONNA_GIVE_YOU_UP.id)).toBe(true);
+  expect(karaoke!.voiceAdvance(code, singer)).toBe(true);
+  const generation = karaoke!.findRoom(code)!.state().loadingGeneration;
+  send(display, { type: 'ready', loadingGeneration: generation });
+  await waitFor(display, message => message.type === 'karaoke_state'
+    && message.phase === 'loading' && message.displayReady === true);
+  expect(karaoke!.markMediaReady(code, singer, NEVER_GONNA_GIVE_YOU_UP.id,
+    generation, KARAOKE_COUNTDOWN_MS)).toBe(true);
+  now.value = KARAOKE_COUNTDOWN_MS + KARAOKE_SONG_DURATION_MS;
+  const hits = NEVER_GONNA_GIVE_YOU_UP.chart.words.map((word, index) => ({
+    wordId: word.id, judgment: index === 0 ? 'perfect' as const : 'miss' as const,
+    points: index === 0 ? 1_000 : 0,
+  }));
+  expect(karaoke!.finalizeMediaScore(code, singer, 1_000, hits)).toBe(true);
+  await waitFor(display, message => message.type === 'karaoke_state' && message.phase === 'results');
 }
 
 describe('KaraokeServer authority and lifecycle', () => {
@@ -215,6 +243,43 @@ describe('KaraokeServer authority and lifecycle', () => {
       'PAID', singer, PT_BR_ORIGINAL_DEVELOPMENT_SONG.id, generation, KARAOKE_COUNTDOWN_MS,
     )).toBe(true);
     await waitFor(display, message => message.type === 'karaoke_state' && message.phase === 'countdown');
+  });
+
+  it('lets only the elected standalone display replay a singer result without joining as a player', async () => {
+    const now = { value: 0 };
+    const port = await start({ now: () => now.value, tickMs: 5 });
+    const singer = karaoke!.voiceJoin('TOUCH-REPLAY', 'Ada')!;
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'TOUCH-REPLAY' });
+    await waitFor(host, message => message.type === 'host_identity' && message.isHost === true);
+    const nonhost = await connect(port);
+    send(nonhost, { type: 'spectate', roomCode: 'TOUCH-REPLAY' });
+    await waitFor(nonhost, message => message.type === 'host_identity' && message.isHost === false);
+    await finishVoiceRound('TOUCH-REPLAY', singer, host, now);
+
+    send(nonhost, { type: 'advance' });
+    await waitFor(nonhost, message => message.type === 'error' && message.code === 'forbidden');
+    expect(karaoke!.findRoom('TOUCH-REPLAY')!.phase).toBe('results');
+
+    send(host, { type: 'advance' });
+    await waitUntil(() => karaoke!.findRoom('TOUCH-REPLAY')!.phase === 'song_select');
+    expect(karaoke!.findRoom('TOUCH-REPLAY')!.state().result).toBeNull();
+  });
+
+  it('keeps authenticated station result replay locked on the elected display', async () => {
+    const now = { value: 0 };
+    const port = await start({ displayToken: 'secret', now: () => now.value, tickMs: 5 });
+    karaoke!.setDisplayAuthenticationRequirement(code => code === 'STATION-REPLAY');
+    const singer = karaoke!.voiceJoin('STATION-REPLAY', 'Ada')!;
+    const host = await connect(port);
+    send(host, { type: 'display_auth', roomCode: 'STATION-REPLAY', token: 'secret' });
+    send(host, { type: 'spectate', roomCode: 'STATION-REPLAY' });
+    await waitFor(host, message => message.type === 'host_identity' && message.isHost === true);
+    await finishVoiceRound('STATION-REPLAY', singer, host, now);
+
+    send(host, { type: 'advance' });
+    await waitFor(host, message => message.type === 'error' && message.code === 'station_requeue_required');
+    expect(karaoke!.findRoom('STATION-REPLAY')!.phase).toBe('results');
   });
 
   it('does not treat standalone host capability as station authentication', async () => {

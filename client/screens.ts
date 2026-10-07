@@ -3,6 +3,7 @@
 // Gameplay input remains on the phone; styling lives in racer.css.
 import type { LobbyPlayer, RaceResult, MenuTouchState } from '../shared/types';
 import { controlsLegendHtml } from './controls-legend';
+import { resultTechHtml } from './result-tech';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../shared/i18n/locales';
 import { RACER_MESSAGES, type RacerMessageKey } from '../shared/i18n/racer';
 import { createTranslator } from '../shared/i18n/translate';
@@ -185,10 +186,12 @@ export class Screens {
     }
   }
 
-  show(): void {
+  show(results = false): void {
     this.visible = true; this.root.style.display = 'flex';
     document.body.classList.add('in-menu');
     this.root.classList.remove('is-race');
+    this.root.classList.toggle('results-screen', results);
+    this.root.classList.toggle('station-result', results && this.stationManaged);
   }
   hide(): void {
     this.visible = false; this.root.style.display = 'none'; this.phase = null;
@@ -349,7 +352,20 @@ export class Screens {
   // ── Results — this race + all-time board ─────────────────────────────────────────────────────
   renderResults(results: RaceResult[], carNameFor: (i: number) => string,
                 global?: { map: string | null; entries: GlobalEntry[] }): void {
-    this.show(); this.phase = 'results';
+    const active = this.root.ownerDocument.activeElement;
+    const focusSelector = active && this.root.contains(active)
+      ? active.matches('button[data-menu-action="advance"]') ? 'button[data-menu-action="advance"]'
+        : active.matches('a.menu-button[href]') ? 'a.menu-button[href]'
+          : active.matches('a[href]') && active.closest('.racer-result-tech') ? '.racer-result-tech a[href]'
+            : null
+      : null;
+    const preserveView = this.visible && this.phase === 'results' ? {
+      page: this.root.scrollTop,
+      standings: this.root.querySelector<HTMLElement>('.res-list')?.scrollTop ?? 0,
+      board: this.root.querySelector<HTMLElement>('.board')?.scrollTop ?? 0,
+      expanded: [...this.root.querySelectorAll<HTMLDetailsElement>('details')].map((detail, index) => detail.open ? index : -1),
+    } : null;
+    this.show(true); this.phase = 'results';
     // Dedup: the server re-broadcasts results ~2x/s → rebuilding innerHTML replayed the title +
     // row entrance animations = flicker. Key on the standings + the global board so the only
     // legit re-render is when the all-time board folds in after its fetch.
@@ -368,14 +384,40 @@ export class Screens {
           <div class="rtime" style="font-size:${win ? '24px' : '19px'}">${time}</div>
         </div>`;
     }).join('');
+    const winner = results.find(row => row.place === 1 && row.finished && row.finishT > 0);
+    const heroTitle = winner
+      ? this.text('screen.results.winner', { name: localizedPlayerName(this.locale, winner.name) })
+      : this.text('screen.results.complete');
+    const heroDetail = winner
+      ? this.text('screen.results.winningTime', { time: this.formatSeconds(winner.finishT) }) : '';
     const board = global ? this.boardHtml(global.map, global.entries, carNameFor) : '';
+    const resultFooter = this.stationManaged ? 'screen.results.stationFooter'
+      : this.menuTouch?.canAdvance ? 'screen.results.againFooter'
+        : this.menuTouch?.advancePlayerId ? 'screen.results.waitCurrentFooter'
+          : 'screen.results.waitJoinFooter';
     this.root.innerHTML = `
       ${this.head(this.text('screen.results.title'), '')}
+      <div class="res-hero">
+        <div class="res-hero-copy"><span class="res-hero-kicker">${this.text('screen.results.title')}</span>
+          <h1>${esc(heroTitle)}</h1>${heroDetail ? `<p>${esc(heroDetail)}</p>` : ''}</div>
+      </div>
+      ${this.menuFooter(this.text(resultFooter), 'results')}
       <div class="results-wrap">
         <div class="res-list"><div class="col-label">${this.text('screen.results.thisRace')}</div>${rows}</div>
         ${board}
       </div>
-      ${this.menuFooter(this.text(this.stationManaged?'screen.results.stationFooter':'screen.results.againFooter'), 'results')}`;
+      <div class="racer-result-tech">${resultTechHtml('racer', this.locale, { stationManaged: this.stationManaged })}</div>`;
+    if (preserveView) {
+      this.root.scrollTop = preserveView.page;
+      const standings = this.root.querySelector<HTMLElement>('.res-list');
+      const boardEl = this.root.querySelector<HTMLElement>('.board');
+      if (standings) standings.scrollTop = preserveView.standings;
+      if (boardEl) boardEl.scrollTop = preserveView.board;
+      this.root.querySelectorAll<HTMLDetailsElement>('details').forEach((detail, index) => {
+        detail.open = preserveView.expanded.includes(index);
+      });
+      if (focusSelector) this.root.querySelector<HTMLElement>(focusSelector)?.focus({ preventScroll: true });
+    }
   }
 
   private boardHtml(map: string | null, entries: GlobalEntry[], carNameFor: (i: number) => string): string {
@@ -418,7 +460,9 @@ export class Screens {
         : phase === 'map_select' ? 'screen.action.race' : 'screen.action.replay';
     const advance = touch && !(this.stationManaged && phase === 'results')
       ? `<button type="button" class="menu-button" data-menu-action="advance" ${touch.canAdvance ? '' : 'disabled'}>${this.text(actionKey)}</button>` : '';
-    return `<div class="scr-foot"><span>${hint}</span>${back || advance ? `<div class="menu-actions">${back}${advance}</div>` : ''}</div>`;
+    const exit = phase === 'results' && !this.stationManaged
+      ? `<a class="menu-button secondary" href="/">${this.text('screen.results.exit')}</a>` : '';
+    return `<div class="scr-foot"><span>${hint}</span>${back || advance || exit ? `<div class="menu-actions">${back}${advance}${exit}</div>` : ''}</div>`;
   }
 
   private chips(players: LobbyPlayer[]): string {

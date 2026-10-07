@@ -480,14 +480,15 @@ describe('Arcade browser UI', () => {
     expect(racerMain).toContain("/game${isDisplay?'?display=1':''}");
     expect(racerScreens).toContain("this.stationManaged ? 'station' : 'standalone'");
     expect(racerScreens).toContain("screen.lobby.stationTitle");
-    expect(racerScreens).toContain("this.stationManaged?'screen.results.stationFooter':'screen.results.againFooter'");
+    expect(racerScreens).toContain("this.stationManaged ? 'screen.results.stationFooter'");
+    expect(racerScreens).toContain("this.menuTouch?.canAdvance ? 'screen.results.againFooter'");
     expect(monsters).toContain('!isDisplay || stationDisplay.active');
     expect(monsters).toContain('if (stationDisplay.active) {');
     expect(monsters).toContain('stationDisplay.active\n    ? `<div class="vm-station-call"');
     expect(monsters).toContain("/battle${isDisplay?'?display=1':''}");
     expect(fighter).toContain('if (stationDisplay.active) return');
     expect(fighter).toContain('stationDisplay.active\n      ? `<div class="station-call-card"');
-    expect(fighter).toContain('rematch.hidden = stationDisplay.active');
+    expect(fighter).toContain("rematch.hidden = action !== 'rematch'");
     expect(fighter).toContain("/fighter${isDisplay?'?display=1':''}");
     expect(stationDisplay).not.toContain('if (rail.root.hidden === !visible) return');
     expect(stationDisplay).toContain("latest?.station.phase==='PLAYING'||latest?.station.phase==='RESULTS'");

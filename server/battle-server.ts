@@ -249,6 +249,10 @@ export class BattleServer {
             return;
           }
           const owner=conn.playerId??room.lobbyPlayers().find(player=>!player.isAi)?.playerId;
+          if(room.phase==='results'&&(!owner||!room.isFinishedBattleParticipant(owner))){
+            this.send(conn,{type:'error',code:'not_ready',message:'The finished players must start a rematch.'});
+            return;
+          }
           if(!room.advance(owner))this.send(conn,{type:'error',code:'not_ready',message:'Complete the current selection first.'});
           this.flushEvents(room); this.pushState(room.code);
         });
@@ -460,10 +464,19 @@ export class BattleServer {
       generation: room.generation, resultsPresented: room.resultsPresented,
       canAdvanceLobby: room.canAdvanceLobby, canStartBattle: room.canStart(),
       activeSide: room.activeSide(), activeMenu: room.activeMenu(),
-      canRematch: room.canRematch,
+      // The room may be ready, but a late player or a secondary display cannot
+      // start its rematch. Send each browser its own actionable permission.
+      canRematch: false,
       result: res ? { winner: res.winner, winnerName: res.winnerName } : null,
     };
-    for (const c of this.conns) if (c.roomCode === roomCode) this.send(c, msg);
+    const firstHuman = room.lobbyPlayers().find(player => !player.isAi)?.playerId;
+    for (const c of this.conns) if (c.roomCode === roomCode) {
+      const owner = c.playerId ?? firstHuman;
+      const canRematch = room.canRematch && this.allowBrowserPlayer(roomCode)
+        && (c.playerId ? room.isFinishedBattleParticipant(c.playerId)
+          : this.isDisplayLeader(c, roomCode) && !!owner && room.isFinishedBattleParticipant(owner));
+      this.send(c, { ...msg, canRematch });
+    }
     this.onRoomState?.(roomCode);
     this.scheduleResultsReady(room);
   }
@@ -616,6 +629,7 @@ export class BattleServer {
   voiceAdvance(code: string, playerId?: string): boolean {
     const room = this.rooms.get(code); if (!room) return false;
     if (!this.allowBrowserPlayer(code) && room.phase === 'results') return false;
+    if (room.phase === 'results' && (!playerId || !room.isFinishedBattleParticipant(playerId))) return false;
     const advanced=room.advance(playerId);this.flushEvents(room);this.pushState(code);
     return advanced;
   }

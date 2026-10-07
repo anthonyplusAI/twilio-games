@@ -1,6 +1,7 @@
 import QRCode from 'qrcode';
 import { locale } from './i18n';
 import { createCoinInsertionPresenter } from './coin-insertion';
+import { resultTechHtml } from './result-tech';
 import {
   captureDisplayToken,
   fetchPublicStation,
@@ -34,6 +35,25 @@ export function createStationDisplay(): StationDisplay {
     return { active: false, displayToken, markEngineReady: () => undefined, markEngineResultsReady: () => undefined };
   }
 
+  document.body.dataset.stationDisplay = 'true';
+  for (const home of document.querySelectorAll<HTMLAnchorElement>('.game-home')) {
+    home.hidden = true;
+    home.setAttribute('aria-hidden', 'true');
+    home.tabIndex = -1;
+  }
+  // The station owns the handoff between matches. A game result can insert an
+  // exit link later, so guard navigation at the document rather than the link.
+  const blockHomeNavigation = (event: MouseEvent) => {
+    const anchor = event.target instanceof Element
+      ? event.target.closest<HTMLAnchorElement>('a[href]')
+      : null;
+    if (!anchor) return;
+    const destination = new URL(anchor.href, location.href);
+    if (destination.origin !== location.origin || !['/', '/index.html'].includes(destination.pathname)) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  };
+  document.addEventListener('click', blockHomeNavigation, true);
   const rail = buildRail();
   const coinInsertion = createCoinInsertionPresenter();
   const resultsFallback = buildResultsFallback();
@@ -43,9 +63,6 @@ export function createStationDisplay(): StationDisplay {
   const homeUrl = new URL('/', location.origin);
   homeUrl.searchParams.set('locale', locale);
   homeUrl.searchParams.set('joinBaseUrl', joinBaseUrl);
-  for (const home of document.querySelectorAll<HTMLAnchorElement>('.game-home, #result a[href="/"]')) {
-    home.href = homeUrl.toString();
-  }
   const customQr=stationQrAsset(locale,stationId,joinBaseUrl);
   void resolveStationQrImage(customQr,()=>QRCode.toDataURL(stationJoinUrl(stationId,locale,joinBaseUrl),{width:420,margin:1,errorCorrectionLevel:'M',color:{dark:'#000D25',light:'#FFFFFF'}})).then(value=>{if(value)rail.qr.src=value;});
   let railMode: 'auto' | 'always' | 'hidden' = 'auto';
@@ -171,6 +188,7 @@ export function createStationDisplay(): StationDisplay {
   polling = setInterval(() => void refresh(), 5_000);
   configPolling = setInterval(() => void refreshRailConfig(), 30_000);
   addEventListener('pagehide', () => {
+    document.removeEventListener('click', blockHomeNavigation, true);
     unsubscribe();
     if (polling !== null) clearInterval(polling);
     if (configPolling !== null) clearInterval(configPolling);
@@ -209,7 +227,11 @@ function buildResultsFallback():HTMLElement{
 }
 
 function renderResultsFallback(root:HTMLElement,results:PublicStation['results'],source:PublicStation['resultSource'],held:boolean,game:PublicStation['activeGame']):void{
+  const renderKey=JSON.stringify([results,source,held,game,locale]);
+  if(root.dataset.renderKey===renderKey){root.hidden=false;return;}
+  root.dataset.renderKey=renderKey;
   root.replaceChildren();
+  root.scrollTop=0;
   const eyebrow=document.createElement('p');eyebrow.className='station-results-eyebrow';eyebrow.textContent=locale==='pt-BR'?'RESULTADOS FINAIS':'FINAL RESULTS';
   const title=document.createElement('h1');title.textContent=game==='chess'
     ?locale==='pt-BR'?'Resultado do duelo':'Duel result'
@@ -240,7 +262,11 @@ function renderResultsFallback(root:HTMLElement,results:PublicStation['results']
   }
   const hold=document.createElement('p');hold.className='station-results-hold';hold.textContent=held
     ?(locale==='pt-BR'?'A cabine manteve o placar na tela.':'The booth is holding the scoreboard on screen.')
-    :(locale==='pt-BR'?'Para jogar novamente, entre de novo na fila.':'To play again, join the line again.');root.append(hold);root.hidden=false;
+    :(locale==='pt-BR'?'Para jogar novamente, entre de novo na fila.':'To play again, join the line again.');root.append(hold);
+  const technology=document.createElement('div');technology.className='station-results-technology';technology.setAttribute('aria-live','off');
+  technology.innerHTML=resultTechHtml(game??'arcade',locale,{stationManaged:true});
+  root.append(technology);
+  root.hidden=false;
 }
 
 async function acknowledge(

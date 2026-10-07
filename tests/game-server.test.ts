@@ -246,6 +246,45 @@ describe('GameServer integration', () => {
     display.ws.close();
   });
 
+  it('enables a results Replay tap only for a caller allowed to advance that round', async () => {
+    server = new GameServer({ port: 0 });
+    server.setRoomConfigProvider(() => ({ carCount: 1, maps: ['Silver Lake'] }));
+    const port = await server.start();
+    const room = server.getOrCreateRoom('LATE-REPLAY');
+    const current = room.addPlayer('Ada') as { playerId: string };
+    room.start();
+    for (let i = 0; i < 60 * 120 && room.phase !== 'results'; i++) room.tick(STEP);
+    expect(room.phase).toBe('results');
+
+    const display = connect(port); await display.open();
+    display.ws.send(JSON.stringify({ type: 'spectate', roomCode: room.code }));
+    const late = connect(port); await late.open();
+    late.ws.send(JSON.stringify({ type: 'join', roomCode: room.code, name: 'Bo' }));
+    await vi.waitFor(() => expect(late.inbox.some(message => message.type === 'results')).toBe(true));
+    const lateId = (late.inbox.find(message => message.type === 'joined') as { playerId: string }).playerId;
+    expect(room.isWaitingForNextRound(lateId)).toBe(true);
+    expect(room.canAdvance(current.playerId)).toBe(true);
+    expect(room.canAdvance(lateId)).toBe(false);
+    expect([...late.inbox].reverse().find(message => message.type === 'results'))
+      .toMatchObject({ touch: { canAdvance: false } });
+    expect([...display.inbox].reverse().find(message => message.type === 'results'))
+      .toMatchObject({ touch: { canAdvance: true, advancePlayerId: current.playerId } });
+
+    // The display must use the phase-bound touch action; a generic player
+    // command without a player identity cannot skip that authorization.
+    display.ws.send(JSON.stringify({ type: 'advance' }));
+    await wait(30);
+    expect(room.phase).toBe('results');
+    late.ws.send(JSON.stringify({ type: 'advance' }));
+    await wait(30);
+    expect(room.phase).toBe('results');
+    display.ws.send(JSON.stringify({ type: 'display_advance', roomCode: room.code,
+      expectedPhase: 'results', forPlayerId: current.playerId }));
+    await vi.waitFor(() => expect(room.phase).toBe('lobby'));
+    display.ws.close();
+    late.ws.close();
+  });
+
   it('two clients in the same room both appear in the snapshot', async () => {
     server = new GameServer({ port: 0, broadcastHz: 30 });
     const port = await server.start();

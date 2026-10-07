@@ -8,6 +8,7 @@ import type {
 } from '../../shared/trivia-protocol';
 import { triviaCountdownCount, triviaQuestionTiming } from './trivia-client-utils';
 import type { TriviaConnectionState } from './trivia-net';
+import { resultTechHtml } from '../result-tech';
 
 export interface TriviaAnswerResultView {
   correct: boolean;
@@ -70,7 +71,8 @@ const COPY = {
     correct: 'Correct', incorrect: 'Incorrect', noAnswer: 'No answer', recorded: 'Answer recorded',
     score: 'Score', points: 'pts', bestStreak: 'Best streak', standings: 'Round standings',
     results: 'Final results', winner: 'Winner', winners: 'It is a tie', finalBoard: 'Final standings',
-    correctCount: 'correct', normalized: 'Leaderboard score', replay: 'Play again', exit: 'Exit', connection: {
+    correctCount: 'correct', normalized: 'Leaderboard score', replay: 'Play again', exit: 'Exit',
+    stationNextRound: 'Want another turn? Rejoin the station queue on your phone.', connection: {
       connecting: 'Connecting', connected: 'Live', reconnecting: 'Reconnecting', closed: 'Disconnected',
     },
   },
@@ -101,7 +103,8 @@ const COPY = {
     correct: 'Correto', incorrect: 'Incorreto', noAnswer: 'Sem resposta', recorded: 'Resposta recebida',
     score: 'Pontos', points: 'pts', bestStreak: 'Melhor sequência', standings: 'Classificação da rodada',
     results: 'Resultados finais', winner: 'Vencedor', winners: 'Empate', finalBoard: 'Classificação final',
-    correctCount: 'acertos', normalized: 'Pontuação do ranking', replay: 'Jogar novamente', exit: 'Sair', connection: {
+    correctCount: 'acertos', normalized: 'Pontuação do ranking', replay: 'Jogar novamente', exit: 'Sair',
+    stationNextRound: 'Quer jogar de novo? Entre novamente na fila da estação pelo telefone.', connection: {
       connecting: 'Conectando', connected: 'Ao vivo', reconnecting: 'Reconectando', closed: 'Desconectado',
     },
   },
@@ -285,11 +288,14 @@ function renderResults(state: TriviaState, context: TriviaViewContext): TriviaRe
   const winnerLabel = winners.length > 1 ? copy.winners : copy.winner;
   const rows = players.map(player => resultRow(player, context.locale, player.rank === bestRank)).join('');
   const category = state.result ? TRIVIA_CATEGORY_LABELS[context.locale][state.result.category] : copy.results;
-  const actions = `<div class="results-actions">${context.canReplay
-    ? `<button id="trivia-replay" class="primary-action" type="button">${escapeHtml(copy.replay)}</button>` : ''}<a id="trivia-exit" class="results-exit" href="/">${escapeHtml(copy.exit)}</a></div>`;
-  const html = `<section class="scene results-scene" data-view="results">
+  const actions = context.stationMode
+    ? `<p class="results-station-note">${escapeHtml(copy.stationNextRound)}</p>`
+    : `<div class="results-actions">${context.canReplay
+      ? `<button id="trivia-replay" class="primary-action" type="button">${escapeHtml(copy.replay)}</button>` : ''}<a id="trivia-exit" class="results-exit" href="/">${escapeHtml(copy.exit)}</a></div>`;
+  const html = `<section class="scene results-scene${context.stationMode ? ' station-managed' : ''}" data-view="results" data-result-id="${escapeHtml(state.result?.resultId ?? 'pending')}">
     <div class="winner-panel">${kicker(category)}<span>${escapeHtml(winnerLabel)}</span><h1>${escapeHtml(winnerNames || copy.results)}</h1>${winners[0] ? `<strong>${formatScore(winners[0].normalizedScore, context.locale)}<small>${escapeHtml(copy.normalized)}</small></strong>` : ''}${actions}</div>
     <section class="final-board" aria-labelledby="final-board-title"><header><div><span>${escapeHtml(copy.results)}</span><h2 id="final-board-title">${escapeHtml(copy.finalBoard)}</h2></div><img src="/brand/Twilio_Logo_Bug_White.svg" alt=""></header><div class="final-rows">${rows}</div></section>
+    ${resultTechHtml('trivia', context.locale, { stationManaged: Boolean(context.stationMode) })}
   </section>`;
   return rendered(`results:${state.result?.resultId ?? 'pending'}`, `${winnerLabel}: ${winnerNames}.`, html);
 }

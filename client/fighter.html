@@ -57,10 +57,18 @@
 
   <div id="fight-call" class="fight-call" aria-live="assertive">Fight</div>
   <section id="result" class="result" role="dialog" aria-modal="true" aria-labelledby="result-title" hidden>
-    <span id="result-kicker">Knockout</span>
-    <strong id="result-title">Nyx wins</strong>
-    <button id="rematch" type="button">Rematch</button>
-    <a href="/">Exit to games</a>
+    <div class="result-hero">
+      <span id="result-kicker">Knockout</span>
+      <h1 id="result-title">Player One wins</h1>
+      <p id="result-champion"></p>
+    </div>
+    <div class="result-actions">
+      <button id="rematch" type="button">Rematch</button>
+      <a id="result-exit" href="/">Exit to games</a>
+      <p id="result-station-next" hidden></p>
+      <p id="result-action-status" hidden></p>
+    </div>
+    <div id="result-tech-slot"></div>
   </section>
 
   <section id="loading" class="loading" aria-live="polite" aria-busy="true">

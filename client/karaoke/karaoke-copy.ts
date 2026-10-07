@@ -35,6 +35,8 @@ export interface KaraokeCopy {
   leaderboardLoading: string;
   noRecords: string;
   again: string;
+  againByPhone: string;
+  stationNextRound: string;
   exit: string;
   spectator: string;
   hostWaiting: string;
@@ -74,7 +76,9 @@ const ENGLISH: KaraokeCopy = {
   countdown: 'GET READY', score: 'Score', combo: 'Combo', bestCombo: 'Best combo', results: 'Final note',
   finalizing: 'Scoring your performance', finalizingBody: 'Holding the final note while we total your score.',
   leaderboard: 'All-time leaderboard', leaderboardLoading: 'Loading top scores', noRecords: 'No scores yet. You set the first one.',
-  again: 'Sing another', exit: 'Exit to games', spectator: 'Watching the current singer', hostWaiting: 'Waiting for the display host',
+  again: 'Sing another', againByPhone: 'To sing again, ask the voice guide on your call.',
+  stationNextRound: 'Want another turn? Rejoin the station queue on your phone.',
+  exit: 'Exit to games', spectator: 'Watching the current singer', hostWaiting: 'Waiting for the display host',
   connecting: 'Connecting', connected: 'Live', reconnecting: 'Reconnecting', closed: 'Offline', retry: 'Retry sound check',
   audioError: 'The backing track could not be prepared.', audioRecover: 'Enable concert audio',
   audioRecoverBody: 'Your browser requires one click before concert audio can play. Enable it before calling.',
@@ -101,7 +105,9 @@ const PORTUGUESE: KaraokeCopy = {
   countdown: 'PREPARE-SE', score: 'Pontos', combo: 'Sequência', bestCombo: 'Melhor sequência', results: 'Nota final',
   finalizing: 'Calculando sua apresentação', finalizingBody: 'Segurando a nota final enquanto calculamos sua pontuação.',
   leaderboard: 'Ranking de todos os tempos', leaderboardLoading: 'Carregando melhores pontuações', noRecords: 'Ainda não há pontuações. Faça a primeira.',
-  again: 'Cantar outra', exit: 'Sair para os jogos', spectator: 'Assistindo ao cantor atual', hostWaiting: 'Aguardando a tela principal',
+  again: 'Cantar outra', againByPhone: 'Para cantar de novo, peça ao guia de voz na ligação.',
+  stationNextRound: 'Quer cantar de novo? Entre novamente na fila da estação pelo telefone.',
+  exit: 'Sair para os jogos', spectator: 'Assistindo ao cantor atual', hostWaiting: 'Aguardando a tela principal',
   connecting: 'Conectando', connected: 'Ao vivo', reconnecting: 'Reconectando', closed: 'Desconectado', retry: 'Repetir passagem de som',
   audioError: 'Não foi possível preparar a faixa de apoio.', audioRecover: 'Ativar áudio do show',
   audioRecoverBody: 'O navegador exige um clique antes de tocar o áudio do show. Ative antes de ligar.',

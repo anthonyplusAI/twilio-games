@@ -1984,8 +1984,15 @@ export class HttpServer {
           'roque', 'promover', 'confirmar', 'sim', 'cancelar', 'não', 'ajuda', 'jogar novamente']
         : ['chess', 'pawn', 'knight', 'bishop', 'rook', 'queen', 'king', 'to', 'from', 'takes',
           'castle', 'promote', 'confirm', 'yes', 'cancel', 'no', 'help', 'play again'];
-      const squares = 'abcdefgh'.split('').flatMap(file => Array.from({ length: 8 }, (_, index) => `${file}${index + 1}`));
-      return voiceHintList(commands, squares);
+      const files = 'ABCDEFGH'.split('');
+      const squares = files.flatMap(file => Array.from({ length: 8 }, (_, index) => `${file.toLowerCase()}${index + 1}`));
+      // A caller may identify a piece by file instead of its full starting
+      // square. Keep both the coordinates and these natural file phrases in
+      // Relay's bounded speech hints so "knight on B" survives transcription.
+      const filePhrases = files.flatMap(file => locale === 'pt-BR'
+        ? [`coluna ${file}`, `na coluna ${file}`]
+        : [`${file} file`, `on ${file}`]);
+      return voiceHintList(commands, squares, filePhrases);
     }
     const commands = locale === 'pt-BR'
       ? ['esquerda', 'direita', 'acelerar', 'acelere', 'acelera', 'vai', 'frear', 'freie', 'freia', 'devagar', 'reduzir', 'reduza', 'desacelerar', 'desacelere', 'parar', 'nitro', 'turbo', 'poder', 'começar', 'iniciar', 'próximo', 'próxima', 'corrida', 'correr', 'revanche', 'sim']
@@ -4648,10 +4655,11 @@ export class HttpServer {
       const url = new URL(req.url ?? '', 'http://localhost');
       const map = url.searchParams.get('map') ?? undefined;
       const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get('limit') ?? '10', 10) || 10));
+      await this.leaderboardWrite;
       let entries = [] as ReturnType<typeof parseLeaderboard>;
       try { entries = parseLeaderboard(await readFile(this.leaderboardPath, 'utf8')); } catch { entries = []; }
       const top = topEntries(entries, { map, limit });
-      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify({ entries: top.map(({ enginePlayerId: _enginePlayerId, ...entry }) => entry) }));
       return;
     }

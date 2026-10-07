@@ -97,6 +97,7 @@ html[data-theme="light"] .game-home:hover { border-color: #B10F23; color: #000D2
   position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center;
   background: rgba(0,8,28,.62); backdrop-filter: blur(6px); padding: 24px;
 }
+body.vm-showing-results #vm-hud { display:none; }
 html[data-theme="light"] #overlay { background:rgba(255,255,255,.82); }
 html[data-theme="light"] :is(.vm-eyebrow,#vm-hud) img { filter:brightness(0) saturate(100%) invert(20%) sepia(90%) saturate(5000%) hue-rotate(338deg) brightness(95%); }
 
@@ -117,6 +118,25 @@ html[data-theme="light"] :is(.vm-eyebrow,#vm-hud) img { filter:brightness(0) sat
 .vm-card { background:var(--panel-solid); border: 1px solid var(--glass-brd); border-top: 3px solid var(--red);
   border-radius: 18px; padding: 30px 34px; text-align: center; max-width: 92vw;
   box-shadow: 0 20px 60px rgba(0,0,0,.5); backdrop-filter: blur(6px); }
+.vm-card.vm-results { width: min(860px, 94vw); max-width: 94vw; max-height: calc(100vh - 48px);
+  overflow-y: auto; overscroll-behavior: contain; padding: 22px 28px 26px; text-align: left; }
+.vm-results .vm-head { min-height: 0; margin-bottom: 12px; }
+.vm-results .vm-title { height: auto; justify-content: center; font-size: clamp(24px, 3.6vw, 38px); }
+.vm-result-outcome { padding: 16px 20px; border: 1px solid var(--glass-brd-2); border-left: 5px solid var(--red);
+  border-radius: 12px; background: var(--glass-2); }
+.vm-result-outcome span { display: block; color: var(--ink-dim); font: 700 11px var(--mono); letter-spacing: .18em; text-transform: uppercase; }
+.vm-result-outcome h1 { margin: 5px 0 0; color: var(--red); font: 800 clamp(28px, 4vw, 44px)/1.08 var(--disp);
+  overflow-wrap: anywhere; }
+.vm-result-outcome p { margin: 8px 0 0; color: var(--ink-dim); font-size: 14px; font-weight: 700; }
+.vm-result-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
+.vm-results:not(.station-result) .vm-result-actions { position: sticky; top: 0; z-index: 2;
+  padding: 8px 0; border-bottom: 1px solid var(--glass-brd); background: #091022; }
+html[data-theme="light"] .vm-results:not(.station-result) .vm-result-actions { background: #fff; }
+.vm-result-actions .vm-btn { display: inline-flex; align-items: center; justify-content: center; min-height: 44px;
+  margin: 0; text-decoration: none; }
+.vm-result-actions .vm-dim { margin: 0; }
+.vm-result-next { margin: 0; color: var(--ink); font-size: 15px; line-height: 1.35; }
+.vm-results .result-tech { margin-top: 16px; }
 /* Monster-select card: fills the width but is capped to the viewport height so the whole thing (header
    + 8-tile grid + Battle button) fits WITHOUT scrolling, with margin above/below. Inner rows shrink to
    fit via the min-height:0 + the viewport-relative portrait size below. */
@@ -242,6 +262,11 @@ html[data-theme="light"] .cl-row.cl-power :is(.cl-say,.cl-action) { color:#880B1
 @media (max-width: 520px) {
   #overlay { justify-content: flex-start; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 68px 10px 20px; }
   .vm-card, .vm-card.wide { width: 100%; max-width: none; max-height: none; overflow: visible; padding: 16px 12px; }
+  .vm-card.vm-results { width: 100%; max-width: none; max-height: none; overflow: visible; padding: 16px 12px; }
+  .vm-result-outcome { padding: 14px; }
+  .vm-result-outcome h1 { font-size: 30px; }
+  .vm-result-actions { align-items: stretch; }
+  .vm-results:not(.station-result) .vm-result-actions { top: 58px; }
   .vm-head { min-height: 0; margin-bottom: 10px; }
   .vm-title { height: auto; min-height: 36px; white-space: normal; font-size: 27px; }
   .vm-sub { min-height: 0; font-size: 13px; }

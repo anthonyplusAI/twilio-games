@@ -35,6 +35,17 @@ beforeEach(()=>{
 afterEach(()=>{globalThis.WebSocket=originalWebSocket;vi.useRealTimers();});
 
 describe('battle connection',()=>{
+  it('reports a disconnected result socket before replaying identity on reconnect',()=>{
+    const connection=new BattleConnection('ws://battle');
+    const states:string[]=[];
+    connection.onConnected(()=>states.push('connected'));
+    connection.onDisconnected(()=>states.push('disconnected'));
+    connection.spectate('ROOM');sockets[0]!.open();
+    sockets[0]!.disconnect();
+    expect(states).toEqual(['connected','disconnected']);
+    vi.advanceTimersByTime(500);sockets[1]!.open();
+    expect(states).toEqual(['connected','disconnected','connected']);
+  });
   it('replays only identity when a socket opens, not an action requested while disconnected',()=>{
     const connection=new BattleConnection('ws://battle');
     connection.spectate('ROOM');connection.advance();connection.chooseMove('sparkmouse.jolt');

@@ -1,0 +1,215 @@
+@font-face { font-family: 'Twilio Sans Display'; src: url('/fonts/TwilioSansDisplay-Extrabold.otf') format('opentype'); font-weight: 800; font-display: swap; }
+@font-face { font-family: 'Twilio Sans Text'; src: url('/fonts/TwilioSansText-Regular.otf') format('opentype'); font-weight: 400; font-display: swap; }
+@font-face { font-family: 'Twilio Sans Text'; src: url('/fonts/TwilioSansText-Bold.otf') format('opentype'); font-weight: 700; font-display: swap; }
+@font-face { font-family: 'Twilio Sans Mono'; src: url('/fonts/TwilioSansMono-Regular.otf') format('opentype'); font-weight: 400; font-display: swap; }
+
+.result-tech {
+  --rt-surface: #101c39;
+  --rt-route: #172744;
+  --rt-rule: #536584;
+  --rt-text: #fff;
+  --rt-soft: #dbe3f0;
+  --rt-dim: #b7c5db;
+  --rt-accent: #ff8a9a;
+  position: relative;
+  isolation: isolate;
+  width: 100%;
+  min-width: 0;
+  margin: clamp(12px, 2vh, 22px) 0 0;
+  padding: clamp(14px, 1.7vw, 23px);
+  border: 1px solid var(--rt-rule);
+  border-top: 3px solid #ef223a;
+  border-radius: 16px;
+  color: var(--rt-text);
+  background: var(--rt-surface);
+  font: 400 14px/1.45 'Twilio Sans Text', system-ui, sans-serif;
+  text-align: left;
+  text-transform: none;
+  letter-spacing: normal;
+  -webkit-font-smoothing: antialiased;
+  container: result-tech / inline-size;
+}
+
+html[data-theme='light'] .result-tech {
+  --rt-surface: #fff;
+  --rt-route: #f2f4f8;
+  --rt-rule: #8b98ac;
+  --rt-text: #000d25;
+  --rt-soft: #25334d;
+  --rt-dim: #384965;
+  --rt-accent: #b10f23;
+}
+
+.result-tech h2,
+.result-tech h3,
+.result-tech p { margin: 0; }
+
+.result-tech h2 {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  color: var(--rt-text);
+  font: 800 clamp(18px, 1.9vw, 24px)/1.1 'Twilio Sans Display', system-ui, sans-serif;
+  letter-spacing: .01em;
+}
+
+.result-tech h2::before {
+  content: '';
+  flex: 0 0 12px;
+  width: 12px;
+  height: 12px;
+  border: 3px solid #ef223a;
+  border-radius: 50%;
+  box-shadow: 0 0 0 4px rgb(239 34 58 / 16%);
+}
+
+.result-tech__route {
+  position: relative;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 14px 0 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--rt-rule);
+  border-radius: 10px;
+  background: var(--rt-route);
+  list-style: none;
+}
+
+/* A single pass of the signal adds motion without withholding the route or its text. */
+.result-tech__route::before {
+  content: '';
+  position: absolute;
+  z-index: 1;
+  top: 0;
+  left: 0;
+  width: 24%;
+  height: 3px;
+  background: #ef223a;
+  box-shadow: 0 0 12px rgb(239 34 58 / 60%);
+  pointer-events: none;
+  animation: result-tech-signal 1.15s ease-out 1 both;
+}
+
+@keyframes result-tech-signal {
+  from { transform: translateX(-105%); }
+  to { transform: translateX(425%); }
+}
+
+.result-tech__node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 78px;
+  padding: 10px 21px 10px 13px;
+}
+
+.result-tech__node:not(:last-child) { border-right: 1px solid var(--rt-rule); }
+.result-tech__node:not(:last-child)::after {
+  content: '→';
+  position: absolute;
+  z-index: 2;
+  top: 50%;
+  right: -8px;
+  width: 15px;
+  color: var(--rt-accent);
+  background: var(--rt-route);
+  font: 700 14px/1 'Twilio Sans Text', system-ui, sans-serif;
+  text-align: center;
+  transform: translateY(-50%);
+}
+
+.result-tech__step {
+  color: var(--rt-accent);
+  font: 400 10px/1 'Twilio Sans Mono', ui-monospace, monospace;
+}
+.result-tech__node strong {
+  margin-top: 5px;
+  color: var(--rt-text);
+  font: 700 clamp(12px, 1.2vw, 15px)/1.16 'Twilio Sans Text', system-ui, sans-serif;
+  overflow-wrap: anywhere;
+}
+.result-tech__node small {
+  margin-top: 3px;
+  color: var(--rt-dim);
+  font: 400 11px/1.2 'Twilio Sans Text', system-ui, sans-serif;
+}
+.result-tech__node--voice-paths small:last-child { color: var(--rt-accent); }
+
+.result-tech__example {
+  max-width: 85ch;
+  padding-top: 13px;
+  color: var(--rt-soft);
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.result-tech__more {
+  margin-top: 17px;
+  padding-top: 16px;
+  border-top: 1px solid var(--rt-rule);
+}
+.result-tech__more h3 {
+  color: var(--rt-text);
+  font: 800 18px/1.15 'Twilio Sans Display', system-ui, sans-serif;
+}
+.result-tech__more-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 25px;
+  margin-top: 9px;
+}
+.result-tech__more-grid p {
+  color: var(--rt-soft);
+  font-size: 13px;
+  line-height: 1.45;
+}
+.result-tech__more a {
+  display: inline-block;
+  margin-top: 14px;
+  color: var(--rt-accent);
+  font-weight: 700;
+  font-size: 13px;
+  line-height: 1.4;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 4px;
+}
+.result-tech__more a:hover { color: var(--rt-text); }
+.result-tech__more a:focus-visible { outline: 3px solid #2188ef; outline-offset: 4px; border-radius: 2px; }
+.result-tech__visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+.result-tech--station { padding-block: 13px; }
+.result-tech--station .result-tech__route { margin-top: 10px; }
+.result-tech--station .result-tech__node { min-height: 69px; }
+.result-tech--station .result-tech__example { padding-top: 10px; }
+
+@container result-tech (max-width: 540px) {
+  .result-tech__route { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .result-tech__node { min-height: 66px; }
+  .result-tech__node:nth-child(2) { border-right: 0; }
+  .result-tech__node:nth-child(n + 3) { border-top: 1px solid var(--rt-rule); }
+  .result-tech__node::after { display: none; }
+  .result-tech__more-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+@container result-tech (max-width: 305px) {
+  .result-tech__route { grid-template-columns: minmax(0, 1fr); }
+  .result-tech__node { min-height: 48px; padding: 7px 10px 7px 37px; }
+  .result-tech__node:not(:last-child) { border-right: 0; border-bottom: 1px solid var(--rt-rule); }
+  .result-tech__node:nth-child(n + 3) { border-top: 0; }
+  .result-tech__step { position: absolute; left: 13px; top: 16px; }
+  .result-tech__node strong { margin-top: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .result-tech__route::before { display: none; animation: none; }
+}

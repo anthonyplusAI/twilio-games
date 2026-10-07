@@ -44,8 +44,9 @@ function createShellEnvironment(fullscreen = true): {
     location: { href: 'about:blank' },
     focus: vi.fn(),
   };
+  const childDocument = { addEventListener: vi.fn() } as unknown as Document;
   const frame = Object.assign(new EventTarget(), {
-    className: '', title: '', allow: '', src: '', contentWindow: frameWindow,
+    className: '', title: '', allow: '', src: '', contentWindow: frameWindow, contentDocument: childDocument,
     setAttribute: vi.fn(), remove: vi.fn(),
   }) as unknown as HTMLIFrameElement;
   const body = {
@@ -126,11 +127,14 @@ describe('fullscreen toggle', () => {
     expect(controls).toContain('class="header-icon-button"');
   });
 
-  it('keeps same-origin game navigation inside the fullscreen owner document', () => {
+  it('returns both Home clicks and game-initiated Home navigation to the fullscreen owner page', () => {
     const environment = createShellEnvironment();
     const onOpen = vi.fn();
+    const ownerLocation = {
+      origin: 'https://games.example', href: 'https://games.example/', assign: vi.fn(),
+    };
     vi.stubGlobal('document', environment.document);
-    vi.stubGlobal('location', { origin: 'https://games.example', href: 'https://games.example/' });
+    vi.stubGlobal('location', ownerLocation);
     const shell = createFullscreenGameShell({ onOpen });
 
     expect(shell.launch('/play.html?display=1')).toBe(true);
@@ -139,12 +143,34 @@ describe('fullscreen toggle', () => {
     expect(shell.active).toBe(true);
     expect(onOpen).toHaveBeenCalledOnce();
 
+    (environment.frame.contentWindow!.location as unknown as { href: string }).href = 'https://games.example/play.html?display=1';
+    environment.frame.dispatchEvent(new Event('load'));
+    expect(environment.frame.contentWindow!.focus).toHaveBeenCalledOnce();
+    const clickListener = vi.mocked(environment.frame.contentDocument!.addEventListener).mock.calls[0]?.[1] as (event: MouseEvent) => void;
+    expect(clickListener).toBeTypeOf('function');
+    const exit = { href: 'https://games.example/?locale=en-US' } as HTMLAnchorElement;
+    const click = {
+      button: 0, altKey: false, ctrlKey: false, metaKey: false, shiftKey: false,
+      defaultPrevented: false,
+      target: { closest: () => exit },
+      preventDefault: vi.fn(), stopImmediatePropagation: vi.fn(),
+    } as unknown as MouseEvent;
+    clickListener(click);
+    expect(click.preventDefault).toHaveBeenCalledOnce();
+    expect(click.stopImmediatePropagation).toHaveBeenCalledOnce();
+    expect(ownerLocation.assign).toHaveBeenCalledWith('https://games.example/?locale=en-US');
+
+    // A game can prevent the click while it sends a leave message; its later
+    // iframe navigation is still caught by the load fallback below.
+    clickListener({ ...click, defaultPrevented: true } as MouseEvent);
+    expect(ownerLocation.assign).toHaveBeenCalledOnce();
+
     (environment.frame.contentWindow!.location as unknown as { href: string }).href = 'https://games.example/?locale=en-US';
     environment.frame.dispatchEvent(new Event('load'));
+    expect(ownerLocation.assign).toHaveBeenCalledTimes(2);
     expect(environment.frame.remove).not.toHaveBeenCalled();
     expect(environment.classes).toContain('fullscreen-game-active');
     expect(shell.active).toBe(true);
-    expect(environment.frame.contentWindow!.focus).toHaveBeenCalledOnce();
   });
 
   it('uses normal navigation outside fullscreen and exposes a toggle in every game', () => {

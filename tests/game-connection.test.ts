@@ -69,4 +69,29 @@ describe('GameConnection identity establishment', () => {
     expect(replacement.sent.map(value => JSON.parse(value))).toEqual([{ type: 'spectate', roomCode: '4821' }]);
     connection.dispose();
   });
+
+  it('drops menu actions spoken or tapped while disconnected instead of replaying stale commands', () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const connection = new GameConnection('ws://example.test/game');
+    const first = FakeWebSocket.instances[0]!;
+    connection.join('4821', 'Ada');
+    connection.advance();
+    connection.selectCar(1);
+    first.open();
+    expect(first.sent.map(value => JSON.parse(value))).toEqual([
+      { type: 'join', roomCode: '4821', name: 'Ada' },
+    ]);
+
+    first.close();
+    connection.advance();
+    connection.selectMap('Silver Lake');
+    vi.advanceTimersByTime(500);
+    const replacement = FakeWebSocket.instances[1]!;
+    replacement.open();
+    expect(replacement.sent.map(value => JSON.parse(value))).toEqual([
+      { type: 'join', roomCode: '4821', name: 'Ada' },
+    ]);
+    connection.dispose();
+  });
 });

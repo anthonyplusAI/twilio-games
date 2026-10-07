@@ -5,7 +5,7 @@ import { InterpolationBuffer, RACER_INTERPOLATION_DELAY_MS } from './interpolati
 import { countdownDisplay, isCountdownSoundCue } from '../shared/countdown';
 import { AssetLoader } from './asset-loader';
 import { Screens } from './screens';
-import type { GlobalEntry } from './screens';
+import { RacerResultBoardLoader, fetchRacerLeaderboardEntries } from './racer-result-board-loader';
 import { renderCarThumbnailsAsync, renderMapThumbnail, renderBoostThumbnailAsync } from './thumbnails';
 import { AttractMode } from './attract';
 import { Announcer } from './announcer';
@@ -220,9 +220,10 @@ function pushLine(text: string) {
 }
 const announcer = new Announcer({ sink: null, onLine: pushLine, locale });
 
-// Bumped on every phase change so an in-flight async (e.g. the leaderboard fetch) can tell whether
-// the flow has moved on before it resolves — preventing a stale render from resurrecting a screen.
-let flowEpoch = 0;
+const resultBoardLoader = new RacerResultBoardLoader(fetchRacerLeaderboardEntries);
+function leaveResults(): void {
+  if (flowPhase === 'results') resultBoardLoader.clear();
+}
 
 // Boot veil: an opaque branded cover over the 3D scene ASSEMBLING (map load → camera settle → first
 // attract frames), so the user never sees the connecting→world→top-down→cars cut sequence. We lift
@@ -287,6 +288,7 @@ function cancelPendingRaceSnapshot(): void {
   resolveRaceSnapshot = null;
 }
 conn.onItems((items, map) => {
+  leaveResults();
   cancelPendingRaceSnapshot();
   activeMapPreviewController?.abort();
   activeMapPreviewController = null;
@@ -305,6 +307,7 @@ conn.onItems((items, map) => {
   void prepareRaceScene(items, map ?? urlMap, generation);
 });
 conn.onSnapshot((s) => {
+  leaveResults();
   stationEngineStateReady = true; maybeMarkStationReady();
   if (!raceAssetPrioritized) {
     assets.prioritizeCarIndexes(s.cars.map(car => car.carIndex));
@@ -315,7 +318,7 @@ conn.onSnapshot((s) => {
     const resolve = resolveRaceSnapshot;
     resolveRaceSnapshot = null; cancelRaceSnapshot = null; resolve(s);
   }
-  raceLive = true; flowPhase = 'other'; flowEpoch++;
+  raceLive = true; flowPhase = 'other';
   if (s.phase === 'racing' && !started) {
     getMusicManager().switchContext('racer');
   }
@@ -328,13 +331,14 @@ conn.onSnapshot((s) => {
   if (raceSceneReady) { screens.hide(); if (s.phase !== 'countdown') big.textContent = ''; }
 });
 conn.onLobby((m) => {
+  leaveResults();
   stationEngineStateReady = true; maybeMarkStationReady();
   if (raceLive) {
     racePreparationGeneration += 1; cancelPendingRaceSnapshot(); latestRaceSnapshot = null; buffer.clear(); raceLive = false;
     invalidateLevelLoad();
     liftVeil();
   }
-  flowPhase = 'lobby'; flowEpoch++; big.textContent = '';
+  flowPhase = 'lobby'; big.textContent = '';
   getMusicManager().switchContext('lobby');
   // Play select sound when a new player joins
   if (m.players.length > lastLobbyPlayerCount && lastLobbyPlayerCount > 0) {
@@ -345,6 +349,7 @@ conn.onLobby((m) => {
   screens.renderLobby(m.roomCode, m.players); startAttract();
 });
 conn.onSelectState((m) => {
+  leaveResults();
   stationEngineStateReady = true; maybeMarkStationReady();
   assets.prioritizeCarIndexes(m.players.flatMap(player => player.carIndex === null ? [] : [player.carIndex]));
   if (raceLive) {
@@ -352,39 +357,28 @@ conn.onSelectState((m) => {
     invalidateLevelLoad();
     liftVeil();
   }
-  raceLive = false; flowEpoch++; big.textContent = '';
+  raceLive = false; big.textContent = '';
   screens.setMenuTouch(m.roomCode, m.touch);
   if (m.phase === 'car_select') { flowPhase = 'car_select'; screens.renderCarSelect(m.players); }
   else if (m.phase === 'map_select') { flowPhase = 'map_select'; flowMaps = m.maps; screens.renderMapSelect(m.maps, m.selectedMap, m.players, { counts: m.mapVotes ?? {}, tie: m.mapTie ?? false }); }
   startAttract();
 });
-// Cache the last-fetched all-time board (keyed by map) so REPEAT results broadcasts (~2x/s) re-render
-// WITH the board already in place. Without this, each broadcast rendered first WITHOUT the board, then
-// the async fetch re-rendered WITH it — so the dedup key flip-flopped twice a second and the whole
-// scoreboard rebuilt (animations replayed) = the flicker. With the cache, once the board is known the
-// screen renders the same (board-included) view every broadcast → the dedup guard holds → no flicker.
-let lastBoard: { map: string | null; entries: GlobalEntry[] } | null = null;
 conn.onResults((m) => {
   racePreparationGeneration += 1; cancelPendingRaceSnapshot();
   if (raceLive) invalidateLevelLoad();
   stationDisplay.markEngineResultsReady();
   stationEngineStateReady = true; maybeMarkStationReady();
-  raceLive = false; raceSceneReady = !stationDisplay.active; flowPhase = 'results'; const epoch = ++flowEpoch; big.textContent = '';
+  raceLive = false; raceSceneReady = !stationDisplay.active; flowPhase = 'results'; big.textContent = '';
   getMusicManager().switchContext('leaderboard');
   startAttract();
-  // Render with the cached board if it's for THIS map (so a repeat broadcast doesn't strip it back to
-  // the race-only view); otherwise show race-only until the fetch lands the board (one fold-in).
-  const cached = lastBoard && lastBoard.map === m.map ? lastBoard : undefined;
+  // A race's standings and room identify its result. Broadcasts for that result share one request;
+  // a later round on the same map starts fresh after the intervening lobby/race clears the loader.
+  const resultKey = JSON.stringify([m.roomCode, m.map, m.results]);
   screens.setMenuTouch(m.roomCode, m.touch);
-  screens.renderResults(m.results, (i) => localizedCarName(locale, assets.carName(i)), cached);
-  const q = m.map ? `?map=${encodeURIComponent(m.map)}&limit=10` : '?limit=10';
-  fetch(`/api/leaderboard${q}`)
-    .then(r => r.ok ? r.json() : { entries: [] })
-    .then((data) => {
-      lastBoard = { map: m.map, entries: data.entries ?? [] };
-      if (epoch === flowEpoch) screens.renderResults(m.results, (i) => localizedCarName(locale, assets.carName(i)), lastBoard);
-    })
-    .catch(() => { /* keep whatever view is up */ });
+  const board = resultBoardLoader.show(resultKey, m.map, loaded => {
+    if (flowPhase === 'results') screens.renderResults(m.results, (i) => localizedCarName(locale, assets.carName(i)), loaded);
+  });
+  screens.renderResults(m.results, (i) => localizedCarName(locale, assets.carName(i)), board);
 });
 conn.onEvent((e) => {
   announcer.handle(e);

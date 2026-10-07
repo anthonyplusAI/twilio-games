@@ -1,6 +1,7 @@
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { HttpServer } from '../server/http-server';
 import { unlink, writeFile, mkdir } from 'node:fs/promises';
+import type { Server as NodeHttpServer } from 'node:http';
 
 // Unique temp leaderboard path per test (concurrent files / leftover .tmp can't race).
 let LB = 'data/_test-lb.json';
@@ -63,6 +64,34 @@ describe('leaderboard API', () => {
     const res = await fetch(`http://127.0.0.1:${port}/api/leaderboard`);
     expect(res.status).toBe(200);
     expect((await res.json()).entries).toEqual([]);
+  });
+
+  it('waits for an in-progress race write before returning an uncached board', async () => {
+    await writeFile(LB, JSON.stringify(seed));
+    srv = makeServer(); const port = await srv.start();
+    let finishWrite!: () => void;
+    const heldWrite = new Promise<void>(resolve => { finishWrite = resolve; });
+    (srv as unknown as { leaderboardWrite: Promise<void> }).leaderboardWrite = heldWrite.then(() =>
+      writeFile(LB, JSON.stringify([
+        ...seed,
+        { name: 'New winner', map: 'Silver Lake', carIndex: 3, finishT: 20, at: 4 },
+      ])));
+
+    let requestArrived!: () => void;
+    const arrival = new Promise<void>(resolve => { requestArrived = resolve; });
+    (srv as unknown as { server: NodeHttpServer }).server.prependOnceListener('request', requestArrived);
+    const responsePromise = fetch(`http://127.0.0.1:${port}/api/leaderboard?map=Silver%20Lake`);
+    await arrival;
+    const responseBeforeWrite = await Promise.race([
+      responsePromise.then(() => true),
+      new Promise<boolean>(resolve => setTimeout(() => resolve(false), 40)),
+    ]);
+    finishWrite();
+    expect(responseBeforeWrite).toBe(false);
+    const response = await responsePromise;
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    const payload = await response.json() as { entries: Array<{ name: string }> };
+    expect(payload.entries.map(entry => entry.name)).toEqual(['New winner', 'B', 'A']);
   });
 
   it('returns Karaoke scores descending per song without private engine identities', async () => {

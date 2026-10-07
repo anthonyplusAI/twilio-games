@@ -28,6 +28,7 @@ import { injectMusicToggle } from '../music-toggle';
 import { injectFullscreenToggle } from '../fullscreen-toggle';
 import { getSoundEffectsManager } from '../sound-effects';
 import { createStationDisplay } from '../station-display';
+import { resultTechHtml } from '../result-tech';
 import { watchVoiceNumber } from '../station-client';
 import QRCode from 'qrcode';
 
@@ -137,6 +138,7 @@ let menuLevel: 'root' | 'fight' = 'root';   // two-level command menu: root acti
 let phoneNumber = '';   // the number players call to join (from /api/config) — shown in the lobby join flow
 let phoneQr = '/brand/join-qr.png?v=2';
 let joinedHere = false;
+let resultAuthorityFresh = false;
 let touchTargetPlayerId: string | null = null;
 let connectionEpoch = 0;
 let lastResultsAckGeneration: number | null = null;
@@ -183,7 +185,7 @@ conn.onRoster((entries) => {
   }));
   renderOverlay();
 });
-conn.onJoined((id) => { myId = id; joinedHere = true; lastOverlayKey = ''; renderOverlay(); });
+conn.onJoined((id) => { myId = id; joinedHere = true; resultAuthorityFresh = false; lastOverlayKey = ''; renderOverlay(); });
 conn.onError((code, msg) => {
   console.error(`[battle] ${code}: ${msg}`);
   if (code === 'room_full' || code === 'battle_in_progress' || code === 'round_complete') {
@@ -192,9 +194,18 @@ conn.onError((code, msg) => {
 });
 conn.onConnected(() => {
   connectionEpoch++;
+  resultAuthorityFresh = false;
   cancelPlayback();
   lastResultsAckGeneration = null;
   pendingResultsAckGeneration = null;
+  lastOverlayKey = '';
+  renderOverlay();
+});
+conn.onDisconnected(() => {
+  connectionEpoch++;
+  resultAuthorityFresh = false;
+  lastOverlayKey = '';
+  renderOverlay();
 });
 conn.onEvents((events, eventIds, generation) => queueEvents(events, eventIds, generation));
 conn.onShowResults((generation) => {
@@ -215,6 +226,7 @@ conn.onState((incoming) => {
   const prevPlayerCount = state?.players?.length ?? 0;
   const prevMonsterSelections = state?.players?.filter(p => p.monsterId).length ?? 0;
   state = m;
+  resultAuthorityFresh = true;
   if (prevGeneration !== undefined && prevGeneration !== m.generation) {
     cancelPlayback();
     lastActionSide = null;
@@ -481,6 +493,7 @@ function renderOverlay(): void {
   // "Waiting…" canvas rendered ON TOP of the lobby/select overlays (covering the buttons — the bug).
   // Also keep it up while AWAITING CONTINUE (battle ended, holding on the win before the results modal).
   const inBattle = phase === 'battle' || draining || awaitingContinue;
+  document.body.classList.toggle('vm-showing-results', phase === 'results' && !inBattle);
   const stageWasHidden = stageEl.style.display === 'none';
   stageEl.style.display = inBattle ? '' : 'none';
   if (inBattle && stageWasHidden) requestAnimationFrame(() => dispatchEvent(new Event('resize')));
@@ -497,12 +510,45 @@ function renderOverlay(): void {
     if (phase === 'results') scheduleResultsReceipt();
     return;   // nothing meaningful changed → don't rebuild (kills modal spam)
   }
+  const previousResultCard = overlay.querySelector<HTMLElement>('.vm-results');
+  const active = document.activeElement;
+  let focusedResultControl: 'title' | 'rematch' | 'exit' | 'guide' | null = null;
+  if (previousResultCard?.contains(active)) {
+    if (active?.id === 'vm-result-title') focusedResultControl = 'title';
+    else if (active?.matches('[data-act="advance"]')) focusedResultControl = 'rematch';
+    else if (active?.matches('a[href="/"]')) focusedResultControl = 'exit';
+    else if (active?.matches('.result-tech__more a')) focusedResultControl = 'guide';
+  }
+  const previousResultView = phase === 'results' && previousResultCard ? {
+    overlayScroll: overlay.scrollTop,
+    cardScroll: previousResultCard.scrollTop,
+    expanded: [...overlay.querySelectorAll<HTMLDetailsElement>('details')].map((detail, index) => detail.open ? index : -1),
+  } : null;
   lastOverlayKey = key;
   overlay.style.display = 'flex';
   if (phase === 'lobby') overlay.innerHTML = lobbyHtml();
   else if (phase === 'monster_select') overlay.innerHTML = monsterSelectHtml();
   else if (phase === 'results') overlay.innerHTML = resultsHtml();
+  if (previousResultView) {
+    overlay.scrollTop = previousResultView.overlayScroll;
+    const card = overlay.querySelector<HTMLElement>('.vm-results');
+    if (card) card.scrollTop = previousResultView.cardScroll;
+    overlay.querySelectorAll<HTMLDetailsElement>('details').forEach((detail, index) => {
+      detail.open = previousResultView.expanded.includes(index);
+    });
+  }
   wireOverlay();
+  if (phase === 'results') {
+    const focusTarget = focusedResultControl === 'rematch' ? overlay.querySelector<HTMLElement>('[data-act="advance"]')
+      : focusedResultControl === 'exit' ? overlay.querySelector<HTMLElement>('.vm-result-actions a[href="/"]')
+        : focusedResultControl === 'guide' ? overlay.querySelector<HTMLElement>('.result-tech__more a')
+          : null;
+    if (focusedResultControl) (focusTarget ?? overlay.querySelector<HTMLElement>('#vm-result-title'))?.focus({ preventScroll: true });
+    else if (!previousResultCard || !previousResultCard.contains(active))
+      overlay.querySelector<HTMLElement>('#vm-result-title')?.focus({ preventScroll: true });
+  } else if (previousResultCard) {
+    overlay.querySelector<HTMLElement>('.vm-title')?.focus({ preventScroll: true });
+  }
   if (phase === 'monster_select') upgradeSelectPortraits();   // swap placeholders → real GIF/PNG
   if (phase === 'results') scheduleResultsReceipt();
 }
@@ -535,7 +581,12 @@ function overlayKey(phase: string): string {
   const roster3 = roster.length;
   const roster3k = players.map(p => `${p.playerId}:${p.name}:${p.monsterId ?? ''}`).join('|');
   const win = state?.result?.winnerName ?? '';
-  return `${phase}|${isDisplay ? 'D' : 'P'}|${joinedHere ? 'J' : 'j'}|r${roster3}|${roster3k}|${win}|${state?.canRematch ? 'ready' : 'locked'}`;
+  const replay = phase === 'results' && stationDisplay.active ? 'station' : canOfferRematch() ? 'ready' : 'locked';
+  return `${phase}|${isDisplay ? 'D' : 'P'}|${joinedHere ? 'J' : 'j'}|r${roster3}|${roster3k}|${win}|${replay}`;
+}
+
+function canOfferRematch(): boolean {
+  return !stationDisplay.active && resultAuthorityFresh && state?.phase === 'results' && state.canRematch === true;
 }
 
 /** Can THIS client drive the flow (advance / start)? A device player (auto-joined) can drive their
@@ -603,7 +654,7 @@ function lobbyHtml(): string {
 function brandHead(title: string, sub: string): string {
   return `<div class="vm-head">
     <div class="vm-eyebrow"><img src="/brand/Twilio_Logo_Bug_White.svg" alt="">Twilio</div>
-    <div class="vm-title">${esc(title)}</div>
+    <div class="vm-title" role="heading" aria-level="1" tabindex="-1">${esc(title)}</div>
     <div class="vm-sub">${esc(sub)}</div>
   </div>`;
 }
@@ -691,16 +742,26 @@ function monsterSelectHtml(): string {
 
 function resultsHtml(): string {
   const w = state?.result?.winnerName ?? text('results.nobody');
-  const action = !state?.canRematch || stationDisplay.active
-    ? `<div class="vm-dim">${text('results.announcing')}</div>`
-    : isDisplay || joinedHere
-      ? `<button class="vm-btn" data-act="advance">${text('results.rematch')}</button>`
-      : `<div class="vm-dim">${text('results.goodBattle')}</div>`;
-  return `<div class="vm-card">
+  const winningSide = state?.result?.winner;
+  const winningMonster = winningSide === 'a' ? state?.snapshot?.a : winningSide === 'b' ? state?.snapshot?.b : null;
+  const champion = winningMonster
+    ? text('results.winningMonster', { monster: localizedMonsterName(locale, winningMonster.monsterId) }) : '';
+  const action = stationDisplay.active
+    ? `<p class="vm-result-next">${text('results.stationNext')}</p>`
+    : !canOfferRematch()
+      ? `<span class="vm-dim">${text('results.goodBattle')}</span>`
+      : `<button class="vm-btn" data-act="advance">${text('results.rematch')}</button>`;
+  const exit = stationDisplay.active ? '' : `<a class="vm-btn vm-btn-ghost" href="/">${text('results.exit')}</a>`;
+  return `<section class="vm-card vm-results${stationDisplay.active ? ' station-result' : ''}" role="dialog" aria-modal="true" aria-labelledby="vm-result-title">
     ${brandHead(text('lobby.title'), text('results.subtitle'))}
-    <div class="vm-title vm-win" style="font-size:36px">${esc(text('results.wins', { winner: w }))}</div>
-    ${action}
-  </div>`;
+    <div class="vm-result-outcome">
+      <span>${text('results.winner')}</span>
+      <h1 id="vm-result-title" tabindex="-1">${esc(text('results.wins', { winner: w }))}</h1>
+      ${champion ? `<p>${esc(champion)}</p>` : ''}
+    </div>
+    <div class="vm-result-actions">${action}${exit}</div>
+    ${resultTechHtml('monsters', locale, { stationManaged: stationDisplay.active })}
+  </section>`;
 }
 
 function wireOverlay(): void {
@@ -718,7 +779,7 @@ function wireOverlay(): void {
       } else conn.selectMonster(el.dataset.mon!);
     });
   overlay.querySelectorAll<HTMLElement>('[data-act="advance"]').forEach(el =>
-    el.onclick = () => conn.advance());
+    el.onclick = () => { if (state?.phase !== 'results' || canOfferRematch()) conn.advance(); });
   overlay.querySelectorAll<HTMLElement>('[data-act="back"]').forEach(el =>
     el.onclick = () => conn.back());
 }
@@ -736,6 +797,7 @@ else conn.join(roomCode, name);
  *  stays the display). No-op on a device (already a player). */
 function toggleSelfPlaying(): void {
   if (!isDisplay || stationDisplay.active) return;
+  resultAuthorityFresh = false;
   if (joinedHere) { conn.leave(roomCode); joinedHere = false; }
   else conn.join(roomCode, name);
   lastOverlayKey = ''; renderOverlay();
@@ -753,7 +815,7 @@ addEventListener('keydown', (e) => {
   } else if ((e.key === 'p' || e.key === 'P') && isDisplay && state?.phase !== 'battle') {
     toggleSelfPlaying();
   } else if (e.key === 'Enter' && isDisplay && state?.phase !== 'battle'
-    && (state?.phase !== 'results' || (state.canRematch && !stationDisplay.active))) {
+    && (state?.phase !== 'results' || canOfferRematch())) {
     conn.advance();
   }
 });

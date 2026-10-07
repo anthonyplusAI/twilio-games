@@ -69,10 +69,9 @@ export class GameConnection {
     try { this.ws.close(); } catch { /* already closing */ }
   }
 
-  private send(o: unknown) {
-    if (this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(o));
-    else this.ws.addEventListener('open', () => this.ws.send(JSON.stringify(o)), { once: true });
-  }
+  /** A control belongs to the screen/round where it was entered. Identity is replayed
+   * on reconnect; a delayed control must not change a later round. */
+  private send(o: unknown) { this.rawSend(o); }
   join(roomCode: string, name: string) {
     this.identity = { type: 'join', roomCode, name, ...(this.locale ? { locale: this.locale } : {}) };
     this.rawSend(this.identity); // onopen sends it when the initial socket is still connecting

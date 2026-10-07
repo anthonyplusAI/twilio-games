@@ -17,6 +17,72 @@ describe('Voice Chess intent', () => {
     });
   });
 
+  it('keeps spoken source files separate from rank-two homophones', () => {
+    for (const speech of [
+      'move the knight on B to C3',
+      'knight from the B file to C3',
+      'knight from column B to C3',
+      'B-file knight to C3',
+      'knight B to C3',
+      'knight from bee to see three',
+    ]) {
+      expect(parseChessIntent(speech, 'en-US')).toEqual({
+        kind: 'move', query: { piece: 'n', fromFile: 'b', to: 'c3' },
+      });
+    }
+    expect(parseChessIntent('cavalo da coluna B para C3', 'pt-BR')).toEqual({
+      kind: 'move', query: { piece: 'n', fromFile: 'b', to: 'c3' },
+    });
+    expect(parseChessIntent('cavalo na coluna B para C3', 'pt-BR')).toEqual({
+      kind: 'move', query: { piece: 'n', fromFile: 'b', to: 'c3' },
+    });
+  });
+
+  it('keeps a file-only piece reference as a source selection across a pause', () => {
+    expect(parseChessIntent('move the knight on B')).toEqual({ kind: 'select', piece: 'n', fromFile: 'b' });
+    expect(parseChessIntent('B-file knight')).toEqual({ kind: 'select', piece: 'n', fromFile: 'b' });
+    expect(parseChessIntent('cavalo da coluna B', 'pt-BR')).toEqual({ kind: 'select', piece: 'n', fromFile: 'b' });
+    expect(parseChessIntent('select the B-file knight to C3')).toEqual({
+      kind: 'move', query: { piece: 'n', fromFile: 'b', to: 'c3' },
+    });
+    expect(parseChessIntent('to C3')).toMatchObject({ kind: 'move', query: { to: 'c3' } });
+    expect(parseChessIntent('the B-file knight is pinned')).toEqual({ kind: 'unknown' });
+  });
+
+  it('preserves explicitly spoken rank two even when Relay says to', () => {
+    expect(parseChessIntent('knight from B two to C4')).toMatchObject({
+      kind: 'move', query: { piece: 'n', from: 'b2', to: 'c4' },
+    });
+    expect(parseChessIntent('knight on B too C3')).toMatchObject({
+      kind: 'move', query: { piece: 'n', from: 'b2', to: 'c3' },
+    });
+    expect(parseChessIntent('knight B two to C3')).toMatchObject({
+      kind: 'move', query: { piece: 'n', from: 'b2', to: 'c3' },
+    });
+    expect(parseChessIntent('pawn from ee to to ee for')).toMatchObject({
+      kind: 'move', query: { piece: 'p', from: 'e2', to: 'e4' },
+    });
+  });
+
+  it('routes non-command square mentions to conversational interpretation', () => {
+    expect(parseChessIntent('I heard C3 on the board')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('Move my bishup to C3')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('Move my bishup from B2 to C3')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('C3')).toMatchObject({ kind: 'move', query: { to: 'c3' } });
+    expect(parseChessIntent('E2 to E4')).toMatchObject({ kind: 'move', query: { from: 'e2', to: 'e4' } });
+  });
+
+  it('keeps polite actionable requests on the direct path while leaving questions read-only', () => {
+    expect(parseChessIntent('Could you move my bishop to C3?')).toEqual({
+      kind: 'move', query: { piece: 'b', to: 'c3' },
+    });
+    expect(parseChessIntent('Would you move the knight on B to C3?')).toEqual({
+      kind: 'move', query: { piece: 'n', fromFile: 'b', to: 'c3' },
+    });
+    expect(parseChessIntent('Could you tell me if my bishop can move to C3?')).toEqual({ kind: 'unknown' });
+    expect(parseChessIntent('Can my bishop move to C3?')).toEqual({ kind: 'unknown' });
+  });
+
   it('parses captures, promotion, and both forms of castling', () => {
     expect(parseChessIntent('Bishop captures on C6', 'en-US')).toMatchObject({
       kind: 'move', query: { piece: 'b', to: 'c6', captureOnly: true },
@@ -52,6 +118,7 @@ describe('Voice Chess intent', () => {
     expect(parseChessIntent('my knight please', 'en-US')).toEqual({ kind: 'select', piece: 'n' });
     expect(parseChessIntent('move the queen', 'en-US')).toEqual({ kind: 'select', piece: 'q' });
     expect(parseChessIntent('select E2', 'en-US')).toEqual({ kind: 'select', from: 'e2' });
+    expect(parseChessIntent('from E2', 'en-US')).toEqual({ kind: 'select', from: 'e2' });
     expect(parseChessIntent('E4', 'en-US')).toMatchObject({ kind: 'move', query: { to: 'e4' } });
   });
 
@@ -106,6 +173,9 @@ describe('Voice Chess intent', () => {
     });
     expect(parseChessIntent('knight to F3, actually bishop to C4')).toMatchObject({
       kind: 'move', query: { piece: 'b', to: 'c4' },
+    });
+    expect(parseChessIntent('knight on B to F3, no, C3')).toEqual({
+      kind: 'move', query: { piece: 'n', fromFile: 'b', to: 'c3' },
     });
   });
 
