@@ -4,6 +4,8 @@ import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeom
 import { createChessPiece, pieceShardMaterial, pieceSpellColor,
   type ChessColor, type ChessPieceType } from './chess-pieces';
 import { ChessHall, type ChessTheme } from './chess-hall';
+import { WizardPieceLibrary } from './wizard-pieces';
+import type { WizardChessCharacter } from '../../shared/wizard-chess-scene';
 
 export interface BoardPiece {
   square: string;
@@ -156,6 +158,7 @@ export class ChessBoardScene {
   private readonly resizeObserver: ResizeObserver | null;
   private readonly reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
   private readonly hall: ChessHall;
+  private readonly wizardAssets: WizardPieceLibrary;
   private boardMaterials!: {
     stone: THREE.MeshStandardMaterial;
     underStone: THREE.MeshStandardMaterial;
@@ -170,6 +173,10 @@ export class ChessBoardScene {
   private lastFrameAt = 0;
   private humanColor: ChessColor = 'w';
   private animation: MoveAnimation | null = null;
+  private wizardMode = false;
+  private wizardRefreshPending = false;
+  private wizardSpeaker: WizardChessCharacter | null = null;
+  private wizardSpeakerUntil = 0;
   private cameraAdjusted = false;
   private ready = true;
   private onAvailability?: (available: boolean) => void;
@@ -179,6 +186,7 @@ export class ChessBoardScene {
     const lowPowerDisplay = (device.deviceMemory !== undefined && device.deviceMemory <= 4)
       || (device.hardwareConcurrency !== undefined && device.hardwareConcurrency <= 4)
       || matchMedia('(pointer: coarse) and (max-width: 900px)').matches;
+    this.wizardAssets = new WizardPieceLibrary(() => this.refreshWizardPieces(), lowPowerDisplay);
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio || 1, lowPowerDisplay ? 1.3 : 1.7));
     this.renderer.shadowMap.enabled = true;
@@ -255,14 +263,57 @@ export class ChessBoardScene {
     this.hall.setTheme(theme);
     const light = theme === 'light';
     this.renderer.toneMappingExposure = light ? 1.19 : 1.28;
-    this.boardMaterials.stone.color.setHex(light ? 0x273a54 : 0x142139);
-    this.boardMaterials.underStone.color.setHex(light ? 0x16263b : 0x070d1d);
-    this.boardMaterials.metal.color.setHex(light ? 0xb28954 : 0xa77c51);
-    this.boardMaterials.inset.color.setHex(light ? 0x9d2c4d : 0xa91131);
-    this.boardMaterials.lightTile.color.setHex(light ? 0xffffff : 0xdce7fb);
-    this.boardMaterials.darkTile.color.setHex(light ? 0xffffff : 0xc6d5ef);
+    this.boardMaterials.stone.color.setHex(this.wizardMode ? light ? 0x55525a : 0x26212b
+      : light ? 0x273a54 : 0x142139);
+    this.boardMaterials.underStone.color.setHex(this.wizardMode ? light ? 0x34323d : 0x13121c
+      : light ? 0x16263b : 0x070d1d);
+    this.boardMaterials.metal.color.setHex(this.wizardMode ? 0xcaa66b : light ? 0xb28954 : 0xa77c51);
+    this.boardMaterials.inset.color.setHex(this.wizardMode ? 0x422e5b : light ? 0x9d2c4d : 0xa91131);
+    this.boardMaterials.lightTile.color.setHex(this.wizardMode ? 0xeee8d8 : light ? 0xffffff : 0xdce7fb);
+    this.boardMaterials.darkTile.color.setHex(this.wizardMode ? 0xb5afa6 : light ? 0xffffff : 0xc6d5ef);
     this.replaceCoordinates();
+    this.renderer.shadowMap.needsUpdate = true;
   }
+
+  prefetchWizardModels(): void {
+    this.wizardAssets.prefetch();
+  }
+
+  setWizardMode(enabled: boolean): void {
+    if (this.wizardMode === enabled) return;
+    this.cancelAnimation();
+    this.wizardMode = enabled;
+    this.wizardRefreshPending = false;
+    this.wizardSpeaker = null;
+    this.wizardSpeakerUntil = 0;
+    this.pieceLayer.clear();
+    this.pieces.clear();
+    this.setLastMove(null, null);
+    this.setPendingMove(null, null);
+    this.setHint(null, null);
+    this.setSelection(null);
+    this.setCheck(null);
+    this.appliedTheme = null;
+    this.setTheme(this.theme);
+    this.renderer.shadowMap.needsUpdate = true;
+    if (enabled) this.wizardAssets.prefetch(true);
+  }
+
+  /** Give the current speaker a small, readable gesture without rigging the GLBs. */
+  setWizardSpeaker(character: WizardChessCharacter): void {
+    if (!this.wizardMode || this.reducedMotion) return;
+    this.wizardSpeaker = character;
+    this.wizardSpeakerUntil = performance.now() + 1_800;
+  }
+
+  cancelAnimation(): void {
+    if (!this.animation) return;
+    const animation = this.animation;
+    this.animation = null;
+    animation.resolve();
+  }
+
+  get isAnimating(): boolean { return this.animation !== null; }
 
   resetCamera(): void {
     this.cameraAdjusted = false;
@@ -278,8 +329,11 @@ export class ChessBoardScene {
       if (!position || !['w', 'b'].includes(piece.color) || !['p', 'n', 'b', 'r', 'q', 'k'].includes(piece.type)) continue;
       const existing = previous.get(piece.square);
       const group = existing?.type === piece.type && existing.color === piece.color
-        ? existing.group : createChessPiece(piece.type, piece.color);
-      const rotation = piece.color === 'w' ? 0 : Math.PI;
+        ? existing.group : this.wizardMode
+          ? this.wizardAssets.createPiece(piece.square, piece.color, piece.type)
+          : createChessPiece(piece.type, piece.color);
+      const rotation = group.userData.faceAudience
+        ? this.characterFacingRotation(position) : piece.color === 'w' ? 0 : Math.PI;
       changed ||= group !== existing?.group || !group.position.equals(position)
         || group.rotation.y !== rotation || group.rotation.z !== 0 || !group.visible;
       if (existing && group !== existing.group) this.pieceLayer.remove(existing.group);
@@ -354,7 +408,7 @@ export class ChessBoardScene {
 
   dispose(): void {
     cancelAnimationFrame(this.frame);
-    if (this.animation) this.finishAnimation(this.animation);
+    this.cancelAnimation();
     this.resizeObserver?.disconnect();
     window.removeEventListener('resize', this.resize);
     this.canvas.removeEventListener('dblclick', this.onCameraDoubleClick);
@@ -383,6 +437,7 @@ export class ChessBoardScene {
       if ('map' in material && material.map instanceof THREE.Texture) material.map.dispose();
       material.dispose();
     });
+    this.wizardAssets.dispose();
     this.renderer.dispose();
     this.canvas.remove();
   }
@@ -470,6 +525,7 @@ export class ChessBoardScene {
     if (this.ready && !document.hidden) {
       if (this.orbit.update()) this.constrainCameraFraming();
       this.updateAnimation(now);
+      this.updateWizardCharacters(now);
       this.updateParticles(now, dt);
       this.hall.update(now, dt, this.camera);
       this.renderer.render(this.scene, this.camera);
@@ -495,7 +551,9 @@ export class ChessBoardScene {
     animation.attacker.group.position.y += Math.sin(Math.PI * moveFraction) * arc;
     const lunge = capture ? Math.max(0, 1 - Math.abs(t - 0.61) / 0.14) : 0;
     animation.attacker.group.rotation.z = animation.move.piece === 'n' ? -0.27 * lunge : 0;
-    animation.attacker.group.rotation.y = (animation.attacker.color === 'w' ? 0 : Math.PI)
+    animation.attacker.group.rotation.y = (animation.attacker.group.userData.faceAudience
+      ? this.characterFacingRotation(animation.attacker.group.position)
+      : animation.attacker.color === 'w' ? 0 : Math.PI)
       + (animation.move.piece === 'q' || animation.move.piece === 'b' ? Math.sin(Math.PI * t) * 0.55 : 0);
     if (animation.rook && animation.move.rookFrom && animation.move.rookTo) {
       const rookFrom = squarePosition(animation.move.rookFrom);
@@ -510,11 +568,44 @@ export class ChessBoardScene {
     if (capture && t >= 0.66 && !animation.shattered) {
       animation.shattered = true;
       if (animation.victim) {
-        animation.victim.group.visible = false;
-        this.spawnShatter(animation.victim, spellColor(animation.move));
+        if (this.wizardMode && animation.victim.group.userData.wizardCharacter) {
+          this.spawnSparks(animation.victim.group.position.clone().add(new THREE.Vector3(0, 0.6, 0)),
+            new THREE.Color(0xe7c783), 36, 1.1);
+          this.spawnRing(animation.victim.group.position, new THREE.Color(0xb788ff), 1.25);
+        } else {
+          animation.victim.group.visible = false;
+          this.spawnShatter(animation.victim, spellColor(animation.move));
+        }
       }
     }
+    if (capture && animation.victim?.group.userData.wizardCharacter && t >= 0.66) {
+      const fall = Math.min(1, (t - 0.66) / 0.34);
+      animation.victim.group.rotation.z = -fall * 1.1;
+      animation.victim.group.position.y = TOP - fall * 0.12;
+    }
     if (t >= 1) this.finishAnimation(animation);
+  }
+
+  private characterFacingRotation(position: THREE.Vector3): number {
+    return Math.atan2(this.camera.position.x - position.x, this.camera.position.z - position.z);
+  }
+
+  private updateWizardCharacters(now: number): void {
+    if (!this.wizardMode) return;
+    for (const visual of this.pieces.values()) {
+      const character = visual.group.userData.wizardCharacter as WizardChessCharacter | undefined;
+      if (!character || this.animation?.attacker === visual || this.animation?.victim === visual) continue;
+      const home = squarePosition(visual.square);
+      if (!home) continue;
+      const speaking = !this.reducedMotion && character === this.wizardSpeaker
+        && now < this.wizardSpeakerUntil;
+      const phase = now * 0.0025 + (character === 'ron' ? 0 : character === 'harry' ? 2 : 4);
+      visual.group.position.copy(home);
+      visual.group.rotation.y = this.characterFacingRotation(home)
+        + (this.reducedMotion ? 0 : Math.sin(phase) * (speaking ? 0.09 : 0.018));
+      visual.group.rotation.z = this.reducedMotion ? 0 : Math.sin(phase * 1.8) * (speaking ? 0.042 : 0.008);
+      if (!this.reducedMotion) visual.group.position.y += Math.sin(phase * 1.25) * (speaking ? 0.025 : 0.009);
+    }
   }
 
   private finishAnimation(animation: MoveAnimation): void {
@@ -526,6 +617,20 @@ export class ChessBoardScene {
       this.setCheck(king?.square ?? null);
     } else this.setCheck(null);
     animation.resolve();
+    if (this.wizardRefreshPending) this.refreshWizardPieces();
+  }
+
+  private refreshWizardPieces(): void {
+    if (!this.wizardMode || this.pieces.size === 0) return;
+    if (this.animation) {
+      this.wizardRefreshPending = true;
+      return;
+    }
+    this.wizardRefreshPending = false;
+    const position = [...this.pieces.values()].map(({ square, color, type }) => ({ square, color, type }));
+    this.pieceLayer.clear();
+    this.pieces.clear();
+    this.setPosition(position);
   }
 
   private updateParticles(now: number, dt: number): void {

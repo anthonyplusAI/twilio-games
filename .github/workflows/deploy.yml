@@ -363,6 +363,7 @@ jobs:
           ANALYTICS_ADMIN_PIN: ${{ secrets.ANALYTICS_ADMIN_PIN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           KARAOKE_CALIBRATION_OFFSET_MS: ${{ vars.KARAOKE_CALIBRATION_OFFSET_MS }}
           DUB_API_KEY: ${{ secrets.DUB_API_KEY }}
           DUB_FOLDER_ID: ${{ secrets.DUB_FOLDER_ID }}
@@ -386,6 +387,7 @@ jobs:
                 "analytics-admin-pin=${ANALYTICS_ADMIN_PIN:-disabled}" \
                 "openai-api-key=${OPENAI_API_KEY:-disabled}" \
                 "deepgram-api-key=${DEEPGRAM_API_KEY:-disabled}" \
+                "elevenlabs-api-key=${ELEVENLABS_API_KEY:-disabled}" \
                 "dub-api-key=${DUB_API_KEY:-disabled}" \
                 "dub-folder-id=${DUB_FOLDER_ID:-disabled}" \
               --output none
@@ -412,6 +414,7 @@ jobs:
           ANALYTICS_ADMIN_PIN: ${{ secrets.ANALYTICS_ADMIN_PIN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
           DUB_API_KEY: ${{ secrets.DUB_API_KEY }}
           DUB_FOLDER_ID: ${{ secrets.DUB_FOLDER_ID }}
           ACR_SERVER: ${{ steps.acr-creds.outputs.server }}
@@ -838,6 +841,7 @@ jobs:
                 "analytics-admin-pin=${ANALYTICS_ADMIN_PIN:-disabled}" \
                 "openai-api-key=${OPENAI_API_KEY:-disabled}" \
                 "deepgram-api-key=${DEEPGRAM_API_KEY:-disabled}" \
+                "elevenlabs-api-key=${ELEVENLABS_API_KEY:-disabled}" \
                 "dub-api-key=${DUB_API_KEY:-disabled}" \
                 "dub-folder-id=${DUB_FOLDER_ID:-disabled}" \
               --output none

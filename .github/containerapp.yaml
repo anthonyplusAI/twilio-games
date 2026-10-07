@@ -183,6 +183,10 @@ properties:
           # Optional Portuguese-specific ElevenLabs voice. Empty uses Relay's pt-BR default.
           - name: CR_TTS_VOICE_PT_BR
             value: "${CR_TTS_VOICE_PT_BR}"
+          # Optional server-side ElevenLabs key for Wizard Chess display narration. This is
+          # separate from Conversation Relay's phone TTS credentials and never sent to the browser.
+          - name: ELEVENLABS_API_KEY
+            secretRef: elevenlabs-api-key
           # Conversational AI host. The deploy stores an optional missing key as `disabled`, which
           # the server treats as unset and falls back to deterministic scripted behavior.
           - name: OPENAI_API_KEY
