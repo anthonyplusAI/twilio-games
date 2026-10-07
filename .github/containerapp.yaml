@@ -35,6 +35,7 @@ properties:
       - name: analytics-admin-pin
       - name: openai-api-key
       - name: deepgram-api-key
+      - name: elevenlabs-api-key
       - name: dub-api-key
       - name: dub-folder-id
       - name: acr-password
