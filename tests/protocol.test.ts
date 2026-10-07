@@ -6,6 +6,10 @@ describe('parseClientMessage', () => {
     const m = parseClientMessage(JSON.stringify({ type: 'join', roomCode: '4821', name: 'You' }));
     expect(m).toEqual({ type: 'join', roomCode: '4821', name: 'You' });
   });
+  it('accepts an opt-in browser renderer readiness gate', () => {
+    const m = parseClientMessage(JSON.stringify({ type: 'join', roomCode: '4821', name: 'You', rendererReadyGate: true }));
+    expect(m).toEqual({ type: 'join', roomCode: '4821', name: 'You', rendererReadyGate: true });
+  });
   it('parses a valid intent', () => {
     const m = parseClientMessage(JSON.stringify({ type: 'intent', intent: 'MOVE_LEFT' }));
     expect(m).toEqual({ type: 'intent', intent: 'MOVE_LEFT' });

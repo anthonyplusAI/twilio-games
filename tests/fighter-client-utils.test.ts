@@ -28,7 +28,7 @@ describe('fighter client shortcuts', () => {
     const source=readFileSync(new URL('../client/fighter/fighter.ts',import.meta.url),'utf8');
     expect(source).toContain('state.hasExpectedPlayers && state.players.length > 0');
     expect(source).toContain("console.warn('Fighter model failed to load; using fallback actors.'");
-    expect(source).toContain('const FIGHTER_ACTOR_FALLBACK_MS = 5_000');
+    expect(source).toContain('const FIGHTER_ACTOR_FALLBACK_MS = fighterAssetFirstAttemptMs(browserConnection())');
     expect(source).toContain('animationSources = new Map()');
     expect(source).toContain('actorLoadCoordinator.start(');
     expect(source).toContain("fighterConnectionState !== 'connected'");

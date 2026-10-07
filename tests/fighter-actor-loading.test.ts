@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as THREE from 'three';
+import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
+import { FighterActor } from '../client/fighter/fighter-actor';
 import { FighterActorLoadCoordinator, fighterActorLoadContext } from '../client/fighter/fighter-actor-loading';
+import { loadAnimationSources } from '../client/fighter/fighter-assets';
 import type { FighterState } from '../shared/fighter-protocol';
 
 function deferred() {
@@ -21,7 +25,87 @@ function state(phase: FighterState['phase'], generation = 4): FighterState {
 }
 
 describe('Fighter actor loading coordination', () => {
-  afterEach(() => vi.useRealTimers());
+  afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+
+  it('keeps an authored character and its embedded idle when external animation downloads fail', async () => {
+    const model = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1, 2, 1), new THREE.MeshBasicMaterial());
+    body.position.y = 1;
+    model.add(body);
+    model.animations = [new THREE.AnimationClip('embedded-idle', 1, [
+      new THREE.NumberKeyframeTrack('.rotation[z]', [0, 0.5, 1], [0, 0.01, 0]),
+    ])];
+    vi.spyOn(FBXLoader.prototype, 'parse').mockReturnValue(model);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array([1]), { status: 200 })));
+
+    const actor = await FighterActor.load({ id: 'ember', label: 'Ember', file: 'ember.fbx', embeddedIdle: true }, new Map());
+
+    expect(actor.model).toBe(model);
+    expect(actor.playRandom('punch')).toBeGreaterThan(0);
+    expect(actor.playRandom('walk-back')).toBeGreaterThan(0);
+    expect(actor.playRandom('fall', { hold: true, fade: 0, lockFloor: true })).toBeGreaterThan(0);
+    actor.update(0.6);
+    expect(model.rotation.z).toBeGreaterThan(0.5);
+    actor.dispose();
+  });
+
+  it('still animates an authored character without an embedded idle when the clip bank is empty', async () => {
+    const model = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1, 2, 1), new THREE.MeshBasicMaterial());
+    body.position.y = 1;
+    model.add(body);
+    vi.spyOn(FBXLoader.prototype, 'parse').mockReturnValue(model);
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new Uint8Array([1]), { status: 200 })));
+
+    const actor = await FighterActor.load({ id: 'nyx', label: 'Nyx', file: 'nyx.fbx' }, new Map());
+
+    expect(actor.model).toBe(model);
+    expect(actor.playRandom('idle', { loop: true })).toBeGreaterThan(0);
+    expect(actor.playRandom('kick')).toBeGreaterThan(0);
+    actor.dispose();
+  });
+
+  it('retains a downloaded fighter when one shared startup clip fails', async () => {
+    const model = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(1, 2, 1), new THREE.MeshBasicMaterial());
+    body.position.y = 1;
+    model.add(body);
+    const hips = new THREE.Bone();
+    hips.name = 'mixamorigHips';
+    model.add(hips);
+    const clip = new THREE.AnimationClip('motion', 1, [
+      new THREE.QuaternionKeyframeTrack('mixamorig10Hips.quaternion', [0, 1], [0, 0, 0, 1, 0, 0, 0, 1]),
+    ]);
+    vi.spyOn(FBXLoader.prototype, 'parse').mockImplementation(buffer => {
+      if (typeof buffer !== 'string' && new Uint8Array(buffer)[0] === 2) return model;
+      const animation = new THREE.Group();
+      animation.animations = [clip];
+      return animation;
+    });
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => url.includes('run-backward.fbx')
+      ? new Response(null, { status: 503 })
+      : new Response(new Uint8Array([url.includes('nyx.fbx') ? 2 : 1]), { status: 200 })));
+
+    const actor = await FighterActor.load({ id: 'nyx', label: 'Nyx', file: 'nyx.fbx' }, loadAnimationSources());
+
+    expect(actor.model).toBe(model);
+    expect(actor.playRandom('walk-back')).toBeGreaterThan(0);
+    expect(actor.playRandom('punch')).toBeGreaterThan(0);
+    actor.dispose();
+  });
+
+  it('uses the authored actors when they finish inside the first-attempt window', async () => {
+    vi.useFakeTimers();
+    const pending = deferred();
+    const ready = vi.fn(), fallback = vi.fn();
+    const coordinator = new FighterActorLoadCoordinator(12_000);
+    coordinator.start('4:nyx:wraith', () => pending.promise, () => true, ready, fallback);
+    await vi.advanceTimersByTimeAsync(8_000);
+    pending.resolve();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(ready).toHaveBeenCalledTimes(1);
+    expect(fallback).not.toHaveBeenCalled();
+  });
 
   it('keeps one load and one deadline across repeated state frames', async () => {
     vi.useFakeTimers();

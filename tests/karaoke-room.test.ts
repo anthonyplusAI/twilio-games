@@ -85,6 +85,53 @@ describe('authoritative karaoke room', () => {
     expect(room.advance(singer)).toBe(true);
   });
 
+  it('keeps the completed result on display after a hangup until a new singer explicitly joins', () => {
+    let now = 0;
+    const room = new KaraokeRoom('KEEP-RESULT', { now: () => now });
+    room.expectHumanPlayers(1, false);
+    const singer = joined(room);
+    const generation = loadSong(room, singer);
+    expect(room.ready(generation)).toBe(true);
+    expect(room.mediaReady(singer, NEVER_GONNA_GIVE_YOU_UP.id, generation, KARAOKE_COUNTDOWN_MS)).toBe(true);
+    now = KARAOKE_COUNTDOWN_MS + KARAOKE_SONG_DURATION_MS;
+    room.tick();
+    expect(room.finalizeMediaScore(singer, 9_876,
+      finalHits(room.state().selectedSong!, 9_876))).toBe(true);
+    const finished = room.state().result;
+    room.removePlayer(singer);
+    expect(room.state()).toMatchObject({
+      phase: 'results', singer: null, result: finished, score: 9_876,
+      selectedSong: { id: NEVER_GONNA_GIVE_YOU_UP.id },
+    });
+    expect(room.advance(singer)).toBe(false);
+    expect(room.isEmpty).toBe(true);
+
+    const nextSinger = joined(room, 'Grace');
+    expect(nextSinger).not.toBe(singer);
+    expect(room.state()).toMatchObject({ phase: 'lobby', result: null, score: 0, selectedSong: null });
+  });
+
+  it('does not let a late station caller replace a completed result after hangup', () => {
+    let now = 0;
+    const room = new KaraokeRoom('STATION-RESULT', { now: () => now });
+    room.expectHumanPlayers(1, true);
+    const singer = joined(room);
+    const generation = loadSong(room, singer);
+    expect(room.ready(generation)).toBe(true);
+    expect(room.mediaReady(singer, NEVER_GONNA_GIVE_YOU_UP.id, generation, KARAOKE_COUNTDOWN_MS)).toBe(true);
+    now = KARAOKE_COUNTDOWN_MS + KARAOKE_SONG_DURATION_MS;
+    room.tick();
+    expect(room.finalizeMediaScore(singer, 7_500,
+      finalHits(room.state().selectedSong!, 7_500))).toBe(true);
+    const finished = room.state().result;
+
+    room.removePlayer(singer);
+    room.expectHumanPlayers(1, true); // a late call still belongs to this fixed station round
+    expect(room.addPlayer('Late')).toEqual({ error: 'round_complete' });
+    expect(room.restartAfterDisconnect()).toBe(false);
+    expect(room.state()).toMatchObject({ phase: 'results', singer: null, result: finished });
+  });
+
   it('accepts display readiness only for the current loading generation', () => {
     let now = 1_000;
     const room = new KaraokeRoom('READY', { now: () => now });
@@ -272,6 +319,25 @@ describe('authoritative karaoke room', () => {
     expect(room.updateScore(singer, 1)).toBe(false);
     expect(room.advance(singer)).toBe(true);
     expect(room.state()).toMatchObject({ phase: 'song_select', selectedSong: null, result: null, score: 0 });
+  });
+
+  it('rejects fractional final hits that would round differently in the live total and result', () => {
+    let now = 0;
+    const room = new KaraokeRoom('EXACT-SCORE', { now: () => now });
+    const singer = joined(room);
+    room.ready(loadSong(room, singer));
+    now = KARAOKE_COUNTDOWN_MS + KARAOKE_SONG_DURATION_MS;
+    room.tick();
+    const song = room.state().selectedSong!;
+    const fractional = song.chart.words.map((word, index) => ({
+      wordId: word.id,
+      judgment: index < 2 ? 'good' as const : 'miss' as const,
+      points: index < 2 ? 0.6 : 0,
+    }));
+    expect(room.finalizeMediaScore(singer, 1, fractional)).toBe(false);
+    expect(room.state().result).toBeNull();
+    expect(room.finalizeMediaScore(singer, 1, finalHits(song, 1))).toBe(true);
+    expect(room.state().score).toBe(room.state().result!.score);
   });
 
   it('resets active state when the singer really leaves', () => {

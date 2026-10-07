@@ -1,7 +1,7 @@
 import { createServer, type Server as HttpServer } from 'node:http';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
-import { ChessServer } from '../server/chess-server';
+import { ChessServer, CHESS_RESULT_RECONNECT_GRACE_MS } from '../server/chess-server';
 import { ChessRoom } from '../server/chess-room';
 
 let httpServer: HttpServer | null = null;
@@ -98,6 +98,67 @@ describe('Voice Chess display transport', () => {
     }));
   });
 
+  it('keeps a finished chess result on the shared display after the caller hangs up', async () => {
+    const { port, chess } = await hostChess(code => new ChessRoom(code, {
+      humanColor: 'w', random: () => 0, initialFen: '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1',
+    }));
+    const socket = new WebSocket(`ws://127.0.0.1:${port}/chess?display=1`);
+    display = socket;
+    const frames: Array<Record<string, any>> = [];
+    socket.on('message', data => frames.push(JSON.parse(data.toString())));
+    await new Promise<void>((resolve, reject) => { socket.once('open', resolve); socket.once('error', reject); });
+    socket.send(JSON.stringify({ type: 'spectate', roomCode: 'SOLO' }));
+    await vi.waitFor(() => expect(frames.some(frame => frame.type === 'chess_state')).toBe(true));
+    expect(chess.voiceJoin('SOLO', 'Ada', 'CA-solo', 'en-US')).toMatchObject({ playerId: 'c1' });
+    expect(chess.voiceCommand('SOLO', 'CA-solo', 'queen to G7', 'en-US')?.code).toBe('proposed');
+    expect(chess.voiceCommand('SOLO', 'CA-solo', 'confirm', 'en-US')?.code).toBe('confirmed');
+    const finished = chess.findRoom('SOLO')!.state();
+    expect(finished).toMatchObject({ phase: 'finished', result: { winner: 'w' } });
+
+    chess.voiceLeave('SOLO', 'CA-solo');
+    await vi.waitFor(() => expect(frames.some(frame => frame.type === 'chess_state'
+      && frame.gameId === finished.gameId && frame.phase === 'finished'
+      && frame.playerConnected === false && frame.result?.winner === finished.result?.winner)).toBe(true));
+    expect(chess.findRoom('SOLO')!.state()).toMatchObject({ phase: 'finished', result: finished.result });
+    expect(frames.at(-1)?.phase).toBe('finished');
+    const displayClosed = new Promise<void>(resolve => socket.once('close', () => resolve()));
+    socket.close();
+    await displayClosed;
+    expect(chess.findRoom('SOLO')?.state()).toMatchObject({ phase: 'finished', result: finished.result });
+    const reopened = new WebSocket(`ws://127.0.0.1:${port}/chess?display=1`);
+    display = reopened;
+    const restoredFrames: Array<Record<string, any>> = [];
+    reopened.on('message', data => restoredFrames.push(JSON.parse(data.toString())));
+    await new Promise<void>((resolve, reject) => { reopened.once('open', resolve); reopened.once('error', reject); });
+    reopened.send(JSON.stringify({ type: 'spectate', roomCode: 'SOLO' }));
+    await vi.waitFor(() => expect(restoredFrames.some(frame => frame.type === 'chess_state'
+      && frame.phase === 'finished' && frame.result?.winner === finished.result?.winner)).toBe(true));
+    expect(chess.voiceJoin('SOLO', 'Grace', 'CA-new', 'en-US')).toMatchObject({ playerId: 'c1' });
+    expect(chess.findRoom('SOLO')!.state()).toMatchObject({ phase: 'playing', result: null });
+  });
+
+  it('reaps an unattended standalone result after its display reconnect grace', () => {
+    vi.useFakeTimers();
+    const chess = new ChessServer({ roomFactory: code => new ChessRoom(code, {
+      humanColor: 'w', random: () => 0, initialFen: '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1',
+    }) });
+    try {
+      expect(chess.voiceJoin('SOLO', 'Ada', 'CA-solo', 'en-US')).not.toBeNull();
+      expect(chess.voiceCommand('SOLO', 'CA-solo', 'queen to G7', 'en-US')?.code).toBe('proposed');
+      expect(chess.voiceCommand('SOLO', 'CA-solo', 'confirm', 'en-US')?.code).toBe('confirmed');
+      chess.voiceLeave('SOLO', 'CA-solo');
+      expect(chess.findRoom('SOLO')?.state().phase).toBe('finished');
+      vi.advanceTimersByTime(CHESS_RESULT_RECONNECT_GRACE_MS - 1);
+      expect(chess.roomCount).toBe(1);
+      vi.advanceTimersByTime(1);
+      expect(chess.findRoom('SOLO')).toBeUndefined();
+      expect(chess.roomCount).toBe(0);
+    } finally {
+      chess.stopLoopOnly();
+      vi.useRealTimers();
+    }
+  });
+
   it('offers replay for an authenticated non-default standalone match', async () => {
     const { port, chess } = await hostChess(code => new ChessRoom(code, {
       humanColor: 'w', random: () => 0, initialFen: '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1',
@@ -146,6 +207,10 @@ describe('Voice Chess display transport', () => {
     expect(chess.voiceRestart('MAGE', 'CA-station')).toBe(false);
     expect(chess.voiceCommand('MAGE', 'CA-station', 'play again', 'en-US')?.code).toBe('finished');
     expect(chess.findRoom('MAGE')!.state().gameId).toBe(finished.gameId);
+    chess.voiceLeave('MAGE', 'CA-station');
+    expect(chess.voiceJoin('MAGE', 'Late caller', 'CA-late', 'en-US')).toBeNull();
+    expect(chess.voiceJoin('MAGE', 'Late assignment', 'CA-late-station', 'en-US', true)).toBeNull();
+    expect(chess.findRoom('MAGE')!.state()).toMatchObject({ phase: 'finished', result: finished.result });
   });
 
   it('keeps the browser display read-only and publishes only confirmed phone moves', async () => {

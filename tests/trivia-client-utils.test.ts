@@ -9,13 +9,13 @@ import {
 } from '../client/trivia/trivia-client-utils';
 
 describe('Trivia display timing and URLs', () => {
-  it('derives the ten-second display timer from server timestamps', () => {
-    expect(triviaQuestionTiming(20_000, 30_000, 23_401)).toEqual({
-      remainingMs: 6_599,
-      remainingSeconds: 7,
-      progress: 0.6599,
+  it('derives the twenty-five-second display timer from server timestamps', () => {
+    expect(triviaQuestionTiming(20_000, 45_000, 23_401)).toEqual({
+      remainingMs: 21_599,
+      remainingSeconds: 22,
+      progress: 0.86396,
     });
-    expect(triviaQuestionTiming(20_000, 30_000, 31_000)).toEqual({
+    expect(triviaQuestionTiming(20_000, 45_000, 46_000)).toEqual({
       remainingMs: 0,
       remainingSeconds: 0,
       progress: 0,

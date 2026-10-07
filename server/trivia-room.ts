@@ -304,6 +304,17 @@ export class TriviaRoom {
     return true;
   }
 
+  /** A completed standalone display keeps its result until a fresh call starts another session. */
+  prepareForNewCaller(): boolean {
+    if (this.phase !== 'results' || this.stationFixedValue || this.players.some(player => player.connected)) {
+      return false;
+    }
+    this.players.length = 0;
+    this.nextPlayerOrder = 0;
+    this.resetEmptyRoom();
+    return true;
+  }
+
   setName(playerId: string, name: string): boolean {
     const player = this.players.find(candidate => candidate.playerId === playerId);
     if (!player) return false;
@@ -506,9 +517,14 @@ export class TriviaRoom {
     if (!current || current.question.id !== questionId || !player?.connected || player.earlyChoiceId) return false;
     const choiceId = this.resolveChoice(current, spokenOrChoiceId);
     if (!choiceId) return false;
+    // The answer clock is already running while numbered choices are spoken.
+    // A caller who interrupts that reading must lock at the actual speech time.
+    if (this.phase === 'answer_cue') {
+      const now = this.now();
+      return this.commitAnswer(playerId, choiceId, true, now, now);
+    }
     player.earlyChoiceId = choiceId;
-    if (this.phase === 'question_prompt') return this.questionPromptSkipped(playerId, questionId, questionAttemptId);
-    return this.questionAnswerCueSkipped(playerId, questionId, questionAttemptId);
+    return this.questionPromptSkipped(playerId, questionId, questionAttemptId);
   }
 
   pauseAudio(questionId: string, questionAttemptId: number): boolean {
@@ -551,13 +567,13 @@ export class TriviaRoom {
     return this.commitAnswer(playerId, spokenOrChoiceId, final, answeredAtMs, answeredAtMs);
   }
 
-  /** Reserve bounded interpretation time only for a final heard during this attempt's ten-second clock. */
+  /** Reserve bounded interpretation time only for a final heard during this attempt's answer clock. */
   beginSemanticAnswerResolution(playerId: string, questionId: string, questionAttemptId: number,
     onset?: { choiceId?: string; atMs: number }): number | null {
     const receivedAtMs = this.now();
     const current = this.currentQuestion();
     const player = this.players.find(candidate => candidate.playerId === playerId);
-    if (this.phase !== 'question' || !current || current.question.id !== questionId
+    if ((this.phase !== 'question' && this.phase !== 'answer_cue') || !current || current.question.id !== questionId
       || this.questionAttemptIdValue !== questionAttemptId
       || !player?.connected || player.submittedChoiceId !== null
       || this.answeringStartsAt === null || this.questionEndsAt === null
@@ -596,7 +612,7 @@ export class TriviaRoom {
 
   private commitAnswer(playerId: string, spokenOrChoiceId: string, final: boolean,
     answeredAtMs: number, receivedAtMs: number, semanticResolutionId?: number): boolean {
-    if (this.phase !== 'question') this.tick();
+    if (this.phase !== 'question' && this.phase !== 'answer_cue') this.tick();
     const pending = this.semanticAnswerResolutions.get(playerId);
     const current = this.currentQuestion();
     const reservation = semanticResolutionId === undefined ? null
@@ -605,7 +621,7 @@ export class TriviaRoom {
         ? pending : null;
     if (semanticResolutionId !== undefined && !reservation) return false;
     const receivedDeadlineAt = reservation?.expiresAtMs ?? this.finalAnswerDeadlineAt;
-    if (this.phase !== 'question' || !final || this.answeringStartsAt === null
+    if ((this.phase !== 'question' && this.phase !== 'answer_cue') || !final || this.answeringStartsAt === null
       || this.questionEndsAt === null || receivedDeadlineAt === null
       || !Number.isSafeInteger(answeredAtMs)
       || answeredAtMs < this.answeringStartsAt
@@ -627,7 +643,14 @@ export class TriviaRoom {
     player.submittedElapsedMs = elapsedMs;
     player.submittedCorrect = scored.correct;
     player.submittedPoints = scored.points;
-    if (this.players.every(candidate => candidate.submittedChoiceId !== null)) this.revealQuestion(receivedAtMs);
+    if (this.phase === 'answer_cue') {
+      this.answerCueReadyPlayerIds.add(playerId);
+      this.cueDeliveries.delete(playerId);
+    }
+    if (this.players.every(candidate => candidate.submittedChoiceId !== null)) {
+      if (this.phase === 'answer_cue') this.beginAnswering(receivedAtMs);
+      this.revealQuestion(receivedAtMs);
+    } else if (this.phase === 'answer_cue') this.maybeStartAnswering(receivedAtMs);
     return true;
   }
 
@@ -671,6 +694,13 @@ export class TriviaRoom {
         }
       }
       if (this.phase === 'answer_cue') {
+        // Choice audio must finish while the live clock is running. If it does
+        // not, retry this question instead of scoring an unheard option set.
+        if (this.questionEndsAt !== null && now >= this.questionEndsAt) {
+          this.pauseAudio(this.currentQuestion()!.question.id, this.questionAttemptIdValue);
+          changed = true;
+          continue;
+        }
         const expiredDelivery = this.players.some(player => !this.answerCueReadyPlayerIds.has(player.playerId)
           && (this.cueDeliveries.get(player.playerId)?.deadlineAtMs ?? Infinity) <= now);
         const neverStarted = this.answerCueEndsAt !== null && now >= this.answerCueEndsAt
@@ -767,6 +797,10 @@ export class TriviaRoom {
   get stationFixed(): boolean { return this.stationFixedValue; }
   get allowReplay(): boolean { return this.allowReplayValue; }
   get isEmpty(): boolean { return this.players.length === 0; }
+  get isUnattendedResult(): boolean {
+    return !this.stationFixedValue && this.phase === 'results'
+      && this.players.every(player => !player.connected);
+  }
   get isTimingActive(): boolean {
     return this.phase === 'loading' || this.phase === 'countdown'
       || this.phase === 'question_prompt' || this.phase === 'answer_cue'
@@ -885,6 +919,9 @@ export class TriviaRoom {
     this.phase = 'answer_cue';
     this.questionPromptEndsAt = null;
     this.answerCueEndsAt = startedAtMs + this.answerCueTimeoutMs;
+    this.answeringStartsAt = startedAtMs + TRIVIA_ANSWER_START_DELAY_MS;
+    this.questionEndsAt = this.answeringStartsAt + TRIVIA_ANSWER_WINDOW_MS;
+    this.finalAnswerDeadlineAt = this.questionEndsAt + this.finalAnswerGraceMs;
     this.answerCueReadyPlayerIds.clear();
     this.promptDeliveries.clear();
     for (const player of this.players) if (player.earlyChoiceId) this.answerCueReadyPlayerIds.add(player.playerId);
@@ -894,6 +931,17 @@ export class TriviaRoom {
       questionAttemptId: this.questionAttemptIdValue,
       endsAtMs: this.answerCueEndsAt,
     });
+    this.events.push({
+      type: 'answering_started', questionId: current.question.id,
+      questionAttemptId: this.questionAttemptIdValue,
+      startsAtMs: this.answeringStartsAt,
+      endsAtMs: this.questionEndsAt,
+    });
+    for (const player of this.players) {
+      if (this.phase !== 'answer_cue' && this.phase !== 'question') break;
+      if (player.earlyChoiceId) this.commitAnswer(player.playerId, player.earlyChoiceId, true,
+        this.answeringStartsAt, this.answeringStartsAt);
+    }
     this.maybeStartAnswering(startedAtMs);
   }
 
@@ -905,28 +953,11 @@ export class TriviaRoom {
 
   private beginAnswering(transitionedAtMs: number): void {
     if (this.phase !== 'answer_cue') return;
-    const current = this.currentQuestion();
-    if (!current) return;
     this.phase = 'question';
     this.questionPromptEndsAt = null;
     this.answerCueEndsAt = null;
     this.cueDeliveries.clear();
-    const startedAtMs = transitionedAtMs + TRIVIA_ANSWER_START_DELAY_MS;
-    this.answeringStartsAt = startedAtMs;
-    this.questionEndsAt = startedAtMs + TRIVIA_ANSWER_WINDOW_MS;
-    this.finalAnswerDeadlineAt = this.questionEndsAt + this.finalAnswerGraceMs;
-    this.events.push({
-      type: 'answering_started',
-      questionId: current.question.id,
-      questionAttemptId: this.questionAttemptIdValue,
-      startsAtMs: startedAtMs,
-      endsAtMs: this.questionEndsAt,
-    });
-    for (const player of this.players) {
-      if (this.phase !== 'question') break;
-      if (player.earlyChoiceId) this.commitAnswer(player.playerId, player.earlyChoiceId, true,
-        startedAtMs, startedAtMs);
-    }
+    void transitionedAtMs;
   }
 
   private revealQuestion(revealedAtMs: number): void {

@@ -4,14 +4,23 @@ import { STEP, MAX_PLAYERS } from '../shared/constants';
 import { arcadeGameDefinition } from '../shared/arcade-games';
 
 describe('Room', () => {
-  it('keeps standalone Racer in lobby until every caller confirms a name', () => {
+  it('requires a name in the lobby but keeps a visible selection menu when an unnamed caller joins late', () => {
     const room = new Room('NAMES', 1, { carCount: 2, maps: ['Silver Lake'] });
     const caller = room.addPlayer('Racer 1234', undefined, undefined, false); if ('error' in caller) throw new Error(caller.error);
+    expect(room.start()).toBe(false);
     room.advance(); expect(room.phase).toBe('lobby');
     room.setPlayerInfo(caller.playerId, { name: 'Ada' });
     room.advance(); expect(room.phase).toBe('car_select');
     const late = room.addPlayer('Racer 5678', undefined, undefined, false); if ('error' in late) throw new Error(late.error);
-    expect(room.phase).toBe('lobby');
+    expect(room.phase).toBe('car_select');
+    expect(room.selectCar(caller.playerId, 0)).toBe(true);
+    expect(room.selectCar(late.playerId, 1)).toBe(true);
+    expect(room.advance(caller.playerId)).toBe(true);
+    expect(room.phase).toBe('map_select');
+    expect(room.selectMap('Silver Lake', caller.playerId)).toBe(true);
+    expect(room.selectMap('Silver Lake', late.playerId)).toBe(true);
+    expect(room.advance(late.playerId)).toBe(true);
+    expect(room.phase).toBe('countdown');
   });
   it('returns a rematch to lobby when a caller joined the race before confirming a name', () => {
     const room = new Room('REMATCH-NAME', 1, { carCount: 2, maps: ['Silver Lake'] });

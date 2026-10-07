@@ -14,6 +14,7 @@ export interface KaraokeResultViewInput {
   leaderboardLoading: boolean;
   canReplayOnDisplay: boolean;
   stationManaged: boolean;
+  singerPresent?: boolean;
   guideMode?: boolean;
 }
 
@@ -26,7 +27,7 @@ export function renderKaraokeResultsHtml(input: KaraokeResultViewInput): string 
     ? `<p class="result-station-note">${escapeHtml(copy.stationNextRound)}</p>`
     : input.canReplayOnDisplay ? '' : `<p class="result-phone-note">${escapeHtml(copy.againByPhone)}</p>`;
   const actions = input.stationManaged ? '' : `<div class="flow-actions result-actions">${input.canReplayOnDisplay
-    ? `<button id="advance-flow" class="primary-action" type="button">${escapeHtml(copy.again)}</button>` : ''}<a id="karaoke-exit" class="secondary-action" href="/">${escapeHtml(copy.exit)}</a></div>`;
+    ? `<button id="advance-flow" class="primary-action" type="button">${escapeHtml(input.singerPresent === false ? copy.nextSinger : copy.again)}</button>` : ''}<a id="karaoke-exit" class="secondary-action" href="/">${escapeHtml(copy.exit)}</a></div>`;
   return `<section class="flow-panel results-panel${input.stationManaged ? ' station-managed' : ''}" aria-live="off">
     <div class="flow-kicker"><img src="/brand/Twilio_Logo_Bug_White.svg" alt=""><span>${escapeHtml(copy.appKicker)}</span>${input.guideMode ? `<b class="guide-mode-label">${escapeHtml(copy.guideMode)}</b>` : ''}</div>
     <h1>${escapeHtml(copy.results)}</h1><p>${escapeHtml(input.singerName)}</p>

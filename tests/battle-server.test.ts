@@ -115,6 +115,115 @@ describe('BattleServer', () => {
     expect(presentations).toContainEqual(expect.objectContaining({kind:'results',generation:room.generation}));
     display.ws.close();
   });
+
+  it('keeps the finished battle on a connected display after the last caller hangs up', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const playerId = server.voiceJoin('HANGUP-RESULT', 'Ada')!;
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'HANGUP-RESULT' });
+    await wait(20);
+    server.voiceAdvance('HANGUP-RESULT', playerId);
+    server.voiceSelectMonster('HANGUP-RESULT', playerId, 'embertail');
+    server.voiceAdvance('HANGUP-RESULT', playerId);
+    const room = server.findRoom('HANGUP-RESULT')!;
+    for (let index = 0; index < 100 && room.phase === 'battle'; index++) {
+      const snap = room.snapshot()!;
+      room.chooseMove(playerId, snap.a.moves[1]!.id);
+      if (room.aiPending()) room.resolveAiTurn();
+    }
+    expect(room.phase).toBe('results');
+    expect(server.voiceContinueResults('HANGUP-RESULT', playerId)).toBe(true);
+    send(display.ws, { type: 'ack_results', generation: room.generation });
+    await wait(20);
+    const finished = room.result();
+
+    server.voiceLeave('HANGUP-RESULT', playerId);
+    await wait(20);
+    expect(server.findRoom('HANGUP-RESULT')).toBe(room);
+    expect(room.phase).toBe('results');
+    expect(room.result()).toEqual(finished);
+    expect(display.msgs.filter(message => message.type === 'battle_state').at(-1))
+      .toMatchObject({ type: 'battle_state', phase: 'results', canRematch: false });
+
+    const lateDisplay = await connectCollect(port);
+    send(lateDisplay.ws, { type: 'spectate', roomCode: 'HANGUP-RESULT' });
+    await wait(20);
+    expect(lateDisplay.msgs).toContainEqual(expect.objectContaining({ type: 'battle_state', phase: 'results' }));
+    const next = server.voiceJoin('HANGUP-RESULT', 'Bo');
+    expect(next).toBeTruthy();
+    expect(room.phase).toBe('lobby');
+    display.ws.close(); lateDisplay.ws.close();
+  });
+
+  it('recovers standalone results after display reconnect and releases them after the grace period', async () => {
+    server = new BattleServer({ port: 0, resultReconnectGraceMs: 300 });
+    const port = await server.start();
+    const playerId = server.voiceJoin('RESULT-RECONNECT', 'Ada')!;
+    server.voiceAdvance('RESULT-RECONNECT', playerId);
+    server.voiceSelectMonster('RESULT-RECONNECT', playerId, 'embertail');
+    server.voiceAdvance('RESULT-RECONNECT', playerId);
+    const room = server.findRoom('RESULT-RECONNECT')!;
+    for (let index = 0; index < 100 && room.phase === 'battle'; index++) {
+      const snap = room.snapshot()!;
+      room.chooseMove(playerId, snap.a.moves[1]!.id);
+      if (room.aiPending()) room.resolveAiTurn();
+    }
+    expect(room.phase).toBe('results');
+    // The match normally holds the victory beat before accepting result presentation. Advance
+    // that deadline so this test isolates the later display-reconnect grace period.
+    (room as unknown as { resultsReadyAt: number }).resultsReadyAt = Date.now() - 1;
+    room.acknowledgeResultsPresented(room.generation);
+    const finished = room.result();
+    const first = await connectCollect(port);
+    send(first.ws, { type: 'spectate', roomCode: room.code });
+    await wait(20);
+    server.voiceLeave(room.code, playerId);
+    first.ws.close();
+    await new Promise<void>(resolve => first.ws.once('close', () => resolve()));
+    expect(server.findRoom(room.code)).toBe(room);
+
+    const restored = await connectCollect(port);
+    send(restored.ws, { type: 'spectate', roomCode: room.code });
+    await wait(20);
+    expect(restored.msgs).toContainEqual(expect.objectContaining({ type: 'battle_state', phase: 'results' }));
+    expect(room.result()).toEqual(finished);
+    await wait(350);
+    expect(server.findRoom(room.code)).toBe(room);
+
+    restored.ws.close();
+    await new Promise<void>(resolve => restored.ws.once('close', () => resolve()));
+    await wait(350);
+    expect(server.findRoom(room.code)).toBeUndefined();
+  });
+
+  it('does not replay abandoned battle animations after a display reconnects to setup', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const playerId = server.voiceJoin('ABANDONED-BEATS', 'Ada')!;
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'ABANDONED-BEATS' });
+    await wait(20);
+    server.voiceAdvance('ABANDONED-BEATS', playerId);
+    server.voiceSelectMonster('ABANDONED-BEATS', playerId, 'embertail');
+    server.voiceAdvance('ABANDONED-BEATS', playerId);
+    const battle = server.findRoom('ABANDONED-BEATS')!;
+    expect(battle.phase).toBe('battle');
+    expect(server.voiceChooseAction('ABANDONED-BEATS', playerId,
+      { kind: 'fight', moveId: battle.snapshot()!.a.moves[0]!.id })).toBe(true);
+    await wait(20);
+    expect(display.msgs.some(message => message.type === 'battle_events')).toBe(true);
+
+    server.voiceLeave('ABANDONED-BEATS', playerId);
+    expect(server.findRoom('ABANDONED-BEATS')?.phase).toBe('lobby');
+    expect(server.hasPendingPresentation('ABANDONED-BEATS')).toBe(false);
+    const reconnected = await connectCollect(port);
+    send(reconnected.ws, { type: 'spectate', roomCode: 'ABANDONED-BEATS' });
+    await wait(20);
+    expect(reconnected.msgs).toContainEqual(expect.objectContaining({ type: 'battle_state', phase: 'lobby' }));
+    expect(reconnected.msgs.some(message => message.type === 'battle_events')).toBe(false);
+    display.ws.close(); reconnected.ws.close();
+  });
   it('reports voice setup and menu mutations from the authoritative room result', () => {
     server = new BattleServer({});
     const id = server.voiceJoin('VOICE', 'Ada')!;
@@ -208,6 +317,43 @@ describe('BattleServer', () => {
     expect(observedPhases.at(-1)).toBe('monster_select');
     expect(leader.msgs).toContainEqual(expect.objectContaining({ type: 'battle_state', phase: 'monster_select' }));
     participant.ws.close(); leader.ws.close(); secondary.ws.close(); late.ws.close();
+  });
+
+  it('unlocks a waiting standalone caller after the finished player disconnects', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const original = await connectCollect(port);
+    send(original.ws, { type: 'join', roomCode: 'RESULT-HANDOFF', name: 'Ada' });
+    await wait(20);
+    const originalId = original.msgs.find(message => message.type === 'joined')?.playerId as string;
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'RESULT-HANDOFF' });
+    await wait(20);
+    const room = server.findRoom('RESULT-HANDOFF')!;
+    room.advance(originalId);
+    room.selectMonster(originalId, 'embertail');
+    room.advance(originalId);
+    for (let index = 0; index < 100 && room.phase === 'battle'; index++) {
+      const snap = room.snapshot()!;
+      room.chooseMove(originalId, snap.a.moves[1]!.id);
+      if (room.aiPending()) room.resolveAiTurn();
+    }
+    expect(room.phase).toBe('results');
+    room.acknowledgeResultsPresented(room.generation);
+    const waiting = await connectCollect(port);
+    send(waiting.ws, { type: 'join', roomCode: 'RESULT-HANDOFF', name: 'Bo' });
+    await wait(20);
+    expect(waiting.msgs.filter(message => message.type === 'battle_state').at(-1)?.canRematch).toBe(false);
+
+    original.ws.close();
+    await wait(30);
+    expect(room.phase).toBe('results');
+    expect(waiting.msgs.filter(message => message.type === 'battle_state').at(-1)?.canRematch).toBe(true);
+    expect(display.msgs.filter(message => message.type === 'battle_state').at(-1)?.canRematch).toBe(true);
+    send(waiting.ws, { type: 'advance' });
+    await wait(30);
+    expect(room.phase).toBe('monster_select');
+    waiting.ws.close(); display.ws.close();
   });
   it('sends the roster on connect', async () => {
     server = new BattleServer({ port: 0 });

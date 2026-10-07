@@ -33,6 +33,7 @@ interface BattleEventLedger {
 // it comfortably under typical idle-timeout windows.
 const HEARTBEAT_MS = 30_000;
 const PLAYER_RECONNECT_GRACE_MS = 30_000;
+export const BATTLE_RESULT_RECONNECT_GRACE_MS = 60_000;
 
 export class BattleServer {
   private wss: WebSocketServer | null = null;
@@ -53,11 +54,15 @@ export class BattleServer {
   private allowBrowserPlayer: (roomCode: string) => boolean = () => true;
   private readonly displayToken: string;
   private onDisplayAuthenticated: ((ws: WebSocket) => void) | null = null;
+  private readonly resultReconnectGraceMs: number;
+  private resultReconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  constructor(opts: { port?: number; server?: HttpServer; heartbeatMs?: number; displayToken?: string }) {
+  constructor(opts: { port?: number; server?: HttpServer; heartbeatMs?: number; displayToken?: string;
+    resultReconnectGraceMs?: number }) {
     this.port = opts.port;
     this.displayToken = opts.displayToken?.trim() ?? '';
     this.heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_MS;   // overridable so tests can drive fast sweeps
+    this.resultReconnectGraceMs = opts.resultReconnectGraceMs ?? BATTLE_RESULT_RECONNECT_GRACE_MS;
     if (opts.server) this.attach(opts.server);
   }
 
@@ -178,6 +183,7 @@ export class BattleServer {
         const room = this.room(msg.roomCode);
         const res = room.addPlayer(msg.name);
         if ('error' in res) { this.send(conn, { type: 'error', code: res.error, message: res.error }); return; }
+        this.clearResultReconnectTimer(msg.roomCode);
         conn.roomCode = msg.roomCode; conn.playerId = res.playerId; conn.sessionId = msg.sessionId;
         if (msg.sessionId) this.rememberPlayerSession(msg.sessionId, conn);
         this.send(conn, { type: 'joined', playerId: res.playerId, roomCode: msg.roomCode });
@@ -202,6 +208,7 @@ export class BattleServer {
         }
         this.room(msg.roomCode);
         conn.roomCode = msg.roomCode;   // display / spectator: no slot
+        this.clearResultReconnectTimer(msg.roomCode);
         this.designateDisplayLeader(msg.roomCode);
         if(priorRoom&&priorRoom!==msg.roomCode){this.designateDisplayLeader(priorRoom);this.pushState(priorRoom);this.reapIfEmpty(priorRoom);}
         this.pushState(msg.roomCode);
@@ -249,8 +256,8 @@ export class BattleServer {
             return;
           }
           const owner=conn.playerId??room.lobbyPlayers().find(player=>!player.isAi)?.playerId;
-          if(room.phase==='results'&&(!owner||!room.isFinishedBattleParticipant(owner))){
-            this.send(conn,{type:'error',code:'not_ready',message:'The finished players must start a rematch.'});
+          if(room.phase==='results'&&(!owner||!room.canStartNextRound(owner))){
+            this.send(conn,{type:'error',code:'not_ready',message:'A current player can start the next round when the result is ready.'});
             return;
           }
           if(!room.advance(owner))this.send(conn,{type:'error',code:'not_ready',message:'Complete the current selection first.'});
@@ -346,7 +353,8 @@ export class BattleServer {
   private replayPendingEvents(conn: Conn, code: string): void {
     const room=this.rooms.get(code);
     const ledger=this.eventLedgers.get(code);
-    if(!room||!ledger||ledger.generation!==room.generation)return;
+    if(!room||!ledger||!['battle','results'].includes(room.phase)
+      ||ledger.generation!==room.generation)return;
     const pending=[...ledger.events].filter(([id])=>!ledger.acknowledged.has(id));
     if(!pending.length)return;
     this.send(conn,{type:'battle_events',generation:ledger.generation,
@@ -457,6 +465,9 @@ export class BattleServer {
   private pushState(roomCode: string): void {
     const room = this.rooms.get(roomCode);
     if (!room) return;
+    // A finished/interrupted battle can return to setup without changing generation until the
+    // next fight starts. Do not replay its unpainted animation beats on a new lobby display.
+    if (room.phase === 'lobby' || room.phase === 'monster_select') this.eventLedgers.delete(roomCode);
     const res = room.result();
     const msg: BattleServerMessage = {
       type: 'battle_state', roomCode, phase: room.phase,
@@ -472,9 +483,9 @@ export class BattleServer {
     const firstHuman = room.lobbyPlayers().find(player => !player.isAi)?.playerId;
     for (const c of this.conns) if (c.roomCode === roomCode) {
       const owner = c.playerId ?? firstHuman;
-      const canRematch = room.canRematch && this.allowBrowserPlayer(roomCode)
-        && (c.playerId ? room.isFinishedBattleParticipant(c.playerId)
-          : this.isDisplayLeader(c, roomCode) && !!owner && room.isFinishedBattleParticipant(owner));
+      const canRematch = this.allowBrowserPlayer(roomCode)
+        && (c.playerId ? room.canStartNextRound(c.playerId)
+          : this.isDisplayLeader(c, roomCode) && !!owner && room.canStartNextRound(owner));
       this.send(c, { ...msg, canRematch });
     }
     this.onRoomState?.(roomCode);
@@ -537,13 +548,15 @@ export class BattleServer {
   hasPendingPresentation(code:string):boolean{
     const room=this.rooms.get(code);
     const ledger=this.eventLedgers.get(code);
-    if(!room||!ledger||ledger.generation!==room.generation||!this.displayLeaders.get(code))return false;
+    if(!room||!ledger||!['battle','results'].includes(room.phase)
+      ||ledger.generation!==room.generation||!this.displayLeaders.get(code))return false;
     return [...ledger.events.keys()].some(id=>!ledger.acknowledged.has(id));
   }
 
   abortRoom(code: string): boolean {
     const room = this.rooms.get(code);
     if (!room) return false;
+    this.clearResultReconnectTimer(code);
     for (const conn of this.conns) {
       if (conn.roomCode !== code) continue;
       conn.roomCode = undefined;
@@ -571,10 +584,12 @@ export class BattleServer {
   /** A caller joins `code` as a player. Returns the new playerId, or null if the room is full. */
   voiceJoin(code: string, name: string, preferredSide?: 'a' | 'b', expectedPlayers?:number, nameConfirmed = true): string | null {
     const room = this.room(code);
-    if(expectedPlayers!==undefined)room.expectHumanPlayers(expectedPlayers,preferredSide!==undefined);
-    else if(room.playerCount>=1)room.expectHumanPlayers(2,false);
+    const hadPlayer=room.playerCount>=1;
     const res = room.addPlayer(name, preferredSide, nameConfirmed);
     if ('error' in res) return null;
+    if(expectedPlayers!==undefined)room.expectHumanPlayers(expectedPlayers,preferredSide!==undefined);
+    else if(hadPlayer)room.expectHumanPlayers(2,false);
+    this.clearResultReconnectTimer(code);
     this.pushState(code);
     return res.playerId;
   }
@@ -629,7 +644,7 @@ export class BattleServer {
   voiceAdvance(code: string, playerId?: string): boolean {
     const room = this.rooms.get(code); if (!room) return false;
     if (!this.allowBrowserPlayer(code) && room.phase === 'results') return false;
-    if (room.phase === 'results' && (!playerId || !room.isFinishedBattleParticipant(playerId))) return false;
+    if (room.phase === 'results' && (!playerId || !room.canStartNextRound(playerId))) return false;
     const advanced=room.advance(playerId);this.flushEvents(room);this.pushState(code);
     return advanced;
   }
@@ -645,11 +660,34 @@ export class BattleServer {
     return true;
   }
 
-  private reapIfEmpty(roomCode: string): void {
+  private clearResultReconnectTimer(roomCode: string): void {
+    const timer = this.resultReconnectTimers.get(roomCode);
+    if (timer) clearTimeout(timer);
+    this.resultReconnectTimers.delete(roomCode);
+  }
+
+  private reapIfEmpty(roomCode: string, graceExpired = false): void {
     const room = this.rooms.get(roomCode);
     if (!room || !room.isEmpty) return;
     for (const c of this.conns) if (c.roomCode === roomCode) return;   // a spectator still watching
     if (room.phase === 'results' && this.resultsTimers.has(roomCode)) return;
+    if (room.phase === 'results') {
+      // A finished station room remains owned by the station until handoff or abort. A standalone
+      // display has one minute to reconnect after the caller hangs up before we release the result.
+      if (!this.allowBrowserPlayer(roomCode)) return;
+      if (!graceExpired) {
+        if (!this.resultReconnectTimers.has(roomCode)) {
+          const timer = setTimeout(() => {
+            this.resultReconnectTimers.delete(roomCode);
+            if (this.rooms.get(roomCode) === room) this.reapIfEmpty(roomCode, true);
+          }, this.resultReconnectGraceMs);
+          (timer as { unref?: () => void }).unref?.();
+          this.resultReconnectTimers.set(roomCode, timer);
+        }
+        return;
+      }
+    }
+    this.clearResultReconnectTimer(roomCode);
     const ai = this.aiTimers.get(roomCode);
     if (ai) { clearTimeout(ai.timer); this.aiTimers.delete(roomCode); }
     const results = this.resultsTimers.get(roomCode);
@@ -668,6 +706,7 @@ export class BattleServer {
   }
   stopLoopOnly(): void {
     this.stopHeartbeat();
+    for (const code of this.resultReconnectTimers.keys()) this.clearResultReconnectTimer(code);
     for (const session of this.playerSessions.values()) if (session.leaveTimer) clearTimeout(session.leaveTimer);
     this.playerSessions.clear();
     for (const { timer } of this.aiTimers.values()) clearTimeout(timer);
@@ -682,6 +721,7 @@ export class BattleServer {
   stop(): Promise<void> {
     return new Promise((resolve) => {
       this.stopHeartbeat();
+      for (const code of this.resultReconnectTimers.keys()) this.clearResultReconnectTimer(code);
       for (const session of this.playerSessions.values()) if (session.leaveTimer) clearTimeout(session.leaveTimer);
       this.playerSessions.clear();
       for (const { timer } of this.aiTimers.values()) clearTimeout(timer);

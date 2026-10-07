@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { WebSocket } from 'ws';
-import { GameServer, RACER_BROADCAST_HZ, parseClientMessage } from '../server/game-server';
+import { GameServer, RACER_BROADCAST_HZ, RACER_STANDALONE_RENDER_READY_TIMEOUT_MS, parseClientMessage } from '../server/game-server';
 import { HttpServer, isLateRacerGameplayPrompt } from '../server/http-server';
 import { clearSelectionIndex } from '../server/game-host';
 import type { GameEvent, ServerMessage } from '../shared/types';
@@ -162,6 +162,78 @@ describe('GameServer integration', () => {
     expect(room.snapshot()!.countdown).toBe(beforeDisconnect);
   });
 
+  it('holds a standalone countdown for its displayed map, then starts on display readiness', async () => {
+    server = new GameServer({ port: 0, broadcastHz: 30 });
+    let starts = 0;
+    server.setOnRaceStarted(() => { starts += 1; });
+    const port = await server.start();
+    const display = connect(port); await display.open();
+    display.ws.send(JSON.stringify({ type: 'spectate', roomCode: 'SOLO-MAP' }));
+    const player = connect(port); await player.open();
+    player.ws.send(JSON.stringify({ type: 'join', roomCode: 'SOLO-MAP', name: 'Ada', rendererReadyGate: true }));
+    await wait(30);
+    player.ws.send(JSON.stringify({ type: 'ready' }));
+    await vi.waitFor(() => expect(server.findRoom('SOLO-MAP')?.phase).toBe('countdown'));
+    const room = server.findRoom('SOLO-MAP')!;
+    const before = room.snapshot()!.countdown;
+    server.stepRoomForTest(room, 1);
+    expect(room.snapshot()!.countdown).toBe(before);
+    expect(starts).toBe(0);
+    expect(display.inbox.some(message => message.type === 'items')).toBe(true);
+
+    // A player saying start again cannot release the display's loading hold.
+    player.ws.send(JSON.stringify({ type: 'ready' }));
+    await wait(20);
+    expect(room.snapshot()!.countdown).toBe(before);
+    display.ws.send(JSON.stringify({ type: 'ready' }));
+    await wait(20);
+    server.stepRoomForTest(room, .5);
+    expect(room.snapshot()!.countdown).toBeLessThan(before);
+    expect(starts).toBe(1);
+    player.ws.close(); display.ws.close();
+  });
+
+  it('releases a standalone countdown after the bounded map-loading timeout', async () => {
+    server = new GameServer({ port: 0, broadcastHz: 30 });
+    const port = await server.start();
+    const display = connect(port); await display.open();
+    display.ws.send(JSON.stringify({ type: 'spectate', roomCode: 'SLOW-MAP' }));
+    const player = connect(port); await player.open();
+    player.ws.send(JSON.stringify({ type: 'join', roomCode: 'SLOW-MAP', name: 'Ada' }));
+    await wait(30);
+    player.ws.send(JSON.stringify({ type: 'ready' }));
+    await vi.waitFor(() => expect(server.findRoom('SLOW-MAP')?.phase).toBe('countdown'));
+    const room = server.findRoom('SLOW-MAP')!;
+    const before = room.snapshot()!.countdown;
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + RACER_STANDALONE_RENDER_READY_TIMEOUT_MS + 1);
+    try {
+      server.stepRoomForTest(room, .5);
+      expect(room.snapshot()!.countdown).toBeLessThan(before);
+    } finally { clock.mockRestore(); }
+    player.ws.close(); display.ws.close();
+  });
+
+  it('lets a local browser player prepare the map when no shared display is attached', async () => {
+    server = new GameServer({ port: 0, broadcastHz: 30 });
+    const port = await server.start();
+    const player = connect(port); await player.open();
+    player.ws.send(JSON.stringify({ type: 'join', roomCode: 'LOCAL-MAP', name: 'Ada', rendererReadyGate: true }));
+    await wait(20);
+    player.ws.send(JSON.stringify({ type: 'ready' }));
+    await vi.waitFor(() => expect(server.findRoom('LOCAL-MAP')?.phase).toBe('countdown'));
+    const room = server.findRoom('LOCAL-MAP')!;
+    const before = room.snapshot()!.countdown;
+    server.stepRoomForTest(room, .5);
+    expect(room.snapshot()!.countdown).toBe(before);
+
+    player.ws.send(JSON.stringify({ type: 'ready' }));
+    await wait(20);
+    server.stepRoomForTest(room, .5);
+    expect(room.snapshot()!.countdown).toBeLessThan(before);
+    player.ws.close();
+  });
+
   it('applies shared-screen taps only to the current station caller seat and current menu', async () => {
     server = new GameServer({ port: 0, displayToken: 'station-display-token' });
     const events: GameEvent[] = [];
@@ -244,6 +316,36 @@ describe('GameServer integration', () => {
     expect(room.phase).toBe('lobby');
     expect(room.lobbyPlayers().map(player => player.playerId)).toEqual([next.playerId]);
     display.ws.close();
+  });
+
+  it('restores a finished standalone race after a brief display outage, then reaps it after the grace period', async () => {
+    server = new GameServer({ port: 0, resultReconnectGraceMs: 300 });
+    server.setRoomConfigProvider(() => ({ carCount: 1, maps: ['Silver Lake'] }));
+    const port = await server.start();
+    const room = server.getOrCreateRoom('RACE-RECONNECT');
+    const player = room.addPlayer('Ada') as { playerId: string };
+    room.start();
+    for (let index = 0; index < 60 * 120 && room.phase !== 'results'; index++) room.tick(STEP);
+    expect(room.phase).toBe('results');
+    const finished = room.results();
+    const first = connect(port); await first.open();
+    first.ws.send(JSON.stringify({ type: 'spectate', roomCode: room.code }));
+    await vi.waitFor(() => expect(first.inbox.some(message => message.type === 'results')).toBe(true));
+    server.voiceLeave(room.code, player.playerId);
+    first.ws.close();
+    await new Promise<void>(resolve => first.ws.once('close', () => resolve()));
+    expect(server.findRoom(room.code)).toBe(room);
+
+    const restored = connect(port); await restored.open();
+    restored.ws.send(JSON.stringify({ type: 'spectate', roomCode: room.code }));
+    await vi.waitFor(() => expect(restored.inbox.some(message => message.type === 'results')).toBe(true));
+    expect(room.results()).toEqual(finished);
+    await wait(350);
+    expect(server.findRoom(room.code)).toBe(room);
+
+    restored.ws.close();
+    await new Promise<void>(resolve => restored.ws.once('close', () => resolve()));
+    await vi.waitFor(() => expect(server.findRoom(room.code)).toBeUndefined());
   });
 
   it('enables a results Replay tap only for a caller allowed to advance that round', async () => {
@@ -667,7 +769,7 @@ describe('HttpServer voice routing seams', () => {
     expect(room.lobbyPlayers()[0]).toMatchObject({name:'Racer 1234',carIndex:null});
   });
 
-  it('lets a late map-select caller provide a name and choose a car before voting', async()=>{
+  it('keeps a late caller on map selection and accepts an explicit name without misreading a choice', async()=>{
     http=new HttpServer({port:0,publicBaseUrl:'http://localhost',validateSignatures:false});await http.start();
     const game=(http as unknown as {game:GameServer}).game;
     game.setRoomConfigProvider(()=>({carCount:2,carNames:['Roadster','Coupe'],maps:['Silver Lake','Drift']}));
@@ -675,12 +777,12 @@ describe('HttpServer voice routing seams', () => {
     room.advance();room.selectCar(first.playerId,0);room.advance();
     const late=room.addPlayer('Racer 2222',undefined,undefined,false) as {playerId:string};
 
-    expect(room.phase).toBe('lobby');
-    expect(http.directSelectionForTest(room,late.playerId,'Bo')).toContain('Nice to meet you');
-    expect(game.voiceAdvance(room.code,late.playerId)).toBe(true);
+    expect(room.phase).toBe('map_select');
+    expect(http.directSelectionForTest(room,late.playerId,'something fast')).toBeNull();
+    expect(room.lobbyPlayers().find(player=>player.playerId===late.playerId)?.name).toBe('Racer 2222');
+    expect(http.directSelectionForTest(room,late.playerId,"I'm Bo")).toContain('Nice to meet you');
     expect(http.directSelectionForTest(room,late.playerId,'two')).toContain('Coupe');
     expect(room.lobbyPlayers().find(player=>player.playerId===late.playerId)).toMatchObject({name:'Bo',carIndex:1});
-    expect(game.voiceAdvance(room.code,late.playerId)).toBe(true);
     expect(http.directSelectionForTest(room,late.playerId,'one')).toContain("vote's in");
     expect(room.mapVotes().counts).toEqual({'Silver Lake':1});
   });

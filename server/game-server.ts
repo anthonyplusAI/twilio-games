@@ -20,7 +20,8 @@ export function parseClientMessage(raw: string): ParseResult {
         return err('bad_join', 'roomCode and name required');
       return { type: 'join', roomCode: obj.roomCode, name: obj.name,
                ...(typeof obj.color === 'string' ? { color: obj.color } : {}),
-               ...(isSupportedLocale(obj.locale) ? { locale: obj.locale } : {}) };
+               ...(isSupportedLocale(obj.locale) ? { locale: obj.locale } : {}),
+               ...(obj.rendererReadyGate === true ? { rendererReadyGate: true } : {}) };
     case 'intent':
       if (!INTENTS.includes(obj.intent)) return err('bad_intent', 'unknown intent');
       return { type: 'intent', intent: obj.intent };
@@ -69,9 +70,12 @@ export function parseClientMessage(raw: string): ParseResult {
 function err(code: string, message: string): ParseResult { return { type: 'error', code, message }; }
 
 export const RACER_BROADCAST_HZ = 30;
+export const RACER_RESULT_RECONNECT_GRACE_MS = 60_000;
+export const RACER_STANDALONE_RENDER_READY_TIMEOUT_MS = 16_000;
 const RACER_LOBBY_BROADCAST_HZ = 2;
 
-interface Conn { ws: WebSocket; roomCode?: string; playerId?: string; locale?: SupportedLocale; stationDisplay?: boolean; hostAuthorized?: boolean; }
+interface Conn { ws: WebSocket; roomCode?: string; playerId?: string; locale?: SupportedLocale;
+  stationDisplay?: boolean; hostAuthorized?: boolean; rendererReadyGate?: boolean; }
 
 export class GameServer {
   private wss: WebSocketServer | null = null;
@@ -98,13 +102,19 @@ export class GameServer {
   private reported = new WeakSet<Room>();
   private started = new WeakSet<Room>();
   private stationRendererReady = new WeakMap<Room, WebSocket | null>();
+  private standaloneRendererGate = new WeakMap<Room, { deadline: number; released: boolean;
+    source: 'display' | 'player' }>();
   private allowBrowserPlayer: (roomCode: string) => boolean = () => true;
   private readonly displayToken: string;
   private onDisplayAuthenticated: ((ws: WebSocket) => void) | null = null;
+  private readonly resultReconnectGraceMs: number;
+  private resultReconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-  constructor(opts: { port?: number; server?: HttpServer; broadcastHz?: number; displayToken?: string }) {
+  constructor(opts: { port?: number; server?: HttpServer; broadcastHz?: number; displayToken?: string;
+    resultReconnectGraceMs?: number }) {
     this.port = opts.port;
     this.displayToken = opts.displayToken?.trim() ?? '';
+    this.resultReconnectGraceMs = opts.resultReconnectGraceMs ?? RACER_RESULT_RECONNECT_GRACE_MS;
     const broadcastHz=opts.broadcastHz??RACER_BROADCAST_HZ;
     this.broadcastEvery = 1 / broadcastHz;
     this.lobbyBroadcastEvery=Math.max(1,Math.round(broadcastHz/RACER_LOBBY_BROADCAST_HZ));
@@ -207,8 +217,10 @@ export class GameServer {
         const room = this.room(msg.roomCode);
         const res = room.addPlayer(msg.name, msg.color);
         if ('error' in res) return this.send(conn, { type: 'error', code: res.error, message: res.error });
+        this.clearResultReconnectTimer(msg.roomCode);
         this.releasePreviousBinding(conn, msg.roomCode);
         conn.roomCode = msg.roomCode; conn.playerId = res.playerId;
+        conn.rendererReadyGate = msg.rendererReadyGate === true;
         this.send(conn, { type: 'joined', playerId: res.playerId, lane: res.lane, roomCode: msg.roomCode });
         if(['countdown','racing'].includes(room.phase))this.send(conn,anyItems(room));
         this.pushLobby(msg.roomCode);   // update every conn's roster instantly
@@ -223,6 +235,14 @@ export class GameServer {
             this.markStationRendererReady(conn.roomCode, conn.ws);
             break;
           }
+          if (room?.phase === 'countdown' && !room.usesStationSetup) {
+            const gate = this.standaloneRendererGate.get(room);
+            const permitted = gate?.source === 'display'
+              ? !conn.playerId && !conn.stationDisplay && conn.hostAuthorized
+              : gate?.source === 'player' && !!conn.playerId && conn.rendererReadyGate;
+            if (gate && permitted) { gate.released = true; this.roomAccum.delete(room); }
+            break;
+          }
           if(room?.usesStationSetup){
             this.send(conn,{type:'error',code:'station_voice_only',message:'station_voice_only'});
             break;
@@ -233,6 +253,7 @@ export class GameServer {
           }
           if (room && (room.phase === 'lobby' || room.phase === 'finished')) {
             if (room.start()) {
+              this.resetRendererPreparation(room);
               this.reportStartedOnce(room);
               this.broadcastItems(conn.roomCode);
             } else this.pushLobby(conn.roomCode);
@@ -329,7 +350,7 @@ export class GameServer {
           const before = room.phase;
           room.advance(conn.playerId);
           const after = room.phase;
-          if (after === 'countdown') this.stationRendererReady.delete(room);
+          if (after === 'countdown' && before !== 'countdown') this.resetRendererPreparation(room);
           if (after === 'countdown' || after === 'racing') this.reportStartedOnce(room);
           // Crossing into a race broadcasts items (with the chosen map) to EVERY conn in the room
           // so all displays/players load the right level; otherwise refresh the select screen.
@@ -359,6 +380,7 @@ export class GameServer {
           this.send(conn, { type: 'error', code: 'station_requeue_required', message: 'station_requeue_required' });
         } else if (room) {
           if (room.start()) {
+            if (room.phase === 'countdown') this.resetRendererPreparation(room);
             this.reportAbandonedOnce(room); this.reportStartedOnce(room); this.broadcastItems(conn.roomCode!);
           } else this.pushLobby(conn.roomCode!);
         }
@@ -375,9 +397,11 @@ export class GameServer {
           this.releasePreviousBinding(conn, msg.roomCode);
         }
         conn.stationDisplay = stationDisplay;
+        conn.rendererReadyGate = false;
         conn.hostAuthorized = !stationDisplay || msg.displayToken === this.displayToken;
         if (this.displayToken && msg.displayToken === this.displayToken) this.onDisplayAuthenticated?.(conn.ws);
         conn.roomCode = msg.roomCode;   // no playerId: receives broadcasts, occupies no slot
+        this.clearResultReconnectTimer(msg.roomCode);
         this.pushLobby(msg.roomCode);   // send the display the current select/lobby state immediately
         if (['countdown', 'racing'].includes(room.phase)) this.send(conn, anyItems(room));
         break;
@@ -390,6 +414,7 @@ export class GameServer {
           conn.playerId = undefined;
           conn.hostAuthorized = false;
           conn.stationDisplay = false;
+          conn.rendererReadyGate = false;
           this.reapRoomIfEmpty(conn.roomCode);
         } else if (conn.roomCode) {
           // A display leaving its room is no longer an eligible standalone voice destination.
@@ -403,6 +428,7 @@ export class GameServer {
           conn.roomCode = undefined;
           conn.hostAuthorized = false;
           conn.stationDisplay = false;
+          conn.rendererReadyGate = false;
           this.reapRoomIfEmpty(roomCode);
         }
         break;
@@ -419,6 +445,7 @@ export class GameServer {
   abortRoom(code: string): boolean {
     const room = this.rooms.find(code);
     if (!room) return false;
+    this.clearResultReconnectTimer(code);
     for (const conn of this.conns) {
       if (conn.roomCode !== code) continue;
       conn.roomCode = undefined;
@@ -488,7 +515,7 @@ export class GameServer {
     const before = room.phase;
     room.advance(spokenReplyPlayerId);
     const after = room.phase;
-    if (after === 'countdown') this.stationRendererReady.delete(room);
+    if (after === 'countdown' && before !== 'countdown') this.resetRendererPreparation(room);
     if (after === 'countdown' || after === 'racing') this.reportStartedOnce(room);
     if (after === 'countdown' || after === 'racing') this.broadcastItems(roomCode);
     else this.pushLobby(roomCode);
@@ -501,7 +528,8 @@ export class GameServer {
 
   private publishSetupMutation(room:Room,before:Phase,spokenReplyPlayerId?:string):void {
     const after=room.phase;
-    if(after==='countdown')this.stationRendererReady.delete(room);
+    if(after!=='results'&&after!=='finished')this.clearResultReconnectTimer(room.code);
+    if(after==='countdown'&&before!=='countdown')this.resetRendererPreparation(room);
     if(after==='countdown'||after==='racing'){
       this.reportStartedOnce(room);this.broadcastItems(room.code);
     }else this.pushLobby(room.code);
@@ -555,6 +583,37 @@ export class GameServer {
     this.roomAccum.delete(room);
     return true;
   }
+
+  private resetRendererPreparation(room: Room): void {
+    this.stationRendererReady.delete(room);
+    this.standaloneRendererGate.delete(room);
+  }
+
+  /** A standalone display is already present during voice/menu selection. Give it one bounded
+   * loading window so an authored map cannot replace a track after the cars start moving. */
+  private rendererPreparationPending(room: Room): boolean {
+    if (room.phase !== 'countdown') return false;
+    if (room.usesStationSetup) return !this.stationRendererReady.has(room);
+    if (!this.started.has(room) && !this.standaloneRendererGate.has(room)) {
+      let displayReady = false;
+      let playerReady = false;
+      for (const conn of this.conns) {
+        if (conn.roomCode !== room.code || conn.ws.readyState !== WebSocket.OPEN) continue;
+        if (!conn.playerId && !conn.stationDisplay && conn.hostAuthorized) displayReady = true;
+        else if (conn.playerId && conn.rendererReadyGate) playerReady = true;
+        if (displayReady) break;
+      }
+      if (displayReady || playerReady) this.standaloneRendererGate.set(room, {
+        deadline: Date.now() + RACER_STANDALONE_RENDER_READY_TIMEOUT_MS,
+        released: false,
+        source: displayReady ? 'display' : 'player',
+      });
+    }
+    const gate = this.standaloneRendererGate.get(room);
+    if (!gate || gate.released) return false;
+    if (Date.now() >= gate.deadline) { gate.released = true; return false; }
+    return true;
+  }
   /** Number of live rooms (test/diagnostic hook for the room-leak fix). */
   get roomCount(): number { return this.rooms.count; }
   /** Live WS connections (displays + device players). Used by the voice router to auto-join a caller
@@ -581,6 +640,7 @@ export class GameServer {
     conn.playerId = undefined;
     conn.stationDisplay = false;
     conn.hostAuthorized = false;
+    conn.rendererReadyGate = false;
     if (room && previousPlayerId) {
       const before = room.phase;
       room.removePlayer(previousPlayerId);
@@ -600,10 +660,33 @@ export class GameServer {
    * still pointing at it. Prevents the room + its accumulator from leaking for the life of the
    * process after an event's worth of one-off room codes.
    */
-  private reapRoomIfEmpty(roomCode: string): void {
+  private clearResultReconnectTimer(roomCode: string): void {
+    const timer = this.resultReconnectTimers.get(roomCode);
+    if (timer) clearTimeout(timer);
+    this.resultReconnectTimers.delete(roomCode);
+  }
+
+  private reapRoomIfEmpty(roomCode: string, graceExpired = false): void {
     const room = this.rooms.find(roomCode);
     if (!room || !room.isEmpty) return;
     for (const c of this.conns) if (c.roomCode === roomCode) return;   // a spectator is still watching
+    if (room.phase === 'results' || room.phase === 'finished') {
+      // The station owns its handoff. A standalone result survives a brief display outage so a
+      // reconnecting screen can show the score and technology explanation after the call ends.
+      if (room.usesStationSetup) return;
+      if (!graceExpired) {
+        if (!this.resultReconnectTimers.has(roomCode)) {
+          const timer = setTimeout(() => {
+            this.resultReconnectTimers.delete(roomCode);
+            if (this.rooms.find(roomCode) === room) this.reapRoomIfEmpty(roomCode, true);
+          }, this.resultReconnectGraceMs);
+          (timer as { unref?: () => void }).unref?.();
+          this.resultReconnectTimers.set(roomCode, timer);
+        }
+        return;
+      }
+    }
+    this.clearResultReconnectTimer(roomCode);
     this.roomAccum.delete(room);
     this.rooms.remove(roomCode);
   }
@@ -641,7 +724,7 @@ export class GameServer {
       else this.reportFinishedOnce(room);   // belt-and-suspenders if it slipped through
       return;
     }
-    if (room.phase === 'countdown' && room.usesStationSetup && !this.stationRendererReady.has(room)) {
+    if (this.rendererPreparationPending(room)) {
       this.roomAccum.delete(room);
       return;
     }
@@ -671,7 +754,7 @@ export class GameServer {
 
   private reportStartedOnce(room: Room): void {
     if (this.started.has(room) || (room.phase !== 'countdown' && room.phase !== 'racing')) return;
-    if (room.usesStationSetup && room.phase === 'countdown' && !this.stationRendererReady.has(room)) return;
+    if (this.rendererPreparationPending(room)) return;
     this.started.add(room); this.onRaceStarted?.(room);
   }
 
@@ -765,6 +848,7 @@ export class GameServer {
    */
   stopLoopOnly(): void {
     this.clearLoop();
+    for (const code of this.resultReconnectTimers.keys()) this.clearResultReconnectTimer(code);
     for (const c of this.conns) c.ws.close();
     this.conns.clear();
   }
@@ -772,6 +856,7 @@ export class GameServer {
   stop(): Promise<void> {
     return new Promise((resolve) => {
       this.clearLoop();
+      for (const code of this.resultReconnectTimers.keys()) this.clearResultReconnectTimer(code);
       for (const c of this.conns) c.ws.close();
       this.conns.clear();
       if (this.wss) this.wss.close(() => resolve()); else resolve();

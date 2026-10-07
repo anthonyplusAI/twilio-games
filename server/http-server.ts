@@ -59,6 +59,7 @@ import { matchChoice, clearSelectionIndex, type HostContext } from './game-host'
 import { interpretVoiceTurn, type VoiceInterpretAction, type VoiceInterpretChoice,
   type VoiceInterpretFact, type VoiceInterpretRequest } from './voice-interpreter';
 import { BattleVoiceSession, parseSpokenName, isAdvanceWord, type BattleVoiceSnapshot } from './battle-voice';
+import { isExplicitSpokenName } from '../shared/spoken-name';
 import { FighterVoiceSession, type FighterVoiceSnapshot } from './fighter-voice';
 import type { BattleHostContext } from './battle-host';
 import { monsterById, rosterEntries } from '../shared/monster-roster';
@@ -2223,6 +2224,8 @@ export class HttpServer {
       queueEarlyAnswer: (code, playerId, questionId, attemptId, choiceId) =>
         this.trivia.voiceQueueEarlyAnswer(code, playerId, questionId, attemptId, choiceId),
       pauseAudio: (code, questionId, attemptId) => this.trivia.voicePauseAudio(code, questionId, attemptId),
+      retryQuestion: (code, playerId, questionId, attemptId) =>
+        this.trivia.voiceRetryQuestion(code, playerId, questionId, attemptId),
       beginAnswerResolution: (code, playerId, questionId, attemptId, onset) =>
         this.trivia.voiceBeginAnswerResolution(code, playerId, questionId, attemptId, onset),
       finishAnswerResolution: (code, playerId, questionId, attemptId, resolutionId) =>
@@ -2402,14 +2405,14 @@ export class HttpServer {
   ): KaraokeVoiceSession {
     let session: KaraokeVoiceSession;
     session = new KaraokeVoiceSession({
-      bind: (code, name, callSid, locale, nameConfirmed) => {
+      bind: (code, name, callSid, locale, nameConfirmed, stationManaged) => {
         code = code.trim().toUpperCase();
         const sid = callSid.trim();
         const registeredAccountSid = this.voiceAccountSids.get(sid);
         if (!validProviderIdentity(sid) || !registeredAccountSid) return null;
         const resumed = this.resumeKaraokeVoiceCall(code, callSid, session);
         if (resumed) return { playerId: resumed, resumed: true };
-        const playerId = this.karaoke.voiceJoin(code, name, 1, nameConfirmed, locale);
+        const playerId = this.karaoke.voiceJoin(code, name, 1, nameConfirmed, locale, stationManaged);
         if (!playerId) return null;
         this.rememberKaraokeVoiceCall(callSid, code, playerId, locale, session);
         this.registerKaraokeVoiceSession(code, session);
@@ -3014,21 +3017,14 @@ export class HttpServer {
     // recap prompts mentioning a rematch must not advance results back to car select).
     if (utterance.trim().startsWith('(')) return null;
 
-    // NAME CAPTURE (deterministic, LLM-independent): the FIRST thing we ask is the caller's name, so in
-    // the LOBBY, while they still have the auto placeholder name, treat a name-like reply as their name.
-    // Late callers may answer the same prompt in selection, but an actual car/map match wins.
-    const explicitName = locale === 'pt-BR'
-      ? /^(?:meu nome é|meu nome e|eu sou|pode me chamar de)\b/i.test(utterance.trim())
-      : /^(?:my name is|i am|i'm|im|call me|this is)\b/i.test(utterance.trim());
+    // The lobby requests a name. Once car or track selection is visible, only an explicit
+    // introduction may change it; open-ended choice descriptions belong to the intent resolver.
+    const explicitName = isExplicitSpokenName(utterance, locale);
     const me = room.lobbyPlayers().find(p => p.playerId === playerId);
     const hasRealName = room.hasConfirmedName(playerId);
     const parsedName = !hasRealName ? parseSpokenName(utterance, locale) : null;
     const acceptingName = room.phase === 'lobby' || room.phase === 'car_select' || room.phase === 'map_select';
-    const bareLateName = room.phase !== 'lobby' && acceptingName && parsedName
-      && utterance.trim().split(/\s+/).length <= 2
-      && clearSelectionIndex(utterance, carChoices, locale) === null
-      && clearSelectionIndex(utterance, mapChoices, locale) === null;
-    if (!nameLocked && acceptingName && (room.phase === 'lobby' || explicitName || bareLateName)) {
+    if (!nameLocked && acceptingName && (room.phase === 'lobby' || explicitName)) {
       if (!hasRealName && !isRacerAdvanceWord(utterance, locale)) {
         const name = parsedName;
         if (name) {
@@ -3366,7 +3362,8 @@ export class HttpServer {
       const board=rank&&count?`Você está em ${ordinal(rank,locale)} de ${count} na classificação.`
         :context.allTimeBest?`${context.allTimeBest.name} lidera a classificação com ${time(context.allTimeBest.time)} segundos.`
           :'A classificação está na tela.';
-      return `${race} ${board}${context.stationManaged
+      const technology='O Twilio Conversation Relay transformou seus comandos falados de direção e turbo nesta corrida na tela.';
+      return `${race} ${board} ${technology}${context.stationManaged
         ? ' Para correr novamente, veja nas mensagens as instruções sobre moedas.'
         : ' Quer correr de novo?'}`;
     }
@@ -3376,7 +3373,8 @@ export class HttpServer {
     const board=rank&&count?`You rank ${ordinal(rank,locale)} of ${count} on the leaderboard.`
       :context.allTimeBest?`${context.allTimeBest.name} leads the leaderboard at ${time(context.allTimeBest.time)} seconds.`
         :'The leaderboard is on the display.';
-    return `${race} ${board}${context.stationManaged
+    const technology='Twilio Conversation Relay turned your spoken steering and boosts into this race on screen.';
+    return `${race} ${board} ${technology}${context.stationManaged
       ? ' For another race, check your messages for game coin instructions.'
       : ' Want another race?'}`;
   }
@@ -3448,7 +3446,7 @@ export class HttpServer {
         myMonsterType: mon?.type ?? null,
         canAdvanceLobby:room.canAdvanceLobby,
         canStartBattle,
-        canRematch: room.canRematch,
+        canRematch: room.canStartNextRound(playerId),
         foeName: null, foeMonsterName: null, foeMonsterType: null, myHp: null, myMaxHp: null, foeHp: null, foeMaxHp: null,
         myPotions: 2, myGuarding: false, myTaunted: false, foeGuarding: false, foeTaunted: false,
         turn: null, activeSide: null, activeMenu: 'root', whoseTurn: null, participating: false, myMoves: [], winnerName: res?.winnerName ?? null,
@@ -3466,7 +3464,7 @@ export class HttpServer {
       myMonsterType: me.type,
       canAdvanceLobby:room.canAdvanceLobby,
       canStartBattle,
-      canRematch: room.canRematch,
+      canRematch: room.canStartNextRound(playerId),
       foeName: foe.name,
       foeMonsterName: localizedMonsterName(locale, foe.monsterId),
       foeMonsterType: foe.type,

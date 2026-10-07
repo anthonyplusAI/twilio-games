@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
 import { createChessPiece, pieceShardMaterial, pieceSpellColor,
   type ChessColor, type ChessPieceType } from './chess-pieces';
+import { ChessHall, type ChessTheme } from './chess-hall';
 
 export interface BoardPiece {
   square: string;
@@ -154,10 +155,17 @@ export class ChessBoardScene {
   private readonly particles: Particle[] = [];
   private readonly resizeObserver: ResizeObserver | null;
   private readonly reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
-  private readonly embers: THREE.Points;
-  private readonly emberPositions: Float32Array;
-  private readonly crimsonLight: THREE.PointLight;
-  private readonly cobaltLight: THREE.PointLight;
+  private readonly hall: ChessHall;
+  private boardMaterials!: {
+    stone: THREE.MeshStandardMaterial;
+    underStone: THREE.MeshStandardMaterial;
+    metal: THREE.MeshStandardMaterial;
+    inset: THREE.MeshStandardMaterial;
+    lightTile: THREE.MeshStandardMaterial;
+    darkTile: THREE.MeshStandardMaterial;
+  };
+  private theme: ChessTheme = 'light';
+  private appliedTheme: ChessTheme | null = null;
   private frame = 0;
   private lastFrameAt = 0;
   private humanColor: ChessColor = 'w';
@@ -167,13 +175,17 @@ export class ChessBoardScene {
   private onAvailability?: (available: boolean) => void;
 
   constructor(private readonly container: HTMLElement) {
-    const lowPowerDisplay = (navigator as Navigator & { deviceMemory?: number }).deviceMemory !== undefined
-      ? (navigator as Navigator & { deviceMemory?: number }).deviceMemory! <= 4
-      : matchMedia('(pointer: coarse) and (max-width: 900px)').matches;
+    const device = navigator as Navigator & { deviceMemory?: number };
+    const lowPowerDisplay = (device.deviceMemory !== undefined && device.deviceMemory <= 4)
+      || (device.hardwareConcurrency !== undefined && device.hardwareConcurrency <= 4)
+      || matchMedia('(pointer: coarse) and (max-width: 900px)').matches;
     this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
     this.renderer.setPixelRatio(Math.min(devicePixelRatio || 1, lowPowerDisplay ? 1.3 : 1.7));
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    // Only chess pieces move. Rebuilding the shadow atlas while the board is idle wastes GPU time.
+    this.renderer.shadowMap.autoUpdate = false;
+    this.renderer.shadowMap.needsUpdate = true;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.28;
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -203,39 +215,17 @@ export class ChessBoardScene {
     });
     this.canvas.addEventListener('webglcontextrestored', () => {
       this.ready = true;
+      this.renderer.shadowMap.needsUpdate = true;
       this.onAvailability?.(true);
     });
 
-    this.scene.background = new THREE.Color(0x030b1b);
-    this.scene.fog = new THREE.FogExp2(0x030b1b, 0.018);
-    this.scene.add(new THREE.HemisphereLight(0xdbe8ff, 0x2d1824, 1.7));
-    const keyLight = new THREE.DirectionalLight(0xfff1dc, 3.0);
-    keyLight.position.set(-4, 12, 7);
-    keyLight.castShadow = true;
-    keyLight.shadow.mapSize.set(lowPowerDisplay ? 1024 : 2048, lowPowerDisplay ? 1024 : 2048);
-    keyLight.shadow.camera.left = -12;
-    keyLight.shadow.camera.right = 12;
-    keyLight.shadow.camera.top = 12;
-    keyLight.shadow.camera.bottom = -12;
-    keyLight.shadow.bias = -0.00012;
-    this.scene.add(keyLight);
-    this.crimsonLight = new THREE.PointLight(0xff2846, 28, 13, 2);
-    this.crimsonLight.position.set(-5.6, 2.5, 1.2);
-    this.scene.add(this.crimsonLight);
-    this.cobaltLight = new THREE.PointLight(0x4ab4ff, 18, 13, 2);
-    this.cobaltLight.position.set(5.7, 2.9, -1.5);
-    this.scene.add(this.cobaltLight);
-
-    this.createHall();
+    this.hall = new ChessHall(this.scene, lowPowerDisplay, this.reducedMotion);
     this.createBoard();
     this.scene.add(this.board);
     this.scene.add(this.pieceLayer);
     this.scene.add(this.coordinateLayer);
-    const { points, positions } = this.createEmbers();
-    this.embers = points;
-    this.emberPositions = positions;
-    this.scene.add(points);
     this.setHumanColor('w');
+    this.setTheme('light');
 
     this.resizeObserver = typeof ResizeObserver !== 'undefined'
       ? new ResizeObserver(() => this.resize()) : null;
@@ -258,23 +248,54 @@ export class ChessBoardScene {
     this.replaceCoordinates();
   }
 
+  setTheme(theme: ChessTheme): void {
+    if (this.appliedTheme === theme) return;
+    this.appliedTheme = theme;
+    this.theme = theme;
+    this.hall.setTheme(theme);
+    const light = theme === 'light';
+    this.renderer.toneMappingExposure = light ? 1.19 : 1.28;
+    this.boardMaterials.stone.color.setHex(light ? 0x273a54 : 0x142139);
+    this.boardMaterials.underStone.color.setHex(light ? 0x16263b : 0x070d1d);
+    this.boardMaterials.metal.color.setHex(light ? 0xb28954 : 0xa77c51);
+    this.boardMaterials.inset.color.setHex(light ? 0x9d2c4d : 0xa91131);
+    this.boardMaterials.lightTile.color.setHex(light ? 0xffffff : 0xdce7fb);
+    this.boardMaterials.darkTile.color.setHex(light ? 0xffffff : 0xc6d5ef);
+    this.replaceCoordinates();
+  }
+
   resetCamera(): void {
     this.cameraAdjusted = false;
     this.positionCamera();
   }
 
   setPosition(next: readonly BoardPiece[]): void {
-    for (const visual of this.pieces.values()) this.pieceLayer.remove(visual.group);
+    const previous = new Map(this.pieces);
+    let changed = false;
     this.pieces.clear();
     for (const piece of next) {
       const position = squarePosition(piece.square);
       if (!position || !['w', 'b'].includes(piece.color) || !['p', 'n', 'b', 'r', 'q', 'k'].includes(piece.type)) continue;
-      const group = createChessPiece(piece.type, piece.color);
+      const existing = previous.get(piece.square);
+      const group = existing?.type === piece.type && existing.color === piece.color
+        ? existing.group : createChessPiece(piece.type, piece.color);
+      const rotation = piece.color === 'w' ? 0 : Math.PI;
+      changed ||= group !== existing?.group || !group.position.equals(position)
+        || group.rotation.y !== rotation || group.rotation.z !== 0 || !group.visible;
+      if (existing && group !== existing.group) this.pieceLayer.remove(existing.group);
       group.position.copy(position);
-      group.rotation.y = piece.color === 'w' ? 0 : Math.PI;
-      this.pieceLayer.add(group);
+      group.rotation.y = rotation;
+      group.rotation.z = 0;
+      group.visible = true;
+      if (group.parent !== this.pieceLayer) this.pieceLayer.add(group);
       this.pieces.set(piece.square, { ...piece, group });
+      previous.delete(piece.square);
     }
+    for (const visual of previous.values()) {
+      this.pieceLayer.remove(visual.group);
+      changed = true;
+    }
+    if (changed) this.renderer.shadowMap.needsUpdate = true;
   }
 
   animateTo(next: readonly BoardPiece[], move: BoardMove): Promise<void> {
@@ -302,8 +323,8 @@ export class ChessBoardScene {
   }
 
   setPendingMove(from: string | null, to: string | null): void {
-    this.placeHighlight('pending-from', from, 0xffd18b, 0.20);
-    this.placeHighlight('pending-to', to, 0xffcc69, 0.30);
+    this.placeHighlight('pending-from', from, 0x09eb65, 0.48);
+    this.placeHighlight('pending-to', to, 0x00ed57, 0.78);
   }
 
   setSelection(square: string | null): void {
@@ -335,6 +356,28 @@ export class ChessBoardScene {
     this.orbit.removeEventListener('start', this.onCameraStart);
     this.orbit.removeEventListener('end', this.onCameraEnd);
     this.orbit.dispose();
+    this.hall.dispose();
+    for (const particle of this.particles) {
+      this.scene.remove(particle.mesh);
+      particle.material.dispose();
+    }
+    this.particles.length = 0;
+    const geometry = new Set<THREE.BufferGeometry>();
+    const materials = new Set<THREE.Material>();
+    for (const layer of [this.board, this.coordinateLayer, ...this.highlights.values()]) {
+      layer.traverse(object => {
+        if (object instanceof THREE.Mesh || object instanceof THREE.LineLoop || object instanceof THREE.Sprite) {
+          if (object instanceof THREE.Mesh || object instanceof THREE.LineLoop) geometry.add(object.geometry);
+          const objectMaterials = Array.isArray(object.material) ? object.material : [object.material];
+          objectMaterials.forEach(material => materials.add(material));
+        }
+      });
+    }
+    geometry.forEach(item => item.dispose());
+    materials.forEach(material => {
+      if ('map' in material && material.map instanceof THREE.Texture) material.map.dispose();
+      material.dispose();
+    });
     this.renderer.dispose();
     this.canvas.remove();
   }
@@ -384,7 +427,7 @@ export class ChessBoardScene {
     const sign = this.humanColor === 'w' ? 1 : -1;
     const shift = narrow ? -0.75 : 0;
     this.orbit.maxZoom = 1.65;
-    this.camera.zoom = 1;
+    this.camera.zoom = narrow ? 1 : 0.88;
     this.camera.position.set(sign * (narrow ? 0.45 : 8.5), (narrow ? 18.5 : 13.1) + shift,
       sign * (narrow ? 14.4 : 13.4));
     this.orbit.target.set(0, 0.3 + shift, 0);
@@ -423,17 +466,7 @@ export class ChessBoardScene {
       if (this.orbit.update()) this.constrainCameraFraming();
       this.updateAnimation(now);
       this.updateParticles(now, dt);
-      if (!this.reducedMotion) {
-        this.crimsonLight.intensity = 27 + Math.sin(now * 0.0019) * 2.5;
-        this.cobaltLight.intensity = 17 + Math.sin(now * 0.0015 + 1.2) * 2;
-        this.embers.rotation.y = Math.sin(now * 0.00007) * 0.02;
-        const positions = this.emberPositions;
-        for (let i = 1; i < positions.length; i += 3) {
-          positions[i] = (positions[i] ?? 0) + dt * (i % 4 === 0 ? 0.12 : 0.075);
-          if ((positions[i] ?? 0) > 6.8) positions[i] = -0.8;
-        }
-        (this.embers.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
-      }
+      this.hall.update(now, dt, this.camera);
       this.renderer.render(this.scene, this.camera);
     }
     this.frame = requestAnimationFrame(this.tick);
@@ -452,6 +485,7 @@ export class ChessBoardScene {
       : t;
     const eased = moveFraction * moveFraction * (3 - 2 * moveFraction);
     animation.attacker.group.position.copy(from).lerp(to, eased);
+    this.renderer.shadowMap.needsUpdate = true;
     const arc = animation.move.piece === 'n' ? 0.64 : animation.move.piece === 'b' || animation.move.piece === 'q' ? 0.43 : 0.24;
     animation.attacker.group.position.y += Math.sin(Math.PI * moveFraction) * arc;
     const lunge = capture ? Math.max(0, 1 - Math.abs(t - 0.61) / 0.14) : 0;
@@ -654,7 +688,7 @@ export class ChessBoardScene {
       sprite.material.dispose();
     }
     const near = this.humanColor === 'w' ? 1 : -1;
-    const color = '#efd9ac';
+    const color = this.theme === 'light' ? '#fff0c8' : '#efd9ac';
     for (let i = 0; i < 8; i++) {
       const file = this.humanColor === 'w' ? i : 7 - i;
       const fileLabel = textSprite(FILES[file]!.toUpperCase(), color);
@@ -668,10 +702,10 @@ export class ChessBoardScene {
   }
 
   private createBoard(): void {
-    const stone = new THREE.MeshStandardMaterial({ color: 0x142139, roughness: 0.48, metalness: 0.20 });
-    const underStone = new THREE.MeshStandardMaterial({ color: 0x070d1d, roughness: 0.62, metalness: 0.12 });
-    const metal = new THREE.MeshStandardMaterial({ color: 0xa77c51, roughness: 0.3, metalness: 0.72 });
-    const redInset = new THREE.MeshStandardMaterial({ color: 0xa91131, roughness: 0.25, metalness: 0.42,
+    const stone = new THREE.MeshStandardMaterial({ color: 0x273a54, roughness: 0.48, metalness: 0.20 });
+    const underStone = new THREE.MeshStandardMaterial({ color: 0x16263b, roughness: 0.62, metalness: 0.12 });
+    const metal = new THREE.MeshStandardMaterial({ color: 0xb28954, roughness: 0.3, metalness: 0.72 });
+    const redInset = new THREE.MeshStandardMaterial({ color: 0x9d2c4d, roughness: 0.25, metalness: 0.42,
       emissive: 0x8e0b25, emissiveIntensity: 0.55 });
     const under = new THREE.Mesh(new RoundedBoxGeometry(9.45, 0.30, 9.45, 3, 0.12), underStone);
     under.position.y = -0.27;
@@ -691,14 +725,26 @@ export class ChessBoardScene {
     this.board.add(inlay);
     const lightMaterial = new THREE.MeshStandardMaterial({ map: marbleTexture(true), roughness: 0.48, metalness: 0.05 });
     const darkMaterial = new THREE.MeshStandardMaterial({ map: marbleTexture(false), roughness: 0.38, metalness: 0.15 });
+    this.boardMaterials = { stone, underStone, metal, inset: redInset,
+      lightTile: lightMaterial, darkTile: darkMaterial };
     const tileGeometry = new THREE.BoxGeometry(0.994, 0.047, 0.994);
+    const lightTiles = new THREE.InstancedMesh(tileGeometry, lightMaterial, 32);
+    const darkTiles = new THREE.InstancedMesh(tileGeometry, darkMaterial, 32);
+    const tile = new THREE.Object3D();
+    let lightIndex = 0;
+    let darkIndex = 0;
     for (let rank = 1; rank <= 8; rank++) for (let file = 0; file < 8; file++) {
-      const tile = new THREE.Mesh(tileGeometry, (file + rank) % 2 ? darkMaterial : lightMaterial);
       tile.position.set(file - 3.5, 0.372, 4.5 - rank);
       tile.rotation.y = ((file * 3 + rank * 7) % 4) * Math.PI / 2;
-      tile.receiveShadow = true;
-      this.board.add(tile);
+      tile.updateMatrix();
+      if ((file + rank) % 2) darkTiles.setMatrixAt(darkIndex++, tile.matrix);
+      else lightTiles.setMatrixAt(lightIndex++, tile.matrix);
     }
+    lightTiles.instanceMatrix.needsUpdate = true;
+    darkTiles.instanceMatrix.needsUpdate = true;
+    lightTiles.receiveShadow = true;
+    darkTiles.receiveShadow = true;
+    this.board.add(lightTiles, darkTiles);
     // An illuminated groove and four corner seals make the board feel like a magical artifact.
     const groove = new THREE.LineLoop(new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(-4.08, 0.405, -4.08), new THREE.Vector3(4.08, 0.405, -4.08),
@@ -724,79 +770,4 @@ export class ChessBoardScene {
     }
   }
 
-  private createHall(): void {
-    const floor = new THREE.Mesh(new THREE.CircleGeometry(17, 64),
-      new THREE.MeshStandardMaterial({ color: 0x101c33, roughness: 0.92, metalness: 0.04 }));
-    floor.rotation.x = -Math.PI / 2;
-    floor.position.y = -0.74;
-    floor.receiveShadow = true;
-    this.scene.add(floor);
-    const innerRing = new THREE.Mesh(new THREE.TorusGeometry(6.6, 0.035, 7, 80),
-      new THREE.MeshBasicMaterial({ color: 0x71354b, transparent: true, opacity: 0.48 }));
-    innerRing.rotation.x = Math.PI / 2;
-    innerRing.position.y = -0.72;
-    this.scene.add(innerRing);
-    const outerRing = innerRing.clone();
-    outerRing.scale.setScalar(1.75);
-    outerRing.position.y = -0.715;
-    this.scene.add(outerRing);
-    const pillarMat = new THREE.MeshStandardMaterial({ color: 0x202d46, roughness: 0.68, metalness: 0.10 });
-    const capitalMat = new THREE.MeshStandardMaterial({ color: 0x59647a, roughness: 0.6, metalness: 0.14 });
-    const goldMat = new THREE.MeshStandardMaterial({ color: 0x8c704f, roughness: 0.4, metalness: 0.58 });
-    for (const x of [-8.3, 8.3]) for (const z of [-8.3, 8.3]) {
-      const column = new THREE.Group();
-      column.position.set(x, -0.73, z);
-      const base = new THREE.Mesh(new THREE.CylinderGeometry(0.72, 0.83, 0.54, 12), pillarMat);
-      base.position.y = 0.27;
-      base.castShadow = true;
-      column.add(base);
-      const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.43, 0.49, 4.65, 12), pillarMat);
-      shaft.position.y = 2.86;
-      shaft.castShadow = true;
-      column.add(shaft);
-      for (const y of [0.63, 4.67]) {
-        const ring = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.55, 0.20, 12), goldMat);
-        ring.position.y = y;
-        column.add(ring);
-      }
-      const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.76, 0.54, 0.52, 12), capitalMat);
-      cap.position.y = 5.12;
-      column.add(cap);
-      const crest = new THREE.Mesh(new THREE.ConeGeometry(0.42, 0.72, 8), capitalMat);
-      crest.position.y = 5.75;
-      column.add(crest);
-      this.scene.add(column);
-    }
-    const flameMaterial = new THREE.MeshBasicMaterial({ color: 0xff4860 });
-    const brazierMaterial = new THREE.MeshStandardMaterial({ color: 0x9b6a50, roughness: 0.38, metalness: 0.68 });
-    for (const x of [-5.5, 5.5]) for (const z of [-5.5, 5.5]) {
-      const bowl = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.12, 0.22, 10), brazierMaterial);
-      bowl.position.set(x, 0.55, z);
-      this.scene.add(bowl);
-      const flame = new THREE.Mesh(new THREE.ConeGeometry(0.12, 0.45, 9), flameMaterial);
-      flame.position.set(x, 0.88, z);
-      this.scene.add(flame);
-      const glow = new THREE.PointLight(0xff465d, 3.7, 4.5, 2);
-      glow.position.set(x, 1.12, z);
-      this.scene.add(glow);
-    }
-  }
-
-  private createEmbers(): { points: THREE.Points; positions: Float32Array } {
-    const count = 135;
-    const positions = new Float32Array(count * 3);
-    const random = seededRandom(0x172637);
-    for (let i = 0; i < count; i++) {
-      const theta = random() * Math.PI * 2;
-      const radius = 5 + random() * 8;
-      positions[i * 3] = Math.cos(theta) * radius;
-      positions[i * 3 + 1] = random() * 6.8 - 0.8;
-      positions[i * 3 + 2] = Math.sin(theta) * radius;
-    }
-    const geometry = new THREE.BufferGeometry();
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    const material = new THREE.PointsMaterial({ color: 0xf07883, size: 0.055, transparent: true, opacity: 0.58,
-      sizeAttenuation: true, depthWrite: false });
-    return { points: new THREE.Points(geometry, material), positions };
-  }
 }

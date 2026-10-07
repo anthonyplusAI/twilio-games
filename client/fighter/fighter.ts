@@ -3,7 +3,7 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 import { FighterActor } from './fighter-actor';
 import { FighterActorLoadCoordinator, fighterActorLoadContext, type FighterActorLoadContext } from './fighter-actor-loading';
-import { FIGHTERS, FIGHTER_ASSET_VERSION, loadAnimationSources, preferProceduralFighterAssets } from './fighter-assets';
+import { FIGHTERS, FIGHTER_ASSET_VERSION, fighterAssetFirstAttemptMs, loadAnimationSources, preferProceduralFighterAssets } from './fighter-assets';
 import { FighterAtmosphere, fighterAtmosphereSpec, type FighterAtmosphereSpec } from './fighter-atmosphere';
 import { FighterConnection, type FighterConnectionState } from './fighter-net';
 import { fighterResultActionState, isInteractiveShortcutTarget, resolveNumericSelection } from './fighter-client-utils';
@@ -83,7 +83,6 @@ if (pageUrl.searchParams.has('hostToken')) {
 const params = pageUrl.searchParams;
 const isDisplay = params.get('display') === '1';
 document.body.classList.toggle('event-display', isDisplay);
-localizeStaticUi();
 const roomCode = params.get('room') || DEFAULT_ROOM;
 const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const connection = new FighterConnection(`${wsProtocol}//${location.host}/fighter${isDisplay?'?display=1':''}`, locale);
@@ -116,8 +115,10 @@ let roster: FighterRosterEntry[] = [];
 let maps: FighterMapEntry[] = [];
 let phoneNumber = t('phone.fallback');
 const FIGHTER_ACTOR_TIMEOUT_MS = 30_000;
-const FIGHTER_ACTOR_FALLBACK_MS = 5_000;
-const FIGHTER_MAP_TIMEOUT_MS = 7_000;
+// The selected authored assets get a real first attempt before the display tells the
+// server it is ready. The procedural stage remains visible while those bytes arrive.
+const FIGHTER_ACTOR_FALLBACK_MS = fighterAssetFirstAttemptMs(browserConnection());
+const FIGHTER_MAP_TIMEOUT_MS = fighterAssetFirstAttemptMs(browserConnection());
 let phoneQr = '/brand/join-qr.png?v=2';
 let movement: Partial<Record<FighterId, { from: number; to: number; elapsed: number; jump: boolean; duration: number }>> = {};
 const actionDurations: Record<FighterId, number> = { p1: FIGHTER_RUN_FORWARD_DURATION, p2: FIGHTER_RUN_FORWARD_DURATION };
@@ -146,6 +147,7 @@ const cameraAxis = new THREE.Vector3(), cameraTarget = new THREE.Vector3(), came
 let flowMessage = '';
 let animationSources: Awaited<ReturnType<typeof loadAnimationSources>> | null = null;
 let animationLoadController: AbortController | null = null;
+let animationLoadPromise: Promise<Awaited<ReturnType<typeof loadAnimationSources>>> | null = null;
 const actorLoads = new Map<string, Promise<FighterActor>>();
 const actorLoadControllers = new Map<string, AbortController>();
 const fallbackActorIds = new Set<string>();
@@ -172,6 +174,9 @@ let pendingFightReceipt='';
 let sentFightReceipt='';
 let pendingResultReceipt='';
 let sentResultReceipt='';
+
+// Static labels include result-button state, which reads the initialized host/connection fields.
+localizeStaticUi();
 
 connection.onRoster((fighters, mapEntries) => { roster = fighters; maps = mapEntries; renderFlow(); });
 connection.onJoined(id => { playerId = id; renderFlow(); });
@@ -252,7 +257,8 @@ connection.onState(next => {
   }
   updateNames(next);
   if (next.phase === 'map_select') for (const player of next.players) if (player.fighterId) preloadFighterActor(player.fighterId);
-  if (next.selectedMap && ['loading', 'intro', 'countdown', 'fight', 'victory', 'results'].includes(next.phase)) applyMapTheme(next.selectedMap);
+  // Start the selected arena while callers are still deciding whether to begin.
+  if (next.selectedMap && ['map_select', 'loading', 'intro', 'countdown', 'fight', 'victory', 'results'].includes(next.phase)) applyMapTheme(next.selectedMap);
   if (fighterActorLoadContext(next) && (phaseChanged || selectionChanged || !actors)) prepareFight(next);
   if (phaseChanged && next.phase === 'intro') beginIntro(next);
   if (previousPhase === 'intro' && next.phase === 'countdown') endIntro(next);
@@ -296,8 +302,10 @@ async function initialize(): Promise<void> {
   const attempt = ++initializationAttempt;
   animationLoadController?.abort();
   animationLoadController = null;
+  animationLoadPromise = null;
   initializationFailed = false;
-  // Rendering and server readiness must never wait for optional FBX downloads.
+  // Render the lobby immediately. Match readiness waits for selected authored assets
+  // for a bounded period, while the procedural actors/stage cover true failures.
   animationSources = new Map();
   loading.classList.remove('done'); loading.setAttribute('aria-busy', 'true'); hideAssetError();
   setLoading(.05, t('loading.openingLobby'));
@@ -307,24 +315,29 @@ async function initialize(): Promise<void> {
     scheduleFightReceipt();scheduleResultReceipt();
   }, 250);
   setLoading(1, t('loading.ready'));
+  if (!preferProceduralFighterAssets(browserConnection()) && state?.phase !== 'fight') {
+    const controller = new AbortController();
+    animationLoadController = controller;
+    animationLoadPromise = loadAnimationSources(undefined, controller.signal).then(realSources => {
+      if (controller.signal.aborted || attempt !== initializationAttempt) return new Map();
+      animationSources = realSources;
+      // Warm only the chosen pair while players are in setup. Starting a large FBX during
+      // an active bout would compete with voice, map, and rendering traffic.
+      if (state?.phase === 'map_select') for (const player of state.players)
+        if (player.fighterId) preloadFighterActor(player.fighterId);
+      return realSources;
+    }, error => {
+      if (!controller.signal.aborted) console.warn('Fighter animations failed to load; procedural actors stay active.', error);
+      return new Map();
+    }).finally(() => {
+      if (animationLoadController === controller) {
+        animationLoadController = null;
+        animationLoadPromise = null;
+      }
+    });
+  }
   if (state?.phase === 'loading' || state?.phase === 'intro' || state?.phase === 'countdown' || state?.phase === 'fight') prepareFight(state);
   maybeSignalReady(); renderFlow();
-  if (preferProceduralFighterAssets(browserConnection()) || state?.phase === 'fight') return;
-  const controller = new AbortController();
-  animationLoadController = controller;
-  void loadAnimationSources(undefined, controller.signal).then(realSources => {
-    if (controller.signal.aborted) return;
-    if (attempt !== initializationAttempt) return;
-    animationSources = realSources;
-    // Warm only the chosen pair while players are in setup. Starting a large FBX during
-    // an active bout would compete with voice, map, and rendering traffic.
-    if (state?.phase === 'map_select') for (const player of state.players)
-      if (player.fighterId) preloadFighterActor(player.fighterId);
-  }, error => {
-    if (!controller.signal.aborted) console.warn('Fighter animations failed to load; procedural actors stay active.', error);
-  }).finally(() => {
-    if (animationLoadController === controller) animationLoadController = null;
-  });
 }
 
 function renderFlow(): void {
@@ -422,8 +435,7 @@ function updateTouchTarget(next:FighterState,previous:FighterState|null):void{
 function touchPicker(current:FighterState,target:FighterLobbyPlayer|null,kind:'fighter'|'map'):string{
   if(!isHost||!target)return '';
   const humans=current.players.filter(player=>!player.isAi);
-  const prompt=t(kind==='fighter'?'select.touchFighterFor':'select.touchArenaFor',{name:target.name});
-  return `<div class="touch-player-picker"><p>${escapeHtml(prompt)}</p><div class="touch-player-options">${humans.map(player=>{
+  return `<div class="touch-player-picker"><div class="touch-player-options">${humans.map(player=>{
     const chosen=kind==='fighter'?Boolean(player.fighterId):Boolean(current.mapVotesByPlayerId[player.playerId]);
     return `<button type="button" data-touch-player="${escapeHtml(player.playerId)}" aria-pressed="${player.playerId===target.playerId}" class="${player.playerId===target.playerId?'active':''}">${escapeHtml(player.name)}${chosen?' ✓':''}</button>`;
   }).join('')}</div></div>`;
@@ -571,7 +583,13 @@ function prepareFight(next: FighterState): void {
 
 function ensureFightActors(context: FighterActorLoadContext): void {
   if (!animationSources) return;
-  if (!animationSources.size) { installFallbackActors(context); return; }
+  // Save Data and a display joining mid-bout keep the immediate local actors.
+  // During setup, an empty animation bank is not a reason to skip the selected FBX:
+  // FighterActor can play its embedded idle and local action motions.
+  if (preferProceduralFighterAssets(browserConnection())
+    || state?.phase === 'fight' && !animationSources.size && !animationLoadPromise) {
+    installFallbackActors(context); return;
+  }
   const { p1Id, p2Id } = context;
   const load = (id: string) => {
     const existing = loadedActors.get(id); if (existing && !fallbackActorIds.has(id)) return Promise.resolve(existing);
@@ -585,10 +603,11 @@ function ensureFightActors(context: FighterActorLoadContext): void {
     }
     return pending;
   };
-  installFallbackActors(context);
   actorLoadCoordinator.start(
     context.key,
     async () => {
+      // Fetch the chosen FBX files while the shared animation bank is still in
+      // flight. FighterActor combines them once both are available.
       await Promise.all([load(p1Id), load(p2Id)]);
     },
     () => fighterActorLoadContext(state)?.key === context.key,
@@ -645,7 +664,8 @@ function resetFallbackActors(): void {
 }
 
 function preloadFighterActor(id: string): void {
-  if (!animationSources?.size || loadedActors.has(id) && !fallbackActorIds.has(id) || actorLoads.has(id)) return;
+  if (!animationSources || preferProceduralFighterAssets(browserConnection())
+    || loadedActors.has(id) && !fallbackActorIds.has(id) || actorLoads.has(id)) return;
   const spec = FIGHTERS.find(fighter => fighter.id === id); if (!spec) return;
   const pending = loadFighterActor(spec); actorLoads.set(id, pending);
   void pending.then(actor => storeLoadedActor(id, actor, new Set([id])))
@@ -679,6 +699,7 @@ function cancelOptionalFightDownloads(): void {
 
 function loadFighterActor(spec: (typeof FIGHTERS)[number]): Promise<FighterActor> {
   return new Promise((resolve, reject) => {
+    const sources = animationSources?.size ? animationSources : animationLoadPromise ?? animationSources ?? new Map();
     const controller = new AbortController();
     actorLoadControllers.set(spec.id, controller);
     let settled = false;
@@ -695,7 +716,7 @@ function loadFighterActor(spec: (typeof FIGHTERS)[number]): Promise<FighterActor
     const timer = setTimeout(() => {
       controller.abort(new Error(`fighter model timed out after ${FIGHTER_ACTOR_TIMEOUT_MS / 1000} seconds`));
     }, FIGHTER_ACTOR_TIMEOUT_MS);
-    void FighterActor.load(spec, animationSources!, undefined, controller.signal).then(actor => {
+    void FighterActor.load(spec, sources, undefined, controller.signal).then(actor => {
       if (settled) { actor.dispose(); return; }
       settled = true; clear(); resolve(actor);
     }, error => {
@@ -914,13 +935,13 @@ function applyMapTheme(mapId: string): void {
     theme.procedural.visible = true;
     mapReadyId = mapId; maybeSignalReady(); return;
   }
-  // A selected 3D arena may be tens of megabytes. Its themed local stage is ready for
-  // play now; downloading the optional scene cannot hold the first playable frame.
+  // Show a themed local stage during loading, but let the selected authored arena
+  // finish its bounded first attempt before the server starts the countdown.
   showProceduralMap(config, atmosphereSpec);
-  mapReadyId = mapId; maybeSignalReady();
   if (preferProceduralFighterAssets(browserConnection())
     || state?.phase === 'fight' || state?.phase === 'victory' || state?.phase === 'results') {
     failedMapKey = loadKey;
+    mapReadyId = mapId; maybeSignalReady();
     return;
   }
   const controller = new AbortController();

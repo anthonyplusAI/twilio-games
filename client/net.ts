@@ -22,7 +22,8 @@ export class GameConnection {
   private backoff = 500;                        // ms; doubles per failed attempt, capped
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /** The identity to replay on reconnect (last join or spectate), so we rejoin the same room. */
-  private identity: { type: 'join'; roomCode: string; name: string; locale?: SupportedLocale } | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; displayToken?: string } | null = null;
+  private identity: { type: 'join'; roomCode: string; name: string; locale?: SupportedLocale;
+    rendererReadyGate?: boolean } | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; displayToken?: string } | null = null;
 
   constructor(private url: string, private locale?: SupportedLocale) {
     this.connect();
@@ -72,8 +73,9 @@ export class GameConnection {
   /** A control belongs to the screen/round where it was entered. Identity is replayed
    * on reconnect; a delayed control must not change a later round. */
   private send(o: unknown) { this.rawSend(o); }
-  join(roomCode: string, name: string) {
-    this.identity = { type: 'join', roomCode, name, ...(this.locale ? { locale: this.locale } : {}) };
+  join(roomCode: string, name: string, rendererReadyGate = false) {
+    this.identity = { type: 'join', roomCode, name, ...(this.locale ? { locale: this.locale } : {}),
+      ...(rendererReadyGate ? { rendererReadyGate: true } : {}) };
     this.rawSend(this.identity); // onopen sends it when the initial socket is still connecting
   }
   spectate(roomCode: string, displayToken?: string) {

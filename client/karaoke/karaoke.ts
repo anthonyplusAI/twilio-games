@@ -145,14 +145,25 @@ const stopVoiceNumber = watchVoiceNumber(locale, number => {
 audio.onAutoplayBlocked(blocked => { audioRecovery.hidden = !blocked; renderFlow(true); });
 audio.onRunningStateChange(() => { maybeSignalReady(); renderFlow(true); });
 audioRecovery.addEventListener('click', () => void enableConcertAudio());
-document.addEventListener('pointerdown', () => {
+function flowControlTarget(target: EventTarget | null): Element | null {
+  return target instanceof Element
+    ? target.closest('#flow-overlay button, #flow-overlay a, #flow-overlay summary, #flow-overlay input')
+    : null;
+}
+document.addEventListener('pointerdown', event => {
   unlockInteraction();
-  void recoverAudio();
+  // A synchronous flow redraw here removes the pressed song card before its click fires.
+  // Recover after the control has completed its own click instead.
+  if (!flowControlTarget(event.target)) void recoverAudio();
 }, { passive: true });
-document.addEventListener('keydown', () => {
+document.addEventListener('keydown', event => {
   unlockInteraction();
-  void recoverAudio();
+  if (!flowControlTarget(event.target)) void recoverAudio();
 }, { passive: true });
+document.addEventListener('click', event => {
+  const control = flowControlTarget(event.target);
+  if (control?.tagName === 'BUTTON' && control.id !== 'enable-concert-audio') void recoverAudio();
+});
 
 element('music-toggle')?.addEventListener('click', () => {
   audio.setMuted(musicManager.getIsMuted());
@@ -569,8 +580,9 @@ function renderResults(): void {
     leaderboardEntries,
     leaderboardLoading,
     canReplayOnDisplay: isHost && connectionState === 'connected'
-      && Boolean(state!.singer?.nameConfirmed) && !stationManaged,
+      && Boolean(state!.singer?.nameConfirmed || (state!.result && !state!.singer)) && !stationManaged,
     stationManaged,
+    singerPresent: Boolean(state!.singer),
     guideMode,
   };
   flowOverlay.innerHTML = renderKaraokeResultsHtml(view);
@@ -777,7 +789,7 @@ function localizeStaticUi(): void {
   audioRecovery.querySelector('small')!.textContent = copy.audioRecoverBody;
   connectionStatus.textContent = copy.connecting;
   const hudLabels = document.querySelectorAll('.hud-score span,.hud-combo span');
-  if (hudLabels[0]) hudLabels[0].textContent = copy.score;
+  if (hudLabels[0]) hudLabels[0].textContent = copy.liveScore;
   if (hudLabels[1]) hudLabels[1].textContent = copy.combo;
 }
 

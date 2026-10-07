@@ -22,7 +22,7 @@ function openQuestion(now: { value: number }, station = false) {
 }
 
 describe('trivia audible readiness', () => {
-  it('keeps the ten-second clock closed until every player hears or skips the prompt and cue', () => {
+  it('keeps the clock closed until everyone hears the question, then runs it during choices', () => {
     const now = { value: 1000 };
     const { room, first, second } = openQuestion(now);
     const prompt = room.state();
@@ -33,12 +33,13 @@ describe('trivia audible readiness', () => {
     const attemptId = prompt.questionAttemptId!;
     const firstDelivery = room.beginPromptDelivery(first, questionId, attemptId)!;
     expect(room.questionPromptReady(first, questionId, attemptId, firstDelivery)).toBe(true);
-    now.value += TRIVIA_ANSWER_WINDOW_MS + 1;
+    now.value += 10_001;
     room.tick();
     expect(room.state()).toMatchObject({ phase: 'question_prompt', questionEndsAtMs: null });
     const secondDelivery = room.beginPromptDelivery(second, questionId, attemptId)!;
     expect(room.questionPromptReady(second, questionId, attemptId, secondDelivery)).toBe(true);
-    expect(room.state()).toMatchObject({ phase: 'answer_cue', questionEndsAtMs: null });
+    expect(room.state()).toMatchObject({ phase: 'answer_cue', answeringStartsAtMs: now.value,
+      questionEndsAtMs: now.value + TRIVIA_ANSWER_WINDOW_MS });
     const firstCue = room.beginAnswerCueDelivery(first, questionId, attemptId)!;
     const secondCue = room.beginAnswerCueDelivery(second, questionId, attemptId)!;
     expect(room.questionAnswerCueReady(first, questionId, attemptId, firstCue)).toBe(true);

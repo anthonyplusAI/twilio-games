@@ -393,7 +393,8 @@ function updateTimeDrivenUi(frameNow: number): void {
       countdownAnnouncement = key;
       announce(String(count));
     }
-  } else if (current?.phase === 'question' && current.answeringStartsAtMs !== null
+  } else if ((current?.phase === 'answer_cue' || current?.phase === 'question')
+    && current.answeringStartsAtMs !== null
     && current.questionEndsAtMs !== null) {
     const timing = triviaQuestionTiming(current.answeringStartsAtMs, current.questionEndsAtMs, now);
     const seconds = document.getElementById('question-seconds');

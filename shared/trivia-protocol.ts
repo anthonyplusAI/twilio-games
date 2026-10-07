@@ -253,7 +253,8 @@ export function projectTriviaState(state: TriviaAuthoritativeState, locale: Supp
     nameConfirmed: player.nameConfirmed ?? true,
     playerOrder: player.playerOrder,
     connected: player.connected,
-    answered: (state.phase === 'question' || state.phase === 'reveal') && player.submittedChoiceId != null,
+    answered: (state.phase === 'answer_cue' || state.phase === 'question' || state.phase === 'reveal')
+      && player.submittedChoiceId != null,
     rawScore: player.rawScore,
     correctCount: player.correctCount,
     bestStreak: player.bestStreak,
@@ -269,7 +270,8 @@ export function projectTriviaState(state: TriviaAuthoritativeState, locale: Supp
         nameConfirmed: player.nameConfirmed ?? true,
         playerOrder: player.playerOrder,
         connected: player.connected,
-        answered: (state.phase === 'question' || state.phase === 'reveal') && player.submittedChoiceId != null,
+        answered: (state.phase === 'answer_cue' || state.phase === 'question' || state.phase === 'reveal')
+          && player.submittedChoiceId != null,
         rawScore: player.rawScore,
         correctCount: player.correctCount,
         bestStreak: player.bestStreak,

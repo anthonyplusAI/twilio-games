@@ -411,6 +411,8 @@ export class KaraokeMediaSession {
   private readonly scheduleTimeout: typeof setTimeout;
   private readonly cancelTimeout: typeof clearTimeout;
   private readonly judgedWords = new Set<string>();
+  private readonly confirmedLiveJudgments = new Map<string, KaraokeMediaFinalJudgment>();
+  private latestSongTimestampMs = 0;
   private finalResult: KaraokeMediaFinalResult | null = null;
   private finalizationPromise: Promise<KaraokeMediaFinalResult> | null = null;
   private scoreFrozen = false;
@@ -666,7 +668,10 @@ export class KaraokeMediaSession {
   }
 
   private judgeThrough(songTimestampMs: number): void {
-    const summary = this.scorer.summary();
+    this.latestSongTimestampMs = Math.max(this.latestSongTimestampMs, songTimestampMs);
+    // The display must not count interim ASR guesses that can later reverse.
+    // These are the same finalized lyric facts used by the result/leaderboard.
+    const summary = this.scorer.summary({ finalLyricsOnly: true });
     for (let index = 0; index < this.song.chart.words.length; index += 1) {
       const word = this.song.chart.words[index]!;
       const lyricGraceMs = this.lyricRecognizer && !this.lyricProviderFailed ? this.lyricJudgmentGraceMs : 0;
@@ -676,7 +681,10 @@ export class KaraokeMediaSession {
   }
 
   private buildFinalJudgments(summary: KaraokeScoreSummary): readonly KaraokeMediaFinalJudgment[] {
-    return Object.freeze(this.song.chart.words.map((_word, index) => this.judgmentForWord(index, summary)));
+    return Object.freeze(this.song.chart.words.map((_word, index) => {
+      const calculated = this.judgmentForWord(index, summary);
+      return this.confirmedLiveJudgments.get(calculated.wordId) ?? calculated;
+    }));
   }
 
   private judgmentForWord(index: number, summary: KaraokeScoreSummary): KaraokeMediaFinalJudgment {
@@ -693,17 +701,21 @@ export class KaraokeMediaSession {
   private emitLiveJudgment(index: number, summary: KaraokeScoreSummary): void {
     const word = this.song.chart.words[index]!;
     if (this.judgedWords.has(word.id)) return;
+    // A provider final may arrive after the acoustic window matures. Until then
+    // the HUD shows only settled points; the remaining words settle at the end.
+    if (this.lyricRecognitionRequired && !summary.words[index]?.lyricEvidence?.final) return;
     this.judgedWords.add(word.id);
     const hit = this.judgmentForWord(index, summary);
     this.judgmentsEmitted += 1;
     try {
-      if (!this.scoreServer.recordWordJudgment(
+      if (this.scoreServer.recordWordJudgment(
         this.attempt.roomCode,
         this.attempt.playerId,
         hit.wordId,
         hit.judgment,
         hit.points,
-      )) this.judgmentsRejected += 1;
+      )) this.confirmedLiveJudgments.set(hit.wordId, hit);
+      else this.judgmentsRejected += 1;
     } catch {
       this.judgmentsRejected += 1;
     }
@@ -730,7 +742,8 @@ export class KaraokeMediaSession {
           source: result.source,
         }];
       });
-      this.scorer.replaceLyricResult(result.resultId, evidence, result.final);
+      if (this.scorer.replaceLyricResult(result.resultId, evidence, result.final)
+        && result.final && !this.finalizationPromise) this.judgeThrough(this.latestSongTimestampMs);
     } catch {
       this.markLyricProviderFailed();
     }

@@ -33,7 +33,7 @@ describe('solo Fighter voice balance',()=>{
     const fighters=FIGHTER_ROSTER.slice(0,3).map(fighter=>fighter.id);
     const winsByPace=new Map<number,number>();
     for(const policy of ['kick','mixed','guarded'] as const){
-      for(const pace of [1.2,1.6,2.0]){
+      for(const pace of [1.2,1.6,2.0,2.5,3.0]){
         let segmentWins=0;
         for(let index=0;index<24;index++){
           const seed=(index*0x1f123bb5+(policy==='kick'?11:policy==='mixed'?29:47))>>>0;
@@ -42,10 +42,10 @@ describe('solo Fighter voice balance',()=>{
         winsByPace.set(pace,(winsByPace.get(pace)??0)+segmentWins);
       }
     }
-    const typicalVoiceRate=((winsByPace.get(1.6)??0)+(winsByPace.get(2.0)??0))/144;
-    expect(typicalVoiceRate).toBeGreaterThanOrEqual(0.60);
-    expect(typicalVoiceRate).toBeLessThanOrEqual(0.75);
-    expect((winsByPace.get(2.0)??0)/72).toBeGreaterThanOrEqual(0.50);
-    expect((winsByPace.get(1.2)??0)/72).toBeGreaterThanOrEqual(0.75);
+    const speechPacedRate=((winsByPace.get(2.0)??0)+(winsByPace.get(2.5)??0))/144;
+    expect(speechPacedRate).toBeGreaterThanOrEqual(0.78);
+    expect(speechPacedRate).toBeLessThanOrEqual(0.92);
+    expect((winsByPace.get(2.5)??0)/72).toBeGreaterThanOrEqual(0.70);
+    expect((winsByPace.get(3.0)??0)/72).toBeGreaterThanOrEqual(0.55);
   });
 });

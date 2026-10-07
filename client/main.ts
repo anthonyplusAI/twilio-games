@@ -10,7 +10,8 @@ import { renderCarThumbnailsAsync, renderMapThumbnail, renderBoostThumbnailAsync
 import { AttractMode } from './attract';
 import { Announcer } from './announcer';
 import QRCode from 'qrcode';
-import { fetchMaps, loadMapWorld, disposeMapWorld, applyTrackTransform, CANONICAL_TRACK } from './map-world';
+import { fetchMaps, loadMapWorld, disposeMapWorld, applyTrackTransform, CANONICAL_TRACK, type MapConfig } from './map-world';
+import { SelectedMapPrefetch } from './selected-map-prefetch';
 import { CurvedTrack } from './track-path';
 import { surfaceOptsFromPath } from './track-surface';
 import { mergeLevel, resolveCarScale, resolveItemScale, resolveCamera } from '../shared/level';
@@ -294,14 +295,9 @@ conn.onItems((items, map) => {
   activeMapPreviewController = null;
   const generation = ++racePreparationGeneration;
   raceAssetPrioritized = false;
-  if (!stationDisplay.active) {
-    buffer.clear(); raceLive = true; stopAttract();
-    renderer.buildItems(items);
-    void loadRaceLevelWithinBudget(map ?? urlMap, generation).then(applied => {
-      if (applied && generation === racePreparationGeneration && raceLive) renderer.buildItems(items);
-    });
-    return;
-  }
+  // Every shared display warms the chosen scene before showing a countdown. The standalone server
+  // now holds its countdown for this same readiness receipt, so slow scenery cannot snap into a
+  // race that has already begun.
   raceSceneReady = false; raceLive = true; latestRaceSnapshot = null; buffer.clear(); stopAttract();
   veilLifted = false; veilEl.classList.remove('hide');
   void prepareRaceScene(items, map ?? urlMap, generation);
@@ -332,6 +328,7 @@ conn.onSnapshot((s) => {
 });
 conn.onLobby((m) => {
   leaveResults();
+  selectedMapPrefetch.clear();
   stationEngineStateReady = true; maybeMarkStationReady();
   if (raceLive) {
     racePreparationGeneration += 1; cancelPendingRaceSnapshot(); latestRaceSnapshot = null; buffer.clear(); raceLive = false;
@@ -358,12 +355,17 @@ conn.onSelectState((m) => {
     liftVeil();
   }
   raceLive = false; big.textContent = '';
+  // Begin the chosen GLB download/decode while everyone is still voting. A later vote replaces
+  // the pending world, so the race can use the actual map without spending its whole load budget.
+  selectedMapPrefetch.start(m.phase === 'map_select' && m.selectedMap !== loadedMap
+    ? m.selectedMap : null);
   screens.setMenuTouch(m.roomCode, m.touch);
   if (m.phase === 'car_select') { flowPhase = 'car_select'; screens.renderCarSelect(m.players); }
   else if (m.phase === 'map_select') { flowPhase = 'map_select'; flowMaps = m.maps; screens.renderMapSelect(m.maps, m.selectedMap, m.players, { counts: m.mapVotes ?? {}, tie: m.mapTie ?? false }); }
   startAttract();
 });
 conn.onResults((m) => {
+  selectedMapPrefetch.clear();
   racePreparationGeneration += 1; cancelPendingRaceSnapshot();
   if (raceLive) invalidateLevelLoad();
   stationDisplay.markEngineResultsReady();
@@ -415,9 +417,23 @@ const GANTRY_FILES = { start: 'racer/track/starting_line.glb', finish: 'racer/tr
 const RACER_CONFIG_TIMEOUT_MS = 15_000;
 const RACER_MAP_TIMEOUT_MS = 45_000;
 const RACER_STANDALONE_MAP_TIMEOUT_MS = 15_000;
-const RACER_RACE_SCENE_BUDGET_MS = 1_800;
+// Station launch allows plenty of time for its authored scene before callers enter a race.
+// Standalone play starts immediately, so keep its late visual upgrade shorter.
+const RACER_STATION_SCENE_BUDGET_MS = 24_000;
+const RACER_STANDALONE_SCENE_BUDGET_MS = 12_000;
 /** The map currently loaded into the renderer, so applyLevel() can skip redundant reloads. */
 let loadedMap: string | null = null;
+interface PrefetchedMap { config: MapConfig; world: NonNullable<Awaited<ReturnType<typeof loadMapWorld>>>; }
+const selectedMapPrefetch = new SelectedMapPrefetch<PrefetchedMap>(
+  async (name, signal) => {
+    const config = (await fetchMaps(signal))[name];
+    if (!config) return null;
+    const world = await loadMapWorld(config, signal);
+    return world ? { config, world } : null;
+  },
+  prefetched => disposeMapWorld(prefetched.world),
+);
+addEventListener('pagehide', () => selectedMapPrefetch.clear(), { once: true });
 let levelLoadGeneration = 0;
 let levelLoadController: AbortController | null = null;
 let activeMapPreviewController: AbortController | null = null;
@@ -456,16 +472,30 @@ async function applyLevel(mapName: string | null | undefined, deadlineSignal?: A
   let applied = false;
   try {
     if (controller.signal.aborted) return false;
-    const maps = await withTimeout(fetchMaps(controller.signal), RACER_CONFIG_TIMEOUT_MS, 'map catalog', () => controller.abort());
+    // A fully decoded vote selection already has its catalog entry. Reuse it if the internet
+    // drops between voting and the start signal; a second network request is unnecessary.
+    const cachedConfig = raceLive ? selectedMapPrefetch.peekReady(mapName)?.config : null;
+    let maps = cachedConfig ? { [mapName]: cachedConfig }
+      : await withTimeout(fetchMaps(controller.signal), RACER_CONFIG_TIMEOUT_MS, 'map catalog', () => controller.abort());
     if (controller.signal.aborted || generation !== levelLoadGeneration) return false;
+    // The map catalog can briefly fail on a spotty connection. One quick retry prevents an empty
+    // response from being mistaken for an intentionally missing authored track.
+    if (!maps[mapName]) {
+      await new Promise(resolve => setTimeout(resolve, 350));
+      if (controller.signal.aborted || generation !== levelLoadGeneration) return false;
+      const newlyReady = raceLive ? selectedMapPrefetch.peekReady(mapName)?.config : null;
+      maps = newlyReady ? { [mapName]: newlyReady }
+        : await withTimeout(fetchMaps(controller.signal), RACER_CONFIG_TIMEOUT_MS, 'map catalog retry', () => controller.abort());
+    }
     const cfg = maps[mapName];
     if (!cfg) throw new Error(`map ${mapName} is unavailable`);
     if (cfg) {
       // Normalize the saved config into a full level (fills defaults; optional lighting/effects/props).
       const level = mergeLevel(cfg);
-      const world = stationDisplay.active
+      const prefetched = raceLive ? await selectedMapPrefetch.take(mapName, controller.signal) : null;
+      const world = prefetched?.world ?? (stationDisplay.active
         ? await withTimeout(loadMapWorld(cfg, controller.signal), RACER_MAP_TIMEOUT_MS, `map ${mapName}`, () => controller.abort())
-        : await withTimeout(loadMapWorld(cfg, controller.signal), RACER_STANDALONE_MAP_TIMEOUT_MS, `map ${mapName}`, () => controller.abort());
+        : await withTimeout(loadMapWorld(cfg, controller.signal), RACER_STANDALONE_MAP_TIMEOUT_MS, `map ${mapName}`, () => controller.abort()));
       if (controller.signal.aborted || generation !== levelLoadGeneration) {
         if (world) disposeMapWorld(world);
         return false;
@@ -525,22 +555,25 @@ function resetToGeneratedRaceScene(): void {
   void renderer.setStartFinishLines(GANTRY_FILES, {});
 }
 
-/** Give a cached or quickly loaded map a short window, then play on the complete generated track. */
+/** Give the map prefetched during voting a bounded chance to finish before using the generated track. */
 async function loadRaceLevelWithinBudget(mapName: string | null | undefined, generation: number): Promise<boolean> {
   if (generation !== racePreparationGeneration) return false;
-  if (!mapName) { resetToGeneratedRaceScene(); return true; }
-  if (mapName === loadedMap) { invalidateLevelLoad(); return true; }
+  if (!mapName) { selectedMapPrefetch.clear(); resetToGeneratedRaceScene(); return true; }
+  if (mapName === loadedMap) { selectedMapPrefetch.clear(); invalidateLevelLoad(); return true; }
   resetToGeneratedRaceScene();
   const budgetController = new AbortController();
   try {
     const applied = await withTimeout(
-      applyLevel(mapName, budgetController.signal), RACER_RACE_SCENE_BUDGET_MS, 'race map',
+      applyLevel(mapName, budgetController.signal),
+      stationDisplay.active ? RACER_STATION_SCENE_BUDGET_MS : RACER_STANDALONE_SCENE_BUDGET_MS,
+      'race map',
       () => budgetController.abort(),
     );
     if (!applied && generation === racePreparationGeneration) resetToGeneratedRaceScene();
-  } catch {
+  } catch (error) {
     budgetController.abort();
     if (generation !== racePreparationGeneration) return false;
+    console.warn(`Voice Racer map ${mapName} did not finish within the scene budget; using the generated track.`, error);
     resetToGeneratedRaceScene();
   }
   return generation === racePreparationGeneration;
@@ -574,7 +607,7 @@ async function prepareRaceScene(
     raceSceneReady = true;
     screens.hide(); big.textContent = '';
     liftVeil();
-    if (stationDisplay.active) conn.ready();
+    conn.ready();
     maybeMarkStationReady();
   } catch (error) {
     if (generation !== racePreparationGeneration) return;
@@ -600,7 +633,7 @@ async function loadAssetsInBackground(): Promise<void> {
   // Portrait captures run independently from the backdrop. A slow map or prop must not leave the car
   // grid spinning, and a live station race pauses this cosmetic work instead of cancelling it.
   const capturesMayStart = new Promise<void>(resolve => setTimeout(resolve, 1500));
-  const canCapture = () => !raceLive;
+  const canCapture = () => !raceLive && !selectedMapPrefetch.isLoading;
   void (async () => {
     await capturesMayStart;
     await renderCarThumbnailsAsync(assets, (i, url) => screens.setCarThumb(i, url), 256, canCapture);
@@ -687,7 +720,7 @@ function boot() {
   // connection's room, not a playerId), so the game starts with ZERO players and fills up as people
   // call in. A device player join()s with their own name + gets a car.
   if (isDisplay) conn.spectate(roomCode, stationDisplay.displayToken ?? undefined);
-  else conn.join(roomCode, name);
+  else conn.join(roomCode, name, true);
 
   // SHARED-SCREEN "I'm playing" TOGGLE (P): the screen defaults to spectator, but the operator can
   // opt IN to also play on this keyboard (joins as a real player + car), and opt back OUT (drops the
@@ -696,7 +729,7 @@ function boot() {
     addEventListener('keydown', (e) => {
       if (e.key !== 'p' && e.key !== 'P') return;
       if (displayIsPlaying) { conn.leave(); renderer.setMyId(''); renderer.setSpectator(true); displayIsPlaying = false; }
-      else { conn.join(roomCode, name); displayIsPlaying = true; }   // onJoined sets myId → chase cam
+      else { conn.join(roomCode, name, true); displayIsPlaying = true; }   // onJoined sets myId → chase cam
       screens.setSelfPlaying(displayIsPlaying);
     });
   }

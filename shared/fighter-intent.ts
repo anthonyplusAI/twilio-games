@@ -8,20 +8,22 @@ const MAX_COMMANDS_PER_UTTERANCE = 2;
 // forms still reaches the semantic interpreter, rather than becoming a guessed action.
 const COMMANDS: Record<SupportedLocale, [FighterCommand, RegExp][]> = {
   'en-US': [
-    ['forward', /^(?:(?:move|step|go|walk|advance) (?:forward|in|closer)(?: to (?:my |the |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|get closer(?: to (?:my |the |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|close the distance|approach (?:my |the |your )?(?:opponent|rival|fighter|enemy|him|her|them)|forward|closer|in)$/],
-    ['back', /^(?:(?:move|step|go|walk|pull) (?:back|backward|away)(?: from (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|back away(?: from (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|back|backward|away)$/],
+    ['forward', /^(?:(?:move|step|go|walk|advance) (?:forward|in|closer)(?: to (?:my |the |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|take (?:a )?step (?:toward|towards|closer to) (?:my |the |your )?(?:opponent|rival|fighter|enemy|him|her|them)|get closer(?: to (?:my |the |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|close the distance|approach (?:my |the |your )?(?:opponent|rival|fighter|enemy|him|her|them)|forward|closer|in)$/],
+    ['back', /^(?:(?:move|step|go|walk|pull|get) (?:back|backward|away)(?: from (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|back away(?: from (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|back it up|back|backward|away)$/],
     ['jump', /^(?:jump|leap|hop)(?: up|over him|over her|over them)?$/],
-    ['punch', /^(?:(?:punch|jab|strike|hit)(?: (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|(?:throw|give|deliver|land)(?: (?:him|her|them))? (?:a |an )?(?:quick |fast |hard |light |strong )?(?:punch|jab|strike|hit)(?: at (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?)$/],
-    ['kick', /^(?:(?:kick|roundhouse)(?: (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|(?:throw|give|deliver|land)(?: (?:him|her|them))? (?:a |an )?(?:quick |fast |hard |light |strong )?(?:roundhouse )?kick(?: at (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?)$/],
+    ['punch', /^(?:(?:punch|jab|strike|hit)(?: (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|(?:throw|give|deliver|land|use|go for)(?: (?:him|her|them))? (?:a |an )?(?:quick |fast |hard |light |strong )?(?:punch|jab|strike|hit)(?: at (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?)$/],
+    ['punch', /^hit (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them) with (?:a |an )?(?:quick |fast |hard )?(?:punch|jab)$/],
+    ['kick', /^(?:(?:kick|roundhouse)(?: (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?|(?:throw|give|deliver|land|use|go for)(?: (?:him|her|them))? (?:a |an )?(?:quick |fast |hard |light |strong )?(?:roundhouse )?kick(?: at (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them))?)$/],
+    ['kick', /^hit (?:the |my |your )?(?:opponent|rival|fighter|enemy|him|her|them) with (?:a |an )?(?:roundhouse )?kick$/],
     ['block', /^(?:(?:block|guard|defend)(?: (?:the |his |her |their )?(?:attack|punch|kick|hit|strike))?|put (?:my|your) guard up)$/],
   ],
   'pt-BR': [
     ['forward', /^(?:(?:(?:mover|andar|ir|va|vai) )?(?:(?:para|pra) (?:a )?)?(?:frente|avancar|avanca|avance|aproximar|aproxime-se|se aproxime|chegue mais perto)|(?:me |se )?aproximar (?:do|da) (?:rival|oponente|adversario)|chegar mais perto (?:do|da) (?:rival|oponente|adversario))$/],
     ['back', /^(?:(?:(?:mover|andar|ir|va|vai) )?(?:(?:para|pra) )?(?:tras|recuar|recua|recue|afastar|afaste-se|se afaste)|(?:me |se )?afastar (?:do|da) (?:rival|oponente|adversario))$/],
     ['jump', /^(?:pular|pule|saltar|salte)$/],
-    ['punch', /^(?:soco|soca|socar|golpear|(?:de|da|dar) um soco)(?: (?:nele|nela|no rival|na rival|no oponente|no adversario))?$/],
-    ['kick', /^(?:chute|chuta|chutar|(?:de|da|dar) um chute)(?: (?:nele|nela|no rival|na rival|no oponente|no adversario))?$/],
-    ['block', /^(?:bloquear|bloqueia|bloqueie|defender|defende|defenda|defenda-se|levante a guarda)$/],
+    ['punch', /^(?:soco|soca|socar|golpear|(?:de|da|dar|manda|mande) um soco)(?: (?:nele|nela|no rival|na rival|no oponente|no adversario))?$/],
+    ['kick', /^(?:chute|chuta|chutar|(?:de|da|dar) um chute)(?: (?:nele|nela|no rival|na rival|no oponente|no adversario|o adversario))?$/],
+    ['block', /^(?:bloquear|bloqueia|bloqueie|defender|defende|defenda|defenda-se|levante a guarda|levanta a guarda)$/],
   ],
 };
 
@@ -39,7 +41,7 @@ function trimPoliteness(text: string, locale: SupportedLocale): string {
   let next = text;
   const prefix = locale === 'pt-BR'
     ? /^(?:por favor|pode|poderia|voce pode|quero|eu quero|vamos) /
-    : /^(?:please|can you|could you|would you|will you|i want to|i would like to|i'd like to|let's|let us|go ahead and) /;
+    : /^(?:please|can you|could you|would you|will you|i want to|i need to|i need you to|i would like to|i'd like to|let's|let us|go ahead and) /;
   const suffix = locale === 'pt-BR' ? / (?:por favor|agora)$/ : / (?:please|now|right now|for me)$/;
   while (prefix.test(next)) next = next.replace(prefix, '');
   while (suffix.test(next)) next = next.replace(suffix, '');

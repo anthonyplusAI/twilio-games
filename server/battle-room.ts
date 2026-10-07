@@ -57,7 +57,17 @@ export class BattleRoom {
     &&this.resultsReadyAt>0&&Date.now()>=this.resultsReadyAt;}
   get canRematch(): boolean { return this._phase === 'results' && (this._resultsPresented || Date.now() >= this.resultsReadyAt); }
   get rematchReadyInMs(): number { return this._phase === 'results'&&!this._resultsPresented ? Math.max(0, this.resultsReadyAt - Date.now()) : 0; }
-  isFinishedBattleParticipant(playerId:string):boolean{return this._phase==='results'&&this.isBattleParticipant(playerId);}
+  isFinishedBattleParticipant(playerId:string):boolean{
+    return this._phase==='results'&&this.slots.some(slot=>slot.id===playerId)
+      &&this.isBattleParticipant(playerId);
+  }
+  /** A late caller may take over a finished standalone room only after its original players leave.
+   * Until then the original players own the replay decision and the displayed result stays put. */
+  canStartNextRound(playerId:string):boolean{
+    if(this._phase!=='results'||!this.canRematch||!this.slots.some(slot=>slot.id===playerId))return false;
+    return this.isBattleParticipant(playerId)
+      || !this.slots.some(slot=>this.isBattleParticipant(slot.id));
+  }
   acknowledgeResultsPresented(generation:number):boolean{
     if(this._phase!=='results'||!this._result||generation!==this.battleGeneration||this._resultsPresented)return false;
     this._resultsPresented=true;return true;
@@ -99,6 +109,17 @@ export class BattleRoom {
   /** Add a human player. Battles are 1v1, so at most 2 humans. A late second player may join while
    *  results remain visible, but the finished battle stays intact until an explicit rematch. */
   addPlayer(name: string, preferredSide?: Side, nameConfirmed = true): { playerId: string } | { error: string } {
+    // Keep the final screen after the last caller leaves. A new standalone caller explicitly begins
+    // the next session; a late station caller must not erase the previous match's result.
+    if (this._phase === 'results' && this.slots.length === 0) {
+      if (this.fixedExpectedHumanPlayers) return { error: 'round_complete' };
+      this.reset();
+      // The prior duel may have required two callers and player-bound station-style setup.
+      // A new standalone caller starts with the same solo policy as a fresh room.
+      this.expectedHumanPlayers = 1;
+      this.automaticSetup = false;
+      this.fixedExpectedHumanPlayers = false;
+    }
     if (this._phase === 'results' && this.slots.length >= 2) return { error: 'room_full' };
     if (this._phase === 'battle' && this.slots.length >= 2) return { error: 'battle_in_progress' };
     if (this.slots.length >= 2) return { error: 'room_full' };
@@ -107,7 +128,6 @@ export class BattleRoom {
     const id = `p${this.nextId++}`;
     this.slots.push({ id, name: name || `Player ${this.slots.length + 1}`, nameConfirmed, monsterId: null, isAi: false, side });
     this.slots.sort((left, right) => left.side.localeCompare(right.side));
-    if (!nameConfirmed && this._phase === 'monster_select') this._phase = 'lobby';
     return { playerId: id };
   }
 
@@ -128,7 +148,9 @@ export class BattleRoom {
     const wasInBattle = this.isBattleParticipant(playerId);
     this.slots = this.slots.filter(s => s.id !== playerId);
     if (this.slots.length === 0) {
-      this.reset(); this.automaticSetup = false; this.expectedHumanPlayers = 1; this.fixedExpectedHumanPlayers = false;
+      if (this._phase !== 'results') {
+        this.reset(); this.automaticSetup = false; this.expectedHumanPlayers = 1; this.fixedExpectedHumanPlayers = false;
+      }
     }
     else {
       if (!this.fixedExpectedHumanPlayers) this.expectedHumanPlayers = this.slots.length;
@@ -168,7 +190,7 @@ export class BattleRoom {
    *  (keep the roster, back to monster_select). Starting the battle fills an AI opponent when solo. */
   advance(playerId?: string): boolean {
     if (this._phase === 'results') {
-      if (!this.canRematch || (playerId && !this.isBattleParticipant(playerId))) return false;
+      if (!this.slots.length || !this.canRematch || (playerId && !this.canStartNextRound(playerId))) return false;
       this.world = null; this.ai = null; this._result = null;
       this.resultsReadyAt = 0;
       this._resultsPresented = false;

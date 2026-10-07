@@ -76,6 +76,38 @@ function finishRound(room: TriviaRoom, playerId: string, now: { value: number })
 }
 
 describe('authoritative trivia room', () => {
+  it('starts the shared answer clock before choice audio finishes and scores a spoken choice during it', () => {
+    const now = { value: 10_000 };
+    const room = new TriviaRoom('CHOICES-CLOCK', { bank, now: () => now.value });
+    const first = joined(room, 'Ada');
+    const second = joined(room, 'Grace');
+    room.advance(first);
+    room.advance(first);
+    room.ready(room.state().loadingGeneration);
+    now.value += TRIVIA_COUNTDOWN_MS;
+    room.tick();
+    const question = room.state().question!;
+    const attempt = room.state().questionAttemptId!;
+    for (const player of [first, second]) {
+      const generation = room.beginPromptDelivery(player, question.id, attempt)!;
+      expect(room.questionPromptReady(player, question.id, attempt, generation)).toBe(true);
+    }
+
+    expect(room.state()).toMatchObject({
+      phase: 'answer_cue', answeringStartsAtMs: now.value,
+      questionEndsAtMs: now.value + TRIVIA_ANSWER_WINDOW_MS,
+    });
+    now.value += 4_000;
+    expect(room.answer(first, correctChoice(room))).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'answer_cue' });
+    expect(room.state().players.find(player => player.playerId === first)?.answered).toBe(true);
+    const secondCue = room.beginAnswerCueDelivery(second, question.id, attempt)!;
+    expect(room.questionAnswerCueReady(second, question.id, attempt, secondCue)).toBe(true);
+    expect(room.state()).toMatchObject({
+      phase: 'question', answeringStartsAtMs: 13_000, questionEndsAtMs: 13_000 + TRIVIA_ANSWER_WINDOW_MS,
+    });
+  });
+
   it('holds the next question until two staggered voice reveals finish after the visual minimum', () => {
     const now = { value: 0 };
     const room = new TriviaRoom('REVEAL-VOICES', { bank, now: () => now.value });
@@ -429,6 +461,23 @@ describe('authoritative trivia room', () => {
     expect(station.state()).toEqual(terminal);
   });
 
+  it('keeps a completed standalone result until a new caller explicitly starts a session', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('SOLO-FINISHED', { bank, now: () => now.value });
+    room.expectHumanPlayers(1, true, { stationFixed: false, allowReplay: true });
+    const oldPlayer = joined(room, 'Ada');
+    finishRound(room, oldPlayer, now);
+    const result = room.state().result;
+
+    expect(room.prepareForNewCaller()).toBe(false);
+    expect(room.setPlayerConnected(oldPlayer, false)).toBe(true);
+    expect(room.state().result).toEqual(result);
+    expect(room.prepareForNewCaller()).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'lobby', result: null, players: [] });
+    const newcomer = joined(room, 'Grace');
+    expect(room.state().players).toEqual([expect.objectContaining({ playerId: newcomer, name: 'Grace' })]);
+  });
+
   it('accepts revisable votes and resolves plurality ties and no-vote rounds to mixed', () => {
     const tied = new TriviaRoom('TIE', { bank, seed: 2 });
     const players = [joined(tied, 'One'), joined(tied, 'Two'), joined(tied, 'Three'), joined(tied, 'Four')];
@@ -509,7 +558,7 @@ describe('authoritative trivia room', () => {
     });
   });
 
-  it('publishes a redacted prompt and starts the ten-second window only after audible readiness', () => {
+  it('publishes a redacted prompt and starts the clock after the question, before choices', () => {
     const now = { value: 10_000 };
     const room = new TriviaRoom('CLOCK', { bank, now: () => now.value });
     const player = joined(room);
@@ -532,7 +581,8 @@ describe('authoritative trivia room', () => {
     expect(room.questionAnswerCueReady(player, questionId, attemptId, 1)).toBe(false);
     const promptDelivery = room.beginPromptDelivery(player, questionId, attemptId)!;
     expect(room.questionPromptReady(player, questionId, attemptId, promptDelivery)).toBe(true);
-    expect(room.state().phase).toBe('answer_cue');
+    expect(room.state()).toMatchObject({ phase: 'answer_cue', answeringStartsAtMs: now.value,
+      questionEndsAtMs: now.value + TRIVIA_ANSWER_WINDOW_MS });
     const cueDelivery = room.beginAnswerCueDelivery(player, questionId, attemptId)!;
     expect(room.questionAnswerCueReady(player, questionId, attemptId, cueDelivery)).toBe(true);
     expect(room.state()).toMatchObject({ phase: 'question', answeringStartsAtMs: now.value,
@@ -544,12 +594,12 @@ describe('authoritative trivia room', () => {
       { type: 'question_started', questionId, questionAttemptId: attemptId,
         questionIndex: 0, promptDeadlineAtMs: now.value + 60_000 },
       { type: 'answering_started', questionId, questionAttemptId: attemptId,
-        startsAtMs: now.value, endsAtMs: now.value + 10_000 },
+        startsAtMs: now.value, endsAtMs: now.value + TRIVIA_ANSWER_WINDOW_MS },
     ]));
     expect(JSON.stringify(room.state())).not.toMatch(/correctChoiceId|aliases|explanation/);
   });
 
-  it('starts answering once after all four callers finish prompt and cue playback', () => {
+  it('starts one shared clock after all four question prompts and keeps it through cue playback', () => {
     const now = { value: 5_000 };
     const room = new TriviaRoom('PROMPT-FOUR', { bank, now: () => now.value });
     const players = [joined(room, 'One'), joined(room, 'Two'), joined(room, 'Three'), joined(room, 'Four')];
@@ -570,6 +620,8 @@ describe('authoritative trivia room', () => {
       expect(room.questionPromptReady(player, questionId, attemptId, delivery)).toBe(true);
     }
     expect(room.phase).toBe('answer_cue');
+    const clockStartedAt = now.value;
+    expect(room.state().answeringStartsAtMs).toBe(clockStartedAt);
     expect(room.questionAnswerCueReady(players[0]!, 'stale-question', attemptId, 1)).toBe(false);
     for (const player of players.slice(0, -1)) {
       const delivery = room.beginAnswerCueDelivery(player, questionId, attemptId)!;
@@ -580,11 +632,11 @@ describe('authoritative trivia room', () => {
     const lastCue = room.beginAnswerCueDelivery(players[3]!, questionId, attemptId)!;
     expect(room.questionAnswerCueReady(players[3]!, questionId, attemptId, lastCue)).toBe(true);
     expect(room.phase).toBe('question');
-    expect(room.state()).toMatchObject({ answeringStartsAtMs: now.value,
-      questionEndsAtMs: now.value + TRIVIA_ANSWER_WINDOW_MS });
+    expect(room.state()).toMatchObject({ answeringStartsAtMs: clockStartedAt,
+      questionEndsAtMs: clockStartedAt + TRIVIA_ANSWER_WINDOW_MS });
     expect(room.drainEvents().filter(event => event.type === 'answering_started')).toEqual([{
       type: 'answering_started', questionId, questionAttemptId: attemptId,
-      startsAtMs: now.value, endsAtMs: now.value + TRIVIA_ANSWER_WINDOW_MS,
+      startsAtMs: clockStartedAt, endsAtMs: clockStartedAt + TRIVIA_ANSWER_WINDOW_MS,
     }]);
   });
 
@@ -834,13 +886,13 @@ describe('authoritative trivia room', () => {
 
   it.each([
     [0, 1_300],
-    [2_999, 1_300],
-    [3_000, 1_200],
-    [5_999, 1_200],
-    [6_000, 1_100],
-    [8_999, 1_100],
-    [9_000, 1_000],
-    [10_000, 1_000],
+    [7_999, 1_300],
+    [8_000, 1_200],
+    [15_999, 1_200],
+    [16_000, 1_100],
+    [22_999, 1_100],
+    [23_000, 1_000],
+    [25_000, 1_000],
   ])('uses the exact core speed boundary at %i ms', (elapsedMs, expectedPoints) => {
     const now = { value: 0 };
     const room = new TriviaRoom(`SPEED-${elapsedMs}`, { bank, now: () => now.value });

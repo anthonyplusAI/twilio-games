@@ -33,6 +33,7 @@ export class KaraokeRoom {
   private nextPlayer = 1;
   private expectedPlayerCountValue: 1 = 1;
   private automaticSetupValue = false;
+  private fixedStationRound = false;
   private locale: SupportedLocale;
   private selectedSongValue: KaraokeSong | null = null;
   private selectedByPlayerId: string | null = null;
@@ -67,6 +68,12 @@ export class KaraokeRoom {
   }
 
   addPlayer(name: string, nameConfirmed = true): { playerId: string } | { error: string } {
+    // The previous singer may hang up while the display is still showing results.
+    // Only a new, explicit join clears that finished screen for the next round.
+    if (!this.singer && this.phase === 'results' && this.resultValue) {
+      if (this.fixedStationRound) return { error: 'round_complete' };
+      this.resetRound('lobby');
+    }
     if (this.singer || (this.phase !== 'lobby' && this.phase !== 'song_select')) return { error: 'room_full' };
     const playerId = `k${this.nextPlayer++}`;
     this.singer = { playerId, name: cleanName(name), nameConfirmed };
@@ -78,7 +85,7 @@ export class KaraokeRoom {
     if (this.singer?.playerId !== playerId) return;
     this.singer = null;
     this.keyboardScoringPlayerId = null;
-    this.resetRound('lobby');
+    if (this.phase !== 'results' || !this.resultValue) this.resetRound('lobby');
     this.automaticSetupValue = false;
   }
 
@@ -97,9 +104,10 @@ export class KaraokeRoom {
     return this.singer?.playerId === playerId && this.singer.nameConfirmed;
   }
 
-  expectHumanPlayers(_count: number, _fixed = true): void {
+  expectHumanPlayers(_count: number, fixed = true): void {
     this.expectedPlayerCountValue = 1;
     this.automaticSetupValue = true;
+    if (fixed) this.fixedStationRound = true;
     this.keyboardScoringPlayerId = null;
   }
 
@@ -152,6 +160,14 @@ export class KaraokeRoom {
       return true;
     }
     return false;
+  }
+
+  /** Elected standalone displays can clear an abandoned result explicitly. */
+  restartAfterDisconnect(): boolean {
+    if (this.phase !== 'results' || this.singer || !this.resultValue
+      || this.automaticSetupValue || this.fixedStationRound) return false;
+    this.resetRound('lobby');
+    return true;
   }
 
   ready(generation: number): boolean {
@@ -285,13 +301,13 @@ export class KaraokeRoom {
   finalizeMediaScore(playerId: string, score: number, hits: readonly KaraokeHit[]): boolean {
     this.tick();
     if (this.phase !== 'finalizing' || this.resultValue || this.singer?.playerId !== playerId
-      || !this.selectedSongValue || !Number.isFinite(score)) return false;
+      || !this.selectedSongValue || !Number.isSafeInteger(score) || score < 0 || score > KARAOKE_MAX_SCORE) return false;
     const chartWords = this.selectedSongValue.chart.words;
     const chartWordIds = new Set(chartWords.map(word => word.id));
     const suppliedWordIds = new Set<string>();
     for (const hit of hits) {
       if (!chartWordIds.has(hit.wordId) || suppliedWordIds.has(hit.wordId)
-        || !isJudgment(hit.judgment) || !Number.isFinite(hit.points)
+        || !isJudgment(hit.judgment) || !Number.isSafeInteger(hit.points)
         || hit.points < 0 || hit.points > KARAOKE_MAX_SCORE) return false;
       suppliedWordIds.add(hit.wordId);
     }
@@ -355,6 +371,7 @@ export class KaraokeRoom {
   get expectedPlayerCount(): 1 { return this.expectedPlayerCountValue; }
   get hasExpectedPlayers(): boolean { return this.singer !== null; }
   get isEmpty(): boolean { return this.singer === null; }
+  get isFixedStationRound(): boolean { return this.fixedStationRound; }
   get isTimingActive(): boolean { return this.phase === 'loading' || this.phase === 'countdown' || this.phase === 'performing'; }
 
   private beginLoading(): void {

@@ -14,6 +14,7 @@ interface Session {
 }
 const RECONNECT_MS = 30_000;
 const HEARTBEAT_MS = 30_000;
+export const FIGHTER_RESULT_RECONNECT_GRACE_MS = 60_000;
 
 export class FighterServer {
   private wss: WebSocketServer;
@@ -31,14 +32,18 @@ export class FighterServer {
   private onRoomState: ((code: string) => void) | null = null;
   private onVoiceCommandOutcomes: ((code: string, outcomes: FighterVoiceCommandOutcome[]) => void) | null = null;
   private resultsFallbackTimers=new Map<string,{timer:ReturnType<typeof setTimeout>;generation:number}>();
+  private resultReconnectTimers=new Map<string,ReturnType<typeof setTimeout>>();
+  private readonly resultReconnectGraceMs:number;
   private allowBrowserPlayer: (roomCode: string) => boolean = () => true;
 
   private readonly displayToken: string;
   private onDisplayAuthenticated: ((ws: WebSocket) => void) | null = null;
 
-  constructor(opts: { server: HttpServer; displayToken?: string; heartbeatMs?: number }) {
+  constructor(opts: { server: HttpServer; displayToken?: string; heartbeatMs?: number;
+    resultReconnectGraceMs?: number }) {
     this.displayToken = opts.displayToken?.trim() ?? '';
     this.heartbeatMs = opts.heartbeatMs ?? HEARTBEAT_MS;
+    this.resultReconnectGraceMs=opts.resultReconnectGraceMs??FIGHTER_RESULT_RECONNECT_GRACE_MS;
     this.wss = new WebSocketServer({ noServer: true });
     this.loop = setInterval(() => this.tick(), 50);
     (this.loop as { unref?: () => void }).unref?.();
@@ -67,6 +72,7 @@ export class FighterServer {
   abortRoom(code: string): boolean {
     code = canonicalRoomCode(code);
     if (!this.rooms.has(code)) return false;
+    this.clearResultReconnectTimer(code);
     for (const conn of this.conns) {
       if (conn.roomCode !== code) continue;
       conn.roomCode = undefined;
@@ -154,6 +160,7 @@ export class FighterServer {
       }
       const result = this.room(code).addPlayer(msg.name);
       if ('error' in result) { this.send(conn, { type: 'error', code: result.error, message: result.error }); return; }
+      this.clearResultReconnectTimer(code);
       conn.roomCode = code; conn.playerId = result.playerId; conn.sessionId = msg.sessionId;
       const currentHost = this.hosts.get(code);
       if (conn.display && conn.hostAuthorized && this.allowBrowserPlayer(code) && (!currentHost || !currentHost.playerId)) {
@@ -191,6 +198,7 @@ export class FighterServer {
         this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'Invalid display token.' }); return;
       }
       conn.roomCode = code; conn.display = true; conn.hostAuthorized = !stationDisplay || conn.authorizedRoomCode===code; this.room(code);
+      this.clearResultReconnectTimer(code);
       if (conn.displayAuthenticated&&conn.authorizedRoomCode===code) this.onDisplayAuthenticated?.(conn.ws);
       if (!this.hosts.has(code) && conn.hostAuthorized) this.hosts.set(code, conn);
       this.pushHostIdentity(code); this.pushState(code); return;
@@ -386,17 +394,40 @@ export class FighterServer {
       this.send(candidate, { type: 'host_identity', roomCode: code, isHost: this.hosts.get(code) === candidate, loadingGeneration });
     }
   }
-  private reap(code: string): void {
+  private clearResultReconnectTimer(code:string):void{
+    const timer=this.resultReconnectTimers.get(code);
+    if(timer)clearTimeout(timer);
+    this.resultReconnectTimers.delete(code);
+  }
+  private reap(code: string,graceExpired=false): void {
     const room = this.rooms.get(code); if (!room?.isEmpty) return;
     if ([...this.conns].some(conn => conn.roomCode === code)) return;
     if ([...this.sessions.values()].some(session => session.roomCode === code)) return;
+    if(room.phase==='results'||(room.phase==='victory'&&room.state().result)){
+      if(!this.allowBrowserPlayer(code))return;
+      if(!graceExpired){
+        if(!this.resultReconnectTimers.has(code)){
+          const timer=setTimeout(()=>{
+            this.resultReconnectTimers.delete(code);
+            if(this.rooms.get(code)===room)this.reap(code,true);
+          },this.resultReconnectGraceMs);
+          (timer as {unref?:()=>void}).unref?.();
+          this.resultReconnectTimers.set(code,timer);
+        }
+        return;
+      }
+    }
+    this.clearResultReconnectTimer(code);
     this.hosts.delete(code);this.clearResultsFallback(code);this.rooms.delete(code);
   }
 
   voiceJoin(code: string, name: string, preferredSide?: FighterId, expectedPlayers?:number, nameConfirmed = true): string | null {
-    code=canonicalRoomCode(code);const room=this.room(code);if(expectedPlayers!==undefined)room.expectHumanPlayers(expectedPlayers,preferredSide!==undefined);
-    else if(room.playerCount>=1)room.expectHumanPlayers(2,false);
-    const result = room.addPlayer(name, preferredSide, nameConfirmed); if ('error' in result) return null; this.pushState(code); return result.playerId;
+    code=canonicalRoomCode(code);const room=this.room(code);const hadPlayer=room.playerCount>=1;
+    if (!this.allowBrowserPlayer(code) && (room.phase === 'victory' || room.phase === 'results')) return null;
+    const result = room.addPlayer(name, preferredSide, nameConfirmed); if ('error' in result) return null;
+    if(expectedPlayers!==undefined)room.expectHumanPlayers(expectedPlayers,preferredSide!==undefined);
+    else if(hadPlayer)room.expectHumanPlayers(2,false);
+    this.clearResultReconnectTimer(code);this.pushState(code); return result.playerId;
   }
   voiceLeave(code: string, id: string): void { code = canonicalRoomCode(code); const room=this.rooms.get(code);room?.removePlayer(id);if(room)this.flush(room);this.pushState(code); this.reap(code); }
   voiceSetName(code:string,id:string,name:string):void {
@@ -466,6 +497,7 @@ export class FighterServer {
 
   stopLoopOnly(): void {
     clearInterval(this.loop); if (this.heartbeat) { clearInterval(this.heartbeat); this.heartbeat = null; }
+    for(const code of this.resultReconnectTimers.keys())this.clearResultReconnectTimer(code);
     for (const session of this.sessions.values()) if (session.timer) clearTimeout(session.timer);
     this.sessions.clear(); this.hosts.clear();
     for(const code of this.resultsFallbackTimers.keys())this.clearResultsFallback(code);

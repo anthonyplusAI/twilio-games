@@ -44,10 +44,12 @@ describe('Racer current-screen semantic fallback', () => {
     } as HostContext;
     const station = http.racerResultsRecap(resultContext, row.locale);
     expect(station).toMatch(row.placement);
+    expect(station).toMatch(/Twilio Conversation Relay/i);
     expect(station).toMatch(row.nextStep);
     expect(station).not.toMatch(row.standalone);
 
     const standalone = http.racerResultsRecap({ ...resultContext, stationManaged: false }, row.locale);
+    expect(standalone).toMatch(/Twilio Conversation Relay/i);
     expect(standalone).toMatch(row.standalone);
     expect(standalone).not.toMatch(row.nextStep);
   });

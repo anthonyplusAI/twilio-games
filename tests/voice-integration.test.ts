@@ -198,6 +198,13 @@ describe('voice integration (fake Conversation Relay client)', () => {
       const player=room.lobbyPlayers()[0]!;
       room.setPlayerInfo(player.playerId,{name:'Ada'});
       room.advance();room.selectCar(player.playerId,0);room.advance();room.selectMap('Silver Lake');room.advance();
+      // This integration drives the room directly, bypassing the usual items broadcast. The
+      // standalone screen must still acknowledge scene readiness before the countdown runs.
+      const pausedCountdown = room.snapshot()!.countdown;
+      game.stepRoomForTest(room, .1);
+      expect(room.snapshot()!.countdown).toBe(pausedCountdown);
+      display.send(JSON.stringify({type:'ready'}));
+      await wait(20);
       for(let i=0;i<100&&room.phase!=='racing';i++)game.stepRoomForTest(room,0.1);
       expect(room.phase).toBe('racing');
       voice.send(JSON.stringify({type:'interrupt',utteranceUntilInterrupt:'',durationUntilInterruptMs:0}));

@@ -44,7 +44,8 @@ export interface WorldSnapshot {
 
 // ---- Protocol: client -> server ----
 export type ClientMessage =
-  | { type: 'join'; roomCode: string; name: string; color?: string; locale?: SupportedLocale }
+  | { type: 'join'; roomCode: string; name: string; color?: string; locale?: SupportedLocale;
+      rendererReadyGate?: boolean }
   | { type: 'intent'; intent: Intent }
   | { type: 'ready' }
   | { type: 'restart' }

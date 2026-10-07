@@ -351,10 +351,14 @@ interface QueuedBattleEvent { event: BattleEvent; eventId: number; generation: n
 let eventQ: QueuedBattleEvent[] = [];
 let playbackEpoch = 0;
 let playbackTimer: ReturnType<typeof setTimeout> | null = null;
+let resultsRevealTimer: ReturnType<typeof setTimeout> | null = null;
+const RESULTS_VICTORY_HOLD_MS = 2_800;
 function cancelPlayback(): void {
   playbackEpoch++;
   if (playbackTimer) clearTimeout(playbackTimer);
   playbackTimer = null;
+  if (resultsRevealTimer) clearTimeout(resultsRevealTimer);
+  resultsRevealTimer = null;
   eventQ = [];
   pendingHandoff = null;
   draining = false;
@@ -389,8 +393,8 @@ function drainNext(): void {
   const beat = eventQ.shift();
   if (!beat) {
     draining = false; renderer.setActiveSide(null);
-    // Battle just ended? Don't jump straight to the results modal — hold on the arena with a
-    // "▶ Continue" prompt so the win lands, and wait for the player to acknowledge.
+    // Let the win land on the arena, then reveal the result and its How it works section without
+    // requiring a phone caller to press a keyboard key or discover an invisible extra voice step.
     if (state?.phase === 'results') {
       if (stationDisplay.active) {
         awaitingContinue = false;
@@ -401,6 +405,10 @@ function drainNext(): void {
       awaitingContinue = true;
       renderer.setEventBanner(text('battle.continue', { winner: state.result?.winnerName ?? text('results.winner') }));
       renderOverlay();
+      resultsRevealTimer = setTimeout(() => {
+        resultsRevealTimer = null;
+        if (state?.phase === 'results' && awaitingContinue && !draining) dismissContinue();
+      }, RESULTS_VICTORY_HOLD_MS);
       return;
     }
     paintBattle(); renderOverlay(); return;
@@ -824,6 +832,8 @@ stageEl.addEventListener('click', () => { if (awaitingContinue) dismissContinue(
 
 /** Player acknowledged the win → drop the hold + clear the banner so the results modal appears. */
 function dismissContinue(): void {
+  if (resultsRevealTimer) clearTimeout(resultsRevealTimer);
+  resultsRevealTimer = null;
   awaitingContinue = false;
   renderer.setEventBanner('');
   lastOverlayKey = '';   // force the results overlay to (re)build now that the stage is hidden

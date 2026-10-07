@@ -60,8 +60,17 @@ describe('buildBattleSystemPrompt', () => {
   });
 
   it('after taking the name it guides the next step (no dead air)', () => {
-    const p = buildBattleSystemPrompt(ctx({ myName: null })).toLowerCase();
+    const p = buildBattleSystemPrompt(ctx({ phase: 'lobby', myName: null })).toLowerCase();
     expect(p).toMatch(/next|do not just say|nice to meet/);
+  });
+  it('keeps name onboarding in the lobby and accepts conversational menu requests', () => {
+    const lobby = buildBattleSystemPrompt(ctx({ phase: 'lobby', myName: null }));
+    expect(lobby).toContain('not required passwords');
+    expect(lobby).toContain('clear request to continue');
+    for (const phase of ['monster_select', 'battle', 'results'] as const) {
+      expect(buildBattleSystemPrompt(ctx({ phase, myName: null })))
+        .not.toContain('FIRST job: ask their name');
+    }
   });
 
   it('on monster-select it tells the caller to PICK a monster', () => {

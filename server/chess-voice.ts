@@ -339,23 +339,21 @@ export class ChessVoiceSession {
         ? 'Se quiser outra partida, diga jogar de novo.'
         : 'Say play again for a new game.';
     if (this.commandLocale === 'pt-BR') {
-      if (drew) return `Empate. ${next}`;
-      const outcome = won
+      const outcome = drew ? 'Empate.' : won
         ? 'Xeque-mate! Você venceu o duelo de magos.'
         : 'Xeque-mate. O mago rival venceu desta vez.';
-      return `${outcome} ${next}`;
+      return `${outcome} A Twilio Conversation Relay transmitiu seus lances falados; o jogo atualizou o tabuleiro. ${next}`;
     }
-    if (drew) return `The duel ends in a draw. ${next}`;
-    const outcome = won
+    const outcome = drew ? 'The duel ends in a draw.' : won
       ? 'Checkmate! You won the wizard duel.'
       : 'Checkmate. The rival wizard wins this time.';
-    return `${outcome} ${next}`;
+    return `${outcome} Twilio Conversation Relay carried your spoken moves; the game updated the board. ${next}`;
   }
 
   private stationWaitLine(): string {
     return this.commandLocale === 'pt-BR'
-      ? 'A estação prepara a próxima partida. Aguarde o próximo jogo.'
-      : 'The station will prepare the next game. Please wait for the next match.';
+      ? 'A estação prepara a próxima partida.'
+      : 'The station will prepare the next game.';
   }
 
   private speak(line: string, throughComputerReply = false): void {
