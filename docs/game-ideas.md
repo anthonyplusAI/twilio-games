@@ -11,10 +11,10 @@
 
 **Status:** Implemented and playable
 
-**Current implementation delta (2026-08-29):** Voice Trivia is the fifth game in the canonical
+**Current implementation delta (2026-10-07):** Voice Trivia is the fifth game in the canonical
 registry at `/trivia.html`, with one to four human players and no AI fallback. Players vote by voice
 for one of eight categories or Mixed, then every player may answer each of eight questions during a
-ten-second window. Correct answers earn speed-tier points plus a streak bonus; final ordering uses
+25-second window that starts after the spoken question, before the choices are read. Correct answers earn speed-tier points plus a streak bonus; final ordering uses
 score, correct-answer count, cumulative correct-answer time, and stable player order. The localized
 shared display shows answer locks, reveals, explanations, standings, and final normalized scores.
 

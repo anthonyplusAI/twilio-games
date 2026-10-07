@@ -101,10 +101,10 @@ native Brazilian Portuguese review. A later human review must preserve the AI-as
 identify the actual reviewer rather than relabeling the existing audit.
 
 Runtime publishes the selected localized prompt and choices in `question_prompt` and waits for the
-authenticated display to paint that stage before the phones read the choices. The common 10-second
-answer window opens after caller prompt and cue delivery or an explicit skip. English uses One through
-Four; Brazilian Portuguese uses Um through Quatro. Reconnecting unanswered callers receive current
-question guidance without changing the shared answer deadline.
+authenticated display to paint that stage before the phones speak the question. The common 25-second
+answer window opens as `answer_cue` begins, before Relay reads the numbered choices. English uses One
+through Four; Brazilian Portuguese uses Um through Quatro. Reconnecting unanswered callers receive
+current-question guidance without changing the shared answer deadline.
 
 Use `/editor?game=trivia` to edit the complete bilingual bank, answer key, private voice aliases,
 sources, and review metadata. The API is `no-store`, requires `EDITOR_TOKEN` when configured, and uses

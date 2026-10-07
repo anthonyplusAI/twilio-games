@@ -1,4 +1,5 @@
-import { TRIVIA_ROUND_CATEGORY_IDS, TRIVIA_ROUND_QUESTION_COUNT } from '../../shared/trivia';
+import { TRIVIA_ANSWER_WINDOW_MS, TRIVIA_ROUND_CATEGORY_IDS,
+  TRIVIA_ROUND_QUESTION_COUNT } from '../../shared/trivia';
 import { TRIVIA_CATEGORY_LABELS } from '../../shared/i18n/trivia';
 import type { SupportedLocale } from '../../shared/i18n/locales';
 import type {
@@ -45,7 +46,7 @@ export interface TriviaRenderedView {
 
 const COPY = {
   'en-US': {
-    app: 'Voice Trivia', eyebrow: 'Twilio quiz stage', tagline: 'Eight questions. Ten seconds. Answer out loud.',
+    app: 'Voice Trivia', eyebrow: 'Twilio quiz stage', tagline: 'Eight questions. Answer while the clock runs.',
     home: 'Home', homeLabel: 'Return to Twilio Games home', stageLabel: 'Voice Trivia quiz stage',
     theme: { light: 'Light theme', dark: 'Dark theme' },
     connecting: 'Opening the quiz stage', connectingBody: 'Connecting to the live Trivia room.',
@@ -58,14 +59,16 @@ const COPY = {
     callQrPreparing: 'Preparing the call QR code. You can call the number below.',
     callQrUnavailable: 'QR code unavailable. Call the number below.',
     ready: 'Ready', confirming: 'Confirming name', reconnecting: 'Reconnecting', openSeat: 'Open seat', waiting: 'Waiting',
-    category: 'Choose the category', categoryBody: 'Vote by voice or tap a category for the named player. The live totals decide the round.',
+    category: 'Choose the category', categoryBody: 'Choose a category for the named player. The live totals decide the round.',
     categoryTouch: '{name} is voting on this screen', categorySubmitting: "Recording {name}'s vote...", categoryWaiting: 'Waiting for phone votes', vote: 'vote', votes: 'votes',
     loading: 'Building the question deck', loadingBody: 'The display is checking fonts and stage readiness.',
     displayReady: 'Display ready', displayPreparing: 'Preparing display', countdown: 'Round starts in',
-    question: 'Question', of: 'of', getReady: 'Get ready', promptBody: 'Phones are finishing the question prompt. The ten-second clock starts after all phones are ready.',
-    cueReady: 'Get ready to answer', cueBody: 'Phones are synchronizing the answer cue. The ten-second clock starts after all phones are ready.',
+    question: 'Question', of: 'of', getReady: 'Get ready', promptBody: 'Phones are hearing the question. The clock starts before the choices are spoken.',
+    cueReady: 'Answer now', cueBody: 'The clock is running while the choices are spoken. Answer anytime.',
     audioProblem: 'Question audio needs attention', audioProblemBody: 'The answer clock is paused. Ask the operator to retry this question.',
+    audioProblemCallerBody: 'The answer clock is paused. On the call, ask the agent to retry this question.',
     audioExpired: 'This round has ended', audioExpiredBody: 'Question audio could not be recovered. Ask the operator about starting a new game.',
+    audioExpiredCallerBody: 'Question audio could not be recovered. Hang up and call back to start a new game.',
     answerNow: 'Answer now', seconds: 'seconds', listening: 'Listening', locked: 'Answer locked',
     reveal: 'Answer reveal', correctAnswer: 'Correct answer', explanation: 'Why it is right',
     correct: 'Correct', incorrect: 'Incorrect', noAnswer: 'No answer', recorded: 'Answer recorded',
@@ -77,7 +80,7 @@ const COPY = {
     },
   },
   'pt-BR': {
-    app: 'Quiz por Voz', eyebrow: 'Palco de quiz da Twilio', tagline: 'Oito perguntas. Dez segundos. Responda em voz alta.',
+    app: 'Quiz por Voz', eyebrow: 'Palco de quiz da Twilio', tagline: 'Oito perguntas. Responda enquanto o tempo corre.',
     home: 'Início', homeLabel: 'Voltar ao início do Twilio Games', stageLabel: 'Palco do Quiz por Voz',
     theme: { light: 'Tema claro', dark: 'Tema escuro' },
     connecting: 'Abrindo o palco do quiz', connectingBody: 'Conectando à sala ao vivo.',
@@ -90,14 +93,16 @@ const COPY = {
     callQrPreparing: 'Preparando o código QR. Você pode ligar para o número abaixo.',
     callQrUnavailable: 'Código QR indisponível. Ligue para o número abaixo.',
     ready: 'Pronto', confirming: 'Confirmando nome', reconnecting: 'Reconectando', openSeat: 'Lugar livre', waiting: 'Aguardando',
-    category: 'Escolham a categoria', categoryBody: 'Votem por voz ou toquem numa categoria para o jogador indicado. Os totais ao vivo decidem a rodada.',
+    category: 'Escolham a categoria', categoryBody: 'Escolham uma categoria para o jogador indicado. Os totais ao vivo decidem a rodada.',
     categoryTouch: '{name} está votando nesta tela', categorySubmitting: 'Registrando o voto de {name}...', categoryWaiting: 'Aguardando votos por telefone', vote: 'voto', votes: 'votos',
     loading: 'Montando as perguntas', loadingBody: 'A tela está verificando fontes e o palco.',
     displayReady: 'Tela pronta', displayPreparing: 'Preparando a tela', countdown: 'A rodada começa em',
-    question: 'Pergunta', of: 'de', getReady: 'Preparem-se', promptBody: 'Os telefones estão terminando a pergunta. O cronômetro de dez segundos começa quando todos os telefones estiverem prontos.',
-    cueReady: 'Preparem-se para responder', cueBody: 'Os telefones estão sincronizando o aviso de resposta. O cronômetro de dez segundos começa quando todos os telefones estiverem prontos.',
+    question: 'Pergunta', of: 'de', getReady: 'Preparem-se', promptBody: 'Os telefones estão ouvindo a pergunta. O cronômetro começa antes das opções.',
+    cueReady: 'Respondam agora', cueBody: 'O cronômetro corre enquanto as opções são faladas. Responda a qualquer momento.',
     audioProblem: 'Áudio da pergunta precisa de atenção', audioProblemBody: 'O cronômetro está pausado. Peça ao operador para repetir esta pergunta.',
+    audioProblemCallerBody: 'O cronômetro está pausado. Na chamada, peça ao agente para repetir esta pergunta.',
     audioExpired: 'Esta rodada terminou', audioExpiredBody: 'Não foi possível recuperar o áudio da pergunta. Fale com o operador para iniciar um novo jogo.',
+    audioExpiredCallerBody: 'Não foi possível recuperar o áudio da pergunta. Desligue e ligue novamente para começar um novo jogo.',
     answerNow: 'Respondam agora', seconds: 'segundos', listening: 'Escutando', locked: 'Resposta registrada',
     reveal: 'Revelação da resposta', correctAnswer: 'Resposta correta', explanation: 'Por que está certa',
     correct: 'Correto', incorrect: 'Incorreto', noAnswer: 'Sem resposta', recorded: 'Resposta recebida',
@@ -234,13 +239,13 @@ function renderQuestion(
 ): TriviaRenderedView {
   const copy = COPY[context.locale];
   const question = state.question;
-  const answering = stage === 'answering';
+  const answering = stage === 'answering' || stage === 'cue';
   const timing = answering && state.answeringStartsAtMs !== null && state.questionEndsAtMs !== null
     ? triviaQuestionTiming(state.answeringStartsAtMs, state.questionEndsAtMs, context.serverNowMs)
     : null;
   const answered = state.players.filter(player => player.answered).length;
   const activelyAnswering = answering;
-  const mode = activelyAnswering ? copy.answerNow : stage === 'cue' ? copy.cueReady : copy.getReady;
+  const mode = activelyAnswering ? copy.answerNow : copy.getReady;
   const timer = timing
     ? `<div id="question-timer" class="question-timer${timing.remainingSeconds <= 5 ? ' urgent' : ''}" aria-label="${escapeHtml(copy.answerNow)}"><strong id="question-seconds">${timing.remainingSeconds}</strong><span>${escapeHtml(copy.seconds)}</span><div class="timer-track" role="progressbar" aria-label="${escapeHtml(copy.answerNow)}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(timing.progress * 100)}"><i id="timer-fill" style="transform:scaleX(${timing.progress})"></i></div></div>`
     : `<div class="prompt-status"><span class="voice-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span><strong>${escapeHtml(stage === 'cue' ? copy.cueBody : copy.promptBody)}</strong></div>`;
@@ -249,22 +254,23 @@ function renderQuestion(
     <div class="question-layout"><article class="question-board"><h1>${escapeHtml(question.prompt)}</h1><ol class="choice-grid">${renderChoices(question.choices)}</ol></article><aside class="answer-status" aria-label="${escapeHtml(copy.players)}">${state.players.map(player => playerPill(player, context.locale, activelyAnswering)).join('')}</aside></div>
   </section>`;
   const announcement = answering
-    ? answered > 0 ? `${answered} of ${state.players.length} ${copy.locked}.` : `${copy.answerNow}. ${timing?.remainingSeconds ?? 10} ${copy.seconds}.`
-    : stage === 'cue' ? `${copy.cueReady}. ${copy.cueBody}`
-      : `${copy.question} ${(state.questionIndex ?? 0) + 1}. ${question.prompt}. ${question.choices.map((choice, index) => `${index + 1}. ${choice.text}`).join('. ')}`;
+    ? answered > 0 ? `${answered} of ${state.players.length} ${copy.locked}.` : `${copy.answerNow}. ${timing?.remainingSeconds ?? TRIVIA_ANSWER_WINDOW_MS / 1_000} ${copy.seconds}.`
+    : `${copy.question} ${(state.questionIndex ?? 0) + 1}. ${question.prompt}. ${question.choices.map((choice, index) => `${index + 1}. ${choice.text}`).join('. ')}`;
   return rendered(`${state.phase}:${state.questionAttemptId}:${question.id}:${stage}:${answered}`, announcement, html);
 }
 
 function renderAudioProblem(state: Extract<TriviaState, { phase: 'audio_problem' }>, context: TriviaViewContext): TriviaRenderedView {
   const copy = COPY[context.locale];
   return rendered(`audio_problem:${state.questionAttemptId}`, copy.audioProblem,
-    panel('audio-problem', copy.eyebrow, copy.audioProblem, copy.audioProblemBody, ''));
+    panel('audio-problem', copy.eyebrow, copy.audioProblem,
+      context.stationMode ? copy.audioProblemBody : copy.audioProblemCallerBody, ''));
 }
 
 function renderAudioExpired(state: TriviaState, context: TriviaViewContext): TriviaRenderedView {
   const copy = COPY[context.locale];
   return rendered(`audio_expired:${state.questionAttemptId}`, copy.audioExpired,
-    panel('audio-problem', copy.eyebrow, copy.audioExpired, copy.audioExpiredBody, ''));
+    panel('audio-problem', copy.eyebrow, copy.audioExpired,
+      context.stationMode ? copy.audioExpiredBody : copy.audioExpiredCallerBody, ''));
 }
 
 function renderReveal(state: Extract<TriviaState, { phase: 'reveal' }>, context: TriviaViewContext): TriviaRenderedView {

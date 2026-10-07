@@ -26,7 +26,9 @@ export const TRIVIA_QUESTIONS_PER_CATEGORY = 25;
 export const TRIVIA_QUESTION_BANK_SIZE = 200;
 export const TRIVIA_ROUND_QUESTION_COUNT = 8;
 export const TRIVIA_CHOICE_COUNT = 4;
-export const TRIVIA_ANSWER_WINDOW_MS = 10_000;
+// The clock begins before four choices are spoken, so it must include time to
+// hear them as well as time to answer over a phone connection.
+export const TRIVIA_ANSWER_WINDOW_MS = 25_000;
 export const TRIVIA_MAX_RAW_SCORE = 12_900;
 export const TRIVIA_MAX_NORMALIZED_SCORE = 100_000;
 export const TRIVIA_MAX_JSON_LENGTH = 2 * 1024 * 1024;
@@ -509,9 +511,9 @@ export function resolveTriviaChoiceId(
 
 export function triviaBasePoints(elapsedMs: number): number {
   if (!Number.isFinite(elapsedMs) || elapsedMs < 0 || elapsedMs > TRIVIA_ANSWER_WINDOW_MS) return 0;
-  if (elapsedMs < 3_000) return 1_300;
-  if (elapsedMs < 6_000) return 1_200;
-  if (elapsedMs < 9_000) return 1_100;
+  if (elapsedMs < 8_000) return 1_300;
+  if (elapsedMs < 16_000) return 1_200;
+  if (elapsedMs < 23_000) return 1_100;
   return 1_000;
 }
 

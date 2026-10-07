@@ -174,6 +174,9 @@ export class FighterVoiceSession {
       ?this.t('voice.resultWin',{name:snapshot.winnerName??this.t('voice.winnerFallback')})
       :this.t('voice.resultLoss',{name:snapshot.winnerName??this.t('voice.winnerFallback')});
   }
+  private resultSummaryText(snapshot:FighterVoiceSnapshot):string{
+    return `${this.resultWinnerText(snapshot)} ${this.t('voice.resultTech')} ${this.resultTail(snapshot)}`;
+  }
   private resultTail(snapshot:FighterVoiceSnapshot):string{
     if(snapshot.resultsPresentationTimedOut===true&&!snapshot.resultsPresented)
       return this.t(this.stationManaged?'voice.resultsDisplayTimeoutStation':'voice.resultsDisplayTimeout');
@@ -204,7 +207,7 @@ export class FighterVoiceSession {
   private sayResultCue(snapshot:FighterVoiceSnapshot):void{
     const key=this.resultKey(snapshot);if(!key){this.sayCurrent(this.resultTail(snapshot));return;}
     this.setResultKey(key);
-    const text=`${this.resultWinnerText(snapshot)} ${this.resultTail(snapshot)}`;
+    const text=this.resultSummaryText(snapshot);
     const cueEpoch=++this.terminalCueEpoch;
     const speechEpoch=this.speechEpoch;
     if(this.stationManaged&&(snapshot.resultsPresented===true||snapshot.resultsPresentationTimedOut===true)){
@@ -250,7 +253,8 @@ export class FighterVoiceSession {
       const snapshot = this.deps.snapshot(code, joined.playerId, this.commandLocale); this.lastPhase = snapshot?.phase ?? null;
       this.introPhase=snapshot?.phase??null;
       if(snapshot&&!this.isCallIntroPhase(snapshot.phase))this.introExpired=true;
-      this.awaitingName=!this.authoritativeName&&!(snapshot?.nameConfirmed??!this.isPlaceholderName(snapshot?.myName??null));
+      this.awaitingName=snapshot?.phase==='lobby'&&!this.authoritativeName
+        &&!(snapshot.nameConfirmed??!this.isPlaceholderName(snapshot.myName));
       this.lastLobbyReady=snapshot?this.isLobbyReady(snapshot):false;
       this.lastFighterChoicesReady=snapshot?this.areFighterChoicesReady(snapshot):false;
       this.lastMapVotesReady=snapshot?this.areMapVotesReady(snapshot):false;
@@ -272,8 +276,10 @@ export class FighterVoiceSession {
           this.sayCurrent(this.t('voice.controlsIntro'));
           this.sayCurrent(this.t('voice.fightHelp'));
           this.speakContext(snapshot);
-        }else{
+        }else if(snapshot?.phase==='lobby'){
           this.sayCurrent(this.t('voice.tellName'),this.phaseGuard('lobby',false));
+        }else if(snapshot){
+          this.speakContext(snapshot);
         }
       }
       return;
@@ -315,15 +321,16 @@ export class FighterVoiceSession {
     const snapshot = this.deps.snapshot(this.code!, this.playerId!, this.commandLocale); if (!snapshot) return;
     const unnamed = !this.isNameConfirmed(snapshot);
     const phaseChoices = snapshot.phase === 'fighter_select' ? snapshot.fighters : snapshot.phase === 'map_select' ? snapshot.maps : [];
+    const menuAdvance = isFighterMenuAdvance(spoken, this.commandLocale);
     const informationRequest = isFighterInformationRequest(spoken, this.commandLocale)
       || hasMultipleVoiceChoiceMentions(spoken, phaseChoices, this.commandLocale);
     if (isFighterGameplayHelpRequest(spoken, this.commandLocale)) {
       this.sayCurrent(this.t('voice.fightHelp')); return;
     }
-    if(!unnamed)this.awaitingName=false;
-    if(this.awaitingName&&unnamed){
+    if(!unnamed||snapshot.phase!=='lobby')this.awaitingName=false;
+    if(this.awaitingName&&unnamed&&snapshot.phase==='lobby'){
       const name=parseFighterSpokenName(spoken,this.commandLocale);
-      if(name&&!informationRequest&&!isFighterAdvanceWord(spoken,this.commandLocale)&&!isFighterStarAlias(spoken,this.commandLocale)){
+      if(name&&!informationRequest&&!menuAdvance&&!isFighterStarAlias(spoken,this.commandLocale)){
         this.awaitingName=false;this.applyingName=true;this.deps.setName(this.code!,this.playerId!,name);this.applyingName=false;
         const next=this.deps.snapshot(this.code!,this.playerId!,this.commandLocale)??snapshot;
         this.sayCurrent(this.t('voice.welcomeName',{name}));
@@ -337,10 +344,9 @@ export class FighterVoiceSession {
       else this.speakContext(snapshot);
       return;
     }
-    const looksLikeChoice = phaseChoices.length > 0 && !!matchChoice(spoken, phaseChoices, this.commandLocale);
-    if (unnamed && !informationRequest && (snapshot.phase === 'lobby' || isExplicitName(spoken, this.commandLocale) || !looksLikeChoice)) {
+    if (unnamed && !informationRequest && (snapshot.phase === 'lobby' || isExplicitName(spoken, this.commandLocale))) {
       const name = parseFighterSpokenName(spoken, this.commandLocale);
-      if (name && !isFighterAdvanceWord(spoken, this.commandLocale) && !isFighterStarAlias(spoken, this.commandLocale)) {
+      if (name && !menuAdvance && !isFighterStarAlias(spoken, this.commandLocale)) {
         if(snapshot.phase==='lobby'){
           this.applyingName=true;this.deps.setName(this.code!,this.playerId!,name);this.applyingName=false;
           this.sayCurrent(this.t('voice.welcomeName',{name}));
@@ -369,15 +375,14 @@ export class FighterVoiceSession {
         if(!selected)this.sayCurrent(this.t('voice.fighterUnavailable',{name:fighter.name}));
         else {
           const next = this.deps.snapshot(this.code!, this.playerId!, this.commandLocale) ?? snapshot;
-          const namePrompt = unnamed ? this.t('voice.namePromptSuffix') : '';
-          const values = { name: fighter.name, namePrompt };
+          const values = { name: fighter.name, namePrompt: '' };
            if (!this.hasExpectedPlayers(next)) this.sayCurrent(this.t('voice.fighterLockedWaitingPlayerTwo', values));
            else if(this.areFighterChoicesReady(next))this.sayCurrent(this.t('voice.fighterLockedNext',values));
            else this.sayCurrent(this.t('voice.fighterLockedWaiting',values));
         }
         return;
       }
-      if (isFighterAdvanceWord(spoken, this.commandLocale)) { this.advanceOrExplain(snapshot); return; }
+      if (menuAdvance) { this.advanceOrExplain(snapshot); return; }
       if(this.interpret(spoken,snapshot))return;
       this.sayCurrent(this.t('voice.fighterUnknown', { prompt: this.t('voice.choiceFighter') })); return;
     }
@@ -398,7 +403,7 @@ export class FighterVoiceSession {
           :this.t('voice.mapUnavailable',{name:this.localizedMapName(map)}));
         return;
       }
-      if(isFighterAdvanceWord(spoken,this.commandLocale)||isFighterFightAlias(spoken,this.commandLocale)||isFighterStarAlias(spoken,this.commandLocale)){
+      if(menuAdvance||isFighterFightAlias(spoken,this.commandLocale)||isFighterStarAlias(spoken,this.commandLocale)){
         this.advanceOrExplain(snapshot);return;
       }
       if(this.interpret(spoken,snapshot))return;
@@ -438,7 +443,8 @@ export class FighterVoiceSession {
         this.sayCurrent(this.contextText(snapshot));
       return;
     }
-    if (isFighterAdvanceWord(spoken, this.commandLocale) || isFighterStarAlias(spoken, this.commandLocale)) {
+    if (isFighterAdvanceWord(spoken, this.commandLocale)
+      || snapshot.phase === 'lobby' && menuAdvance || isFighterStarAlias(spoken, this.commandLocale)) {
       if(snapshot.phase==='results'&&this.stationManaged)
         this.sayCurrent(this.contextText(snapshot));
       else this.advanceOrExplain(snapshot);
@@ -723,7 +729,7 @@ export class FighterVoiceSession {
     if(snapshot.phase==='loading'||snapshot.phase==='intro'||snapshot.phase==='countdown')return this.t('voice.getReady');
     if(snapshot.phase==='victory')return this.t('voice.victoryPlaying');
     if(snapshot.phase==='results')return snapshot.winnerName
-      ?`${this.resultWinnerText(snapshot)} ${this.resultTail(snapshot)}`:this.resultTail(snapshot);
+      ?this.resultSummaryText(snapshot):this.resultTail(snapshot);
     return this.t('voice.sayStart');
   }
 
@@ -795,7 +801,7 @@ export class FighterVoiceSession {
       const guard=this.phaseGuard(snapshot.phase,confirmed);
       this.sayCurrent(text,guard);
     };
-    if(!confirmed){say(this.t('voice.tellName'));return;}
+    if(!confirmed&&snapshot.phase==='lobby'){say(this.t('voice.tellName'));return;}
     if (snapshot.phase === 'lobby') {
       if (!this.authoritativeName&&this.isPlaceholderName(snapshot.myName)) say(this.t('voice.tellName'));
       else if(snapshot.automaticSetup&&!this.hasExpectedPlayers(snapshot))say(this.t('voice.waitingLobbyPlayers'));
@@ -966,9 +972,18 @@ const FIGHTER_MAP_NAME_KEYS: Record<string, FighterMessageKey> = {
 function isFighterAdvanceWord(spoken: string, locale: SupportedLocale): boolean {
   if (locale === 'en-US') return isEnglishAdvanceWord(spoken);
   const text = normalizeForMatching(spoken, locale);
-  if(isFighterQuestionOrNegation(text,locale))return false;
+  if(/[?？¿]/u.test(spoken)||isFighterQuestionOrNegation(text,locale))return false;
   if (/\b(?:comecar|iniciar|avancar|proxim[oa]|continuar|lutar|luta|combater|pront[oa]|revanche|jogar de novo|jogar novamente|mais uma vez)\b/.test(text)) return true;
   return /\b(?:escolher|escolha|selecionar|selecione)\b/.test(text) && /\b(?:lutador|personagem|campeao)\b/.test(text);
+}
+
+function isFighterMenuAdvance(spoken:string,locale:SupportedLocale):boolean{
+  if(isFighterAdvanceWord(spoken,locale))return true;
+  const text=normalizeForMatching(spoken,locale);
+  if(/[?？¿]/u.test(spoken)||isFighterQuestionOrNegation(text,locale))return false;
+  return locale==='pt-BR'
+    ? /^(?:sim|claro|pode ser|beleza|ta bom|tudo bem|ok|certo|perfeito|vamos nessa|bora|pode continuar|pode seguir)(?: por favor| agora)?$/.test(text)
+    : /^(?:yes|yeah|yep|sure|ok|okay|alright|all right|sounds good|go ahead|all set|ready when you are)(?: please| now)?$/.test(text);
 }
 
 function isFighterQuestionOrNegation(text:string,locale:SupportedLocale):boolean{
@@ -1042,11 +1057,12 @@ function isFighterContinueResultWord(spoken:string,locale:SupportedLocale):boole
 }
 
 function isFighterFightAlias(spoken: string, locale: SupportedLocale): boolean {
-  return locale === 'en-US' && /^(?:flight|fights)$/.test(normalizeForMatching(spoken, locale));
+  return locale === 'en-US' && !/[?？¿]/u.test(spoken)
+    && /^(?:flight|fights)$/.test(normalizeForMatching(spoken, locale));
 }
 
 function isFighterStarAlias(spoken:string,locale:SupportedLocale):boolean{
-  return locale==='en-US'&&normalizeForMatching(spoken,locale)==='star';
+  return locale==='en-US'&&!/[?？¿]/u.test(spoken)&&normalizeForMatching(spoken,locale)==='star';
 }
 
 function parseFighterSpokenName(spoken: string, locale: SupportedLocale): string | null {

@@ -259,8 +259,20 @@ describe('hostTurn', () => {
     expect(out).toContain('Ada');
   });
   it('prompts for the name first when it is not set yet', () => {
-    const p = buildSystemPrompt(ctx({ myName: null }));
+    const p = buildSystemPrompt(ctx({ phase: 'lobby', myName: null }));
     expect(p.toLowerCase()).toMatch(/name/);
     expect(p.toLowerCase()).toContain('set_name');
+  });
+  it('does not restart name onboarding after the screen moves beyond the lobby', () => {
+    for (const phase of ['car_select', 'map_select', 'countdown', 'racing', 'results'] as const) {
+      const p = buildSystemPrompt(ctx({ phase, myName: null }));
+      expect(p).not.toContain('Ask their name');
+      expect(p).not.toContain('The caller has NOT given their name yet');
+    }
+  });
+  it('treats menu words as examples rather than required phrases', () => {
+    const p = buildSystemPrompt(ctx({ phase: 'lobby' }));
+    expect(p).toContain('not required passwords');
+    expect(p).toContain('natural paraphrase');
   });
 });

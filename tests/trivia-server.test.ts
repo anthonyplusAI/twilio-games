@@ -1,9 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WebSocket } from 'ws';
 import { TriviaRoom } from '../server/trivia-room';
-import { TriviaServer, TRIVIA_RECONNECT_GRACE_MS } from '../server/trivia-server';
+import { TriviaServer, TRIVIA_RECONNECT_GRACE_MS, TRIVIA_STANDALONE_AUDIO_RETRY_LIMIT,
+  TRIVIA_RESULT_RECONNECT_GRACE_MS } from '../server/trivia-server';
 import { parseTriviaQuestionBankJson, type TriviaQuestionBank } from '../shared/trivia';
 
 type Message = Record<string, unknown>;
@@ -96,7 +97,7 @@ async function advanceQuestionAudio(client: Client, code: string, phonePlayers: 
 
   const cue = await waitFor(client, message => message.type === 'trivia_state' && message.phase === 'answer_cue'
     && message.questionAttemptId === attemptId);
-  expect(cue.answeringStartsAtMs).toBeNull();
+  expect(cue.answeringStartsAtMs).not.toBeNull();
   send(client, { type: 'view_rendered', phase: 'answer_cue', questionId,
     questionAttemptId: attemptId, renderRevision: cue.renderRevision });
   await waitUntil(() => trackedKeyboardPlayers(code)?.size
@@ -112,6 +113,95 @@ async function advanceQuestionAudio(client: Client, code: string, phonePlayers: 
 }
 
 describe('TriviaServer authority and lifecycle', () => {
+  it('allows only the current standalone caller to retry failed audio, with a per-question cap', () => {
+    const now = { value: 0 };
+    trivia = new TriviaServer({ bank, now: () => now.value,
+      roomFactory: (code, options) => new TriviaRoom(code, { ...options, countdownMs: 20 }) });
+    const player = trivia.voiceJoin('RECOVER', 'Ada', 1)!;
+    trivia.voiceAdvance('RECOVER', player);
+    trivia.voiceAdvance('RECOVER', player);
+    const room = trivia.findRoom('RECOVER')!;
+    room.ready(room.state().loadingGeneration);
+    now.value = room.state().countdownEndsAtMs!;
+    room.tick();
+    const questionId = room.state().question!.id;
+    const firstAttempt = room.state().questionAttemptId!;
+    expect(room.pauseAudio(questionId, firstAttempt)).toBe(true);
+    expect(trivia.voiceRetryQuestion('RECOVER', 'unbound', questionId, firstAttempt)).toBe('unavailable');
+    expect(trivia.voiceRetryQuestion('RECOVER', player, questionId, firstAttempt - 1)).toBe('unavailable');
+    expect(trivia.voiceSnapshot('RECOVER', player)?.audioRetryRemaining)
+      .toBe(TRIVIA_STANDALONE_AUDIO_RETRY_LIMIT);
+
+    for (let retry = 1; retry <= TRIVIA_STANDALONE_AUDIO_RETRY_LIMIT; retry++) {
+      const attempt = room.state().questionAttemptId!;
+      expect(trivia.voiceRetryQuestion('RECOVER', player, questionId, attempt)).toBe('retried');
+      expect(room.state()).toMatchObject({ phase: 'question_prompt', questionAttemptId: attempt + 1 });
+      expect(trivia.voiceRetryQuestion('RECOVER', player, questionId, attempt)).toBe('unavailable');
+      expect(room.pauseAudio(questionId, attempt + 1)).toBe(true);
+      expect(trivia.voiceSnapshot('RECOVER', player)?.audioRetryRemaining)
+        .toBe(TRIVIA_STANDALONE_AUDIO_RETRY_LIMIT - retry);
+    }
+    expect(trivia.voiceRetryQuestion('RECOVER', player, questionId, room.state().questionAttemptId!))
+      .toBe('limit');
+    expect(room.phase).toBe('audio_problem');
+
+    const stationPlayer = trivia.voiceJoin('STATION-RECOVER', 'Grace', 1, true, 'en-US',
+      { stationFixed: true, allowReplay: false, participantIndex: 0 })!;
+    trivia.voiceAdvance('STATION-RECOVER', stationPlayer);
+    trivia.voiceAdvance('STATION-RECOVER', stationPlayer);
+    const stationRoom = trivia.findRoom('STATION-RECOVER')!;
+    stationRoom.ready(stationRoom.state().loadingGeneration);
+    now.value = stationRoom.state().countdownEndsAtMs!;
+    stationRoom.tick();
+    const stationQuestion = stationRoom.state().question!;
+    const stationAttempt = stationRoom.state().questionAttemptId!;
+    expect(stationRoom.pauseAudio(stationQuestion.id, stationAttempt)).toBe(true);
+    expect(trivia.voiceRetryQuestion('STATION-RECOVER', stationPlayer, stationQuestion.id, stationAttempt))
+      .toBe('unavailable');
+    expect(stationRoom.phase).toBe('audio_problem');
+  });
+  it('reaps an unattended standalone result after its display reconnect grace', () => {
+    vi.useFakeTimers();
+    const now = { value: 0 };
+    trivia = new TriviaServer({ bank, now: () => now.value,
+      roomFactory: (code, options) => new TriviaRoom(code, { ...options, countdownMs: 20 }) });
+    try {
+      const player = trivia.voiceJoin('SOLO-GRACE', 'Ada', 1)!;
+      trivia.voiceAdvance('SOLO-GRACE', player);
+      trivia.voiceAdvance('SOLO-GRACE', player);
+      const room = trivia.findRoom('SOLO-GRACE')!;
+      room.ready(room.state().loadingGeneration);
+      now.value = room.state().countdownEndsAtMs!;
+      room.tick();
+      for (let index = 0; index < 8; index++) {
+        const question = room.state().question!;
+        const attemptId = room.state().questionAttemptId!;
+        const promptDelivery = room.beginPromptDelivery(player, question.id, attemptId)!;
+        expect(room.questionPromptReady(player, question.id, attemptId, promptDelivery)).toBe(true);
+        const cueDelivery = room.beginAnswerCueDelivery(player, question.id, attemptId)!;
+        expect(room.questionAnswerCueReady(player, question.id, attemptId, cueDelivery)).toBe(true);
+        now.value = room.state().answeringStartsAtMs!;
+        trivia.voiceAnswer('SOLO-GRACE', player,
+          bank.questions.find(candidate => candidate.id === question.id)!.correctChoiceId);
+        now.value = room.state().revealEndsAtMs!;
+        room.tick();
+      }
+      expect(room.phase).toBe('results');
+      trivia.voiceLeave('SOLO-GRACE', player);
+      expect(trivia.findRoom('SOLO-GRACE')?.phase).toBe('results');
+      expect(trivia.voiceJoin('SOLO-GRACE', 'Invalid caller', 0)).toBeNull();
+      expect(trivia.findRoom('SOLO-GRACE')?.phase).toBe('results');
+      vi.advanceTimersByTime(TRIVIA_RESULT_RECONNECT_GRACE_MS - 1);
+      expect(trivia.roomCount).toBe(1);
+      vi.advanceTimersByTime(1);
+      expect(trivia.findRoom('SOLO-GRACE')).toBeUndefined();
+      expect(trivia.roomCount).toBe(0);
+    } finally {
+      trivia.stopLoopOnly();
+      trivia = undefined;
+      vi.useRealTimers();
+    }
+  });
   it('provides clock sync and bounds connections, rooms, payload, and compression', async () => {
     const port = await start({ now: () => 30_100, maxConnections: 2, maxRooms: 1 });
     const first = await connect(port);
@@ -677,6 +767,15 @@ describe('TriviaServer authority and lifecycle', () => {
     expect(trivia!.voiceAdvance('RESULT', player)).toBe(false);
     send(display, { type: 'advance' });
     await waitFor(display, message => message.type === 'error' && message.code === 'station_requeue_required');
+    const stationResult = room.state().result;
+    const stationExpectedPlayers = room.state().expectedPlayerCount;
+    trivia!.voiceLeave('RESULT', player);
+    expect(trivia!.voiceJoin('RESULT', 'Late caller', 2, true, 'en-US',
+      { stationFixed: false, allowReplay: true })).toBeNull();
+    expect(room.state()).toMatchObject({ phase: 'results', result: stationResult,
+      expectedPlayerCount: stationExpectedPlayers });
+    expect(room.stationFixed).toBe(true);
+    expect(room.allowReplay).toBe(false);
 
     const standalone = trivia!.voiceJoin('SOLO-REPLAY', 'Grace', 1)!;
     expect(trivia!.findRoom('SOLO-REPLAY')!.stationFixed).toBe(false);
@@ -703,9 +802,27 @@ describe('TriviaServer authority and lifecycle', () => {
       standaloneRoom.tick();
     }
     expect(standaloneRoom.phase).toBe('results');
-    const standaloneDisplay = await connect(port);
+    let standaloneDisplay = await connect(port);
     send(standaloneDisplay, { type: 'spectate', roomCode: 'SOLO-REPLAY' });
     await waitFor(standaloneDisplay, message => message.type === 'host_identity' && message.isHost === true);
+    const finishedResult = standaloneRoom.state().result;
+    trivia!.voiceLeave('SOLO-REPLAY', standalone);
+    const afterHangup = await waitFor(standaloneDisplay, message => message.type === 'trivia_state'
+      && message.phase === 'results' && (message.players as Array<{ connected: boolean }>)[0]?.connected === false);
+    expect(afterHangup.result).toEqual(finishedResult);
+    expect(standaloneRoom.state().result).toEqual(finishedResult);
+    const displayClosed = new Promise<void>(resolve => standaloneDisplay.ws.once('close', () => resolve()));
+    standaloneDisplay.ws.close();
+    await displayClosed;
+    expect(trivia!.findRoom('SOLO-REPLAY')?.state()).toMatchObject({
+      phase: 'results', result: finishedResult,
+    });
+    standaloneDisplay = await connect(port);
+    send(standaloneDisplay, { type: 'spectate', roomCode: 'SOLO-REPLAY' });
+    await waitFor(standaloneDisplay, message => message.type === 'host_identity' && message.isHost === true);
+    const restored = await waitFor(standaloneDisplay, message => message.type === 'trivia_state'
+      && message.phase === 'results');
+    expect(restored.result).toEqual(finishedResult);
     const nonhostDisplay = await connect(port);
     send(nonhostDisplay, { type: 'spectate', roomCode: 'SOLO-REPLAY' });
     await waitFor(nonhostDisplay, message => message.type === 'host_identity' && message.isHost === false);

@@ -18,8 +18,10 @@ afterEach(async () => {
   http = undefined;
 });
 
-async function start(displayToken?: string, heartbeatMs?: number, connected?: (ws:WebSocket)=>void): Promise<number> {
-  http = createServer(); fighter = new FighterServer({ server: http, displayToken, heartbeatMs });
+async function start(displayToken?: string, heartbeatMs?: number, connected?: (ws:WebSocket)=>void,
+  resultReconnectGraceMs?: number): Promise<number> {
+  http = createServer(); fighter = new FighterServer({ server: http, displayToken, heartbeatMs,
+    resultReconnectGraceMs });
   http.on('upgrade', (request, socket, head) => fighter!.handleUpgrade(request, socket, head, connected));
   await new Promise<void>(resolve => http!.listen(0, '127.0.0.1', resolve));
   const address = http.address(); if (!address || typeof address === 'string') throw new Error('missing port');
@@ -157,6 +159,120 @@ describe('FighterServer WebSocket authority and lifecycle', () => {
     expect(fighter!.voiceShowResults('REVEAL',playerId)).toBe(true);
     expect(room.phase).toBe('results');
     await waitFor(display,message=>message.type==='show_results'&&message.loadingGeneration===room.state().loadingGeneration);
+  });
+
+  it('keeps the results display after the last phone caller hangs up', async () => {
+    const port = await start();
+    const playerId = fighter!.voiceJoin('FINISHED', 'Ada')!;
+    fighter!.voiceAdvance('FINISHED', playerId);
+    fighter!.voiceSelectFighter('FINISHED', playerId, 'nyx');
+    fighter!.voiceAdvance('FINISHED', playerId);
+    fighter!.voiceSelectMap('FINISHED', playerId, 'void');
+    fighter!.voiceAdvance('FINISHED', playerId);
+    const room = fighter!.findRoom('FINISHED')!;
+    room.ready(room.state().loadingGeneration);
+    room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    const world = room.state().world!;
+    world.status = 'finished'; world.winner = 'p1';
+    room.tick(.1); room.tick(10.5);
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: 'FINISHED' });
+    await waitFor(display, message => message.type === 'fighter_state' && message.phase === 'results');
+
+    const before = display.messages.length;
+    fighter!.voiceLeave('FINISHED', playerId);
+    await vi.waitFor(() => expect(display.messages.slice(before).some(message =>
+      message.type === 'fighter_state' && message.phase === 'results')).toBe(true));
+    const retained = display.messages.slice(before).find(message => message.type === 'fighter_state')!;
+    expect(retained.result).toMatchObject({ winner: 'p1', winnerName: 'Ada' });
+    expect(room.isEmpty).toBe(true);
+    expect(fighter!.findRoom('FINISHED')).toBe(room);
+  });
+
+  it('shows a fresh standalone lobby when another caller joins after the result remains visible', async () => {
+    const port = await start();
+    const first = fighter!.voiceJoin('NEXT-CALLER', 'Ada')!;
+    fighter!.voiceAdvance('NEXT-CALLER', first);
+    fighter!.voiceSelectFighter('NEXT-CALLER', first, 'nyx');
+    fighter!.voiceAdvance('NEXT-CALLER', first);
+    fighter!.voiceSelectMap('NEXT-CALLER', first, 'void');
+    fighter!.voiceAdvance('NEXT-CALLER', first);
+    const room = fighter!.findRoom('NEXT-CALLER')!;
+    room.ready(room.state().loadingGeneration); room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    const world = room.state().world!; world.status = 'finished'; world.winner = 'p1';
+    room.tick(.1); room.tick(10.5);
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: room.code });
+    await waitFor(display, message => message.type === 'fighter_state' && message.phase === 'results');
+    const beforeLeave = display.messages.length;
+    fighter!.voiceLeave(room.code, first);
+    await waitFor(display, message => display.messages.indexOf(message) >= beforeLeave
+      && message.type === 'fighter_state' && message.phase === 'results'
+      && (message.result as { winnerName?: string } | undefined)?.winnerName === 'Ada');
+    expect(room.isEmpty).toBe(true);
+
+    const before = display.messages.length;
+    const next = fighter!.voiceJoin(room.code, 'Bea', undefined, undefined, false);
+    expect(next).not.toBeNull();
+    expect(fighter!.findRoom(room.code)).toBe(room);
+    const lobby = await waitFor(display, message => display.messages.indexOf(message) >= before
+      && message.type === 'fighter_state' && message.phase === 'lobby');
+    expect(lobby.result).toBeNull();
+    expect(lobby.players).toEqual([expect.objectContaining({ playerId: next, name: 'Bea' })]);
+  });
+
+  it.each(['victory', 'results'] as const)('keeps a fixed station %s when an unrelated new caller reaches its room', async finalPhase => {
+    await start(); fighter!.setBrowserPlayerAdmission(code => code !== 'FIXED-RESULT');
+    const first = fighter!.voiceJoin('FIXED-RESULT', 'Ada')!;
+    fighter!.voiceAdvance('FIXED-RESULT', first);
+    fighter!.voiceSelectFighter('FIXED-RESULT', first, 'nyx');
+    fighter!.voiceAdvance('FIXED-RESULT', first);
+    fighter!.voiceSelectMap('FIXED-RESULT', first, 'void');
+    fighter!.voiceAdvance('FIXED-RESULT', first);
+    const room = fighter!.findRoom('FIXED-RESULT')!;
+    room.ready(room.state().loadingGeneration); room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    const world = room.state().world!; world.status = 'finished'; world.winner = 'p1';
+    room.tick(.1); if (finalPhase === 'results') room.tick(10.5);
+    fighter!.voiceLeave(room.code, first);
+
+    expect(fighter!.voiceJoin(room.code, 'Late')).toBeNull();
+    expect(room.state()).toMatchObject({ phase: finalPhase, result: { winnerName: 'Ada' } });
+  });
+
+  it('restores a finished match when the standalone display reconnects, then reaps it on expiry', async () => {
+    const port = await start(undefined, undefined, undefined, 300);
+    const playerId = fighter!.voiceJoin('RESULT-RECONNECT', 'Ada')!;
+    fighter!.voiceAdvance('RESULT-RECONNECT', playerId);
+    fighter!.voiceSelectFighter('RESULT-RECONNECT', playerId, 'nyx');
+    fighter!.voiceAdvance('RESULT-RECONNECT', playerId);
+    fighter!.voiceSelectMap('RESULT-RECONNECT', playerId, 'void');
+    fighter!.voiceAdvance('RESULT-RECONNECT', playerId);
+    const room = fighter!.findRoom('RESULT-RECONNECT')!;
+    room.ready(room.state().loadingGeneration);
+    room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    const world = room.state().world!;
+    world.status = 'finished'; world.winner = 'p1';
+    room.tick(.1); room.tick(10.5);
+    expect(room.phase).toBe('results');
+    const first = await connect(port);
+    send(first, { type: 'spectate', roomCode: room.code });
+    await waitFor(first, message => message.type === 'fighter_state' && message.phase === 'results');
+    fighter!.voiceLeave(room.code, playerId);
+    first.ws.close();
+    await new Promise<void>(resolve => first.ws.once('close', () => resolve()));
+    expect(fighter!.findRoom(room.code)).toBe(room);
+
+    const restored = await connect(port);
+    send(restored, { type: 'spectate', roomCode: room.code });
+    const result = await waitFor(restored, message => message.type === 'fighter_state' && message.phase === 'results');
+    expect(result.result).toMatchObject({ winner: 'p1', winnerName: 'Ada' });
+    await new Promise(resolve => setTimeout(resolve, 350));
+    expect(fighter!.findRoom(room.code)).toBe(room);
+
+    restored.ws.close();
+    await new Promise<void>(resolve => restored.ws.once('close', () => resolve()));
+    await new Promise(resolve => setTimeout(resolve, 350));
+    expect(fighter!.findRoom(room.code)).toBeUndefined();
   });
 
   it('does not advance a paid station fight out of results', async () => {

@@ -266,11 +266,29 @@ describe('KaraokeServer authority and lifecycle', () => {
     expect(karaoke!.findRoom('TOUCH-REPLAY')!.state().result).toBeNull();
   });
 
+  it('lets the elected standalone display restart only after a finished caller has hung up', async () => {
+    const now = { value: 0 };
+    const port = await start({ now: () => now.value, tickMs: 5 });
+    const singer = karaoke!.voiceJoin('AFTER-HANGUP', 'Ada')!;
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: 'AFTER-HANGUP' });
+    await waitFor(display, message => message.type === 'host_identity' && message.isHost === true);
+    await finishVoiceRound('AFTER-HANGUP', singer, display, now);
+    karaoke!.voiceLeave('AFTER-HANGUP', singer);
+    await waitFor(display, message => message.type === 'karaoke_state'
+      && message.phase === 'results' && message.singer === null);
+
+    send(display, { type: 'advance' });
+    await waitFor(display, message => message.type === 'karaoke_state'
+      && message.phase === 'lobby' && message.singer === null && message.result === null);
+    expect(karaoke!.findRoom('AFTER-HANGUP')!.state().result).toBeNull();
+  });
+
   it('keeps authenticated station result replay locked on the elected display', async () => {
     const now = { value: 0 };
     const port = await start({ displayToken: 'secret', now: () => now.value, tickMs: 5 });
     karaoke!.setDisplayAuthenticationRequirement(code => code === 'STATION-REPLAY');
-    const singer = karaoke!.voiceJoin('STATION-REPLAY', 'Ada')!;
+    const singer = karaoke!.voiceJoin('STATION-REPLAY', 'Ada', 1, true, 'en-US', true)!;
     const host = await connect(port);
     send(host, { type: 'display_auth', roomCode: 'STATION-REPLAY', token: 'secret' });
     send(host, { type: 'spectate', roomCode: 'STATION-REPLAY' });
@@ -280,6 +298,69 @@ describe('KaraokeServer authority and lifecycle', () => {
     send(host, { type: 'advance' });
     await waitFor(host, message => message.type === 'error' && message.code === 'station_requeue_required');
     expect(karaoke!.findRoom('STATION-REPLAY')!.phase).toBe('results');
+    const finished = karaoke!.findRoom('STATION-REPLAY')!.state().result;
+    karaoke!.voiceLeave('STATION-REPLAY', singer);
+    expect(karaoke!.voiceJoin('STATION-REPLAY', 'Late', 1, true, 'en-US', true)).toBeNull();
+    expect(karaoke!.findRoom('STATION-REPLAY')!.state()).toMatchObject({
+      phase: 'results', singer: null, result: finished,
+    });
+  });
+
+  it('keeps a completed display and leaderboard score when the phone leaves, then resets on a new call', async () => {
+    const now = { value: 0 };
+    const port = await start({ displayToken: 'secret', now: () => now.value, tickMs: 5 });
+    karaoke!.setDisplayAuthenticationRequirement(code => code === 'FINISHED-DISPLAY');
+    const display = await connect(port);
+    send(display, { type: 'display_auth', roomCode: 'FINISHED-DISPLAY', token: 'secret' });
+    send(display, { type: 'spectate', roomCode: 'FINISHED-DISPLAY' });
+    await waitFor(display, message => message.type === 'host_identity' && message.isHost === true);
+    const singer = karaoke!.voiceJoin('FINISHED-DISPLAY', 'Ada')!;
+    await finishVoiceRound('FINISHED-DISPLAY', singer, display, now);
+    const finished = karaoke!.findRoom('FINISHED-DISPLAY')!.state().result;
+
+    karaoke!.voiceLeave('FINISHED-DISPLAY', singer);
+    await waitFor(display, message => message.type === 'karaoke_state'
+      && message.phase === 'results' && message.singer === null);
+    expect(karaoke!.findRoom('FINISHED-DISPLAY')!.state()).toMatchObject({
+      phase: 'results', result: finished, score: finished!.score,
+    });
+    expect(karaoke!.roomCount).toBe(1);
+
+    const nextSinger = karaoke!.voiceJoin('FINISHED-DISPLAY', 'Ana', 1, true, 'pt-BR');
+    expect(nextSinger).not.toBeNull();
+    await waitFor(display, message => message.type === 'karaoke_state'
+      && message.phase === 'lobby' && message.singer !== null
+      && message.preferredLocale === 'pt-BR');
+    expect(karaoke!.findRoom('FINISHED-DISPLAY')!.state().result).toBeNull();
+  });
+
+  it('restores a singer result after standalone display reconnect and reaps it after grace expiry', async () => {
+    const now = { value: 0 };
+    const port = await start({ now: () => now.value, tickMs: 5, resultReconnectGraceMs: 300 });
+    const singer = karaoke!.voiceJoin('RESULT-RECONNECT', 'Ada')!;
+    const first = await connect(port);
+    send(first, { type: 'spectate', roomCode: 'RESULT-RECONNECT' });
+    await waitFor(first, message => message.type === 'host_identity' && message.isHost === true);
+    await finishVoiceRound('RESULT-RECONNECT', singer, first, now);
+    const room = karaoke!.findRoom('RESULT-RECONNECT')!;
+    const finished = room.state().result;
+    karaoke!.voiceLeave(room.code, singer);
+    first.ws.close();
+    await new Promise<void>(resolve => first.ws.once('close', () => resolve()));
+    expect(karaoke!.findRoom(room.code)).toBe(room);
+
+    const restored = await connect(port);
+    send(restored, { type: 'spectate', roomCode: room.code });
+    const state = await waitFor(restored, message => message.type === 'karaoke_state'
+      && message.phase === 'results');
+    expect(state.result).toEqual(finished);
+    await new Promise(resolve => setTimeout(resolve, 350));
+    expect(karaoke!.findRoom(room.code)).toBe(room);
+
+    restored.ws.close();
+    await new Promise<void>(resolve => restored.ws.once('close', () => resolve()));
+    await new Promise(resolve => setTimeout(resolve, 350));
+    expect(karaoke!.findRoom(room.code)).toBeUndefined();
   });
 
   it('does not treat standalone host capability as station authentication', async () => {

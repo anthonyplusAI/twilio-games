@@ -136,9 +136,6 @@ export class Room {
     }
     this.lobby.addPlayer(id, name, color2, stationIndex);
     if (nameConfirmed) this.confirmedPlayerNames.add(id);
-    else if (this._phase === 'car_select' || this._phase === 'map_select') {
-      this.lobby.returnToLobby(); this._phase = 'lobby';
-    }
     if (stationIndex !== undefined) this.stationSlots.set(stationIndex, id);
     // If a race is already running, slot this player into the live world so they get a car.
     if (this.world && (this._phase === 'countdown' || this._phase === 'racing')) {
@@ -287,7 +284,11 @@ export class Room {
   }
 
   start(): boolean {
-    if (this.lobby.playerCount < this.requiredHumanPlayers || !this.allNamesConfirmed()) return false;
+    // Lobby onboarding confirms names before its first advance. A later caller may join while
+    // choices are already on screen, and their generated display name must not rewind the menu or
+    // block a race after everyone has picked. They can still introduce themselves explicitly.
+    if (this.lobby.playerCount < this.requiredHumanPlayers
+      || (this._phase === 'lobby' && !this.allNamesConfirmed())) return false;
     // Evolve the seed each start so every race gets a NEW (deterministic-per-race) course.
     this.seed = (Math.imul(this.seed ^ (this.seed >>> 15), 0x2c1b3c6d) + 0x9e3779b9) >>> 0;
     this.raceMap = this.lobby.selectedMap;

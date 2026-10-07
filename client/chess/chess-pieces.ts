@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 
 export type ChessColor = 'w' | 'b';
 export type ChessPieceType = 'p' | 'n' | 'b' | 'r' | 'q' | 'k';
@@ -21,6 +22,7 @@ const sphere = new THREE.SphereGeometry(1, 20, 12);
 const smallSphere = new THREE.SphereGeometry(1, 12, 8);
 const cone = new THREE.ConeGeometry(1, 1, 12);
 const box = new THREE.BoxGeometry(1, 1, 1);
+const pieceGeometryCache = new Map<string, readonly { geometry: THREE.BufferGeometry; material: THREE.Material }[]>();
 
 function profile(name: string, points: readonly (readonly [number, number])[]): THREE.LatheGeometry {
   let result = latheCache.get(name);
@@ -191,7 +193,7 @@ function makeKing(group: THREE.Group, body: THREE.Material, accent: THREE.Materi
   add(group, smallSphere, accent, [0, 1.555, 0], [0.06, 0.06, 0.06]);
 }
 
-export function createChessPiece(type: ChessPieceType, color: ChessColor): THREE.Group {
+function sculptPiece(type: ChessPieceType, color: ChessColor): THREE.Group {
   const group = new THREE.Group();
   const body = color === 'w' ? ivory : obsidian;
   const shade = color === 'w' ? ivoryShadow : obsidianShadow;
@@ -204,6 +206,49 @@ export function createChessPiece(type: ChessPieceType, color: ChessColor): THREE
     case 'b': makeBishop(group, body, shade, accent); break;
     case 'q': makeQueen(group, body, accent); break;
     case 'k': makeKing(group, body, accent); break;
+  }
+  group.userData = { type, color };
+  return group;
+}
+
+/** Merge fixed sculptural details once, leaving only a few draws per animated piece. */
+export function createChessPiece(type: ChessPieceType, color: ChessColor): THREE.Group {
+  const key = `${color}:${type}`;
+  let meshes = pieceGeometryCache.get(key);
+  if (!meshes) {
+    const sculpture = sculptPiece(type, color);
+    const byMaterial = new Map<THREE.Material, THREE.BufferGeometry[]>();
+    sculpture.updateMatrixWorld(true);
+    sculpture.traverse(object => {
+      if (!(object instanceof THREE.Mesh)) return;
+      const material = object.material as THREE.Material;
+      let baked = object.geometry.clone();
+      baked.applyMatrix4(object.matrixWorld);
+      if (baked.index) {
+        const expanded = baked.toNonIndexed();
+        baked.dispose();
+        baked = expanded;
+      }
+      const geometries = byMaterial.get(material) ?? [];
+      geometries.push(baked);
+      byMaterial.set(material, geometries);
+    });
+    const merged: { geometry: THREE.BufferGeometry; material: THREE.Material }[] = [];
+    for (const [material, geometries] of byMaterial) {
+      const geometry = mergeGeometries(geometries, false);
+      geometries.forEach(item => item.dispose());
+      if (!geometry) throw new Error(`Could not merge ${key} chess geometry.`);
+      merged.push({ geometry, material });
+    }
+    meshes = merged;
+    pieceGeometryCache.set(key, meshes);
+  }
+  const group = new THREE.Group();
+  for (const { geometry, material } of meshes) {
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    group.add(mesh);
   }
   group.userData = { type, color };
   return group;

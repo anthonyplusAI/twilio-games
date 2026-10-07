@@ -233,6 +233,67 @@ describe('BattleRoom', () => {
     expect(r.result()).not.toBeNull();
   });
 
+  it('keeps the completed result after its last caller hangs up until a new standalone caller joins', () => {
+    const r = room();
+    const original = r.addPlayer('Ada') as { playerId: string };
+    r.advance(); r.selectMonster(original.playerId, 'embertail'); r.advance();
+    for (let i = 0; i < 100 && r.phase === 'battle'; i++) {
+      const snapshot = r.snapshot()!;
+      r.chooseMove(original.playerId, snapshot.a.moves[1]!.id);
+      if (r.aiPending()) r.resolveAiTurn();
+    }
+    expect(r.phase).toBe('results');
+    expect(r.acknowledgeResultsPresented(r.generation)).toBe(true);
+    const result = r.result();
+    const finalSnapshot = r.snapshot();
+
+    r.removePlayer(original.playerId);
+
+    expect(r.isEmpty).toBe(true);
+    expect(r.phase).toBe('results');
+    expect(r.result()).toEqual(result);
+    expect(r.snapshot()).toEqual(finalSnapshot);
+    expect(r.resultsPresented).toBe(true);
+    expect(r.isFinishedBattleParticipant(original.playerId)).toBe(false);
+    expect(r.advance(original.playerId)).toBe(false);
+
+    const next = r.addPlayer('Bo') as { playerId: string };
+    expect(next.playerId).toBeTruthy();
+    expect(r.phase).toBe('lobby');
+    expect(r.result()).toBeNull();
+    expect(r.advance(next.playerId)).toBe(true);
+  });
+
+  it('starts a fresh solo session after both players leave a completed standalone duel', () => {
+    const r = room();
+    const ada = r.addPlayer('Ada') as { playerId: string };
+    const bo = r.addPlayer('Bo') as { playerId: string };
+    r.expectHumanPlayers(2, false);
+    r.advance(ada.playerId);
+    r.selectMonster(ada.playerId, 'embertail');
+    r.selectMonster(bo.playerId, 'thornling');
+    r.advance(bo.playerId);
+    for (let i = 0; i < 100 && r.phase === 'battle'; i++) {
+      const snapshot = r.snapshot()!;
+      if (r.activeSide() === 'a') r.chooseMove(ada.playerId, snapshot.a.moves[1]!.id);
+      else r.chooseMove(bo.playerId, snapshot.b.moves[0]!.id);
+    }
+    expect(r.phase).toBe('results');
+    r.removePlayer(ada.playerId);
+    r.removePlayer(bo.playerId);
+    expect(r.phase).toBe('results');
+
+    const next = r.addPlayer('Cy') as { playerId: string };
+    expect(r.phase).toBe('lobby');
+    expect(next.playerId).toBeTruthy();
+    expect(r.advance()).toBe(true);
+    expect(r.phase).toBe('monster_select');
+    r.selectMonster(next.playerId, 'embertail');
+    expect(r.advance(next.playerId)).toBe(true);
+    expect(r.phase).toBe('battle');
+    expect(r.snapshot()?.b.name).toBe('Rival');
+  });
+
   it('lets only a finished-battle participant request its rematch', () => {
     vi.useFakeTimers();
     try {
@@ -259,6 +320,32 @@ describe('BattleRoom', () => {
       expect(r.advance(original.playerId)).toBe(true);
       expect(r.phase).toBe('monster_select');
     } finally { vi.useRealTimers(); }
+  });
+
+  it('lets a waiting caller start the next round after the finished players leave', () => {
+    const r = room();
+    const original = r.addPlayer('Ada') as { playerId: string };
+    r.advance(); r.selectMonster(original.playerId, 'embertail'); r.advance();
+    for (let index = 0; index < 100 && r.phase === 'battle'; index++) {
+      const snap = r.snapshot()!;
+      r.chooseMove(original.playerId, snap.a.moves[1]!.id);
+      if (r.aiPending()) r.resolveAiTurn();
+    }
+    expect(r.phase).toBe('results');
+    expect(r.acknowledgeResultsPresented(r.generation)).toBe(true);
+    const result = r.result();
+    const waiting = r.addPlayer('Bo') as { playerId: string };
+    expect(r.canStartNextRound(waiting.playerId)).toBe(false);
+    expect(r.advance(waiting.playerId)).toBe(false);
+    expect(r.result()).toEqual(result);
+
+    r.removePlayer(original.playerId);
+    expect(r.phase).toBe('results');
+    expect(r.result()).toEqual(result);
+    expect(r.canStartNextRound(waiting.playerId)).toBe(true);
+    expect(r.advance(waiting.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');
+    expect(r.result()).toBeNull();
   });
 
   it('unlocks a finished participant’s rematch when the matching result overlay is actually presented', () => {

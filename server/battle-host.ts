@@ -67,6 +67,7 @@ export function buildBattleSystemPrompt(ctx: BattleHostContext, locale: Supporte
     'TYPE MATCHUPS (so you can answer "what beats what"): the 9 types are normal, fire, water, grass, electric, rock, ground, flying, psychic. Key rules: fire beats grass + flying; water beats fire, rock, ground; grass beats water, rock, ground; electric beats water + flying (but does nothing extra to ground); rock beats fire + flying + psychic; ground beats fire, electric, rock; flying beats grass; psychic beats normal + flying but is resisted by rock. A super-effective hit does DOUBLE damage; a resisted one does HALF. Encourage players to attack with a type their foe is weak to.',
     '',
     'YOU CAN ANSWER QUESTIONS. If the caller asks about the game, controls, type matchups, what is on their screen, Twilio, or how this is built, answer helpfully in a sentence or two, then steer back to the battle.',
+    'MENU INTENT: "next" and "battle" are examples, not required passwords. Understand clear requests to continue, choose a monster, or start the fight even when the caller phrases them differently. Advance only if the current screen is ready; ask briefly when the intent is uncertain. Let callers interrupt your menu speech at any time.',
     'ABOUT THE TECH ("how does this work / how is this built"): built on Twilio Conversation Relay. The call streams live to a server over a WebSocket; Twilio transcribes the caller\'s speech and speaks your replies with text-to-speech; Conversation Relay handles real-time, interruptible voice — the caller can talk over you any time. The battle logic + this AI host run on the server. Keep tech answers short + in-character, not a lecture.',
     '',
     locale === 'pt-BR'
@@ -83,11 +84,11 @@ export function buildBattleSystemPrompt(ctx: BattleHostContext, locale: Supporte
   // Name onboarding ONLY matters before a battle — never hijack a live battle with "ask their name /
   // pick a monster" just because we don't have a real name (the "it told me to pick a monster mid-
   // battle" bug). In battle/results, skip it entirely and commentate the actual game.
-  if (!ctx.myName && (ctx.phase === 'lobby' || ctx.phase === 'monster_select')) {
-    lines.push("The caller has NOT given their name yet. FIRST job: ask their name. The moment they say it, record it AND in the SAME reply greet them by name and tell them to say next when ready to pick a monster. Do not advance until the caller says the prompted keyword.");
+  if (!ctx.myName && ctx.phase === 'lobby') {
+    lines.push("The caller has NOT given their name yet. FIRST job: ask their name. The moment they say it, record it AND in the SAME reply greet them by name and invite them to choose monsters when ready. Do not advance merely because they supplied a name; listen for a clear request to continue.");
   }
   if (ctx.phase === 'lobby') {
-    lines.push("SCREEN: the LOBBY (players call in; the shared screen shows who's in). Once you have their name: greet them, say others can still call in, and tell them to say next when everyone is ready to pick monsters. Never advance without that spoken command.");
+    lines.push("SCREEN: the LOBBY (players call in; the shared screen shows who's in). Once you have their name: greet them, say others can still call in, and invite them to continue when everyone is ready to pick monsters. Never advance without a clear request from a caller.");
   }
   if (ctx.phase === 'monster_select') {
     lines.push(`SCREEN: the MONSTER-PICKING screen — a grid of creatures is on the display RIGHT NOW. Tell the caller to PICK their monster (say a name or a number). The ONLY monsters are, in order: ${numberedList(ctx.monsters)}. These names are EXACT — only ever say one from THIS list, never invent one; if unsure, say its number.`);

@@ -32,6 +32,7 @@ const FINAL_REPEAT_GUARD_MS = 160;
 export const TRIVIA_SPEECH_RETRY_DELAY_MS = 300;
 export const TRIVIA_SPEECH_MAX_ATTEMPTS = 2;
 export type TriviaSpeechOutcome = 'played' | 'estimated' | 'interrupted' | 'failed';
+export type TriviaAudioRetryResult = 'retried' | 'limit' | 'unavailable';
 
 export interface TriviaIntentRequest {
   game: 'trivia';
@@ -101,6 +102,8 @@ export interface TriviaVoiceSnapshot {
   readonly displayViewReady: boolean;
   /** Supports an accurate reveal delta after a transport reconnect. */
   readonly myQuestionPoints: number;
+  /** Server-owned retry budget for this round question, shared across reconnects. */
+  readonly audioRetryRemaining: number;
 }
 
 export interface TriviaVoiceDeps {
@@ -138,6 +141,8 @@ export interface TriviaVoiceDeps {
   queueEarlyAnswer(code: string, playerId: string, questionId: string,
     questionAttemptId: number, choiceId: string): boolean;
   pauseAudio(code: string, questionId: string, questionAttemptId: number): boolean;
+  retryQuestion(code: string, playerId: string, questionId: string,
+    questionAttemptId: number): TriviaAudioRetryResult;
   beginAnswerResolution(code: string, playerId: string, questionId: string,
     questionAttemptId: number, onset?: { choiceId?: string; atMs: number }): number | null;
   finishAnswerResolution(code: string, playerId: string, questionId: string,
@@ -428,7 +433,7 @@ export class TriviaVoiceSession {
     const snapshot = this.currentSnapshot();
     if (!snapshot) return;
     if (!this.isCallIntroPhase(snapshot.phase)) this.introExpired = true;
-    this.awaitingName = !snapshot.nameConfirmed;
+    this.awaitingName = snapshot.phase === 'lobby' && !snapshot.nameConfirmed;
     this.lastPhase = snapshot.phase;
     this.announcedCategoryVote = this.categoryVoteContext(snapshot);
     this.observedStateQuestionKey = questionKey(snapshot);
@@ -455,11 +460,11 @@ export class TriviaVoiceSession {
     }
 
     void this.speak(this.text('voice.welcome'), this.callIntroGuard());
-    if (!snapshot.nameConfirmed) {
+    if (snapshot.phase === 'lobby' && !snapshot.nameConfirmed) {
       this.askName();
       return;
     }
-    if (snapshot.myName) void this.speak(this.text('voice.welcomeName', { name: snapshot.myName }),
+    if (snapshot.nameConfirmed && snapshot.myName) void this.speak(this.text('voice.welcomeName', { name: snapshot.myName }),
       this.setupGuard(snapshot.myName));
     void this.speak(this.text('voice.gameplay'), this.setupGuard());
     this.onStateChanged();
@@ -471,7 +476,8 @@ export class TriviaVoiceSession {
     this.abortSemantic();
     this.lastFinal = null;
     this.inputStreamScope ??= inputScope(snapshot);
-    if (snapshot.phase !== 'question' || snapshot.myAnswered || !this.activeQuestionKey) {
+    if ((snapshot.phase !== 'question' && snapshot.phase !== 'answer_cue')
+      || snapshot.myAnswered || !this.activeQuestionKey) {
       this.answerOnset = null;
       this.speechOnset = null;
       return;
@@ -507,7 +513,7 @@ export class TriviaVoiceSession {
     speechOnset: { scope: string; atMs: number } | null,
     receivedAtMs: number,
   ): void {
-    if (!snapshot.nameConfirmed) {
+    if (snapshot.phase === 'lobby' && !snapshot.nameConfirmed) {
       this.captureName(spoken);
       return;
     }
@@ -517,7 +523,7 @@ export class TriviaVoiceSession {
       return;
     }
     if (snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue') {
-      this.handleQuestionPreparation(spoken, snapshot);
+      this.handleQuestionPreparation(spoken, snapshot, answerOnset, speechOnset, receivedAtMs);
       return;
     }
     if (snapshot.phase === 'question') {
@@ -533,8 +539,19 @@ export class TriviaVoiceSession {
       this.commitAnswer(spoken, snapshot, answerOnset, speechOnset, receivedAtMs);
       return;
     }
+    if (snapshot.phase === 'audio_problem') {
+      if (this.stationManaged) {
+        void this.speak(this.text('voice.audioProblem'), this.questionGuard(questionKey(snapshot)!, ['audio_problem']));
+      } else if (isTriviaAudioRetryRequest(spoken, this.commandLocale)) {
+        this.retryQuestionAudio(snapshot);
+      } else {
+        this.interpret(spoken, snapshot, receivedAtMs);
+      }
+      return;
+    }
     if (snapshot.phase === 'audio_expired') {
-      void this.speak(this.text('voice.audioExpired'), this.phaseGuard('audio_expired'));
+      void this.speak(this.text(this.stationManaged ? 'voice.audioExpired'
+        : 'voice.audioExpiredStandalone'), this.phaseGuard('audio_expired'));
       return;
     }
     if (snapshot.phase === 'results' && isPlayAgain(spoken, this.commandLocale)) {
@@ -593,7 +610,10 @@ export class TriviaVoiceSession {
     this.onStateChanged();
   }
 
-  private handleQuestionPreparation(spoken: string, snapshot: TriviaVoiceSnapshot): void {
+  private handleQuestionPreparation(spoken: string, snapshot: TriviaVoiceSnapshot,
+    answerOnset: { scope: string; choiceId: string; atMs: number } | null = null,
+    speechOnset: { scope: string; atMs: number } | null = null,
+    receivedAtMs = this.now()): void {
     const key = questionKey(snapshot);
     if (!key) return;
     if (isTriviaQuestionInformationRequest(spoken, this.commandLocale)) {
@@ -602,7 +622,8 @@ export class TriviaVoiceSession {
     }
     const choiceId = this.resolveAnswer(spoken, snapshot);
     if (choiceId) {
-      this.holdEarlyAnswer(choiceId, snapshot);
+      if (snapshot.phase === 'answer_cue') this.commitAnswer(spoken, snapshot, answerOnset, speechOnset, receivedAtMs);
+      else this.holdEarlyAnswer(choiceId, snapshot);
       return;
     }
     if (isTriviaSkipReading(spoken, this.commandLocale)) {
@@ -617,7 +638,7 @@ export class TriviaVoiceSession {
       else this.presentAnswerCue(snapshot, true);
       return;
     }
-    this.interpret(spoken, snapshot, this.now());
+    this.interpret(spoken, snapshot, receivedAtMs, answerOnset, speechOnset);
   }
 
   private holdEarlyAnswer(spokenOrChoiceId: string, snapshot: TriviaVoiceSnapshot): void {
@@ -653,6 +674,30 @@ export class TriviaVoiceSession {
     this.onStateChanged();
   }
 
+  private retryQuestionAudio(snapshot: TriviaVoiceSnapshot): void {
+    const key = questionKey(snapshot);
+    const question = snapshot.question;
+    const attemptId = snapshot.questionAttemptId;
+    if (this.stationManaged || snapshot.phase !== 'audio_problem' || !key || !question
+      || attemptId === null || !this.code || !this.playerId) return;
+    this.deps.preemptSpeech();
+    const outcome = this.applyAuthority(() => this.deps.retryQuestion(
+      this.code!, this.playerId!, question.id, attemptId,
+    ));
+    if (outcome === 'retried') {
+      this.onStateChanged();
+      return;
+    }
+    if (outcome === 'limit') {
+      void this.speak(this.text('voice.audioRetryLimit'), this.questionGuard(key, ['audio_problem']));
+      return;
+    }
+    const current = this.currentSnapshot();
+    if (current?.phase === 'audio_problem' && questionKey(current) === key) {
+      void this.speak(this.text('voice.audioProblemStandalone'), this.questionGuard(key, ['audio_problem']));
+    } else this.onStateChanged();
+  }
+
   private interpret(spoken: string, snapshot: TriviaVoiceSnapshot, receivedAtMs: number,
     answerOnset: { scope: string; choiceId: string; atMs: number } | null = null,
     speechOnset: { scope: string; atMs: number } | null = null,
@@ -668,12 +713,16 @@ export class TriviaVoiceSession {
     const choices = snapshot.phase === 'category_select'
       ? TRIVIA_ROUND_CATEGORY_IDS.map(id => ({ id, label: TRIVIA_CATEGORY_LABELS[this.commandLocale][id],
         aliases: TRIVIA_CATEGORY_ALIASES[this.commandLocale][id] }))
-      : question?.choices.map(choice => ({ id: choice.id, label: choice.text, aliases: choice.aliases })) ?? [];
+      : (snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue'
+          || snapshot.phase === 'question')
+        ? question?.choices.map(choice => ({ id: choice.id, label: choice.text, aliases: choice.aliases })) ?? []
+        : [];
     const actions: TriviaIntentRequest['actions'] = informationOnly ? [] : snapshot.phase === 'category_select'
       ? [{ id: 'select_category', description: 'Vote for one displayed category',
           targetIds: TRIVIA_ROUND_CATEGORY_IDS }]
       : snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue'
-        ? [{ id: 'answer_choice', description: 'Commit one displayed answer for the common start',
+        ? [{ id: 'answer_choice', description: snapshot.phase === 'answer_cue'
+          ? 'Commit one displayed answer during the live timer' : 'Save one displayed answer for the common start',
             targetIds: question?.choices.map(choice => choice.id) ?? [] },
           { id: 'skip_reading', description: 'Stop reading this question and wait for the shared answer start' },
           { id: 'repeat_question', description: 'Read this question and its choices again' }]
@@ -681,6 +730,8 @@ export class TriviaVoiceSession {
           ? [{ id: 'answer_choice', description: 'Commit one displayed answer',
               targetIds: question?.choices.map(choice => choice.id) ?? [] },
             { id: 'repeat_question', description: 'Read the visible question again' }]
+          : snapshot.phase === 'audio_problem' && !this.stationManaged
+            ? [{ id: 'retry_question', description: 'Replay the current failed question audio from the start' }]
           : snapshot.phase === 'results' && !this.stationManaged
             ? [{ id: 'play_again', description: 'Start another trivia round' }]
             : [];
@@ -690,31 +741,32 @@ export class TriviaVoiceSession {
     const epoch = ++this.semanticEpoch;
     const scope = questionKey(snapshot);
     const resultId = snapshot.result?.resultId;
-    const validOnset = snapshot.phase === 'question' && answerOnset
+    const activeClock = snapshot.phase === 'answer_cue' || snapshot.phase === 'question';
+    const validOnset = activeClock && answerOnset
       && answerOnset.scope === inputScope(snapshot)
       && snapshot.answeringStartsAtMs !== null && snapshot.questionEndsAtMs !== null
       && answerOnset.atMs >= snapshot.answeringStartsAtMs
       && answerOnset.atMs <= snapshot.questionEndsAtMs && answerOnset.atMs <= receivedAtMs
       && question?.choices.some(choice => choice.id === answerOnset.choiceId)
       ? answerOnset : null;
-    const validSpeechOnset = snapshot.phase === 'question' && speechOnset
+    const validSpeechOnset = activeClock && speechOnset
       && speechOnset.scope === inputScope(snapshot)
       && snapshot.answeringStartsAtMs !== null && snapshot.questionEndsAtMs !== null
       && speechOnset.atMs >= snapshot.answeringStartsAtMs
       && speechOnset.atMs <= snapshot.questionEndsAtMs && speechOnset.atMs <= receivedAtMs
       ? speechOnset : null;
-    const lateOnset = snapshot.phase === 'question' && snapshot.questionEndsAtMs !== null
+    const lateOnset = activeClock && snapshot.questionEndsAtMs !== null
       && receivedAtMs > snapshot.questionEndsAtMs
       ? validOnset
         ? { choiceId: validOnset.choiceId, atMs: validOnset.atMs }
         : validSpeechOnset ? { atMs: snapshot.questionEndsAtMs } : undefined
       : undefined;
-    if (snapshot.phase === 'question' && snapshot.questionEndsAtMs !== null
+    if (activeClock && snapshot.questionEndsAtMs !== null
       && receivedAtMs > snapshot.questionEndsAtMs && !lateOnset) {
-      void this.speak(this.text('voice.answerTooLate'), this.questionGuard(scope!, ['question']));
+      void this.speak(this.text('voice.answerTooLate'), this.questionGuard(scope!, ['answer_cue', 'question']));
       return;
     }
-    const resolutionId = !informationOnly && snapshot.phase === 'question' && question && snapshot.questionAttemptId !== null
+    const resolutionId = !informationOnly && activeClock && question && snapshot.questionAttemptId !== null
       ? this.deps.beginAnswerResolution(this.code!, this.playerId!, question.id,
         snapshot.questionAttemptId, lateOnset)
       : null;
@@ -735,8 +787,9 @@ export class TriviaVoiceSession {
     const job = Promise.resolve().then(() => resolveIntent(request)).then(result => {
       if (controller.signal.aborted || epoch !== this.semanticEpoch || !this.active) return;
       const current = this.currentSnapshot();
-      if (!current || current.phase !== snapshot.phase || questionKey(current) !== scope
-        || current.result?.resultId !== resultId || !current.nameConfirmed) return;
+      if (!current || questionKey(current) !== scope
+        || (current.phase !== snapshot.phase && !(snapshot.phase === 'answer_cue' && current.phase === 'question'))
+        || current.result?.resultId !== resultId) return;
       if (snapshot.phase === 'category_select' && current.myCategoryVote !== snapshot.myCategoryVote) return;
       if (result.kind === 'answer') {
         const fact = this.voiceFacts(current).find(candidate => candidate.id === result.factId);
@@ -765,7 +818,7 @@ export class TriviaVoiceSession {
           this.onStateChanged();
         }
       } else if (result.actionId === 'answer_choice' && result.targetId) {
-        if (current.phase === 'question') this.commitAnswerAt(result.targetId, current,
+        if (current.phase === 'question' || current.phase === 'answer_cue') this.commitAnswerAt(result.targetId, current,
           validOnset?.choiceId === result.targetId ? validOnset.atMs
             : lateOnset && !lateOnset.choiceId ? lateOnset.atMs : receivedAtMs,
           resolutionId ?? undefined);
@@ -782,6 +835,8 @@ export class TriviaVoiceSession {
         else if (current.phase === 'answer_cue') this.presentAnswerCue(current, true);
         else if (current.phase === 'question') void this.speak(this.questionPrompts(current).join(' '),
           this.questionGuard(scope!, ['question']));
+      } else if (result.actionId === 'retry_question' && current.phase === 'audio_problem') {
+        this.retryQuestionAudio(current);
       } else if (result.actionId === 'play_again' && current.phase === 'results') {
         this.applyAuthority(() => this.deps.advance(this.code!, this.playerId!));
         this.onStateChanged();
@@ -816,6 +871,10 @@ export class TriviaVoiceSession {
     if (snapshot.phase === 'results' && snapshot.result) return [{ id: 'standings', text:
       snapshot.result.players.map(player => `${player.name}: ${formatNumber(this.commandLocale,
         player.normalizedScore)}`).join('; ') }];
+    if (snapshot.phase === 'audio_problem') return [{ id: 'audio_recovery', text: this.text(
+      this.stationManaged ? 'voice.audioProblem'
+        : snapshot.audioRetryRemaining > 0 ? 'voice.audioProblemStandalone' : 'voice.audioRetryLimit',
+    ) }];
     return [];
   }
 
@@ -828,6 +887,9 @@ export class TriviaVoiceSession {
     if (snapshot.phase === 'category_select' || snapshot.phase === 'question'
       || snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue') {
       void this.speak(this.text(key), this.snapshotGuard(snapshot));
+    } else if (snapshot.phase === 'audio_problem' && !this.stationManaged) {
+      void this.speak(this.text(snapshot.audioRetryRemaining > 0
+        ? 'voice.audioProblemStandalone' : 'voice.audioRetryLimit'), this.snapshotGuard(snapshot));
     }
   }
 
@@ -863,18 +925,21 @@ export class TriviaVoiceSession {
       || snapshot.answeringStartsAtMs === null || snapshot.questionEndsAtMs === null) return;
     if (answeredAtMs < snapshot.answeringStartsAtMs) return;
     if (answeredAtMs > snapshot.questionEndsAtMs) {
-      void this.speak(this.text('voice.answerTooLate'), this.questionGuard(questionKey, ['question']));
+      void this.speak(this.text('voice.answerTooLate'), this.questionGuard(questionKey, ['answer_cue', 'question']));
       return;
     }
 
+    if (snapshot.phase === 'answer_cue') this.deps.preemptSpeech();
     const accepted = this.applyAuthority(() => this.deps.answerAt(
       this.code!, this.playerId!, choiceId, true, answeredAtMs, semanticResolutionId,
     ));
     if (accepted) {
       this.lockedQuestions.add(questionKey);
-      void this.speak(this.text('voice.answerAccepted'), this.questionGuard(questionKey, ['question', 'reveal']));
+      void this.speak(this.text('voice.answerAccepted'), this.questionGuard(questionKey,
+        ['answer_cue', 'question', 'reveal']));
     } else if (!this.currentSnapshot()?.myAnswered) {
-      void this.speak(this.text('voice.answerTooLate'), this.questionGuard(questionKey, ['question']));
+      void this.speak(this.text('voice.answerTooLate'), this.questionGuard(questionKey,
+        ['answer_cue', 'question']));
     }
     this.onStateChanged();
   }
@@ -883,14 +948,14 @@ export class TriviaVoiceSession {
     const snapshot = this.currentSnapshot();
     if (!snapshot) return;
     this.observeQuestion(snapshot);
-    if (!snapshot.nameConfirmed) {
+    if (snapshot.phase === 'lobby' && !snapshot.nameConfirmed) {
       this.askName();
       return;
     }
     if (snapshot.phase === 'category_select' && /^[1-9]$/.test(digit)) this.chooseCategory(digit, snapshot);
     else if (snapshot.phase === 'question' && /^[1-4]$/.test(digit)) this.commitAnswer(digit, snapshot);
-    else if ((snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue')
-      && /^[1-4]$/.test(digit)) this.holdEarlyAnswer(digit, snapshot);
+    else if (snapshot.phase === 'question_prompt' && /^[1-4]$/.test(digit)) this.holdEarlyAnswer(digit, snapshot);
+    else if (snapshot.phase === 'answer_cue' && /^[1-4]$/.test(digit)) this.commitAnswer(digit, snapshot);
     else if ((snapshot.phase === 'question_prompt' || snapshot.phase === 'answer_cue')
       && digit === '#') this.skipQuestionAudio(snapshot);
   }
@@ -906,7 +971,7 @@ export class TriviaVoiceSession {
       this.deps.preemptSpeech();
     }
     this.observeQuestion(snapshot);
-    if (!snapshot.nameConfirmed) {
+    if (snapshot.phase === 'lobby' && !snapshot.nameConfirmed) {
       this.awaitingName = true;
       this.askName();
       return;
@@ -950,7 +1015,9 @@ export class TriviaVoiceSession {
       const attemptId = snapshot.questionAttemptId;
       if (attemptId !== null && !this.announcedAudioProblems.has(attemptId)) {
         this.announcedAudioProblems.add(attemptId);
-        void this.speak(this.text('voice.audioProblem'), this.questionGuard(questionKey(snapshot)!, ['audio_problem']));
+        const key = this.stationManaged ? 'voice.audioProblem'
+          : snapshot.audioRetryRemaining > 0 ? 'voice.audioProblemStandalone' : 'voice.audioRetryLimit';
+        void this.speak(this.text(key), this.questionGuard(questionKey(snapshot)!, ['audio_problem']));
       }
       return;
     }
@@ -958,7 +1025,8 @@ export class TriviaVoiceSession {
       const attemptId = snapshot.questionAttemptId;
       if (attemptId !== null && !this.announcedAudioExpiries.has(attemptId)) {
         this.announcedAudioExpiries.add(attemptId);
-        void this.speak(this.text('voice.audioExpired'), this.phaseGuard('audio_expired'));
+        void this.speak(this.text(this.stationManaged ? 'voice.audioExpired'
+          : 'voice.audioExpiredStandalone'), this.phaseGuard('audio_expired'));
       }
       return;
     }
@@ -1005,7 +1073,7 @@ export class TriviaVoiceSession {
   }
 
   private speakContext(snapshot: TriviaVoiceSnapshot): void {
-    if (!snapshot.nameConfirmed) {
+    if (snapshot.phase === 'lobby' && !snapshot.nameConfirmed) {
       this.askName();
     } else if (snapshot.phase === 'lobby') {
       this.onStateChanged();
@@ -1081,7 +1149,7 @@ export class TriviaVoiceSession {
       || !this.beginRequiredSpeech(attemptKey)) return;
     const prompt = concise
       ? this.compactQuestionPrompt(snapshot)
-      : this.questionPrompts(snapshot).join(' ');
+      : this.questionOnlyPrompt(snapshot);
     const generation = this.deps.beginPromptDelivery(this.code!, this.playerId!, question.id,
       snapshot.questionAttemptId, Math.ceil(prompt.length / 12) * 1_000);
     if (generation === null) {
@@ -1155,8 +1223,8 @@ export class TriviaVoiceSession {
     this.answerCueAttemptToken = token;
     const guard = this.paintedQuestionGuard(questionKey, 'answer_cue');
     const cue = repeatQuestion
-      ? `${this.questionPrompts(snapshot).join(' ')} ${this.text('voice.getReady')}`
-      : this.text('voice.getReady');
+      ? this.questionPrompts(snapshot).join(' ')
+      : this.choicesPrompt(snapshot);
     const settlement = this.speakOutcome(cue, guard).then(outcome => {
       if (this.answerCueAttemptToken !== token) return;
       this.answerCueAttemptToken = null;
@@ -1329,14 +1397,15 @@ export class TriviaVoiceSession {
       correct: formatNumber(this.commandLocale, mine.correctCount),
     } : null;
     const spokenPrompts = this.stationManaged
-      // The result hold is bounded. A separate short station line includes the full
-      // outcome and replay guidance within one Relay talk cycle.
-      ? [personal ? this.text(winners.length > 1 ? 'voice.stationResultTie' : 'voice.stationResultWinner', {
+      // The station hold is short. Queue the outcome, technology, and next step
+      // in one Relay talk cycle so the explanation starts before retirement.
+      ? [`${personal ? this.text(winners.length > 1 ? 'voice.stationResultTie' : 'voice.stationResultWinner', {
           winner: winners[0]?.name ?? snapshot.myName ?? this.text('voice.playerPlaceholder'),
           score: personal.score, correct: personal.correct,
-        }) : `${outcome} ${this.text('voice.stationRequeue')}`]
+        }) : outcome} ${this.text('voice.howItWorks')} ${this.text('voice.stationRequeue')}`]
       : [outcome,
           ...(personal ? [this.text('voice.result', personal)] : []),
+          this.text('voice.howItWorks'),
           this.text('voice.playAgain')];
     this.resultAttempts.add(result.resultId);
     const settlement = (async (): Promise<TriviaSpeechOutcome> => {
@@ -1371,20 +1440,31 @@ export class TriviaVoiceSession {
   private questionPrompts(snapshot: TriviaVoiceSnapshot): string[] {
     const question = snapshot.question;
     if (!question) return [];
-    const choices = question.choices.map((choice, index) => `${this.choiceNumber(index)}, ${choice.text}`);
-    return [this.text('voice.question', {
+    return [this.questionOnlyPrompt(snapshot), this.choicesPrompt(snapshot)];
+  }
+
+  private questionOnlyPrompt(snapshot: TriviaVoiceSnapshot): string {
+    const question = snapshot.question;
+    if (!question) return '';
+    return this.text('voice.question', {
       number: (snapshot.questionIndex ?? 0) + 1,
       prompt: question.prompt,
-    }), this.text('voice.questionChoices', {
+    });
+  }
+
+  private choicesPrompt(snapshot: TriviaVoiceSnapshot): string {
+    const question = snapshot.question;
+    if (!question) return '';
+    const choices = question.choices.map((choice, index) => `${this.choiceNumber(index)}, ${choice.text}`);
+    return this.text('voice.questionChoices', {
       choices: choices.join('; '),
-    })];
+    });
   }
 
   private compactQuestionPrompt(snapshot: TriviaVoiceSnapshot): string {
     const question = snapshot.question;
     if (!question) return '';
-    return `${(snapshot.questionIndex ?? 0) + 1}. ${question.prompt} ${question.choices.map((choice, index) =>
-      `${index + 1}. ${choice.text}`).join('; ')}`;
+    return `${(snapshot.questionIndex ?? 0) + 1}. ${question.prompt}`;
   }
 
   private choiceNumber(index: number): string {
@@ -1419,7 +1499,8 @@ export class TriviaVoiceSession {
   }
 
   private askName(): void {
-    if (this.namePrompted || this.currentSnapshot()?.nameConfirmed) return;
+    const snapshot = this.currentSnapshot();
+    if (this.namePrompted || snapshot?.phase !== 'lobby' || snapshot.nameConfirmed) return;
     this.namePrompted = true;
     void this.speak(this.text('voice.askName'), this.nameGuard());
   }
@@ -1768,6 +1849,17 @@ function isTriviaRepeatQuestion(spoken: string, locale: SupportedLocale): boolea
     : /\b(?:repeat|say it again|read it again|what was the question|tell me the choices)\b/.test(normalized);
 }
 
+function isTriviaAudioRetryRequest(spoken: string, locale: SupportedLocale): boolean {
+  const normalized = normalizeForMatching(spoken, locale);
+  if (!normalized || isNegatedTriviaChoice(normalized, locale)) return false;
+  if (isTriviaRepeatQuestion(spoken, locale)) return true;
+  return locale === 'pt-BR'
+    ? /\b(?:tentar novamente|tente de novo|tenta de novo|recomecar|reiniciar a pergunta|ler de novo|ouvir de novo)\b/.test(normalized)
+      || /^(?:sim|claro|pode|vamos|continue|de novo|mais uma vez)(?: por favor)?$/.test(normalized)
+    : /\b(?:retry|replay|try (?:it|that(?: question)?|the question)? ?again|start (?:it|that|the question) (?:over|again)|read (?:the question|it|that) (?:over|again))\b/.test(normalized)
+      || /^(?:yes|yeah|sure|okay|ok|continue|go ahead|again|one more time)(?: please)?$/.test(normalized);
+}
+
 function isTriviaQuestionInformationRequest(spoken: string, locale: SupportedLocale): boolean {
   const text = normalizeForMatching(spoken, locale);
   if (!text) return false;
@@ -1787,7 +1879,9 @@ function questionKey(snapshot: TriviaVoiceSnapshot | null): string | null {
 }
 
 function inputScope(snapshot: TriviaVoiceSnapshot): string {
-  return `${snapshot.phase}:${questionKey(snapshot) ?? ''}:${snapshot.nameConfirmed ? 1 : 0}`;
+  const phase = snapshot.phase === 'answer_cue' || snapshot.phase === 'question'
+    ? 'answering' : snapshot.phase;
+  return `${phase}:${questionKey(snapshot) ?? ''}:${snapshot.nameConfirmed ? 1 : 0}`;
 }
 
 function matchSelectionLetter(text: string, locale: SupportedLocale): number | null {

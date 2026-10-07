@@ -92,10 +92,14 @@ describe('standalone and station display UX', () => {
   it('warms a playable Racer scene before releasing a station countdown, even without optional assets', () => {
     const script = readClient('main.ts');
     expect(script).toContain('loadRaceLevelWithinBudget(mapName, generation)');
-    expect(script).toContain('RACER_RACE_SCENE_BUDGET_MS = 1_800');
+    expect(script).toContain('RACER_STATION_SCENE_BUDGET_MS = 24_000');
+    expect(script).toContain('RACER_STANDALONE_SCENE_BUDGET_MS = 12_000');
+    expect(script).toContain('selectedMapPrefetch.start(');
+    expect(script).toContain('conn.join(roomCode, name, true)');
     expect(script).toContain('resetToGeneratedRaceScene()');
     expect(script).toContain('renderer.render(first, { splitScreen })');
-    expect(script).toContain('if (stationDisplay.active) conn.ready()');
+    expect(script).toContain('conn.ready()');
+    expect(script).toMatch(/conn\.onItems\([\s\S]*?raceSceneReady = false;[\s\S]*?prepareRaceScene\(items, map \?\? urlMap, generation\)/);
     expect(script).toContain('buffer.clear()');
     expect(script).toContain('() => !raceLive');
     expect(script).toContain('cancelPendingRaceSnapshot()');

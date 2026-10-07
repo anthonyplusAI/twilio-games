@@ -136,22 +136,22 @@ describe('Voice Trivia display DOM projection', () => {
     expect(rendered.announcement).toContain('Correct answer: WebSocket');
   });
 
-  it('renders a localized answer cue status with no answer countdown', () => {
+  it('shows the authoritative answer countdown while choices are being spoken', () => {
     const cue = renderTriviaView(state({
       phase: 'answer_cue', questionIndex: 0, question,
-      answerCueEndsAtMs: 45_000, answeringStartsAtMs: null, questionEndsAtMs: null,
+      answerCueEndsAtMs: 45_000, answeringStartsAtMs: 18_000, questionEndsAtMs: 43_000,
     }), context);
     expect(cue.html).toContain('data-view="answer_cue"');
-    expect(cue.html).toContain('Get ready to answer');
-    expect(cue.html).toContain('Phones are synchronizing the answer cue.');
-    expect(cue.html).not.toContain('id="question-seconds"');
-    expect(cue.announcement).toBe('Get ready to answer. Phones are synchronizing the answer cue. The ten-second clock starts after all phones are ready.');
+    expect(cue.html).toContain('id="question-seconds">23</strong>');
+    expect(cue.html).toContain('Answer now');
+    expect(cue.html).not.toContain('Phones are synchronizing');
 
     const portuguese = renderTriviaView(state({
       phase: 'answer_cue', questionIndex: 0, question,
+      answeringStartsAtMs: 18_000, questionEndsAtMs: 43_000,
     }), { ...context, locale: 'pt-BR' });
-    expect(portuguese.html).toContain('Preparem-se para responder');
-    expect(portuguese.html).toContain('Os telefones estão sincronizando o aviso de resposta.');
+    expect(portuguese.html).toContain('id="question-seconds">23</strong>');
+    expect(portuguese.html).toContain('Respondam agora');
   });
 
   it('places the authoritative answer clock above the choices and explains the pre-clock wait', () => {
@@ -165,7 +165,7 @@ describe('Voice Trivia display DOM projection', () => {
     const reading = renderTriviaView(state({
       phase: 'question_prompt', questionIndex: 0, questionAttemptId: 1, question,
     }), context);
-    expect(reading.html).toMatch(/ten.second.*clock.*starts.*after.*phones/i);
+    expect(reading.html).toMatch(/clock starts before the choices/i);
     expect(reading.html).not.toContain('id="question-seconds"');
   });
 
@@ -301,12 +301,26 @@ describe('Voice Trivia display DOM projection', () => {
     expect(reveal.announcement).not.toContain('A very long explanation');
   });
 
-  it('shows a terminal audio failure once the operator retry window expires', () => {
+  it('shows a terminal audio failure once the recovery window expires', () => {
     const expired = renderTriviaView(state({ phase: 'audio_expired', question: null,
       questionAttemptId: 7, audioProblem: null }), context);
     expect(expired.html).toContain('This round has ended');
+    expect(expired.html).toContain('Hang up and call back');
     expect(expired.html).not.toContain('retry this question');
     expect(expired.announcementKey).toContain('7');
+  });
+
+  it('gives the right audio recovery path for a standalone caller and a station operator', () => {
+    const problem = state({ phase: 'audio_problem', questionIndex: 0, question,
+      questionAttemptId: 7,
+      audioProblem: { questionId: question.id, questionAttemptId: 7, recoveryDeadlineAtMs: 50_000 },
+    });
+    const standalone = renderTriviaView(problem, { ...context, stationMode: false });
+    const station = renderTriviaView(problem, { ...context, stationMode: true });
+    expect(standalone.html).toContain('On the call, ask the agent to retry this question');
+    expect(standalone.html).not.toContain('Ask the operator');
+    expect(station.html).toContain('Ask the operator to retry this question');
+    expect(station.html).not.toContain('On the call, ask the agent');
   });
 
   it('escapes server-provided text and includes the accessibility and motion contracts', () => {

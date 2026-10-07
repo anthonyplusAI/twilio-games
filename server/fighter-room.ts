@@ -36,6 +36,8 @@ export class FighterRoom {
   private _hudPresented=false;
   private _resultsPresented=false;
   private resultsPresentationDeadline=0;
+  private resultPlayers: FighterLobbyPlayer[] | null = null;
+  private resultWinnerName: string | null = null;
   private voiceCommands = new Map<string, QueuedFighterCommand[]>();
   private voiceCommandOutcomes: FighterVoiceCommandOutcome[] = [];
   private nextVoiceRequestId = 0;
@@ -49,12 +51,16 @@ export class FighterRoom {
   setMaps(maps: FighterMapEntry[]): void { if (maps.length) this.maps = maps; }
 
   addPlayer(name: string, preferredSide?: FighterId, nameConfirmed = true): { playerId: string } | { error: string } {
+    // A new standalone call is an explicit handoff from an otherwise retained final screen.
+    // Fixed station results stay put until their station lifecycle advances them.
+    if ((this.phase === 'victory' || this.phase === 'results') && this.players.length === 0
+      && this.world?.winner && !this.fixedExpectedHumanPlayers)
+      this.resetResultsForNewRound();
     if (this.players.length >= 2 || !['lobby', 'fighter_select'].includes(this.phase)) return { error: 'room_full' };
     const side: FighterId = preferredSide ?? (this.players.some(player => player.side === 'p1') ? 'p2' : 'p1');
     if (this.players.some(player => player.side === side)) return { error: 'room_full' };
     const player = { playerId: `f${this.nextPlayer++}`, name: cleanName(name), nameConfirmed, fighterId: null, side };
     this.players.push(player);this.players.sort((left,right)=>left.side.localeCompare(right.side));
-    if (!nameConfirmed && this.phase === 'fighter_select') this.phase = 'lobby';
     return { playerId: player.playerId };
   }
   expectHumanPlayers(count: number, fixed = true): void {
@@ -67,16 +73,20 @@ export class FighterRoom {
     }
   }
   removePlayer(id: string): void {
+    if ((this.phase === 'victory' || this.phase === 'results') && this.world?.winner) this.captureResult();
     this.rejectPendingVoiceCommands(id, 'player_left');
     this.players = this.players.filter((player) => player.playerId !== id);
     this.mapVotes.delete(id);if(this.phase==='map_select')this.selectedMap=this.mapVoteWinner();
-    if (!this.players.length) { this.phase = 'lobby'; this.world = null; this.selectedMap = null;this.mapVotes.clear();this.aiFighterId = null;this.automaticSetup=false;this.expectedHumanPlayers=1;this.fixedExpectedHumanPlayers=false;this.invalidatePresentation();this.resultsPresentationDeadline=0; }
+    if (!this.players.length) {
+      if ((this.phase === 'victory' || this.phase === 'results') && this.world?.winner) return;
+      this.phase = 'lobby'; this.world = null; this.selectedMap = null;this.mapVotes.clear();this.aiFighterId = null;this.automaticSetup=false;this.expectedHumanPlayers=1;this.fixedExpectedHumanPlayers=false;this.invalidatePresentation();this.resultsPresentationDeadline=0;
+    }
     else {
       if(!this.fixedExpectedHumanPlayers)this.expectedHumanPlayers=this.players.length;
       if(this.phase==='map_select'&&this.players.length<this.expectedHumanPlayers){
         this.phase='fighter_select';this.selectedMap=null;
       }
-      else if (this.phase === 'loading' || this.phase === 'intro' || this.phase === 'fight' || this.phase === 'countdown' || this.phase === 'victory') {
+      else if (this.phase === 'loading' || this.phase === 'intro' || this.phase === 'fight' || this.phase === 'countdown') {
         this.rejectAllPendingVoiceCommands('match_over');
         this.phase = 'fighter_select'; this.world = null; this.selectedMap = null;this.mapVotes.clear();this.aiFighterId = null;
         this.invalidatePresentation();
@@ -110,11 +120,7 @@ export class FighterRoom {
     if (this.phase === 'results') {
       if (playerId && !this.hasPlayer(playerId)) return false;
       if (!this.resultsPresented && !this.resultsPresentationTimedOut) return false;
-      this.phase = 'fighter_select'; this.world = null; this.selectedMap = null;this.mapVotes.clear();
-      this.aiFighterId = null;
-      this.invalidatePresentation();
-      this.resultsPresentationDeadline=0;
-      for (const player of this.players) player.fighterId = null;
+      this.resetResultsForNewRound();
       return true;
     }
     return false;
@@ -286,11 +292,12 @@ export class FighterRoom {
       if (this.players.length === 1 && this.world.status === 'fighting' && this.world.now >= this.aiNext) {
         const command = this.aiCommand();
         this.events.push(...applyFighterCommand(this.world, this.players[0]!.side === 'p1' ? 'p2' : 'p1', command));
-        // Keep a speech-paced caller's recovery window fair after the human-first tick.
-        this.aiNext = this.world.now + 1.0 + this.random() * 0.60;
+        // Voice commands include listening and ASR time. Give a solo caller a full
+        // spoken turn between rival decisions instead of trading at keyboard speed.
+        this.aiNext = this.world.now + 1.30 + this.random() * 0.70;
       }
     } else this.rejectAllPendingVoiceCommands('match_over');
-    if (this.world.status === 'finished') { this.phase = 'victory'; this.victory = FIGHTER_VICTORY_SECONDS; }
+    if (this.world.status === 'finished') { this.captureResult(); this.phase = 'victory'; this.victory = FIGHTER_VICTORY_SECONDS; }
   }
   drainEvents(): FighterEvent[] { const events = this.events; this.events = []; return events; }
   lobbyPlayers(): FighterLobbyPlayer[] {
@@ -303,7 +310,9 @@ export class FighterRoom {
   }
   state(): FighterState {
     const winner = this.world?.winner ?? null;
-    return { roomCode: this.code, phase: this.phase, players: this.lobbyPlayers(), selectedMap: this.selectedMap,
+    return { roomCode: this.code, phase: this.phase,
+      players: (this.phase === 'victory' || this.phase === 'results') && this.resultPlayers ? this.resultPlayers : this.lobbyPlayers(),
+      selectedMap: this.selectedMap,
       mapVotesByPlayerId:Object.fromEntries(this.mapVotes),
       world:this.world,expectedPlayerCount:this.expectedHumanPlayers,hasExpectedPlayers:this.hasExpectedPlayers,automaticSetup:this.automaticSetup,
       loadingGeneration: this.loadingGeneration, intro: this.phase === 'intro' ? this.intro : null,
@@ -328,7 +337,26 @@ export class FighterRoom {
     return queued;
   }
 
-  private nameForSide(side: FighterId): string { return this.lobbyPlayers().find(p => p.side === side)?.name ?? 'Rival'; }
+  private captureResult(): void {
+    if (this.resultPlayers || !this.world?.winner) return;
+    this.resultPlayers = this.lobbyPlayers().map(player => ({ ...player }));
+    this.resultWinnerName = this.resultPlayers.find(player => player.side === this.world!.winner)?.name ?? 'Rival';
+  }
+  private resetResultsForNewRound(): void {
+    this.rejectAllPendingVoiceCommands('match_over');
+    this.phase = this.players.length ? 'fighter_select' : 'lobby';
+    this.world = null; this.selectedMap = null; this.mapVotes.clear(); this.aiFighterId = null;
+    this.resultPlayers = null; this.resultWinnerName = null;
+    this.events = [];
+    this.intro = 0; this.countdown = 0; this.victory = 0; this.loadingElapsed = 0;
+    if (!this.players.length) { this.automaticSetup = false; this.expectedHumanPlayers = 1; this.fixedExpectedHumanPlayers = false; }
+    this.invalidatePresentation(); this.resultsPresentationDeadline = 0;
+    for (const player of this.players) player.fighterId = null;
+  }
+  private nameForSide(side: FighterId): string {
+    if (this.world?.winner === side && this.resultWinnerName) return this.resultWinnerName;
+    return (this.resultPlayers ?? this.lobbyPlayers()).find(player => player.side === side)?.name ?? 'Rival';
+  }
   private mapVoteWinner():string|null {
     const counts=new Map<string,number>();
     for(const mapId of this.mapVotes.values())counts.set(mapId,(counts.get(mapId)??0)+1);
@@ -345,7 +373,7 @@ export class FighterRoom {
     this.rejectAllPendingVoiceCommands('match_over');
     this.invalidatePresentation();
     this.resultsPresentationDeadline=0;
-    this.phase='loading';this.world=createFighterWorld(bounds);this.countdown=0;this.aiNext=0.8;
+    this.phase='loading';this.world=createFighterWorld(bounds);this.countdown=0;this.aiNext=1.0;
     this.loadingElapsed=0;this.loadingGeneration++;return true;
   }
   private aiCommand(): FighterCommand {
@@ -354,9 +382,9 @@ export class FighterRoom {
     const roll = this.random();
     if (distance > 1.75) return 'forward';
     if (roll < 0.12) return 'jump';
-    if (roll < 0.28) return 'block';
-    if (roll < 0.65) return 'punch';
-    if (roll < 0.92) return 'kick';
+    if (roll < 0.32) return 'block';
+    if (roll < 0.61) return 'punch';
+    if (roll < 0.79) return 'kick';
     return 'back';
   }
   private random(): number { this.rng = (Math.imul(this.rng, 1664525) + 1013904223) >>> 0; return this.rng / 0x100000000; }

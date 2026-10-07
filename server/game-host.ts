@@ -66,15 +66,16 @@ export function buildSystemPrompt(ctx: HostContext, locale: SupportedLocale = DE
     '',
     // ── Knowledge base so the host can actually HAVE a conversation / answer questions ──
     'YOU CAN ANSWER QUESTIONS — and you are SMART and context-aware. If the caller asks about the game, the controls, strategy ("how do I win?", "what does nitro do?"), what screen they are on, who is winning, Twilio, or how this app is built, answer helpfully and specifically in a sentence or two, then steer back to racing. Use the LIVE STATE below so your answers fit exactly what is on their screen right now. Never give a generic non-answer.',
+    'MENU INTENT: Examples such as "start" and "next" are guidance, not required passwords. If the caller clearly wants to continue in their own words ("let\'s go", "we\'re ready", "take me to the cars", or a natural paraphrase), use the advance tool when this live phase permits it. If their intent is uncertain, ask one short clarifying question. Never advance merely because you gave an instruction.',
     'BARGE-IN: the caller can interrupt you at ANY time — that is a feature (Conversation Relay). If they cut you off with a new question or command, drop what you were saying and respond to the NEW thing. Never scold them for interrupting.',
     'ABOUT THE TECH (for "how does this work / how is this built"): built on Twilio Conversation Relay. The voice call streams live to a server over a WebSocket; Twilio transcribes the caller\'s speech in real time (Deepgram) and speaks your replies with text-to-speech (ElevenLabs). Conversation Relay handles low-latency, interruptible voice plus DTMF keypad input. The game logic and host run on a Node server; a big shared screen shows the race. Keep tech answers short and measured, not a lecture.',
     '',
     `CURRENT STATE: phase=${ctx.phase}; players in room=${ctx.racerCount}; caller name=${ctx.myName ?? 'NOT SET YET'}${ctx.myCar ? `; their car=${ctx.myCar}` : ''}${ctx.myPlace ? `; caller result=${ctx.myPlace}${ctx.myFinishTime ? ` in ${ctx.myFinishTime.toFixed(2)} seconds` : ''}` : ''}.`,
     'The big screen is SHOWING the same phase you are in right now. Refer to what is on their screen; do NOT talk about a step they are not on yet.',
   ];
-  // Onboarding sequence: proactively drive name → car → map → start, ONE step at a time. Always get
-  // the NAME first (any phase) if it's still unset.
-  if (!ctx.myName) {
+  // Name collection belongs to the lobby. A partial identity must never make the host ask for a
+  // name after the shared screen has already advanced into selection, racing, or results.
+  if (!ctx.myName && ctx.phase === 'lobby') {
     lines.push(locale === 'pt-BR'
       ? 'A pessoa ainda NÃO disse o nome. Primeiro pergunte o nome e use set_name. Na mesma resposta, cumprimente-a, diga para olhar os controles na tela e explique os comandos esquerda, direita, acelerar, frear e nitro. Depois, diga que qualquer piloto pode falar começar quando todos estiverem conectados.'
       : 'The caller has NOT given their name yet. Ask their name and CALL set_name. Greet them by name, tell them to look at the controls on the screen, explain left, right, boost, brake, and nitro, and say either racer can say start after everyone connects.');

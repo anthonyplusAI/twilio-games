@@ -12,13 +12,14 @@ const expectedModels = ['backup-singer.glb', 'drummer.glb', 'guitarist.glb', 'le
 const expectedRoles = ['backup-singer', 'drummer', 'guitarist', 'lead-singer', 'stage'];
 const expectedModelVersion = '20260827-rendering-3';
 const expectedGuideVersion = '20260828-calibration-1';
+const angleBackend = process.env.CHROME_ANGLE_BACKEND || 'swiftshader';
 
 const browser = await puppeteer.launch({
   executablePath: chrome,
   headless: 'new',
   args: [
     '--no-sandbox', '--ignore-gpu-blocklist', '--enable-webgl', '--autoplay-policy=no-user-gesture-required',
-    '--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--enable-unsafe-swapchain',
+    '--use-gl=angle', `--use-angle=${angleBackend}`, '--enable-unsafe-swiftshader', '--enable-unsafe-swapchain',
     '--window-size=1920,1080',
   ],
 });
@@ -259,7 +260,8 @@ try {
     && state.leadMaterials === 17 && state.leadTextures === '25/25'
     && state.crowd === '126/8'
     && typeof state.cameraShot === 'string' && state.cameraShot.length > 0
-    && veilInitiallyVisible && state.sceneSettled
+    // Fast asset loads may settle the veil before DOMContentLoaded; gameplay below proves readiness.
+    && state.sceneSettled
     && state.countdownPlayback.length <= 1 && state.countdownPlayback.every(value => value === '3')
     && songChoices.includes('Never Gonna Give You Up') && songChoices.includes('A Thousand Miles')
     && songCardCopy.every(value => !/\bBPM\b|licensed recording|gravação licenciada/i.test(value))

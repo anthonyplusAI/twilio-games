@@ -36,6 +36,7 @@ interface Session {
 }
 
 export const KARAOKE_RECONNECT_GRACE_MS = 30_000;
+export const KARAOKE_RESULT_RECONNECT_GRACE_MS = 60_000;
 export const KARAOKE_HEARTBEAT_MS = 30_000;
 export const KARAOKE_TICK_MS = 100;
 export const KARAOKE_MAX_CONNECTIONS = 64;
@@ -47,6 +48,7 @@ export interface KaraokeServerOptions {
   displayToken?: string;
   heartbeatMs?: number;
   reconnectGraceMs?: number;
+  resultReconnectGraceMs?: number;
   tickMs?: number;
   now?: () => number;
   songs?: readonly KaraokeSong[];
@@ -72,6 +74,8 @@ export class KaraokeServer {
   private readonly displayToken: string;
   private readonly heartbeatMs: number;
   private readonly reconnectGraceMs: number;
+  private readonly resultReconnectGraceMs: number;
+  private readonly resultReconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly tickMs: number;
   private readonly now: () => number;
   private songs: readonly KaraokeSong[];
@@ -93,6 +97,7 @@ export class KaraokeServer {
     this.displayToken = options.displayToken?.trim() ?? '';
     this.heartbeatMs = options.heartbeatMs ?? KARAOKE_HEARTBEAT_MS;
     this.reconnectGraceMs = options.reconnectGraceMs ?? KARAOKE_RECONNECT_GRACE_MS;
+    this.resultReconnectGraceMs = options.resultReconnectGraceMs ?? KARAOKE_RESULT_RECONNECT_GRACE_MS;
     this.tickMs = options.tickMs ?? KARAOKE_TICK_MS;
     this.now = options.now ?? Date.now;
     this.songs = options.songs ?? KARAOKE_DEVELOPMENT_SONGS;
@@ -176,6 +181,7 @@ export class KaraokeServer {
   abortRoom(code: string): boolean {
     code = canonicalRoomCode(code);
     if (!this.rooms.has(code)) return false;
+    this.clearResultReconnectTimer(code);
     for (const conn of this.conns) {
       if (conn.roomCode !== code) continue;
       conn.roomCode = undefined;
@@ -290,12 +296,13 @@ export class KaraokeServer {
         return;
       }
       const room = this.room(code);
-      room.setPreferredLocale(this.preferredLocale(code, msg.locale ?? DEFAULT_LOCALE));
       const result = room.addPlayer(msg.name);
       if ('error' in result) {
         this.send(conn, { type: 'error', code: result.error, message: result.error });
         return;
       }
+      this.clearResultReconnectTimer(code);
+      room.setPreferredLocale(this.preferredLocale(code, msg.locale ?? DEFAULT_LOCALE));
       conn.roomCode = code;
       conn.playerId = result.playerId;
       conn.sessionId = msg.sessionId;
@@ -361,6 +368,7 @@ export class KaraokeServer {
         return;
       }
       const room = this.room(code);
+      this.clearResultReconnectTimer(code);
       room.setPreferredLocale(this.preferredLocale(code));
       if (conn.displayAuthenticated) this.onDisplayAuthenticated?.(conn.ws);
       this.onDisplayRegistered?.(conn.ws, code);
@@ -383,17 +391,21 @@ export class KaraokeServer {
           this.send(conn, { type: 'error', code: 'select_rejected', message: 'That song is unavailable.' });
         }
         break;
-      case 'advance':
+      case 'advance': {
         if (!isHost) this.rejectAuthority(conn);
         else if (this.requiresDisplayAuth(room.code) && room.phase === 'results') {
           this.send(conn, { type: 'error', code: 'station_requeue_required', message: 'Join the queue again to sing again.' });
         } else if (room.phase === 'song_select' && !conn.playerId) {
           this.send(conn, { type: 'error', code: 'not_ready', message: 'The singer must say Start on their phone.' });
-        } else if (!room.advance(conn.playerId ?? (room.phase === 'results' && conn.display
-          ? room.state().singer?.playerId : undefined))) {
-          this.send(conn, { type: 'error', code: 'not_ready', message: 'Complete the current step first.' });
+        } else {
+          const disconnectedResult = room.phase === 'results' && conn.display && !room.state().singer;
+          const playerId = conn.playerId ?? (room.phase === 'results' && conn.display
+            ? room.state().singer?.playerId : undefined);
+          const advanced = disconnectedResult ? room.restartAfterDisconnect() : room.advance(playerId);
+          if (!advanced) this.send(conn, { type: 'error', code: 'not_ready', message: 'Complete the current step first.' });
         }
         break;
+      }
       case 'ready':
         if (!isHost) this.rejectAuthority(conn);
         else if (!room.ready(msg.loadingGeneration)) {
@@ -596,24 +608,48 @@ export class KaraokeServer {
       && (!this.requiresDisplayAuth(code) || conn.displayAuthenticated === true);
   }
 
-  private reap(code: string): void {
+  private clearResultReconnectTimer(code: string): void {
+    const timer = this.resultReconnectTimers.get(code);
+    if (timer) this.cancelTimeout(timer);
+    this.resultReconnectTimers.delete(code);
+  }
+
+  private reap(code: string, graceExpired = false): void {
     const room = this.rooms.get(code);
     if (!room?.isEmpty) return;
     if ([...this.conns].some(conn => conn.roomCode === code)) return;
     if ([...this.sessions.values()].some(session => session.roomCode === code)) return;
+    if (room.phase === 'results') {
+      // A fixed station result belongs to station handoff. For a standalone result, give the
+      // display a short chance to reconnect after both it and the singer have disconnected.
+      if (room.isFixedStationRound) return;
+      if (!graceExpired) {
+        if (!this.resultReconnectTimers.has(code)) {
+          const timer = this.scheduleTimeout(() => {
+            this.resultReconnectTimers.delete(code);
+            if (this.rooms.get(code) === room) this.reap(code, true);
+          }, this.resultReconnectGraceMs);
+          (timer as { unref?: () => void }).unref?.();
+          this.resultReconnectTimers.set(code, timer);
+        }
+        return;
+      }
+    }
+    this.clearResultReconnectTimer(code);
     this.hosts.delete(code);
     this.rooms.delete(code);
   }
 
   voiceJoin(code: string, name: string, expectedPlayers?: number, nameConfirmed = true,
-    preferredLocale?: SupportedLocale): string | null {
+    preferredLocale?: SupportedLocale, stationManaged = false): string | null {
     code = canonicalRoomCode(code);
     if (!this.rooms.has(code) && this.rooms.size >= this.maxRooms) return null;
     const room = this.room(code);
-    room.setPreferredLocale(preferredLocale ?? this.preferredLocale(code));
-    room.expectHumanPlayers(expectedPlayers ?? 1, expectedPlayers !== undefined);
     const result = room.addPlayer(name, nameConfirmed);
     if ('error' in result) return null;
+    room.expectHumanPlayers(expectedPlayers ?? 1, stationManaged);
+    this.clearResultReconnectTimer(code);
+    room.setPreferredLocale(preferredLocale ?? this.preferredLocale(code));
     this.pushState(code);
     return result.playerId;
   }
@@ -745,6 +781,7 @@ export class KaraokeServer {
   stopLoopOnly(): void {
     if (this.timingLoop) this.cancelInterval(this.timingLoop);
     if (this.heartbeat) this.cancelInterval(this.heartbeat);
+    for (const code of this.resultReconnectTimers.keys()) this.clearResultReconnectTimer(code);
     this.timingLoop = null;
     this.heartbeat = null;
     for (const session of this.sessions.values()) if (session.timer) this.cancelTimeout(session.timer);

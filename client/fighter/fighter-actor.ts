@@ -34,13 +34,24 @@ export class FighterActor {
 
   static async load(
     spec: FighterSpec,
-    sources: ReadonlyMap<string, THREE.AnimationClip>,
+    sources: ReadonlyMap<string, THREE.AnimationClip> | Promise<ReadonlyMap<string, THREE.AnimationClip>>,
     onProgress?: (fraction: number) => void,
     signal?: AbortSignal,
   ): Promise<FighterActor> {
+    // The selected model can download while the shared animation bank is still
+    // loading; waiting for that bank before fetching the FBX wastes the setup window.
     const model = await loadFbx(spec.file, onProgress, signal);
-    prepareFighterModel(model);
-    return new FighterActor(model, clipsForFighter(model, sources, spec.embeddedIdle === true));
+    try {
+      const clips = await sources;
+      if (signal?.aborted) throw signal.reason ?? new DOMException('Fighter asset request aborted', 'AbortError');
+      // The model remains worth showing when the shared clip bank is empty:
+      // embedded idle and local, rig-aware motions keep every action playable.
+      prepareFighterModel(model);
+      return new FighterActor(model, clipsForFighter(model, clips, spec.embeddedIdle === true));
+    } catch (error) {
+      disposeObject(model);
+      throw error;
+    }
   }
 
   static fallback(color: string, fighterId = 'fighter'): FighterActor {

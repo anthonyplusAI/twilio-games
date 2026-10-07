@@ -19,6 +19,13 @@ const result = {
 };
 
 describe('Karaoke leaderboard UI', () => {
+  it('keeps a clear next-singer action and the finished score after the phone leaves', () => {
+    const html = renderKaraokeResultsHtml({ ...result, singerPresent: false });
+    expect(html).toContain('8,642');
+    expect(html).toContain('id="advance-flow"');
+    expect(html).toContain('Next singer');
+    expect(html).toContain('id="karaoke-exit"');
+  });
   it('loads a per-song top ten into the localized results screen', async () => {
     const [script, styles] = await Promise.all([
       readFile('client/karaoke/karaoke.ts', 'utf8'),

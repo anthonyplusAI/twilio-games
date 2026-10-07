@@ -241,6 +241,64 @@ describe('fighter room', () => {
     expect(room.phase).toBe('fighter_select');
   });
 
+  it('keeps the winner, roster, and result visible after every caller hangs up', () => {
+    const room = readyFightRoom();
+    const players = room.state().players;
+    const world = room.state().world!;
+    world.status = 'finished'; world.winner = 'p1';
+    room.tick(.1);
+    room.removePlayer(players[0]!.playerId);
+    room.removePlayer(players[1]!.playerId);
+    expect(room.phase).toBe('victory');
+    room.tick(FIGHTER_VICTORY_SECONDS);
+    room.acknowledgePresentation('results', room.state().loadingGeneration);
+    expect(room.state()).toMatchObject({
+      phase: 'results', result: { winner: 'p1', winnerName: 'Ada' },
+      players: [expect.objectContaining({ name: 'Ada', fighterId: 'nyx' }),
+        expect.objectContaining({ name: 'Bo', fighterId: 'wraith' })],
+    });
+    expect(room.isEmpty).toBe(true);
+    expect(room.advance()).toBe(true);
+    expect(room.phase).toBe('lobby');
+  });
+
+  it.each(['victory', 'results'] as const)('starts a fresh standalone lobby only when a new caller joins an empty %s room', finalPhase => {
+    const room = new FighterRoom('NEXT-CALLER', 1);
+    const first = room.addPlayer('Ada'); if ('error' in first) throw new Error(first.error);
+    room.advance(); room.selectFighter(first.playerId, 'nyx'); room.advance();
+    room.selectMap(first.playerId, 'void'); room.advance();
+    room.ready(room.state().loadingGeneration); room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    const world = room.state().world!; world.status = 'finished'; world.winner = 'p1';
+    room.tick(.1); if (finalPhase === 'results') room.tick(FIGHTER_VICTORY_SECONDS);
+    room.removePlayer(first.playerId);
+
+    expect(room.state()).toMatchObject({ phase: finalPhase, result: { winnerName: 'Ada' } });
+    const next = room.addPlayer('Bea', undefined, false);
+    if ('error' in next) throw new Error(next.error);
+    expect(room.state()).toMatchObject({
+      phase: 'lobby', result: null, selectedMap: null, players: [expect.objectContaining({ playerId: next.playerId, name: 'Bea' })],
+    });
+    expect(room.advance(next.playerId)).toBe(false);
+    room.setName(next.playerId, 'Bea');
+    expect(room.advance(next.playerId)).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+  });
+
+  it.each(['victory', 'results'] as const)('does not let a new caller erase a fixed station %s', finalPhase => {
+    const room = new FighterRoom('FIXED-RESULT', 1);
+    room.expectHumanPlayers(1, true);
+    const first = room.addPlayer('Ada'); if ('error' in first) throw new Error(first.error);
+    room.advance(first.playerId); room.selectFighter(first.playerId, 'nyx'); room.advance(first.playerId);
+    room.selectMap(first.playerId, 'void'); room.advance(first.playerId);
+    room.ready(room.state().loadingGeneration); room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    const world = room.state().world!; world.status = 'finished'; world.winner = 'p1';
+    room.tick(.1); if (finalPhase === 'results') room.tick(FIGHTER_VICTORY_SECONDS);
+    room.removePlayer(first.playerId);
+
+    expect(room.addPlayer('Late')).toEqual({ error: 'room_full' });
+    expect(room.state()).toMatchObject({ phase: finalPhase, result: { winnerName: 'Ada' } });
+  });
+
   it('accepts only current-match display paint receipts and invalidates them on display loss', () => {
     const room = new FighterRoom('PAINT', 1);
     const player=room.addPlayer('Ada');if('error' in player)throw new Error(player.error);

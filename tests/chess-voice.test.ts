@@ -568,6 +568,27 @@ describe('ChessVoiceSession', () => {
     expect(station.spoken.at(-1)).not.toMatch(/say play again/i);
   });
 
+  it.each([
+    { locale: 'en-US', station: false, outcome: /you won the wizard duel/i,
+      technology: /Twilio Conversation Relay.*spoken moves.*board/i, next: /say play again/i },
+    { locale: 'en-US', station: true, outcome: /you won the wizard duel/i,
+      technology: /Twilio Conversation Relay.*spoken moves.*board/i, next: /station will prepare/i },
+    { locale: 'pt-BR', station: false, outcome: /você venceu o duelo de magos/i,
+      technology: /Twilio Conversation Relay.*lances falados.*tabuleiro/i, next: /diga jogar de novo/i },
+    { locale: 'pt-BR', station: true, outcome: /você venceu o duelo de magos/i,
+      technology: /Twilio Conversation Relay.*lances falados.*tabuleiro/i, next: /estação prepara/i },
+  ])('explains $locale Chess voice technology after the result in station=$station', row => {
+    const finished = state({ phase: 'finished', result: { reason: 'checkmate', winner: 'w' } });
+    const game = harness(finished, row.station, false, row.locale);
+    game.setup();
+    const line = game.spoken.at(-1) ?? '';
+    expect(line).toMatch(row.outcome);
+    expect(line).toMatch(row.technology);
+    expect(line).toMatch(row.next);
+    expect(line.search(row.technology)).toBeGreaterThan(line.search(row.outcome));
+    expect(line.search(row.next)).toBeGreaterThan(line.search(row.technology));
+  });
+
   it('releases the caller on close while a replaced transport preserves the binding', () => {
     const first = harness();
     first.setup();

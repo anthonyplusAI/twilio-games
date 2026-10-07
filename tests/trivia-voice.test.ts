@@ -34,6 +34,24 @@ const portugueseChoices: readonly TriviaVoiceChoice[] = [
 ];
 
 describe('TriviaVoiceSession setup and categories', () => {
+  it('never asks for or captures a name after the display has left onboarding', () => {
+    const unconfirmed = player({ name: 'Player', nameConfirmed: false });
+    const category = harness(baseState({ phase: 'category_select', myName: 'Player',
+      nameConfirmed: false, players: [unconfirmed] }), 'en-US', { resumed: true });
+    category.setup();
+    category.prompt('science');
+    expect(category.calls.votes).toEqual(['science']);
+    expect(category.calls.setName).toEqual([]);
+    expect(category.spoken.some(item => /what is your first name/i.test(item.text))).toBe(false);
+
+    const question = harness(questionState({ myName: 'Player', nameConfirmed: false,
+      players: [unconfirmed] }), 'en-US', { resumed: true });
+    question.setup();
+    question.prompt('Paris');
+    expect(question.calls.answers).toEqual([{ choiceId: 'paris', final: true, answeredAtMs: 1_000 }]);
+    expect(question.calls.setName).toEqual([]);
+    expect(question.spoken.some(item => /what is your first name/i.test(item.text))).toBe(false);
+  });
   it('speaks the new category menu after a shared-display replay changes results', async () => {
     const game = harness(resultState([resultPlayer('t1', 'Ada', 2_600, 2, 1)]),
       'en-US', { resumed: true });
@@ -226,6 +244,7 @@ describe('TriviaVoiceSession setup and categories', () => {
         questionRevealReady: () => false,
         queueEarlyAnswer: () => false,
         pauseAudio: () => false,
+        retryQuestion: () => 'unavailable',
         beginAnswerResolution: () => null,
         finishAnswerResolution: () => false,
         answerAt: () => false,
@@ -420,7 +439,7 @@ describe('TriviaVoiceSession setup and categories', () => {
   it('invalidates queued intro speech after category selection advances the screen', () => {
     const game = harness(baseState());
     game.setup();
-    const intro = game.spoken.find(item => /I will read each question/i.test(item.text));
+    const intro = game.spoken.find(item => /I will ask each question/i.test(item.text));
     expect(intro?.isCurrent?.()).toBe(true);
     game.prompt('science');
     expect(game.state.phase).toBe('loading');
@@ -429,6 +448,59 @@ describe('TriviaVoiceSession setup and categories', () => {
 });
 
 describe('TriviaVoiceSession question playback and answers', () => {
+  it.each([
+    { locale: 'en-US' as const, request: 'Could you try that question again for us?' },
+    { locale: 'pt-BR' as const, request: 'Pode repetir essa pergunta de novo, por favor?' },
+  ])('replays the current failed question promptly when the $locale caller asks', row => {
+    const game = harness(audioProblemState(), row.locale, { resumed: true });
+    game.setup();
+    game.prompt(row.request);
+    expect(game.calls.retries).toEqual([{ questionId: 'question-1', attemptId: 1 }]);
+    expect(game.state).toMatchObject({ phase: 'question_prompt', questionAttemptId: 2 });
+  });
+
+  it('uses semantic intent for a conversational failed-audio retry and ignores a stale result', async () => {
+    const requests: TriviaIntentRequest[] = [];
+    const game = harness(audioProblemState(), 'en-US', { resumed: true,
+      resolveIntent: async request => {
+        requests.push(request);
+        return { kind: 'action', actionId: 'retry_question' };
+      } });
+    game.setup();
+    game.prompt('That audio vanished; can we hear the whole item from the top?');
+    await game.session.whenSpeechSettled();
+    expect(requests[0]).toMatchObject({ phase: 'audio_problem',
+      actions: [expect.objectContaining({ id: 'retry_question' })] });
+    expect(game.calls.retries).toEqual([{ questionId: 'question-1', attemptId: 1 }]);
+
+    let resolveIntent!: (result: TriviaIntentResult) => void;
+    const stale = harness(audioProblemState(), 'en-US', { resumed: true,
+      resolveIntent: () => new Promise(resolve => { resolveIntent = resolve; }) });
+    stale.setup();
+    stale.prompt('Can we hear that from the top?');
+    await flushMicrotasks();
+    stale.setState({ questionAttemptId: 2 });
+    resolveIntent({ kind: 'action', actionId: 'retry_question' });
+    await stale.session.whenSpeechSettled();
+    expect(stale.calls.retries).toEqual([]);
+  });
+
+  it('keeps station audio recovery operator-owned and explains the standalone retry limit', () => {
+    const station = harness(audioProblemState(), 'en-US', { resumed: true });
+    station.session.setStationManaged(true);
+    station.setup();
+    station.prompt('Please replay that question');
+    expect(station.calls.retries).toEqual([]);
+    expect(station.spoken.some(item => /operator to replay/i.test(item.text))).toBe(true);
+
+    const limited = harness(audioProblemState({ audioRetryRemaining: 0 }), 'en-US',
+      { resumed: true, retryOutcome: 'limit' });
+    limited.setup();
+    expect(limited.spoken.some(item => /hang up and call back/i.test(item.text))).toBe(true);
+    limited.prompt('Try again');
+    expect(limited.calls.retries).toEqual([{ questionId: 'question-1', attemptId: 1 }]);
+    expect(limited.state.phase).toBe('audio_problem');
+  });
   it('accepts estimated Relay completion only for the current painted prompt and cue', async () => {
     const game = harness(questionPromptState(), 'en-US', {
       deferQuestion: true, deferCue: true, manualTimers: true,
@@ -466,16 +538,21 @@ describe('TriviaVoiceSession question playback and answers', () => {
     expect(game.state.phase).toBe('question');
   });
 
-  it('sends question and choices in one ordered required talk cycle before readiness', async () => {
+  it('finishes the spoken question before starting the choice-reading clock', async () => {
     const game = harness(questionPromptState(), 'en-US', { deferQuestion: true });
     game.setup();
     expect(game.questionSpeech()).toHaveLength(1);
-    expect(game.questionSpeech()[0]?.text).toMatch(/Question 1.*France.*choices are One, Rome.*Four, Vienna/i);
+    expect(game.questionSpeech()[0]?.text).toMatch(/Question 1.*France/i);
+    expect(game.questionSpeech()[0]?.text).not.toMatch(/choices are|One, Rome/i);
     expect(game.calls.promptReady).toEqual([]);
     game.settleQuestion(true);
     await game.session.whenSpeechSettled();
     expect(game.calls.promptReady).toEqual(['question-1']);
     expect(game.state.phase).toBe('answer_cue');
+    game.setState({ displayViewReady: true });
+    game.session.onStateChanged();
+    await game.session.whenSpeechSettled();
+    expect(game.spoken.some(item => /The choices are One, Rome.*Four, Vienna/i.test(item.text))).toBe(true);
   });
   it('does not replay the required reading into an already active answer timer', async () => {
     const game = harness(questionState(), 'en-US', { manualTimers: true });
@@ -517,10 +594,10 @@ describe('TriviaVoiceSession question playback and answers', () => {
 
     expect(game.calls.preempts).toBe(1);
     expect(game.spoken.filter(item => /Question 2/.test(item.text))).toHaveLength(1);
-    expect(game.spoken.filter(item => /choices are One, Rome/.test(item.text))).toHaveLength(1);
+    expect(game.spoken.filter(item => /choices are One, Rome/.test(item.text))).toHaveLength(0);
   });
 
-  it('keeps maximum valid prompt and four-choice content in one ordered Relay job', async () => {
+  it('keeps a long question and four choices in ordered Relay jobs on opposite sides of clock start', async () => {
     const longPrompt = 'P'.repeat(240);
     const longChoices = choices.map((choice, index) => ({ ...choice, text: String(index + 1).repeat(100) }));
     const game = harness(questionPromptState({
@@ -529,12 +606,16 @@ describe('TriviaVoiceSession question playback and answers', () => {
     game.setup();
 
     expect(game.questionSpeech()).toHaveLength(1);
-    expect(Array.from(game.questionSpeech()[0]!.text).length).toBeGreaterThan(500);
-    const complete = game.questionSpeech().map(item => item.text).join(' ');
-    expect(complete).toContain(longPrompt);
-    for (const choice of longChoices) expect(complete).toContain(choice.text);
+    expect(game.questionSpeech()[0]!.text).toContain(longPrompt);
+    for (const choice of longChoices) expect(game.questionSpeech()[0]!.text).not.toContain(choice.text);
     game.settleQuestion(true);
+    await flushMicrotasks();
+    game.setState({ displayViewReady: true });
+    game.session.onStateChanged();
     await game.session.whenSpeechSettled();
+    const choicesSpeech = game.spoken.find(item => item.text.startsWith('The choices are'))?.text ?? '';
+    expect(Array.from(choicesSpeech).length).toBeGreaterThan(400);
+    for (const choice of longChoices) expect(choicesSpeech).toContain(choice.text);
   });
 
   it('preserves the earliest matching interim onset and accepts its final during server grace', () => {
@@ -574,7 +655,7 @@ describe('TriviaVoiceSession question playback and answers', () => {
     expect(game.calls.answers).toEqual([{ choiceId: 'rome', final: true, answeredAtMs: 1_500 }]);
   });
 
-  it('accepts a delayed semantic result for a final heard inside the ten-second clock', async () => {
+  it('accepts a delayed semantic result for a final heard inside the answer clock', async () => {
     vi.useFakeTimers();
     try {
       let finish!: (result: TriviaIntentResult) => void;
@@ -906,13 +987,17 @@ describe('TriviaVoiceSession question playback and answers', () => {
       question: { id: 'question-1', prompt: 'Qual e a capital da Franca?', choices: portugueseChoices },
     }), 'pt-BR', { deferQuestion: true });
     game.setup();
-    expect(game.questionSpeech().map(item => item.text).join(' ')).toMatch(
-      /Pergunta 1.*capital da Franca.*opções são Um, Roma; Dois, Paris; Três, Madri; Quatro, Viena/i,
-    );
+    expect(game.questionSpeech().map(item => item.text).join(' ')).toMatch(/Pergunta 1.*capital da Franca/i);
+    expect(game.spoken.map(item => item.text).join(' ')).not.toMatch(/opções são/i);
     game.settleQuestion(true);
+    await flushMicrotasks();
+    game.setState({ displayViewReady: true });
+    game.session.onStateChanged();
     await game.session.whenSpeechSettled();
     expect(game.calls.promptReady).toEqual(['question-1']);
-    expect(game.calls.cueReady).toEqual([]);
+    expect(game.spoken.map(item => item.text).join(' ')).toMatch(
+      /opções são Um, Roma; Dois, Paris; Três, Madri; Quatro, Viena/i,
+    );
   });
 
   it.each([
@@ -1114,12 +1199,12 @@ describe('TriviaVoiceSession reconnect, reveal, and lifecycle', () => {
     const missingCue = harness(answerCueState(), 'en-US', { resumed: true });
     missingCue.setup();
     await missingCue.session.whenSpeechSettled();
-    expect(missingCue.spoken.filter(item => item.text.startsWith('Get ready.'))).toHaveLength(1);
+    expect(missingCue.spoken.filter(item => item.text.startsWith('The choices are'))).toHaveLength(1);
     expect(missingCue.calls.cueReady).toEqual(['question-1']);
 
     const settledCue = harness(answerCueState({ myAnswerCueReady: true }), 'en-US', { resumed: true });
     settledCue.setup();
-    expect(settledCue.spoken.filter(item => item.text.startsWith('Get ready.'))).toHaveLength(0);
+    expect(settledCue.spoken.filter(item => item.text.startsWith('The choices are'))).toHaveLength(0);
     expect(settledCue.calls.cueReady).toEqual([]);
 
     const resumedActive = harness(questionState(), 'en-US', { resumed: true });
@@ -1127,11 +1212,11 @@ describe('TriviaVoiceSession reconnect, reveal, and lifecycle', () => {
     resumedActive.setup();
     resumedActive.session.onStateChanged();
     expect(resumedActive.spoken.map(item => item.text)).toContain(
-      'Answer now. Prefer one through four. You have 6 seconds remaining.',
+      'You have 6 seconds left. Say the answer in your own words or by number.',
     );
     expect(resumedActive.questionSpeech()).toHaveLength(0);
     expect(resumedActive.spoken.map(item => item.text).join(' ')).not.toMatch(/You are back/i);
-    expect(resumedActive.spoken.filter(item => /seconds remaining/.test(item.text))).toHaveLength(1);
+    expect(resumedActive.spoken.filter(item => /seconds left/.test(item.text))).toHaveLength(1);
     expect(resumedActive.state).toMatchObject({ answeringStartsAtMs: 1_000, questionEndsAtMs: 11_000 });
 
     const resumedLock = harness(questionState({ myAnswered: true }), 'en-US', { resumed: true });
@@ -1184,10 +1269,12 @@ describe('TriviaVoiceSession reconnect, reveal, and lifecycle', () => {
   });
 
   it.each([
-    { locale: 'en-US' as const, name: 'Ada', result: /Ada wins\. Your score: 2,600; 2 correct/i,
-      guidance: /Results on screen.*Check messages for coin instructions to replay/i },
-    { locale: 'pt-BR' as const, name: 'Ana', result: /Ana venceu\. Pontuação 2\.600; 2 acertos/i,
-      guidance: /Resultados na tela.*Veja as mensagens.*moedas.*jogar novamente/i },
+    { locale: 'en-US' as const, name: 'Ada', result: /Ada wins\. 2,600 points; 2 correct/i,
+      technology: /Twilio Conversation Relay.*heard answers.*scored.*screen/i,
+      guidance: /Check messages for coins to replay/i },
+    { locale: 'pt-BR' as const, name: 'Ana', result: /Ana venceu\. 2\.600 pontos; 2 acertos/i,
+      technology: /Twilio Conversation Relay.*ouviu respostas.*pontuou.*tela/i,
+      guidance: /Veja mensagens.*moedas.*jogar de novo/i },
   ])('queues a compact $locale station result before slow Relay playback settles', async row => {
     const game = harness(resultState([
       resultPlayer('t1', row.name, 2_600, 2, 1),
@@ -1197,7 +1284,9 @@ describe('TriviaVoiceSession reconnect, reveal, and lifecycle', () => {
     const resultLines = game.spoken.filter(line => row.guidance.test(line.text));
     expect(resultLines).toHaveLength(1);
     expect(resultLines[0]?.text).toMatch(row.result);
-    expect(resultLines[0]?.text.trim().split(/\s+/).length).toBeLessThanOrEqual(18);
+    expect(resultLines[0]?.text).toMatch(row.technology);
+    expect(resultLines[0]?.text.indexOf('Twilio Conversation Relay')).toBeGreaterThan(0);
+    expect(resultLines[0]?.text.trim().split(/\s+/).length).toBeLessThanOrEqual(32);
 
     let settled = false;
     const waiting = game.session.whenSpeechSettled().then(() => { settled = true; });
@@ -1207,6 +1296,27 @@ describe('TriviaVoiceSession reconnect, reveal, and lifecycle', () => {
     await waiting;
     expect(settled).toBe(true);
     expect(game.retryTimerCount).toBe(0);
+  });
+
+  it.each([
+    { locale: 'en-US' as const, outcome: /Ada wins.*2,600/i,
+      technology: /Twilio Conversation Relay.*heard answers.*scored.*screen/i,
+      replay: /To play again, say Play again/i },
+    { locale: 'pt-BR' as const, outcome: /Ada venceu.*2\.600/i,
+      technology: /Twilio Conversation Relay.*ouviu respostas.*pontuou.*tela/i,
+      replay: /Para jogar novamente, diga Jogar novamente/i },
+  ])('explains $locale Trivia voice technology after the standalone result and before replay guidance', async row => {
+    const game = harness(resultState([resultPlayer('t1', 'Ada', 2_600, 2, 1)]),
+      row.locale, { resumed: true });
+    game.setup();
+    await game.session.whenSpeechSettled();
+    const lines = game.spoken.map(item => item.text);
+    const outcomeIndex = lines.findIndex(line => row.outcome.test(line));
+    const technologyIndex = lines.findIndex(line => row.technology.test(line));
+    const replayIndex = lines.findIndex(line => row.replay.test(line));
+    expect(outcomeIndex).toBeGreaterThanOrEqual(0);
+    expect(technologyIndex).toBeGreaterThan(outcomeIndex);
+    expect(replayIndex).toBeGreaterThan(technologyIndex);
   });
 
   it('tells a caller who answered incorrectly what the full correct answer was', async () => {
@@ -1295,6 +1405,7 @@ interface HarnessOptions {
   manualTimers?: boolean;
   resumed?: boolean;
   resolveIntent?: (request: TriviaIntentRequest) => Promise<TriviaIntentResult>;
+  retryOutcome?: 'limit' | 'unavailable';
 }
 
 function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US', options: HarnessOptions = {}) {
@@ -1320,6 +1431,7 @@ function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US'
     revealBegun: [] as { questionId: string; attemptId: number; generation: number }[],
     revealReady: [] as { questionId: string; attemptId: number; generation: number }[],
     answers: [] as { choiceId: string; final: true; answeredAtMs: number }[],
+    retries: [] as { questionId: string; attemptId: number }[],
     resolutionStarts: [] as { questionId: string; attemptId: number; id: number;
       onset?: { choiceId?: string; atMs: number } }[],
     resolutionFinishes: [] as number[],
@@ -1451,6 +1563,17 @@ function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US'
       setState({ phase: 'audio_problem' });
       return true;
     },
+    retryQuestion: (_code, _playerId, questionId, attemptId) => {
+      calls.retries.push({ questionId, attemptId });
+      if (options.retryOutcome) return options.retryOutcome;
+      if (state.phase !== 'audio_problem' || state.question?.id !== questionId
+        || state.questionAttemptId !== attemptId) return 'unavailable';
+      setState({ phase: 'question_prompt', questionAttemptId: attemptId + 1,
+        myPromptReady: false, myAnswerCueReady: false, displayViewReady: false,
+        answeringStartsAtMs: null, questionEndsAtMs: null,
+        audioRetryRemaining: Math.max(0, state.audioRetryRemaining - 1) });
+      return 'retried';
+    },
     beginAnswerResolution: (_code, _playerId, questionId, attemptId, onset) => {
       const id = calls.resolutionStarts.length + 1;
       calls.resolutionStarts.push({ questionId, attemptId, id, ...(onset ? { onset } : {}) });
@@ -1483,7 +1606,7 @@ function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US'
     resolveIntent: options.resolveIntent,
     say: (text, isCurrent) => {
       spoken.push({ text, ...(isCurrent ? { isCurrent } : {}) });
-      if (options.deferCue && text.startsWith(locale === 'pt-BR' ? 'Prepare-se.' : 'Get ready.')) {
+      if (options.deferCue && /^(?:The choices are|As opções são)/i.test(text)) {
         return new Promise<TriviaSpeechOutcome>(resolve => { cueResolver = resolve; });
       }
       if (options.deferQuestion && isQuestionAudio(text)) {
@@ -1495,7 +1618,7 @@ function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US'
       if (options.deferReveal && /^(?:Correct!|Incorrect\.|Time's up\.|Correto!|Incorreto\.|Tempo esgotado\.)/i.test(text)) {
         return new Promise<TriviaSpeechOutcome>(resolve => { revealResolvers.push(resolve); });
       }
-      if (options.deferResult && /wins with a leaderboard score|tie between|Results on screen|Resultados na tela/i.test(text)) {
+      if (options.deferResult && /wins with a leaderboard score|tie between|wins\. [\d,.]+ points|venceu\. [\d,.]+ pontos/i.test(text)) {
         return new Promise<TriviaSpeechOutcome>(resolve => { resultResolvers.push(resolve); });
       }
       return Promise.resolve('played' as const);
@@ -1588,6 +1711,7 @@ function baseState(overrides: Partial<TriviaVoiceSnapshot> = {}): TriviaVoiceSna
     myAnswerCueReady: false,
     displayViewReady: true,
     myQuestionPoints: 0,
+    audioRetryRemaining: 2,
     ...overrides,
   };
 }
@@ -1616,6 +1740,14 @@ function answerCueState(overrides: Partial<TriviaVoiceSnapshot> = {}): TriviaVoi
   return questionPromptState({
     phase: 'answer_cue',
     myPromptReady: true,
+    ...overrides,
+  });
+}
+
+function audioProblemState(overrides: Partial<TriviaVoiceSnapshot> = {}): TriviaVoiceSnapshot {
+  return questionPromptState({
+    phase: 'audio_problem', myPromptReady: false, myAnswerCueReady: false,
+    displayViewReady: false, audioRetryRemaining: 2,
     ...overrides,
   });
 }
@@ -1732,5 +1864,5 @@ function speechOutcome(outcome: boolean | TriviaSpeechOutcome): TriviaSpeechOutc
 }
 
 function isQuestionAudio(text: string): boolean {
-  return /Question \d|Pergunta \d|choices are|opções são|^\d+\.\s/i.test(text);
+  return /^(?:Question \d|Pergunta \d|\d+\.\s)/i.test(text);
 }

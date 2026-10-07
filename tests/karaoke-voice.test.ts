@@ -58,6 +58,46 @@ describe('KaraokeVoiceSession', () => {
     expect(game.room.phase).toBe('loading');
   });
 
+  it.each([
+    { locale: 'en-US', name: 'Ada', selection: 'song one', affirmation: 'sure' },
+    { locale: 'en-US', name: 'Ada', selection: 'song one', affirmation: 'yes, let us do this' },
+    { locale: 'en-US', name: 'Ada', selection: 'song one', affirmation: 'continue' },
+    { locale: 'en-US', name: 'Ada', selection: 'song one', affirmation: 'go ahead' },
+    { locale: 'en-US', name: 'Ada', selection: 'song one', affirmation: 'I consent' },
+    { locale: 'pt-BR', name: 'Ana', selection: 'música um', affirmation: 'sim' },
+    { locale: 'pt-BR', name: 'Ana', selection: 'música um', affirmation: 'claro, pode continuar' },
+    { locale: 'pt-BR', name: 'Ana', selection: 'música um', affirmation: 'vamos nessa' },
+  ] as const)('accepts clear $locale consent without waiting for the model: $affirmation',
+    ({ locale, name, selection, affirmation }) => {
+      const game = karaokeVoiceGame(locale, true);
+      const singer = game.connect(`CA-AFFIRM-${locale}-${affirmation}`);
+      singer.prompt(name);
+      singer.prompt(selection);
+      expect(game.room.phase).toBe('song_select');
+      singer.prompt(affirmation);
+      expect(game.room.phase).toBe('loading');
+      expect(game.handoffs).toHaveLength(0);
+    });
+
+  it('accepts an open-ended affirmative consent through the contextual intent resolver', async () => {
+    const requests: KaraokeIntentRequest[] = [];
+    const game = karaokeVoiceGame('en-US', false, false, async request => {
+      requests.push(request);
+      return { kind: 'action', actionId: 'start_with_consent' };
+    });
+    const singer = game.connect('CA-AFFIRM-SEMANTIC');
+    singer.prompt('Ada');
+    singer.prompt('song one');
+    singer.prompt('I am comfortable sharing my voice for scoring and ready to sing');
+    await flushMicrotasks();
+    expect(requests).toEqual(expect.arrayContaining([
+      expect.objectContaining({ phase: 'song_select', actions: expect.arrayContaining([
+        expect.objectContaining({ id: 'start_with_consent' }),
+      ]) }),
+    ]));
+    expect(game.room.phase).toBe('loading');
+  });
+
   it.each(['começar agora', 'vamos começar esta música', 'quero iniciar a música agora'])
   ('starts promptly on clear conversational Portuguese consent: %s', phrase => {
     const game = karaokeVoiceGame('pt-BR', false, true);
@@ -68,7 +108,8 @@ describe('KaraokeVoiceSession', () => {
     expect(game.room.phase).toBe('loading');
   });
 
-  it.each(['do not start yet', 'maybe start later', 'can we start?', 'Start?', 'I said start in the song title'])
+  it.each(['do not start yet', 'maybe start later', 'can we start?', 'Start?', 'I said start in the song title',
+    'sure, but not yet', 'yes?', 'continue?', 'no, thanks', 'please wait'])
   ('does not infer consent from ambiguous or negative English speech: %s', phrase => {
     const game = karaokeVoiceGame('en-US', false, true);
     const singer = game.connect(`CA-NO-START-${phrase}`);
@@ -86,6 +127,30 @@ describe('KaraokeVoiceSession', () => {
     singer.prompt('Start?');
     await flushMicrotasks();
     expect(game.room.phase).toBe('song_select');
+  });
+
+  it.each(['yes, but not yet', 'sure, can you explain scoring?', 'continue?'])
+  ('does not let a model action override a conditional or questioning reply: %s', async phrase => {
+    const game = karaokeVoiceGame('en-US', false, true,
+      async () => ({ kind: 'action', actionId: 'start_with_consent' }));
+    const singer = game.connect(`CA-AMBIGUOUS-${phrase}`);
+    singer.prompt('Ada');
+    singer.prompt('song one');
+    singer.prompt(phrase);
+    await flushMicrotasks();
+    expect(game.room.phase).toBe('song_select');
+  });
+
+  it.each(['yes, go ahead with Never Gonna Give You Up', 'start Never Gonna Give You Up'])
+  ('starts the current selection when a clear affirmative mentions its title: %s', phrase => {
+    const game = karaokeVoiceGame('en-US');
+    const singer = game.connect(`CA-AFFIRM-TITLE-${phrase}`);
+    singer.prompt('Ada');
+    singer.prompt('Never Gonna Give You Up');
+    const selections = game.selectionCalls;
+    singer.prompt(phrase);
+    expect(game.selectionCalls).toBe(selections);
+    expect(game.room.phase).toBe('loading');
   });
 
   it('answers a request for disclosure details after “start by” without inferring consent', () => {
@@ -286,9 +351,9 @@ describe('KaraokeVoiceSession', () => {
       title: 'Never Gonna Give You Up',
       start: 'start singing',
       gameplay: /number or title.*say Start.*watch the display.*each word.*target/i,
-      consent: /scoring.*live voice.*third-party speech recognition service.*Say Start anytime to consent/i,
+      consent: /scoring.*live voice.*third-party speech recognition service.*Say Start, yes, or continue anytime to consent/i,
       result: /Score 1,234, best combo 1/i,
-      station: /Results on screen.*check your messages.*coin instructions to replay/i,
+      station: /Results on screen.*check your messages.*replay coins/i,
     },
     {
       locale: 'pt-BR' as const,
@@ -297,9 +362,9 @@ describe('KaraokeVoiceSession', () => {
       title: 'Luz no Ritmo',
       start: 'começar a cantar',
       gameplay: /número ou título.*diga Começar.*olhe para a tela.*cada palavra.*alvo/i,
-      consent: /pontuação.*voz ao vivo.*serviço terceirizado de reconhecimento de fala.*Diga Começar a qualquer momento para consentir/i,
+      consent: /pontuação.*voz ao vivo.*serviço terceirizado de reconhecimento de fala.*Diga Começar, sim ou continuar a qualquer momento para consentir/i,
       result: /Pontuação 1\.234, melhor combo 1/i,
-      station: /Resultados na tela.*mensagens.*conseguir moedas.*jogar novamente/i,
+      station: /Resultados na tela.*mensagens.*conseguir moedas.*cantar novamente/i,
     },
   ])('runs the final-only setup, explicit start, media handoff, and station result in $locale', async row => {
     const game = karaokeVoiceGame(row.locale);
@@ -323,9 +388,6 @@ describe('KaraokeVoiceSession', () => {
     expect(game.room.state().selectedSong?.title).toBe(row.title);
     expect(game.room.state().selectedByPlayerId).toBe(singer.playerId);
     expect(singer.spoken.at(-1)).toMatch(row.consent);
-    singer.prompt(row.locale === 'pt-BR' ? 'sim' : 'yes');
-    expect(game.room.phase).toBe('song_select');
-
     const beforeStartSpeech = singer.spoken.length;
     singer.prompt(row.start);
     expect(game.room.phase).toBe('loading');
@@ -384,7 +446,9 @@ describe('KaraokeVoiceSession', () => {
     expect(singer.spoken.filter(line => row.result.test(line))).toHaveLength(1);
     const resultLine = singer.spoken.find(line => row.result.test(line));
     expect(resultLine).toMatch(row.station);
-    expect(resultLine!.trim().split(/\s+/).length).toBeLessThanOrEqual(18);
+    expect(resultLine).toMatch(/Twilio Conversation Relay/i);
+    expect(resultLine).toMatch(row.locale === 'pt-BR' ? /Media Streams.*canto/i : /Media Streams.*singing/i);
+    expect(resultLine!.trim().split(/\s+/).length).toBeLessThanOrEqual(33);
 
     singer.interrupt();
     expect(singer.spoken.filter(line => row.result.test(line))).toHaveLength(1);
@@ -487,7 +551,7 @@ describe('KaraokeVoiceSession', () => {
     expect(resumed.spoken).toEqual([
       'You are back, Ada.',
       'Your song is Never Gonna Give You Up.',
-      'With scoring, your live voice goes to a third-party speech recognition service. Say Start anytime to consent and sing.',
+      'With scoring, your live voice goes to a third-party speech recognition service. Say Start, yes, or continue anytime to consent and sing. You can interrupt me.',
     ]);
     await Promise.resolve();
     resumed.prompt('start');
@@ -530,6 +594,31 @@ describe('KaraokeVoiceSession', () => {
     resumed.session.handleClose();
     expect(game.leaveCalls).toBe(0);
   });
+
+  it.each([
+    ['en-US', 'Ada', 'song one', 'start', /your score is 900/i, /Media Streams carried your singing/i],
+    ['pt-BR', 'Ana', 'música um', 'começar', /sua pontuação é 900/i, /Media Streams levou seu canto/i],
+  ] as const)('explains the Karaoke voice technology in the standalone $0 result cue',
+    (locale, name, song, start, resultPattern, techPattern) => {
+      const game = karaokeVoiceGame(locale);
+      const singer = game.connect(`CA-TECH-${locale}`);
+      singer.prompt(name);
+      singer.prompt(song);
+      singer.prompt(start);
+      const generation = game.room.state().loadingGeneration;
+      expect(game.room.ready(generation)).toBe(true);
+      expect(game.room.mediaReady(singer.playerId, game.room.state().selectedSong!.id,
+        generation, KARAOKE_COUNTDOWN_MS)).toBe(true);
+      game.setNow(KARAOKE_COUNTDOWN_MS + KARAOKE_SONG_DURATION_MS);
+      game.room.tick();
+      expect(game.room.finalizeMediaScore(singer.playerId, 900,
+        finalHits(game.room.state().selectedSong!, 900))).toBe(true);
+      game.stateChanged();
+      const resultLine = singer.spoken.find(line => resultPattern.test(line));
+      expect(resultLine).toMatch(/Twilio Conversation Relay/i);
+      expect(resultLine).toMatch(techPattern);
+      expect(singer.spoken.at(-1)).toMatch(locale === 'pt-BR' ? /Escolher outra música/i : /Choose another song/i);
+    });
 
   it('queues one complete station result and waits for score readbacks to settle', async () => {
     const game = karaokeVoiceGame('en-US', true, false,

@@ -1,10 +1,29 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as THREE from 'three';
+import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { FighterActor } from '../client/fighter/fighter-actor';
 
 interface ActorState { currentId: string }
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
 describe('FighterActor playback', () => {
+  it('starts fetching the selected real fighter while animation clips are still loading', async () => {
+    let finishClips!: (clips: ReadonlyMap<string, THREE.AnimationClip>) => void;
+    const clips = new Promise<ReadonlyMap<string, THREE.AnimationClip>>(resolve => { finishClips = resolve; });
+    const model = new THREE.Group();
+    model.add(new THREE.Mesh(new THREE.BoxGeometry(1, 2, 1), new THREE.MeshBasicMaterial()));
+    vi.spyOn(FBXLoader.prototype, 'parse').mockReturnValue(model);
+    const fetchAsset = vi.fn(async () => new Response(new Uint8Array([1, 2, 3]), { status: 200 }));
+    vi.stubGlobal('fetch', fetchAsset);
+
+    const loading = FighterActor.load({ id: 'nyx', label: 'Nyx', file: 'nyx.fbx' }, clips);
+    await vi.waitFor(() => expect(fetchAsset).toHaveBeenCalledTimes(1));
+    finishClips(new Map([['idle', new THREE.AnimationClip('idle', 1, [])]]));
+    const actor = await loading;
+    expect(new THREE.Box3().setFromObject(actor.root).isEmpty()).toBe(false);
+    actor.dispose();
+  });
+
   it('creates a visible procedural actor when an FBX model is unavailable', () => {
     const actor = FighterActor.fallback('#ef223a');
     expect(new THREE.Box3().setFromObject(actor.root).isEmpty()).toBe(false);

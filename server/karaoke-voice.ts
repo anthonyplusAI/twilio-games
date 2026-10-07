@@ -63,6 +63,7 @@ export interface KaraokeVoiceDeps {
     callSid: string,
     locale: SupportedLocale,
     nameConfirmed: boolean,
+    stationManaged: boolean,
   ): { playerId: string; resumed: boolean } | null;
   leave(code: string, playerId: string, callSid: string): void;
   setName(code: string, playerId: string, name: string): boolean;
@@ -154,7 +155,10 @@ export class KaraokeVoiceSession {
     const now = Date.now();
     if (this.lastFinal?.text === normalized && this.lastFinal.afterContext === beforeContext
       && now - this.lastFinal.at < FINAL_DUPLICATE_FRAME_MS
-      && !(snapshot.phase === 'song_select' && isExplicitStart(message.voicePrompt, this.commandLocale))) return;
+      && !(snapshot.phase === 'song_select' && (
+        isExplicitStart(message.voicePrompt, this.commandLocale)
+        || isAffirmativeConsent(message.voicePrompt, this.commandLocale)
+      ))) return;
 
     this.cancelSemantic();
     this.handleFinalPrompt(message.voicePrompt, snapshot);
@@ -222,6 +226,7 @@ export class KaraokeVoiceSession {
       callSid,
       this.commandLocale,
       this.authoritativeName !== null,
+      this.stationManaged,
     );
     if (!binding) {
       this.deps.say(this.text('voice.roomUnavailable'));
@@ -236,7 +241,7 @@ export class KaraokeVoiceSession {
     if (!snapshot) return;
     this.introPhase = snapshot.phase;
     if (!this.isCallIntroPhase(snapshot.phase)) this.introExpired = true;
-    this.awaitingName = !snapshot.nameConfirmed;
+    this.awaitingName = snapshot.phase === 'lobby' && !snapshot.nameConfirmed;
     this.remember(snapshot);
 
     if (snapshot.phase === 'loading') {
@@ -258,15 +263,19 @@ export class KaraokeVoiceSession {
     }
 
     this.deps.say(this.text('voice.welcome'), this.callIntroGuard());
-    if (!snapshot.nameConfirmed) {
+    if (!snapshot.nameConfirmed && snapshot.phase === 'lobby') {
       this.deps.say(this.text('voice.askName'), this.nameGuard());
+      return;
+    }
+    if (!snapshot.nameConfirmed && snapshot.phase === 'song_select') {
+      this.speakSongSelection(snapshot);
       return;
     }
     this.finishIntroduction(snapshot);
   }
 
   private handleFinalPrompt(spoken: string, snapshot: KaraokeVoiceSnapshot): void {
-    if (!snapshot.nameConfirmed) {
+    if (!snapshot.nameConfirmed && snapshot.phase === 'lobby') {
       this.captureName(spoken);
       return;
     }
@@ -286,11 +295,20 @@ export class KaraokeVoiceSession {
         return;
       }
       const song = matchKaraokeSong(spoken, this.catalogForLocale(snapshot), this.commandLocale);
+      const consent = isExplicitStart(spoken, this.commandLocale)
+        || isAffirmativeConsent(spoken, this.commandLocale)
+        || (snapshot.selectedSong && song?.id === snapshot.selectedSong.id
+          && isAffirmativeAboutSelectedSong(spoken, snapshot.selectedSong.title, this.commandLocale));
+      if (consent && snapshot.selectedSong && snapshot.selectedByPlayerId === this.playerId
+        && (!song || song.id === snapshot.selectedSong.id)) {
+        this.startSelectedSong(snapshot);
+        return;
+      }
       if (song) {
         this.selectSong(song, snapshot);
         return;
       }
-      if (isExplicitStart(spoken, this.commandLocale)) {
+      if (consent) {
         this.startSelectedSong(snapshot);
         return;
       }
@@ -410,7 +428,8 @@ export class KaraokeVoiceSession {
       return;
     }
     if (snapshot.phase !== 'song_select') {
-      if (!snapshot.nameConfirmed) this.deps.say(this.text('voice.askName'), this.nameGuard());
+      if (!snapshot.nameConfirmed && snapshot.phase === 'lobby')
+        this.deps.say(this.text('voice.askName'), this.nameGuard());
       return;
     }
     if (digit === '*') {
@@ -430,7 +449,7 @@ export class KaraokeVoiceSession {
 
   private speakContext(snapshot: KaraokeVoiceSnapshot): void {
     if (isRelaySilentPhase(snapshot.phase)) return;
-    if (!snapshot.nameConfirmed) {
+    if (!snapshot.nameConfirmed && snapshot.phase === 'lobby') {
       this.awaitingName = true;
       this.deps.say(this.text('voice.askName'), this.nameGuard());
     } else if (snapshot.phase === 'lobby') {
@@ -462,7 +481,8 @@ export class KaraokeVoiceSession {
     const snapshot = this.currentSnapshot();
     const selected = selectionKey(snapshot);
     if (!selected || snapshot?.selectedByPlayerId !== this.playerId) return;
-    // Relay is interruptible; the caller's explicit Start is consent for this selection.
+    // Relay is interruptible; a clear affirmative answer or request to begin is
+    // consent for this selection, even if this spoken disclosure is still queued.
     // Do not tie the command to TTS completion, which would replay a barged-in disclosure.
     try {
       void Promise.resolve(this.deps.say(this.text('voice.startConsent'), this.selectedGuard(selected)))
@@ -554,7 +574,7 @@ export class KaraokeVoiceSession {
     const actions = informationOnly ? [] : snapshot.phase === 'song_select'
       ? [
           { id: 'select_song', description: 'Choose one song shown on the current screen.', targetIds: catalog.map(song => song.id) },
-          { id: 'start_with_consent', description: 'Start the currently selected song only when the caller explicitly asks to start now, consenting to scoring. An interrupted disclosure does not block this.' },
+          { id: 'start_with_consent', description: 'After a song is selected, start when the caller clearly agrees to the scoring disclosure or asks to sing now in their own words. A yes, sure, continue, or similar affirmative response counts. Do not infer consent from questions, negation, hesitation, conditions, or a song title alone. An interrupted disclosure does not block a clear affirmative.' },
           { id: 'list_songs', description: 'Read the available songs.' },
         ]
       : snapshot.phase === 'results'
@@ -655,8 +675,7 @@ export class KaraokeVoiceSession {
   private nameGuard(): () => boolean {
     return () => {
       const snapshot = this.currentSnapshot();
-      return Boolean(snapshot && !snapshot.nameConfirmed
-        && (snapshot.phase === 'lobby' || snapshot.phase === 'song_select'));
+      return Boolean(snapshot && !snapshot.nameConfirmed && snapshot.phase === 'lobby');
     };
   }
 
@@ -817,6 +836,34 @@ function isExplicitStart(spoken: string, locale: SupportedLocale): boolean {
     return /^(?:(?:sim|claro|ok|okay|por favor|vamos|bora|eu quero|quero|estou pront[oa] para|ja estou pront[oa] para)\s+)*(?:comecar|iniciar)(?:\s+(?:(?:a|esta|essa|minha)\s+)?musica)?(?:\s+a\s+cantar)?(?:\s+(?:agora|ja))?(?:\s+por favor)?$/.test(text);
   }
   return /^(?:(?:yes|yeah|yep|sure|ok|okay|alright|please|go ahead(?: and)?|lets|let s|let us|i want to|i wanna|id like to|i would like to|im ready to|i am ready to|were ready to|we are ready to|ready to)\s+)*(?:just\s+)?(?:start|begin)(?:\s+(?:(?:the|this|that|my)\s+)?song)?(?:\s+singing)?(?:\s+(?:right\s+)?now)?(?:\s+please)?$/.test(text);
+}
+
+/** Low-latency consent for short, unambiguous replies; other wording goes to the contextual resolver. */
+function isAffirmativeConsent(spoken: string, locale: SupportedLocale): boolean {
+  if (isConsentQuestionOrNegation(spoken, locale)) return false;
+  const text = normalizeForMatching(spoken, locale).replace(/['’]/g, '');
+  if (!text || text.split(/\s+/).length > 12) return false;
+  if (locale === 'pt-BR') {
+    const simple = /^(?:sim|claro|com certeza|certo|ta bom|tudo bem|ok|okay|eu concordo|eu consinto|pode continuar|pode seguir|pode comecar|vamos nessa|vamos la|bora)(?:\s+(?:por favor|agora|ja))?$/;
+    const affirmativeAction = /^(?:sim|claro|com certeza|certo|ta bom|tudo bem|ok|okay|eu concordo|eu consinto)(?:\s+)?(?:pode\s+)?(?:continuar|seguir|comecar|iniciar|vamos nessa|vamos la|bora)(?:\s+(?:por favor|agora|ja))?$/;
+    return simple.test(text) || affirmativeAction.test(text);
+  }
+  const simple = /^(?:yes|yeah|yep|sure|absolutely|certainly|of course|ok|okay|all right|alright|sounds good|that sounds good|i agree|i consent|continue|go ahead|proceed|lets go|let s go|let us go|im ready|i am ready)(?:\s+(?:please|now|right now))?$/;
+  const affirmativeAction = /^(?:yes|yeah|yep|sure|absolutely|certainly|of course|ok|okay|all right|alright|sounds good|that sounds good|i agree|i consent)(?:\s+)?(?:continue|proceed|go ahead|lets? go|let s go|let us go|lets? do (?:it|this)|let s do (?:it|this)|let us do (?:it|this)|i(?: am|m) ready(?: to sing)?)(?:\s+(?:please|now|right now))?$/;
+  return simple.test(text) || affirmativeAction.test(text);
+}
+
+function isAffirmativeAboutSelectedSong(spoken: string, title: string, locale: SupportedLocale): boolean {
+  const text = normalizeForMatching(spoken, locale).replace(/['’]/g, '');
+  // A song title can itself contain words such as “Never” or “What”; those are
+  // not a refusal or question when the caller clearly names the selected song.
+  const titleText = normalizeForMatching(title, locale).replace(/['’]/g, '');
+  const instruction = text.replace(titleText, ' ').replace(/\s+/g, ' ').trim();
+  if (isConsentQuestionOrNegation(instruction, locale)) return false;
+  if (isExplicitStart(instruction, locale)) return true;
+  return locale === 'pt-BR'
+    ? /^(?:sim|claro|certo|ok|okay|vamos|bora|comecar|iniciar|continuar)\b.*\b(?:comecar|iniciar|continuar|seguir|cantar|vamos nessa|pode)\b/.test(instruction)
+    : /^(?:yes|yeah|yep|sure|okay|ok|alright|absolutely|go ahead|start|begin|continue|proceed)\b.*\b(?:start|begin|continue|proceed|go ahead|sing|lets go|let s go|with)\b/.test(instruction);
 }
 
 function isKaraokeInformationRequest(spoken: string, locale: SupportedLocale): boolean {

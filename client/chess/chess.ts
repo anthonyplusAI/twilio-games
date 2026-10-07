@@ -8,6 +8,8 @@ import { createStationDisplay } from '../station-display';
 import { rejectDisplayToken, watchVoiceNumber } from '../station-client';
 import { wireFullscreenToggle } from '../fullscreen-toggle';
 import { getMusicManager } from '../music-manager';
+import { updateThemeToggleIcon } from '../icon-controls';
+import { currentTheme, wireThemeToggle } from '../theme';
 import type { ChessBoardScene } from './chess-board';
 import { ChessConnection, chessWebSocketUrl, type ChessConnectionState } from './chess-net';
 import { createChessResultDialog } from './chess-result-dialog';
@@ -19,6 +21,8 @@ const boardStage = element<HTMLDivElement>('board-stage');
 const fallback = element<HTMLDivElement>('fallback-board');
 const accessibleBoard = element<HTMLTableElement>('accessible-board');
 const connectionStatus = element<HTMLSpanElement>('connection-status');
+const themeToggle = element<HTMLButtonElement>('theme-toggle');
+const resultThemeToggle = element<HTMLButtonElement>('result-theme-toggle');
 const musicButton = element<HTMLButtonElement>('music-button');
 const musicLabel = element<HTMLSpanElement>('music-label');
 const statusTitle = element<HTMLHeadingElement>('status-title');
@@ -55,6 +59,10 @@ const stationDisplay = createStationDisplay();
 const stationManaged = stationLaunchRequested || stationDisplay.active;
 const isPortuguese = locale === 'pt-BR';
 const music = getMusicManager();
+const themeLabels = {
+  light: isPortuguese ? 'Tema claro' : 'Light theme',
+  dark: isPortuguese ? 'Tema escuro' : 'Dark theme',
+};
 const resultDialog = createChessResultDialog({
   root: app, overlay: resultOverlay, card: resultCard, title: resultTitle,
   replay: resultReplay, exit: resultExit, announcer: liveAnnouncer, statusTitle,
@@ -85,6 +93,15 @@ document.documentElement.lang = locale;
 document.title = isPortuguese ? 'Xadrez por Voz · Twilio Games' : 'Voice Chess · Twilio Games';
 localizeStaticCopy();
 resultTechSlot.innerHTML = resultTechHtml('chess', locale, { stationManaged });
+const stopThemeToggle = wireThemeToggle(themeToggle, themeLabels);
+const stopResultThemeToggle = wireThemeToggle(resultThemeToggle, themeLabels);
+const themeObserver = new MutationObserver(() => {
+  const theme = currentTheme();
+  board?.setTheme(theme);
+  updateThemeToggleIcon(themeToggle, theme, themeLabels.light, themeLabels.dark);
+  updateThemeToggleIcon(resultThemeToggle, theme, themeLabels.light, themeLabels.dark);
+});
+themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 const stopVoiceNumberUpdates = stationLaunchRequested || stationDisplay.active ? null
   : watchVoiceNumber(locale, number => {
     const nextNumber = number.trim();
@@ -141,6 +158,7 @@ async function loadChessScene(): Promise<void> {
     const { ChessBoardScene } = await import('./chess-board');
     if (pageClosing) return;
     const scene = new ChessBoardScene(boardStage);
+    scene.setTheme(currentTheme());
     const current = latestState ?? visualState;
     if (current) synchronizeScene(scene, current);
     board = scene;
@@ -218,6 +236,9 @@ void (document.fonts?.ready ?? Promise.resolve()).then(() => new Promise<void>(r
 
 addEventListener('pagehide', () => {
   pageClosing = true;
+  themeObserver.disconnect();
+  stopThemeToggle();
+  stopResultThemeToggle();
   if (bannerTimer) clearTimeout(bannerTimer);
   phoneQrGeneration += 1;
   stopVoiceNumberUpdates?.();
@@ -356,6 +377,11 @@ function renderStatus(): void {
     detail = isPortuguese ? 'A posição atual continua no tabuleiro.' : 'Your last known position remains on the board.';
     label = isPortuguese ? 'Canal de voz' : 'Voice channel';
     hint = isPortuguese ? 'Aguarde a conexão voltar.' : 'Waiting for the voice link to return.';
+  } else if (state.phase === 'finished') {
+    title = isPortuguese ? 'Duelo encerrado' : 'Duel complete';
+    detail = resultSummary(state.result, state.humanColor, locale);
+    label = isPortuguese ? 'Resultado final' : 'Final result';
+    hint = isPortuguese ? 'O tabuleiro mostra a posição final.' : 'The board shows the final position.';
   } else if (state.phase === 'waiting' || !state.playerConnected) {
     title = isPortuguese ? 'Aguardando sua chamada' : 'Awaiting your call';
     detail = isPortuguese ? 'Seu duelo começa assim que a chamada estiver conectada.'
@@ -370,11 +396,6 @@ function renderStatus(): void {
     label = isPortuguese ? 'Feitiço preparado' : 'Spell prepared';
     hint = isPortuguese ? 'Diga “confirmar” na chamada, ou “cancelar” para escolher outro lance.'
       : 'Say “confirm” on your call, or “cancel” to choose another move.';
-  } else if (state.phase === 'finished') {
-    title = isPortuguese ? 'Duelo encerrado' : 'Duel complete';
-    detail = resultSummary(state.result, state.humanColor, locale);
-    label = isPortuguese ? 'Resultado final' : 'Final result';
-    hint = isPortuguese ? 'O tabuleiro mostra a posição final.' : 'The board shows the final position.';
   } else if (state.turn === state.humanColor) {
     title = isPortuguese ? 'Sua vez' : 'Your move';
     detail = state.selection?.piece

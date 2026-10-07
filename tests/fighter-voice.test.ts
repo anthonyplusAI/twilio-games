@@ -133,6 +133,21 @@ describe('fighter voice session', () => {
     expect(game.room.phase).toBe('fighter_select');
   });
 
+  it('stays on fighter selection when an unnamed caller joins late', () => {
+    const game = voiceGame();
+    const first = game.connect('CA-FIRST-FIGHTER', 'VOICE', undefined, 'Ada');
+    first.prompt('next');
+    expect(game.room.phase).toBe('fighter_select');
+
+    const late = game.connect('CA-LATE-FIGHTER');
+    expect(late.spoken.join(' ')).toMatch(/choose your fighter/i);
+    expect(late.spoken.join(' ')).not.toMatch(/what is your name|tell me your name/i);
+    late.prompt('Nyx');
+    expect(game.room.state().players.find(player => player.playerId === late.playerId)?.fighterId).toBe('nyx');
+    expect(game.room.state().players.find(player => player.playerId === late.playerId)?.name).not.toBe('Nyx');
+    expect(late.spoken.at(-1)).not.toMatch(/tell me your name/i);
+  });
+
   it('uses the live confirmed name when a caller advances while an old name prompt is pending', () => {
     const game = voiceGame();
     const caller = game.connect('CA-confirmed-later');
@@ -167,6 +182,40 @@ describe('fighter voice session', () => {
       caller.prompt('next');
       expect(game.room.phase).toBe('map_select');
     } finally { vi.useRealTimers(); }
+  });
+
+  it('advances ready Fighter menus with conversational affirmatives but never questions or premature assent', () => {
+    const game = voiceGame();
+    const caller = game.connect('CA-MENU-AFFIRMATIVE', 'VOICE', undefined, 'Ada');
+    caller.prompt('sure');
+    expect(game.room.phase).toBe('fighter_select');
+    caller.prompt('yes');
+    expect(game.room.phase).toBe('fighter_select');
+    caller.prompt('Nyx');
+    caller.prompt('Sounds good');
+    expect(game.room.phase).toBe('map_select');
+    caller.prompt('Should we start?');
+    expect(game.room.phase).toBe('map_select');
+    caller.prompt('second');
+    caller.prompt('not yet, please');
+    expect(game.room.phase).toBe('map_select');
+    caller.prompt("Let's go");
+    expect(game.room.phase).toBe('loading');
+  });
+
+  it('uses Portuguese assent only after the current Fighter selection is complete', () => {
+    const game = voiceGame();
+    const caller = game.connect('CA-MENU-PT', 'VOICE', 'pt-BR', 'Ana');
+    caller.prompt('claro');
+    expect(game.room.phase).toBe('fighter_select');
+    caller.prompt('sim');
+    expect(game.room.phase).toBe('fighter_select');
+    caller.prompt('Nyx');
+    caller.prompt('tudo bem');
+    expect(game.room.phase).toBe('map_select');
+    caller.prompt('segundo');
+    caller.prompt('vamos nessa');
+    expect(game.room.phase).toBe('loading');
   });
 
   it('waits for next after every caller chooses a fighter', () => {
@@ -331,6 +380,26 @@ describe('fighter voice session', () => {
     expect(ada.spoken.at(-1)).toMatch(/Ada won.*rematch/i);
   });
 
+  it.each(['victory', 'results'] as const)('welcomes a new standalone caller into a fresh lobby after %s', finalPhase => {
+    const game = voiceGame();
+    const ada = game.connect('CA-OLD-RESULT');
+    ada.prompt('Ada'); ada.prompt('next'); ada.prompt('Nyx'); ada.prompt('next');
+    ada.prompt('second'); ada.prompt('start');
+    game.room.ready(game.room.state().loadingGeneration); game.stateChanged();
+    advanceIntro(game); game.tick(6);
+    const world = game.room.state().world!; world.status = 'finished'; world.winner = 'p1';
+    game.tick(.1); if (finalPhase === 'results') game.tick(FIGHTER_VICTORY_SECONDS);
+    ada.session.handleClose();
+    expect(game.room.state()).toMatchObject({ phase: finalPhase, result: { winnerName: 'Ada' } });
+
+    const bea = game.connect(`CA-NEW-${finalPhase}`);
+    expect(bea.playerId).toBeTruthy();
+    expect(game.room.state()).toMatchObject({ phase: 'lobby', result: null });
+    expect(bea.spoken.join(' ')).toMatch(/name/i);
+    bea.prompt('Bea'); bea.prompt('next');
+    expect(game.room.phase).toBe('fighter_select');
+  });
+
   it('interprets an open-ended request to reveal the Fighter result early', async () => {
     const game=voiceGame(async request=>{
       expect(request.actions).toEqual(expect.arrayContaining([expect.objectContaining({id:'show_results'})]));
@@ -359,6 +428,7 @@ describe('fighter voice session', () => {
       expect(game.room.phase).toBe('results');expect(game.room.resultsPresented).toBe(false);
       vi.advanceTimersByTime(FIGHTER_RESULTS_PRESENTATION_TIMEOUT_MS+1);game.stateChanged();
       expect(ada.spoken.at(-1)).toMatch(/Ada won.*want another fight.*rematch/i);
+      expect(ada.spoken.at(-1)).toMatch(/Ada won.*Twilio Conversation Relay.*real time.*Want another fight/i);
       expect(ada.spoken.at(-1)).not.toMatch(/confirm|display|screen/i);
       ada.prompt('rematch');
       expect(game.room.phase).toBe('fighter_select');
@@ -375,6 +445,7 @@ describe('fighter voice session', () => {
       const world=game.room.state().world!;world.status='finished';world.winner='p1';game.tick(.1);game.tick(FIGHTER_VICTORY_SECONDS);
       vi.advanceTimersByTime(FIGHTER_RESULTS_PRESENTATION_TIMEOUT_MS+1);game.stateChanged();
       expect(ada.spoken.at(-1)).toMatch(/Ada won.*check your messages/i);
+      expect(ada.spoken.at(-1)).toMatch(/Ada won.*Twilio Conversation Relay.*real time.*check your messages/i);
       expect(ada.spoken.at(-1)).not.toMatch(/confirm|result.*display|rematch/i);
       ada.prompt('rematch');
       expect(game.room.phase).toBe('results');
@@ -740,13 +811,15 @@ describe('fighter voice session', () => {
     expect(ana.spoken).toContain('Lutadores prontos.');
   });
 
-  it('captures a late Portuguese caller name without requiring an explicit prefix', () => {
+  it('lets a late Portuguese caller introduce themselves without interrupting fighter selection', () => {
     const game = voiceGame();
     const ana = game.connect('CA-PT-HOST', 'VOICE', 'pt-BR');
     ana.prompt('Ana'); ana.prompt('começar');
     const bia = game.connect('CA-PT-LATE', 'VOICE', 'pt-BR');
 
-    bia.prompt('Bia');
+    expect(game.room.phase).toBe('fighter_select');
+    expect(bia.spoken.join(' ')).not.toMatch(/qual seu nome|diga seu nome/i);
+    bia.prompt('Meu nome é Bia');
 
     expect(game.room.state().players.find(player => player.playerId === bia.playerId)?.name).toBe('Bia');
     expect(bia.spoken.some(line => line.includes('Luta por Voz, Bia'))).toBe(true);
@@ -781,6 +854,19 @@ describe('fighter voice session', () => {
     prompt('kick', true);
     expect(commands.at(-1)).toBe('kick');
     expect(spoken.join(' ')).not.toContain('Say forward');
+  });
+
+  it('executes a natural final combat command synchronously without waiting for semantic inference', () => {
+    const interpret = vi.fn(async (): Promise<VoiceInterpretResult> => ({ kind: 'none' }));
+    const game = voiceGame(interpret), caller = game.connect('CA-FAST-COMBAT');
+    caller.prompt('Ada'); caller.prompt('next'); caller.prompt('Nyx'); caller.prompt('next');
+    caller.prompt('second'); caller.prompt('start');
+    game.room.ready(game.room.state().loadingGeneration); game.stateChanged();
+    advanceIntro(game); game.tick(6);
+    const before = game.commands.length;
+    caller.prompt('Hit him with a kick');
+    expect(game.commands.slice(before)).toEqual([{ playerId: caller.playerId, command: 'kick' }]);
+    expect(interpret).not.toHaveBeenCalled();
   });
 
   it('maps Fighter DTMF choices and fight controls through the active phase', () => {

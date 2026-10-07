@@ -42,6 +42,17 @@ describe('fighter voice intent', () => {
     expect(matchFighterCommands('Quero me aproximar do rival', 'pt-BR')).toEqual(['forward']);
   });
 
+  it('keeps common natural combat requests on the immediate command path', () => {
+    expect(matchFighterCommands('Take a step toward them')).toEqual(['forward']);
+    expect(matchFighterCommands('Back it up')).toEqual(['back']);
+    expect(matchFighterCommands('I need you to block')).toEqual(['block']);
+    expect(matchFighterCommands('Go for a punch')).toEqual(['punch']);
+    expect(matchFighterCommands('Hit him with a kick')).toEqual(['kick']);
+    expect(matchFighterCommands('Manda um soco no rival', 'pt-BR')).toEqual(['punch']);
+    expect(matchFighterCommands('Levanta a guarda', 'pt-BR')).toEqual(['block']);
+    expect(matchFighterCommands('Chuta o adversário', 'pt-BR')).toEqual(['kick']);
+  });
+
   it('leaves advice, hypotheticals, negations, and ambiguous choices to conversation', () => {
     expect(matchFighterCommands('How do I throw a punch?')).toEqual([]);
     expect(matchFighterCommands('Could you tell me whether to kick?')).toEqual([]);

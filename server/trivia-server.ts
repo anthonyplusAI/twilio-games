@@ -6,6 +6,8 @@ import { DEFAULT_LOCALE, type SupportedLocale } from '../shared/i18n/locales';
 import {
   parseTriviaQuestionBankJson,
   resolveTriviaChoiceId,
+  TRIVIA_MAX_PLAYERS,
+  TRIVIA_MIN_PLAYERS,
   type TriviaQuestionBank,
   type TriviaRoundCategoryId,
 } from '../shared/trivia';
@@ -14,7 +16,7 @@ import {
   type TriviaEvent,
   type TriviaServerMessage,
 } from '../shared/trivia-protocol';
-import type { TriviaVoiceSnapshot } from './trivia-voice';
+import type { TriviaAudioRetryResult, TriviaVoiceSnapshot } from './trivia-voice';
 import { TriviaRoom, type TriviaRoomOptions } from './trivia-room';
 
 export interface TriviaVoiceJoinOptions {
@@ -49,6 +51,8 @@ interface Session {
 }
 
 export const TRIVIA_RECONNECT_GRACE_MS = 30_000;
+export const TRIVIA_RESULT_RECONNECT_GRACE_MS = 60_000;
+export const TRIVIA_STANDALONE_AUDIO_RETRY_LIMIT = 2;
 export const TRIVIA_HEARTBEAT_MS = 30_000;
 export const TRIVIA_TICK_MS = 100;
 export const TRIVIA_MAX_CONNECTIONS = 64;
@@ -82,6 +86,8 @@ export class TriviaServer {
   private readonly rooms = new Map<string, TriviaRoom>();
   private readonly sessions = new Map<string, Session>();
   private readonly hosts = new Map<string, Connection>();
+  private readonly resultReconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly standaloneAudioRetries = new Map<string, { questionKey: string; count: number }>();
   private timingLoop: ReturnType<typeof setInterval> | null = null;
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private readonly displayToken: string;
@@ -209,6 +215,7 @@ export class TriviaServer {
   abortRoom(code: string): boolean {
     code = canonicalRoomCode(code);
     if (!this.rooms.has(code)) return false;
+    this.cancelResultReconnect(code);
     for (const conn of this.conns) {
       if (conn.roomCode !== code) continue;
       this.untrackKeyboardPlayer(conn);
@@ -228,6 +235,7 @@ export class TriviaServer {
     this.voiceRuntime.delete(code);
     this.localKeyboardPlayerIds.delete(code);
     this.paintedQuestionViews.delete(code);
+    this.standaloneAudioRetries.delete(code);
     this.syncTimingLoop();
     return true;
   }
@@ -413,6 +421,7 @@ export class TriviaServer {
       conn.display = true;
       conn.hostAuthorized = !stationDisplay || conn.hostAuthorized === true;
       const room = this.room(code);
+      this.cancelResultReconnect(code);
       room.setPreferredLocale(this.preferredLocale(code));
       if (conn.displayAuthenticated) this.onDisplayAuthenticated?.(conn.ws);
       this.onDisplayRegistered?.(conn.ws, code);
@@ -763,25 +772,66 @@ export class TriviaServer {
 
   private reap(code: string): void {
     const room = this.rooms.get(code);
-    if (!room?.isEmpty) return;
-    if ([...this.conns].some(conn => conn.roomCode === code)) return;
-    if ([...this.sessions.values()].some(session => session.roomCode === code)) return;
+    if (!room) return;
+    if (!room.isEmpty && !room.isUnattendedResult) {
+      this.cancelResultReconnect(code);
+      return;
+    }
+    if ([...this.conns].some(conn => conn.roomCode === code)
+      || [...this.sessions.values()].some(session => session.roomCode === code)) {
+      this.cancelResultReconnect(code);
+      return;
+    }
+    if (room.isUnattendedResult) {
+      if (!this.resultReconnectTimers.has(code)) {
+        const timer = this.scheduleTimeout(() => {
+          this.resultReconnectTimers.delete(code);
+          if (this.rooms.get(code) !== room || !room.isUnattendedResult
+            || [...this.conns].some(conn => conn.roomCode === code)
+            || [...this.sessions.values()].some(session => session.roomCode === code)) return;
+          this.deleteRoom(code);
+        }, TRIVIA_RESULT_RECONNECT_GRACE_MS);
+        (timer as { unref?: () => void }).unref?.();
+        this.resultReconnectTimers.set(code, timer);
+      }
+      return;
+    }
+    this.deleteRoom(code);
+  }
+
+  private cancelResultReconnect(code: string): void {
+    const timer = this.resultReconnectTimers.get(code);
+    if (!timer) return;
+    this.cancelTimeout(timer);
+    this.resultReconnectTimers.delete(code);
+  }
+
+  private deleteRoom(code: string): void {
+    this.cancelResultReconnect(code);
     this.hosts.delete(code);
     this.rooms.delete(code);
     this.roomBanks.delete(code);
     this.voiceRuntime.delete(code);
     this.localKeyboardPlayerIds.delete(code);
     this.paintedQuestionViews.delete(code);
+    this.standaloneAudioRetries.delete(code);
   }
 
   voiceJoin(code: string, name: string, expectedPlayers?: number, nameConfirmed = true,
     preferredLocale?: SupportedLocale, options: TriviaVoiceJoinOptions = {}): string | null {
     code = canonicalRoomCode(code);
+    if (expectedPlayers !== undefined && (!Number.isSafeInteger(expectedPlayers)
+      || expectedPlayers < TRIVIA_MIN_PLAYERS || expectedPlayers > TRIVIA_MAX_PLAYERS)) return null;
     if (options.participantIndex !== undefined
       && (!Number.isSafeInteger(options.participantIndex)
         || options.participantIndex < 0 || options.participantIndex > 3)) return null;
     if (!this.rooms.has(code) && this.rooms.size >= this.maxRooms) return null;
     const room = this.room(code);
+    if (room.phase === 'results' && room.stationFixed) return null;
+    if (room.prepareForNewCaller()) {
+      this.cancelResultReconnect(code);
+      this.standaloneAudioRetries.delete(code);
+    }
     room.setPreferredLocale(preferredLocale ?? this.preferredLocale(code));
     const stationFixed = options.stationFixed ?? this.requiresDisplayAuth(code);
     const allowReplay = options.allowReplay ?? !stationFixed;
@@ -934,6 +984,30 @@ export class TriviaServer {
     return true;
   }
 
+  /** A caller can recover only their current standalone question, at most twice. */
+  voiceRetryQuestion(code: string, playerId: string, questionId: string,
+    questionAttemptId: number): TriviaAudioRetryResult {
+    code = canonicalRoomCode(code);
+    const room = this.rooms.get(code);
+    const state = room?.state();
+    if (!room || room.stationFixed || state?.phase !== 'audio_problem'
+      || state.audioProblem.questionId !== questionId
+      || state.audioProblem.questionAttemptId !== questionAttemptId
+      || state.question?.id !== questionId || state.questionIndex === null
+      || !state.players.some(player => player.playerId === playerId && player.connected)) return 'unavailable';
+    const questionKey = `${state.loadingGeneration}:${state.questionIndex}:${questionId}`;
+    const previous = this.standaloneAudioRetries.get(code);
+    const used = previous?.questionKey === questionKey ? previous.count : 0;
+    if (used >= TRIVIA_STANDALONE_AUDIO_RETRY_LIMIT) return 'limit';
+    this.standaloneAudioRetries.set(code, { questionKey, count: used + 1 });
+    if (!this.retryQuestion(code, questionId, questionAttemptId)) {
+      if (previous) this.standaloneAudioRetries.set(code, previous);
+      else this.standaloneAudioRetries.delete(code);
+      return 'unavailable';
+    }
+    return 'retried';
+  }
+
   /** Trusted voice/DTMF answer API. The local browser keyboard path is isolated in onMessage. */
   voiceAnswer(code: string, playerId: string, spokenOrChoiceId: string, final = true): boolean {
     code = canonicalRoomCode(code);
@@ -976,7 +1050,7 @@ export class TriviaServer {
   voiceLeave(code: string, playerId: string): void {
     code = canonicalRoomCode(code);
     const room = this.rooms.get(code);
-    if (room?.stationFixed && room.phase === 'results') {
+    if (room?.phase === 'results') {
       this.voiceTerminalCleanup(code, playerId);
       return;
     }
@@ -988,11 +1062,11 @@ export class TriviaServer {
     this.syncTimingLoop();
   }
 
-  /** Clears live voice state while preserving an authoritative station result snapshot. */
+  /** Clears live voice state while preserving a completed result on connected displays. */
   voiceTerminalCleanup(code: string, playerId: string): boolean {
     code = canonicalRoomCode(code);
     const room = this.rooms.get(code);
-    if (!room?.stationFixed || room.phase !== 'results' || !room.hasPlayer(playerId)) return false;
+    if (!room || room.phase !== 'results' || !room.hasPlayer(playerId)) return false;
     room.setPlayerConnected(playerId, false);
     this.untrackKeyboardPlayer(code, playerId);
     const runtime = this.voiceRuntime.get(code);
@@ -1000,6 +1074,7 @@ export class TriviaServer {
     runtime?.answerCueReady.delete(playerId);
     runtime?.questionPoints.delete(playerId);
     this.pushState(code);
+    if (!room.stationFixed) this.reap(code);
     return true;
   }
 
@@ -1071,6 +1146,11 @@ export class TriviaServer {
         ? true : Boolean(this.paintedQuestionViews.get(code)?.host === this.hosts.get(code)
           && this.paintedQuestionViews.get(code)?.key === `${state.questionAttemptId}:${state.phase}:${state.renderRevision}`),
       myQuestionPoints: runtime?.questionPoints.get(playerId) ?? 0,
+      audioRetryRemaining: room.stationFixed ? 0 : Math.max(0,
+        TRIVIA_STANDALONE_AUDIO_RETRY_LIMIT - (
+          this.standaloneAudioRetries.get(code)?.questionKey
+            === `${state.loadingGeneration}:${state.questionIndex}:${state.question?.id}`
+            ? this.standaloneAudioRetries.get(code)!.count : 0)),
     };
   }
 
@@ -1150,6 +1230,8 @@ export class TriviaServer {
     this.timingLoop = null;
     this.heartbeat = null;
     for (const session of this.sessions.values()) if (session.timer) this.cancelTimeout(session.timer);
+    for (const timer of this.resultReconnectTimers.values()) this.cancelTimeout(timer);
+    this.resultReconnectTimers.clear();
     this.sessions.clear();
     this.hosts.clear();
     for (const conn of this.conns) conn.ws.terminate();
@@ -1158,6 +1240,7 @@ export class TriviaServer {
     this.roomBanks.clear();
     this.voiceRuntime.clear();
     this.localKeyboardPlayerIds.clear();
+    this.standaloneAudioRetries.clear();
     this.wss.close();
   }
 }

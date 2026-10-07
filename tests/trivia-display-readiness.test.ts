@@ -249,6 +249,8 @@ function questionView(phase: 'question_prompt' | 'answer_cue', renderRevision: n
   return {
     ...loadingState(true), phase, questionIndex: 0, questionAttemptId: 1, renderRevision,
     questionPromptEndsAtMs: 30_000, answerCueEndsAtMs: phase === 'answer_cue' ? 40_000 : null,
+    answeringStartsAtMs: phase === 'answer_cue' ? 1_000 : null,
+    questionEndsAtMs: phase === 'answer_cue' ? 26_000 : null,
     question: { id: 'q1', category: 'general', difficulty: 'easy', prompt: 'Question?',
       choices: [
         { id: 'a', text: 'One' }, { id: 'b', text: 'Two' },

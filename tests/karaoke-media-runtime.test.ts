@@ -414,7 +414,11 @@ describe('KaraokeMediaSession scoring and cleanup', () => {
     const recognizer = factory.sessions[0]!;
     recognizer.emit(lyricResult('tone!', 200, 600));
     coverSong(session, 800, 200, 0, 440);
+    expect(scoreServer.hits).toEqual([
+      { wordId: 'runtime-word-1', judgment: 'perfect', points: 100_000 },
+    ]);
     const result = await session.finalize('stop');
+    expect(result.score).toBe(scoreServer.hits.reduce((total, hit) => total + hit.points, 0));
     expect(result.score).toBe(100_000);
     expect(result.scoring.components).toEqual({ timing: 1, lyrics: 1, pitch: 1 });
     expect(result.diagnostics).toMatchObject({
@@ -446,7 +450,9 @@ describe('KaraokeMediaSession scoring and cleanup', () => {
       const recognizer = factory.sessions[0]!;
       recognizer.emit(lyricResult('wrong', 0, 400, false));
       coverSong(session, 600, 0, 0, 440);
-      expect(scoreServer.hits).toEqual([{ wordId: 'runtime-word-1', judgment: 'good', points: 49_000 }]);
+      // An interim transcript may change after the song. It must not contribute
+      // visible points that the final lyric result later rewrites.
+      expect(scoreServer.hits).toEqual([]);
       const finalized = session.finalize('stop');
       expect(runtime.attemptState(issued.attemptId)).toBe('finalizing');
       setTimeout(() => {
@@ -467,6 +473,28 @@ describe('KaraokeMediaSession scoring and cleanup', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('keeps already confirmed live points in the final score when later final segments overlap', async () => {
+    const factory = new FakeLyricRecognizerFactory();
+    const { runtime, scoreServer } = createRuntime(undefined, { lyricRecognizerFactory: factory });
+    const session = runtime.startSession(startFrame(runtime.issueAttempt(BASE_REQUEST)));
+    for (const frame of toneFrames(440, 600)) session.acceptMedia(frame);
+    const recognizer = factory.sessions[0]!;
+    const first = lyricResult('tone', 0, 400);
+    recognizer.emit({
+      ...first,
+      words: first.words.map(word => ({ ...word, confidence: 0.8 })),
+    });
+    coverSong(session, 600, 0, 0, 440);
+    const live = scoreServer.hits[0];
+    expect(live).toMatchObject({ wordId: 'runtime-word-1', points: expect.any(Number) });
+    expect(live!.points).toBeLessThan(100_000);
+    recognizer.emit({ ...lyricResult('tone', 0, 400), resultId: 'later-final-segment' });
+    const result = await session.finalize();
+    expect(result.score).toBe(live!.points);
+    expect(result.judgments).toEqual([live]);
+    runtime.close();
   });
 
   it('reduces acoustic credit without making missing lyric evidence a hard gate', async () => {

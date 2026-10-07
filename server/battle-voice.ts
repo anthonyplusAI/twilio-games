@@ -70,7 +70,7 @@ export interface BattleVoiceDeps {
   continueResults?(code: string, playerId: string): boolean;
   chooseAction(code: string, playerId: string, action: BattleAction): boolean | void;
   advance(code: string, playerId: string): boolean;
-  say(text: string, isCurrent?: () => boolean): void; // speak a line to THIS caller (Relay TTS)
+  say(text: string, isCurrent?: () => boolean): unknown; // Relay TTS may return a playback promise
   /** Schedule `fn` after `ms` (injected so tests can drive the paced-commentary clock synchronously). */
   setTimer(fn: () => void, ms: number): void;
   snapshot(code: string, playerId: string, locale?: SupportedLocale): BattleVoiceSnapshot | null;
@@ -112,6 +112,7 @@ export class BattleVoiceSession {
   private lastResultsNarratedKey: string | null = null;
   private lastResultsPresentationTimedOut = false;
   private beatSpeechEpoch = 0;
+  private pendingTerminalSpeech = new Set<Promise<void>>();
   private text: (key: MonstersMessageKey, values?: MessageValues) => string = createTranslator(DEFAULT_LOCALE, MONSTERS_MESSAGES);
 
   constructor(private deps: BattleVoiceDeps) {}
@@ -159,6 +160,17 @@ export class BattleVoiceSession {
     });
   }
 
+  /** Station retirement must wait for the terminal Relay talk cycle, not only for the battle
+   * animation queue. The HTTP host still applies a bounded timeout if Twilio never confirms it. */
+  private sayStationResult(text: string): void {
+    const delivery = this.deps.say(text);
+    if (!delivery || typeof (delivery as PromiseLike<unknown>).then !== 'function') return;
+    let tracked!: Promise<void>;
+    tracked = Promise.resolve(delivery as PromiseLike<unknown>).then(() => undefined, () => undefined)
+      .finally(() => this.pendingTerminalSpeech.delete(tracked));
+    this.pendingTerminalSpeech.add(tracked);
+  }
+
   /** Retire queued opening speech as soon as the display moves to another screen. */
   private sayCallIntro(text:string):void{
     const code=this.code,playerId=this.playerId,callSid=this.callSid,epoch=this.introEpoch;
@@ -202,7 +214,7 @@ export class BattleVoiceSession {
         const current = this.deps.snapshot(code, joined.playerId, this.commandLocale);
         const snap = current&&this.authoritativeName?{...current,myName:this.authoritativeName}:current;
         if(snap&&!this.isCallIntroPhase(snap.phase))this.introExpired=true;
-        this.awaitingName = !this.authoritativeName && !this.nameIsConfirmed(snap);
+        this.awaitingName = snap?.phase === 'lobby' && !this.authoritativeName && !this.nameIsConfirmed(snap);
         this.lastStateScope = snap ? this.semanticScope(snap) : null;
         this.lastMyMonsterId=snap?.myMonsterId??null;
         this.lastResultsPresentationTimedOut=snap?.resultsPresentationTimedOut===true;
@@ -217,11 +229,10 @@ export class BattleVoiceSession {
            this.lastCanStartBattle=snap?.canStartBattle??false;
           if (snap?.phase === 'battle' && !snap.myMonsterId) {
             this.sayCurrent(this.text('voice.lateBattle'));
-            if(snap.myName){this.sayCurrent(this.text('voice.greetingActions'));}
-            else this.sayCurrent(this.text('voice.askName'));
+            this.sayCurrent(this.text('voice.greetingActions'));
           } else if (snap?.phase === 'results') {
             this.sayCurrent(this.text('voice.lateResults'));
-            this.sayCurrent(snap.myName?this.resultsStatusText(snap):this.text('voice.askName'));
+            this.sayCurrent(this.resultsStatusText(snap));
           } else if(this.authoritativeName&&snap){
             if(snap.phase==='lobby'){
               this.sayCurrent(this.text('voice.greetingRules'));
@@ -231,6 +242,11 @@ export class BattleVoiceSession {
               this.sayCurrent(this.text('voice.greetingActions'));
               this.sayCurrent(this.text(snap.phase==='monster_select'?'voice.helpSelect':'voice.howTo'));
             }
+          } else if (snap?.phase === 'monster_select') {
+            this.sayCurrent(this.text('voice.helpSelect'));
+          } else if (snap?.phase === 'battle') {
+            this.sayCurrent(this.text('voice.currentBattle'));
+            this.sayCurrent(this.text('voice.howTo'));
           } else {
             this.sayCurrent(this.text('voice.askName'));
           }
@@ -300,8 +316,8 @@ export class BattleVoiceSession {
     const current = this.deps.snapshot(this.code!, this.playerId!, this.commandLocale);
     const snap = current&&this.authoritativeName?{...current,myName:this.authoritativeName}:current;
     if (!snap) { void this.converse(text); return; }
-    if (this.nameIsConfirmed(snap)) this.awaitingName = false;
-    if (this.awaitingName) {
+    if (this.nameIsConfirmed(snap) || snap.phase !== 'lobby') this.awaitingName = false;
+    if (this.awaitingName && snap.phase === 'lobby') {
       if (this.captureName(text, snap.phase, true)) { this.awaitingName = false; return; }
       this.sayCurrent(this.text('voice.askName'));
       return;
@@ -317,7 +333,7 @@ export class BattleVoiceSession {
     // Every REQUIRED step of the flow has a deterministic, LLM-INDEPENDENT path here, so the game is
     // fully playable by voice even with the LLM off/slow. The LLM is only a fallback for chat/questions.
 
-    if (snap.phase === 'results' && !snap.participating) {
+    if (snap.phase === 'results' && !snap.participating && !snap.canRematch) {
       this.sayCurrent(this.text('voice.lateResults'));
       return;
     }
@@ -347,7 +363,8 @@ export class BattleVoiceSession {
 
     // NAME CAPTURE: the first thing we ask in the lobby. On the monster-picking screen, however, a
     // monster name must pick the monster, not get mistaken for the caller's missing name.
-    if (!snap.myName && (snap.phase === 'lobby' || (snap.phase === 'battle' && !snap.myMonsterId)) && !isAdvanceWord(text, this.commandLocale)) {
+    if (!snap.myName && (snap.phase === 'lobby' || snap.phase === 'monster_select')
+      && !isAdvanceWord(text, this.commandLocale)) {
       if (this.captureName(text, snap.phase)) return;
     }
 
@@ -473,9 +490,9 @@ export class BattleVoiceSession {
       if (snap.activeMenu === 'fight') actions.push({ id: 'back_menu', description: this.commandLocale === 'pt-BR' ? 'Voltar ao menu de ações' : 'Return to action menu' });
       return actions;
     }
-    if (snap.phase === 'results' && snap.participating) {
+    if (snap.phase === 'results' && (snap.participating || snap.canRematch)) {
       const actions: Array<VoiceInterpretRequest['actions'][number]> = [];
-      if (this.deps.continueResults&&snap.resultsPresented!==true)
+      if (snap.participating&&this.deps.continueResults&&snap.resultsPresented!==true)
         actions.push({ id: 'continue_results', description: this.commandLocale === 'pt-BR' ? 'Mostrar resultado' : 'Show result screen' });
       if (snap.canRematch && (snap.resultsPresented!==false||snap.resultsPresentationTimedOut===true) && !this.stationManaged)
         actions.push({ id: 'rematch', description: this.commandLocale === 'pt-BR' ? 'Jogar revanche' : 'Play a rematch' });
@@ -593,7 +610,7 @@ export class BattleVoiceSession {
     }
     if (actionId === 'continue_results' && snap.phase === 'results' && snap.participating)
       return this.deps.continueResults?.(this.code, this.playerId) ?? false;
-    if (actionId === 'rematch' && snap.phase === 'results' && snap.participating && snap.canRematch
+    if (actionId === 'rematch' && snap.phase === 'results' && snap.canRematch
       && (snap.resultsPresented!==false||snap.resultsPresentationTimedOut===true) && !this.stationManaged)
       return this.deps.advance(this.code, this.playerId);
     return false;
@@ -814,7 +831,7 @@ export class BattleVoiceSession {
     // Station lifecycle can retire the room immediately after this paint receipt. The
     // queued terminal line must remain playable after that intentional retirement.
     const finalLine=this.battleOverLine(event,snap,aName,bName);
-    if(this.stationManaged)this.deps.say(finalLine);
+    if(this.stationManaged)this.sayStationResult(finalLine);
     else this.sayCurrent(finalLine);
     this.introDone=false;
     this.pendingStateCue=false;
@@ -881,16 +898,20 @@ export class BattleVoiceSession {
         if (key && this.lastResultsNarratedKey === key) return;
         if (key && snap?.resultsPresented === true) {
           this.lastResultsNarratedKey = key;
-          this.deps.say(this.battleOverLine(ev, snap, aName, bName));
+          this.sayStationResult(this.battleOverLine(ev, snap, aName, bName));
         } else if (key && snap?.resultsPresentationTimedOut === true) {
           this.lastResultsNarratedKey = key;
-          this.deps.say(this.resultsStatusText(snap));
+          this.sayStationResult(this.resultsStatusText(snap));
         } else {
           // The battle winner is known now, but the result overlay has not been painted.
           // Do not claim it is on the display until its paint receipt arrives.
           this.sayBattleBeat(this.text('battle.eventWin', { winner: ev.winnerName }));
         }
-      } else this.sayBattleBeat(this.battleOverLine(ev, snap, aName, bName));
+      } else {
+        // The screen is still on its short victory animation. Announce the winner now, then save
+        // the full result, Conversation Relay explanation, and replay guidance for the results card.
+        this.sayBattleBeat(this.text('battle.eventWin', { winner: ev.winnerName }));
+      }
       this.introDone = false;
       return;
     }
@@ -929,7 +950,7 @@ export class BattleVoiceSession {
       if(resultTimedOut&&snap&&resultsKey!==this.lastResultsNarratedKey){
         this.lastResultsNarratedKey=resultsKey;
         // A completed station match is retired as soon as recovery is announced.
-        if(this.stationManaged)this.deps.say(this.resultsStatusText(snap));
+        if(this.stationManaged)this.sayStationResult(this.resultsStatusText(snap));
         else this.sayCurrent(this.resultsStatusText(snap));
       }
       if (rematchBecameReady&&!this.stationManaged&&snap?.resultsPresented!==false)
@@ -966,9 +987,13 @@ export class BattleVoiceSession {
       ||!snap.canRematch || !!snap.presentationPending || this.draining || this.evQ.length > 0);
   }
 
-  whenSpeechSettled(): Promise<void> {
-    if (!this.draining && this.evQ.length === 0) return Promise.resolve();
-    return new Promise(resolve => this.settleWaiters.push(resolve));
+  async whenSpeechSettled(): Promise<void> {
+    while (this.draining || this.evQ.length > 0 || this.pendingTerminalSpeech.size > 0) {
+      if (this.draining || this.evQ.length > 0)
+        await new Promise<void>(resolve => this.settleWaiters.push(resolve));
+      if (this.pendingTerminalSpeech.size > 0)
+        await Promise.allSettled([...this.pendingTerminalSpeech]);
+    }
   }
 
   private speakResumeCue(): void {

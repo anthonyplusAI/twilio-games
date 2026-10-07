@@ -23,6 +23,8 @@ interface VoiceBinding {
   connected: boolean;
 }
 
+export const CHESS_RESULT_RECONNECT_GRACE_MS = 60_000;
+
 export interface ChessServerOptions {
   displayToken?: string;
   random?: () => number;
@@ -42,6 +44,7 @@ export class ChessServer {
   private readonly stationRooms = new Set<string>();
   private readonly previouslyBoundRooms = new Set<string>();
   private readonly computerTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly resultReconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private readonly displayToken: string;
   private readonly random: () => number;
@@ -153,6 +156,9 @@ export class ChessServer {
       this.maybeScheduleComputer(code, room);
       return { playerId: current.playerId, resumed: true };
     }
+    // A fixed station result belongs to its current match until station handoff.
+    if (this.stationRooms.has(code) && room.state().phase === 'finished') return null;
+    this.cancelResultReconnect(code);
     if (this.previouslyBoundRooms.has(code)) {
       this.cancelComputer(code);
       room.reset();
@@ -222,6 +228,7 @@ export class ChessServer {
     const binding = this.voiceBindings.get(code);
     if (!room || !binding?.connected || binding.callSid !== callSid.trim()
       || room.state().phase !== 'finished' || this.stationReplayForbidden(code)) return false;
+    this.cancelResultReconnect(code);
     this.cancelComputer(code);
     room.reset();
     room.setPlayerConnected(true);
@@ -247,6 +254,7 @@ export class ChessServer {
   abortRoom(rawCode: string): boolean {
     const code = chessRoomCode(rawCode);
     if (!code || !this.rooms.has(code)) return false;
+    this.cancelResultReconnect(code);
     this.cancelComputer(code);
     for (const display of this.displays) {
       if (display.roomCode !== code) continue;
@@ -263,6 +271,8 @@ export class ChessServer {
   stopLoopOnly(): void {
     for (const timer of this.computerTimers.values()) clearTimeout(timer);
     this.computerTimers.clear();
+    for (const timer of this.resultReconnectTimers.values()) clearTimeout(timer);
+    this.resultReconnectTimers.clear();
     if (this.heartbeat) clearInterval(this.heartbeat);
     this.heartbeat = null;
     for (const display of this.displays) display.ws.terminate();
@@ -337,6 +347,7 @@ export class ChessServer {
       const previousCode = display.roomCode;
       display.roomCode = code;
       display.locale = resolveLocale(message.locale, DEFAULT_LOCALE);
+      this.cancelResultReconnect(code);
       if (previousCode && previousCode !== code) this.reap(previousCode);
       if (display.authenticatedRoomCode === code) this.onDisplayAuthenticated?.(display.ws);
       this.onDisplayRegistered?.(display.ws, code);
@@ -364,6 +375,7 @@ export class ChessServer {
         if (room) this.send(display, this.displayState(display, room));
         return;
       }
+      this.cancelResultReconnect(code);
       this.cancelComputer(code);
       room.reset();
       room.setPlayerConnected(true);
@@ -458,6 +470,36 @@ export class ChessServer {
 
   private reap(code: string): void {
     if (this.voiceBindings.has(code) || [...this.displays].some(display => display.roomCode === code)) return;
+    const room = this.rooms.get(code);
+    if (room?.state().phase === 'finished') {
+      // Station handoff explicitly aborts the old match. A standalone display
+      // can reconnect after a brief network drop without losing its result.
+      if (this.stationRooms.has(code)) return;
+      if (!this.resultReconnectTimers.has(code)) {
+        const timer = setTimeout(() => {
+          this.resultReconnectTimers.delete(code);
+          if (this.rooms.get(code) !== room || this.voiceBindings.has(code)
+            || [...this.displays].some(display => display.roomCode === code)
+            || room.state().phase !== 'finished') return;
+          this.deleteRoom(code);
+        }, CHESS_RESULT_RECONNECT_GRACE_MS);
+        timer.unref?.();
+        this.resultReconnectTimers.set(code, timer);
+      }
+      return;
+    }
+    this.deleteRoom(code);
+  }
+
+  private cancelResultReconnect(code: string): void {
+    const timer = this.resultReconnectTimers.get(code);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.resultReconnectTimers.delete(code);
+  }
+
+  private deleteRoom(code: string): void {
+    this.cancelResultReconnect(code);
     this.cancelComputer(code);
     this.rooms.delete(code);
     this.previouslyBoundRooms.delete(code);

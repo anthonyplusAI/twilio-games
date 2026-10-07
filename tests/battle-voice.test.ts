@@ -246,6 +246,28 @@ describe('BattleVoiceSession', () => {
     expect(resultLine?.isCurrent?.() ?? true).toBe(true);
   });
 
+  it('waits for the spoken station result before retiring the call', async () => {
+    const snap = activeBattle({ phase: 'results', generation: 4, winnerName: 'Ada', resultsPresented: true });
+    let finishPlayback!: (played: boolean) => void;
+    const playback = new Promise<boolean>(resolve => { finishPlayback = resolve; });
+    const { deps } = fakeDeps({
+      snapshot: () => snap,
+      say: text => /Twilio Conversation Relay.*spoken moves/i.test(text) ? playback : undefined,
+    });
+    const session = new BattleVoiceSession(deps);
+    session.setStationManaged(true);
+    session.handleMessage(setup());
+    session.onBattlePresentation({ kind: 'results', generation: 4, result: { winner: 'a', winnerName: 'Ada' } });
+
+    let settled = false;
+    const wait = session.whenSpeechSettled().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    finishPlayback(true);
+    await wait;
+    expect(settled).toBe(true);
+  });
+
   it('binds the caller to the room on setup + greets', () => {
     const { deps, log, said } = fakeDeps();
     const s = new BattleVoiceSession(deps);
@@ -426,7 +448,7 @@ describe('BattleVoiceSession', () => {
     expect(speech).not.toMatch(/what'?s your name|pick a monster/i);
   });
 
-  it('welcomes a late result-screen caller into the next round without normal onboarding', () => {
+  it('welcomes a late result-screen caller without restarting name onboarding', () => {
     const { deps, said } = fakeDeps({
       snapshot: () => battleSnap({ phase: 'results', myName: null, myMonsterId: null, myMonsterName: null, winnerName: 'Ada' }),
     });
@@ -434,8 +456,26 @@ describe('BattleVoiceSession', () => {
     s.handleMessage(setup());
 
     expect(said.join(' ')).toMatch(/battle just ended|next round/i);
-    expect(said.join(' ')).toMatch(/what'?s your name/i);
+    expect(said.join(' ')).not.toMatch(/what'?s your name/i);
     expect(said.join(' ')).not.toMatch(/pick a monster/i);
+  });
+
+  it('allows a waiting caller to request the next round once the finished player leaves', async () => {
+    let phase: BattleVoiceSnapshot['phase'] = 'results';
+    const { deps, log, said } = fakeDeps({
+      snapshot: () => battleSnap({ phase, participating: false, myName: null, myMonsterId: null,
+        myMonsterName: null, winnerName: 'Ada', resultsPresented: true, canRematch: phase === 'results' }),
+      advance: () => { log.push('advance'); phase = 'lobby'; return true; },
+      interpret: async request => {
+        expect(request.actions).toEqual(expect.arrayContaining([expect.objectContaining({ id: 'rematch' })]));
+        return { kind: 'action', actionId: 'rematch' };
+      },
+    });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    expect(said.join(' ')).not.toMatch(/what'?s your name/i);
+    session.handleMessage(prompt('Could we have another go now?'));
+    await vi.waitFor(() => expect(log).toContain('advance'));
   });
 
   it('queues a late caller behind an active battle instead of pretending they are fighting', () => {
@@ -448,7 +488,7 @@ describe('BattleVoiceSession', () => {
 
     said.length = 0;
     s.handleMessage(prompt('Bo'));
-    expect(log).toContain('name Bo');
+    expect(log).not.toContain('name Bo');
     s.handleMessage(prompt('fight'));
     expect(log.some(l => l.startsWith('action '))).toBe(false);
     expect(said.join(' ')).toMatch(/current battle.*in progress|next round/i);
@@ -535,7 +575,7 @@ describe('BattleVoiceSession', () => {
     expect(log).toContain('monster embertail');
   });
 
-  it('finishes requested name capture before interpreting a matching monster name', () => {
+  it('treats a spoken monster name as a selection after the screen leaves the lobby', () => {
     const { deps, log } = fakeDeps({
       snapshot: () => battleSnap({ myName: null }),
     });
@@ -544,8 +584,8 @@ describe('BattleVoiceSession', () => {
 
     s.handleMessage(prompt('Sparkmouse'));
 
-    expect(log).not.toContain('monster sparkmouse');
-    expect(log.some(l => l === 'name Sparkmouse')).toBe(true);
+    expect(log).toContain('monster sparkmouse');
+    expect(log.some(l => l === 'name Sparkmouse')).toBe(false);
   });
 
   it('does not treat a descriptive monster phrase as option one or as the caller name', async () => {
@@ -559,7 +599,8 @@ describe('BattleVoiceSession', () => {
 
     expect(log.some(l => l.startsWith('monster '))).toBe(false);
     expect(log.some(l => l.startsWith('name '))).toBe(false);
-    expect(said.join(' ')).toMatch(/what.*name|name.*challenger/i);
+    expect(said.join(' ')).toMatch(/choose your own monster/i);
+    expect(said.join(' ')).not.toMatch(/what.*name|name.*challenger/i);
   });
 
   it.each(['not Sparkmouse', 'Sparkmouse or Embertail', 'no, not that monster'])
@@ -1307,11 +1348,12 @@ describe('BattleVoiceSession', () => {
     expect(said.join(' ')).toMatch(/choose your own monster/i);
   });
 
-  it('announces the winner and loser when the battle ends', () => {
+  it('announces the winner immediately and gives result, technology, and replay guidance after the results appear', () => {
     const { deps, said } = fakeDeps({
       snapshot: () => battleSnap({
         phase: 'results', myName: 'Ada', myMonsterId: 'sparkmouse', myMonsterName: 'Sparkmouse', myMonsterType: 'electric',
         foeName: 'Bo', foeMonsterName: 'Embertail', foeMonsterType: 'fire', winnerName: 'Ada',
+        resultsPresented: true,
         turn: 3, activeSide: null, activeMenu: 'root', whoseTurn: null,
       }),
     });
@@ -1320,11 +1362,16 @@ describe('BattleVoiceSession', () => {
 
     s.onBattleEvent({ kind: 'battle_over', winner: 'a', winnerName: 'Ada' });
 
+    expect(said.join(' ')).toMatch(/Ada wins/i);
+    expect(said.join(' ')).not.toMatch(/rematch|Conversation Relay/i);
+    s.onBattlePresentation({ kind: 'results', generation: 1, result: { winner: 'a', winnerName: 'Ada' } });
+
     const line = said.join(' ');
     expect(line).toMatch(/Ada wins/i);
     expect(line).toMatch(/Bo loses/i);
     expect(line).toMatch(/Sparkmouse/i);
     expect(line).toMatch(/Embertail/i);
+    expect(line).toMatch(/Twilio Conversation Relay.*spoken moves/i);
     expect(line).toMatch(/rematch/i);
   });
 

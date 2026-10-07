@@ -127,6 +127,8 @@ html[data-theme="light"] :is(.vm-eyebrow,#vm-hud) img { filter:brightness(0) sat
 .vm-result-outcome span { display: block; color: var(--ink-dim); font: 700 11px var(--mono); letter-spacing: .18em; text-transform: uppercase; }
 .vm-result-outcome h1 { margin: 5px 0 0; color: var(--red); font: 800 clamp(28px, 4vw, 44px)/1.08 var(--disp);
   overflow-wrap: anywhere; }
+/* The result heading receives programmatic focus for screen-reader announcement; it is not a control. */
+#vm-result-title:focus { outline: none; }
 .vm-result-outcome p { margin: 8px 0 0; color: var(--ink-dim); font-size: 14px; font-weight: 700; }
 .vm-result-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
 .vm-results:not(.station-result) .vm-result-actions { position: sticky; top: 0; z-index: 2;
