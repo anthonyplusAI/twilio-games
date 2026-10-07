@@ -327,6 +327,7 @@ The application runs locally without Twilio, OpenAI, or Deepgram credentials. Co
 | `VOICE_RELAY_TOKEN` | Dedicated bearer token for Conversation Relay setup frames | Required and separate from `TWILIO_AUTH_TOKEN` in production |
 | `CR_TTS_VOICE` | English ElevenLabs voice ID used by every game's Conversation Relay talk-back | `SA7eD52NRr8WAehitVt1` |
 | `CR_TTS_VOICE_PT_BR` | Optional Brazilian Portuguese ElevenLabs voice ID | Relay's `pt-BR` default voice |
+| `ELEVENLABS_API_KEY` | Optional server-side key for Wizard Chess scene narration on the shared display; separate from Conversation Relay phone audio | Unset; captions and browser speech remain available |
 | `DEFAULT_LOCALE` | Call locale when no localized game display is connected | `en-US` |
 | `OPENAI_API_KEY` | Enables phase-bound semantic interpretation of conversational commands in all six games | Required by deployment; local runs without it retain deterministic commands |
 | `OPENAI_MODEL` | OpenAI model used by the optional host | Server default |

@@ -7,6 +7,16 @@ export type ChessSquare = `${ChessFile}${ChessRank}`;
 export type ChessPhase = 'waiting' | 'playing' | 'pending' | 'finished';
 export type ChessCastleSide = 'king' | 'queen';
 
+/** The screen's temporary cinematic board. The ordinary match remains authoritative underneath. */
+export interface WizardChessSceneSnapshot {
+  id: number;
+  phase: 'story' | 'ready' | 'resolved';
+  /** Server clock timestamps in milliseconds; clients can align them with clock_sync. */
+  startedAt: number;
+  readyAt: number | null;
+  resolvedAt: number | null;
+}
+
 export interface ChessPiecePlacement {
   square: ChessSquare;
   color: ChessColor;
@@ -80,7 +90,14 @@ export type ChessFeedbackCode =
   | 'stale'
   | 'waiting'
   | 'finished'
-  | 'reset';
+  | 'reset'
+  | 'wizard_started'
+  | 'wizard_ready'
+  | 'wizard_resolved'
+  | 'wizard_skipped'
+  | 'wizard_exited'
+  | 'wizard_hint'
+  | 'wizard_waiting';
 
 export interface ChessFeedback {
   code: ChessFeedbackCode;
@@ -115,6 +132,10 @@ export interface ChessState {
   lastMove: ChessMoveRecord | null;
   result: ChessResult | null;
   feedback: ChessFeedback | null;
+  /** The Easter egg is offered only before the caller's first committed move, once per call. */
+  wizardAvailable?: boolean;
+  /** Present while the cinematic overlay owns the display and phone commands. */
+  wizardScene?: WizardChessSceneSnapshot | null;
   /** Server-authorized result-menu action for this display; absent in voice-only snapshots. */
   canReplayOnDisplay?: boolean;
 }
@@ -139,6 +160,7 @@ export type ChessClientMessage =
   | { type: 'leave' }
   | { type: 'display_auth'; roomCode: string; token: string }
   | { type: 'clock_sync'; clientSentAtMs: number }
+  | { type: 'display_wizard_skip'; roomCode: string; sceneId: number }
   | { type: 'display_replay'; roomCode: string; gameId: number };
 export type ChessServerMessage =
   | { type: 'chess_capabilities'; displayAuth: boolean }

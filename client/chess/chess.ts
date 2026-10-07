@@ -10,10 +10,13 @@ import { wireFullscreenToggle } from '../fullscreen-toggle';
 import { getMusicManager } from '../music-manager';
 import { updateThemeToggleIcon } from '../icon-controls';
 import { currentTheme, wireThemeToggle } from '../theme';
-import type { ChessBoardScene } from './chess-board';
+import type { ChessBoardScene, BoardPiece } from './chess-board';
 import { ChessConnection, chessWebSocketUrl, type ChessConnectionState } from './chess-net';
 import { createChessResultDialog } from './chess-result-dialog';
 import { chessResultPresentation, resultSummary } from './chess-result-view';
+import { wizardCharacterAt } from '../../shared/wizard-chess-scene';
+import { WizardSceneController } from './wizard-scene-controller';
+import { wizardPieceArt } from './wizard-2d-art';
 
 const element = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 const app = element<HTMLDivElement>('app');
@@ -71,6 +74,21 @@ const resultDialog = createChessResultDialog({
   root: app, overlay: resultOverlay, card: resultCard, title: resultTitle,
   replay: resultReplay, exit: resultExit, announcer: liveAnnouncer, statusTitle,
 }, stationManaged);
+const wizardScene = new WizardSceneController(locale, {
+  renderPosition(position, scene) {
+    if (latestState) renderAccessiblePosition(latestState, position, true, scene.phase !== 'resolved');
+  },
+  onActiveChange(active) {
+    app.dataset.wizard = active ? 'active' : 'inactive';
+    fallback.classList.toggle('wizard-active', active);
+    element<HTMLElement>('fallback-explanation').textContent = active
+      ? isPortuguese ? 'Xadrez bruxo · tabuleiro 2D' : 'Wizard Chess · live 2D board'
+      : isPortuguese ? 'Tabuleiro ao vivo · modo 2D' : 'Live board · 2D mode';
+    renderCallCard();
+  },
+  setMusicVolume(volume) { music.setVolume(volume); },
+  requestSkip(sceneId) { connection?.skipWizard(sceneId); },
+});
 
 let board: ChessBoardScene | null = null;
 let connection: ChessConnection | null = null;
@@ -91,6 +109,7 @@ let phoneQr = '';
 let phoneQrFailed = false;
 let phoneQrGeneration = 0;
 let pageClosing = false;
+let wizardPrefetchScheduled = false;
 const boardQueue: ChessState[] = [];
 
 document.documentElement.lang = locale;
@@ -164,8 +183,11 @@ async function loadChessScene(): Promise<void> {
     const scene = new ChessBoardScene(boardStage);
     scene.setTheme(currentTheme());
     const current = latestState ?? visualState;
-    if (current) synchronizeScene(scene, current);
     board = scene;
+    wizardScene.attachBoard(scene);
+    if (current && !wizardScene.active) synchronizeScene(scene, current);
+    if (current && (current.phase === 'waiting' || current.wizardAvailable)
+      && !current.wizardScene) scheduleWizardPrefetch();
     scene.setAvailabilityHandler(available => {
       document.body.dataset.renderer = available ? 'three' : 'fallback';
       fallback.hidden = available;
@@ -203,6 +225,7 @@ if (stationLaunchRequested && !stationDisplay.displayToken) {
       stationLaunchRequested ? stationDisplay.displayToken : null, locale);
     connection.onState(receiveState);
     connection.onEvents(receiveEvents);
+    connection.onClockOffset(offset => wizardScene.setClockOffset(offset));
     connection.onError((code, message) => {
       if (code === 'bad_display_auth') {
         if (stationLaunchRequested) rejectDisplayToken(stationDisplay.displayToken);
@@ -249,6 +272,7 @@ addEventListener('pagehide', () => {
   phoneQrGeneration += 1;
   stopVoiceNumberUpdates?.();
   connection?.close();
+  wizardScene.dispose();
   board?.dispose();
   music.stop();
 }, { once: true });
@@ -274,6 +298,9 @@ function receiveState(next: ChessState): void {
     eventBanner.classList.remove('show');
   }
   latestState = next;
+  wizardScene.update(next.wizardScene);
+  if (previous?.wizardScene && !next.wizardScene && board) synchronizeScene(board, next);
+  if ((next.phase === 'waiting' || next.wizardAvailable) && !next.wizardScene) scheduleWizardPrefetch();
   renderConnection();
   renderStatus();
   renderMoveNote();
@@ -290,7 +317,16 @@ async function processBoardQueue(): Promise<void> {
   try {
     while (boardQueue.length) {
       const next = boardQueue.shift()!;
+      // A scene can arrive while an earlier normal move is still animating. Its
+      // already-queued snapshots must not repaint the cinematic board afterward.
+      if (wizardScene.active && latestState?.wizardScene && !next.wizardScene) continue;
       const previous = visualState;
+      if (next.wizardScene) {
+        visualState = next;
+        hasRenderedRoomState = true;
+        maybeMarkStationReady();
+        continue;
+      }
       board?.setHumanColor(next.humanColor);
       const sameGame = previous?.gameId === next.gameId;
       const oneMove = sameGame && previous !== null && next.ply === previous.ply + 1
@@ -302,7 +338,12 @@ async function processBoardQueue(): Promise<void> {
           }, 670);
         }
         await board?.animateTo(next.pieces, next.lastMove);
-      } else if (!previous || !sameGame || previous.fen !== next.fen || previous.ply !== next.ply) {
+        if (wizardScene.active && latestState?.wizardScene) {
+          visualState = next;
+          continue;
+        }
+      } else if (!previous || !sameGame || previous.fen !== next.fen || previous.ply !== next.ply
+        || previous.wizardScene) {
         board?.setPosition(next.pieces);
         board?.setLastMove(next.lastMove?.from ?? null, next.lastMove?.to ?? null);
         const checkedKing = next.lastMove?.check
@@ -331,6 +372,21 @@ function maybeMarkStationReady(): void {
   stationDisplay.markEngineReady();
 }
 
+function scheduleWizardPrefetch(): void {
+  if (wizardPrefetchScheduled) return;
+  wizardPrefetchScheduled = true;
+  setTimeout(() => {
+    wizardPrefetchScheduled = false;
+    if (!pageClosing && latestState
+      && (latestState.phase === 'waiting' || latestState.wizardAvailable)
+      && !latestState.wizardScene) {
+      wizardScene.prefetchOpeningVoice();
+      if (board) board.prefetchWizardModels();
+      else scheduleWizardPrefetch();
+    }
+  }, 1_200);
+}
+
 function validRoomState(state: ChessState): boolean {
   if (typeof state.roomCode !== 'string' || state.roomCode.toUpperCase() !== roomCode.trim().toUpperCase()
     || !Number.isSafeInteger(state.gameId) || state.gameId < 1
@@ -349,6 +405,13 @@ function validRoomState(state: ChessState): boolean {
   if (state.hint && (!/^[a-h][1-8]$/.test(state.hint.from) || !/^[a-h][1-8]$/.test(state.hint.to)
     || !['p', 'n', 'b', 'r', 'q', 'k'].includes(state.hint.piece)
     || state.hint.revision !== state.revision)) return false;
+  if (state.wizardAvailable !== undefined && typeof state.wizardAvailable !== 'boolean') return false;
+  const wizard = state.wizardScene;
+  if (wizard && (!Number.isSafeInteger(wizard.id) || wizard.id < 1
+    || !['story', 'ready', 'resolved'].includes(wizard.phase)
+    || !Number.isFinite(wizard.startedAt) || wizard.startedAt < 0
+    || (wizard.readyAt !== null && !Number.isFinite(wizard.readyAt))
+    || (wizard.resolvedAt !== null && !Number.isFinite(wizard.resolvedAt)))) return false;
   return true;
 }
 
@@ -384,6 +447,14 @@ function renderStatus(): void {
     label = isPortuguese ? 'Canal de voz' : 'Voice channel';
     hint = isPortuguese ? 'Diga uma peça e uma casa na chamada; depois confirme.'
       : 'Say a piece and square on your call, then confirm the move.';
+  } else if (state.wizardScene) {
+    const resolved = state.wizardScene.phase === 'resolved';
+    title = isPortuguese ? 'Xadrez bruxo' : 'Wizard Chess';
+    detail = resolved
+      ? isPortuguese ? 'A jogada do Ron abriu o caminho para Harry.' : 'Ron’s move opened the path for Harry.'
+      : isPortuguese ? 'O tabuleiro espera a jogada do cavalo do Ron.' : 'The board awaits Ron’s knight move.';
+    label = isPortuguese ? 'Cena especial' : 'Special scene';
+    hint = isPortuguese ? 'Você pode falar no telefone a qualquer momento.' : 'You can speak on the phone at any time.';
   } else if (connectionState !== 'connected') {
     title = isPortuguese ? 'Reconectando' : 'Reconnecting';
     detail = isPortuguese ? 'A posição atual continua no tabuleiro.' : 'Your last known position remains on the board.';
@@ -437,7 +508,7 @@ function renderStatus(): void {
 }
 
 function renderHintTracker(state: ChessState | null): void {
-  hintTracker.hidden = state?.phase === 'finished';
+  hintTracker.hidden = state?.phase === 'finished' || !!state?.wizardScene;
   const remaining = state?.hintsRemaining ?? 3;
   hintCount.textContent = `${remaining} / 3`;
   hintTracker.setAttribute('aria-label', isPortuguese
@@ -457,7 +528,8 @@ function renderHintTracker(state: ChessState | null): void {
 function renderCallCard(): void {
   const waitingForCaller = !stationLaunchRequested && !stationDisplay.active
     && connectionState === 'connected' && !transportError
-    && latestState !== null && latestState.phase !== 'finished' && !latestState.playerConnected;
+    && latestState !== null && latestState.phase !== 'finished'
+    && !latestState.wizardScene && !latestState.playerConnected;
   callCard.hidden = !waitingForCaller;
   app.dataset.callCard = waitingForCaller ? 'visible' : 'hidden';
   if (!waitingForCaller) return;
@@ -570,10 +642,12 @@ function showCaptureBanner(move: ChessMoveRecord): void {
   eventBanner.classList.add('show');
 }
 
-function renderAccessiblePosition(state: ChessState): void {
-  const positions = new Map<string, ChessPiecePlacement>(state.pieces.map(piece => [piece.square, piece]));
-  const files = state.humanColor === 'w' ? 'abcdefgh' : 'hgfedcba';
-  const ranks = state.humanColor === 'w' ? [8, 7, 6, 5, 4, 3, 2, 1] : [1, 2, 3, 4, 5, 6, 7, 8];
+function renderAccessiblePosition(state: ChessState, shown: readonly BoardPiece[] = state.pieces,
+  wizardActive = false, wizardHint = false): void {
+  const positions = new Map<string, BoardPiece>(shown.map(piece => [piece.square, piece]));
+  const whitePerspective = wizardActive || state.humanColor === 'w';
+  const files = whitePerspective ? 'abcdefgh' : 'hgfedcba';
+  const ranks = whitePerspective ? [8, 7, 6, 5, 4, 3, 2, 1] : [1, 2, 3, 4, 5, 6, 7, 8];
   const symbols: Record<ChessColor, Record<ChessPieceType, string>> = {
     w: { p: '♙', n: '♘', b: '♗', r: '♖', q: '♕', k: '♔' },
     b: { p: '♟', n: '♞', b: '♝', r: '♜', q: '♛', k: '♚' },
@@ -585,23 +659,35 @@ function renderAccessiblePosition(state: ChessState): void {
     for (const file of files) {
       const square = `${file}${rank}`;
       const piece = positions.get(square);
+      const character = wizardActive && piece ? wizardCharacterAt(square, piece.color, piece.type) : null;
       const cell = document.createElement('td');
       cell.className = (('abcdefgh'.indexOf(file) + rank) % 2 ? 'dark' : 'light')
-        + (state.lastMove?.to === square ? ' last' : '')
-        + (state.selection?.from === square ? ' selected' : '')
-        + (state.pendingMove?.from === square ? ' pending-from' : '')
-        + (state.pendingMove?.to === square ? ' pending-to' : '')
-        + (!state.pendingMove && state.hint?.from === square ? ' hint-from' : '')
-        + (!state.pendingMove && state.hint?.to === square ? ' hint-to' : '');
+        + (!wizardActive && state.lastMove?.to === square ? ' last' : '')
+        + (!wizardActive && state.selection?.from === square ? ' selected' : '')
+        + (!wizardActive && state.pendingMove?.from === square ? ' pending-from' : '')
+        + (!wizardActive && state.pendingMove?.to === square ? ' pending-to' : '')
+        + (wizardHint && square === 'g5' ? ' hint-from' : '')
+        + (wizardHint && square === 'h3' ? ' hint-to' : '')
+        + (!wizardActive && !state.pendingMove && state.hint?.from === square ? ' hint-from' : '')
+        + (!wizardActive && !state.pendingMove && state.hint?.to === square ? ' hint-to' : '');
       cell.dataset.square = square.toUpperCase();
+      if (character) cell.dataset.character = character;
       if (piece) {
         const glyph = document.createElement('span');
-        glyph.className = `fallback-piece ${piece.color === 'w' ? 'ivory' : 'obsidian'}`;
-        glyph.textContent = symbols[piece.color][piece.type];
+        glyph.className = `fallback-piece ${piece.color === 'w' ? 'ivory' : 'obsidian'}`
+          + (wizardActive ? ' wizard-figure' : '')
+          + (character ? ' wizard-character' : '');
+        if (character) glyph.dataset.character = character;
+        if (wizardActive) glyph.innerHTML = wizardPieceArt(piece.type, character);
+        else glyph.textContent = symbols[piece.color][piece.type];
         cell.append(glyph);
       }
       cell.setAttribute('aria-label', piece
-        ? isPortuguese
+        ? character
+          ? isPortuguese
+            ? `${capitalize(character)}, ${pieceName(piece.type)} das pretas em ${square.toUpperCase()}`
+            : `${capitalize(character)}, black ${pieceName(piece.type)} on ${square.toUpperCase()}`
+          : isPortuguese
           ? `${capitalize(pieceName(piece.type))} das ${piece.color === 'w' ? 'brancas' : 'pretas'} em ${square.toUpperCase()}`
           : `${piece.color === 'w' ? 'White' : 'Black'} ${pieceName(piece.type)} on ${square.toUpperCase()}`
         : isPortuguese ? `${square.toUpperCase()}, casa vazia` : `${square.toUpperCase()}, empty`);

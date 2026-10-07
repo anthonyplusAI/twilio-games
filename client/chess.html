@@ -96,6 +96,33 @@
       </div>
     </div>
 
+    <section id="wizard-scene" class="wizard-scene" aria-labelledby="wizard-scene-title" hidden>
+      <div class="wizard-scene-shade" aria-hidden="true"></div>
+      <a class="wizard-credits-link" href="/wizard-chess-credits.html" target="_blank" rel="noopener">
+        <span class="wizard-credits-en" lang="en">3D model credits<span class="wizard-credits-new-tab"> (opens in a new tab)</span></span><span class="wizard-credits-pt" lang="pt-BR">Créditos dos modelos 3D<span class="wizard-credits-new-tab"> (abre em uma nova guia)</span></span><span aria-hidden="true">↗</span>
+      </a>
+      <div class="wizard-scene-shell">
+        <div class="wizard-scene-heading">
+          <span class="wizard-scene-crest" aria-hidden="true">✦</span>
+          <h2 id="wizard-scene-title" tabindex="-1">The chess chamber</h2>
+        </div>
+        <div class="wizard-scene-controls">
+          <button id="wizard-sound-toggle" class="wizard-sound-toggle" type="button" aria-label="Screen voices" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4Z" /><path class="wizard-sound-waves" d="M16 8a6 6 0 0 1 0 8m2-11a10 10 0 0 1 0 14" /><path class="wizard-sound-slash" d="m4 4 16 16" /></svg>
+            <span>Screen voices</span>
+          </button>
+          <button id="wizard-skip-button" class="wizard-skip-button" type="button">Skip story</button>
+        </div>
+        <div id="wizard-transcript" class="wizard-transcript" role="log" aria-label="Character conversation" aria-live="polite" aria-relevant="additions" tabindex="0"></div>
+        <p id="wizard-move-hint" class="wizard-move-hint" role="status" aria-live="polite" tabindex="-1" hidden>Say your next move on the phone when you’re ready.</p>
+        <div id="wizard-scene-victory" class="wizard-scene-victory" role="status" aria-live="polite" tabindex="-1" hidden>
+          <span class="wizard-victory-mark" aria-hidden="true">✦</span>
+          <div><h3>The chamber is won</h3><p>The path ahead is open.</p></div>
+        </div>
+        <p id="wizard-scene-countdown" class="wizard-scene-countdown" role="timer" aria-live="off" hidden>Returning to Voice Chess shortly.</p>
+      </div>
+    </section>
+
     <div id="fallback-board" class="fallback-board">
       <div id="fallback-explanation" class="fallback-explanation">Live board · 2D mode</div>
     </div>

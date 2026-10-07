@@ -28,6 +28,7 @@ The counts below are verified against the committed runtime layout and exclude i
 | `fighters/maps/` | 3 GLBs plus `maps.json` | Fighter map models and the 5-entry map catalog; 2 entries are procedural |
 | `fighters/previews/` | 17 PNG/SVG files | 12 fighter portraits and 5 map previews |
 | `karaoke/` | 5 GLBs plus `venue.json` | Voice Karaoke stage, performers, immutable venue seed, and production asset guide |
+| `chess/wizard/` | 7 GLBs | Voice Chess Wizard Chess statue and character models |
 | `fixtures/` | 2 generated GLBs | Test-only models produced by `npm run make-fixtures` |
 | `manifest.json` | 19 cars, 1 barrier, 1 boost, 0 props | Racer model roles and per-model display transforms |
 
@@ -101,8 +102,10 @@ A missing Voice Karaoke backing instead fails audio preflight and keeps the perf
 check for retry or timeout.
 
 Voice Trivia has no dedicated audio files and reuses the `lobby` music context. Voice Chess uses the
-user-supplied `chess/the-marble-gambit.mp3` and builds its 3D pieces procedurally in the browser,
-so it does not need a separate model bundle.
+user-supplied `chess/the-marble-gambit.mp3` and builds its ordinary 3D pieces procedurally in the
+browser. Its optional Wizard Chess scene loads `chess/wizard/` GLBs through `/assets/chess/wizard/`.
+The four statue models have ground-level pivots and Draco geometry; the three character models are
+unchanged source GLBs with no rigs or embedded animation. No bishop or rook GLB was supplied.
 
 The Monsters arena loads `assets/arena/arena.glb` using `arena.json`. If that GLB fails, the battle keeps its rendered green-void backdrop.
 

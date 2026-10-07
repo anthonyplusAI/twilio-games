@@ -142,6 +142,7 @@ The deployed specification currently sets these variables:
 | `TWILIO_WHATSAPP_CONTENT_SID_STATION_{ADMITTED,OVERFLOW,CALL_NOW,RESULTS,NEXT_GAME}_{EN_US,PT_BR}` | Ten GitHub repository variables | Approved localized WhatsApp templates; call-now uses a static Phone CTA inside and outside the 24-hour window, while other configured templates are selected outside it |
 | `CR_TTS_VOICE` | Pinned to `SA7eD52NRr8WAehitVt1` by deployment | English ElevenLabs Conversation Relay voice for all six games |
 | `CR_TTS_VOICE_PT_BR` | GitHub repository variable | Optional Brazilian Portuguese ElevenLabs voice ID; empty uses Relay's `pt-BR` default |
+| `ELEVENLABS_API_KEY` | Optional Container App secret `elevenlabs-api-key` populated from the matching GitHub repository secret | Synthesizes only the fixed Wizard Chess scene lines for the shared display using the selected Hermione, Ron, and Harry voices; independent of Conversation Relay phone TTS. Missing key leaves captions and browser speech available. |
 | `DEFAULT_LOCALE` | GitHub repository variable | Fallback when the dialed number and selected display do not identify a locale; empty defaults to `en-US` |
 | `OPENAI_API_KEY` | Required Container App secret populated from the matching GitHub secret | Enables bounded conversational command interpretation in all six games and both locales; the deployment check rejects an unset key |
 | `OPENAI_MODEL` | GitHub repository variable | OpenAI model; empty defaults to `gpt-4o-mini` |
@@ -152,6 +153,21 @@ The deployed specification currently sets these variables:
 | `DUB_SHORT_DOMAIN` | GitHub repository variable | Valid custom Dub hostname paired with `DUB_API_KEY`; the workflow rejects a key/domain partial configuration |
 
 The primary account owns the English Voice number, dedicated SMS number, optional WhatsApp sender, TAC/Orchestrator configuration, Memory store, and all REST credentials. The second account owns only the Portuguese Voice number and `TWILIO_PT_AUTH_TOKEN`. Incoming Voice, Voice WebSocket, and session-ended validation accept either configured Auth Token; after authentication, the exact dialed `To` number selects the locale. The Relay token authenticates custom setup parameters but does not turn them into signed claims; station setup revalidates them against the live call binding and persisted match.
+
+To enable the Wizard Chess display narration, create the repository secret `ELEVENLABS_API_KEY` at **GitHub → Settings → Secrets and variables → Actions → New repository secret**, then deploy. For local development, provide the same environment variable to the server process from your local secret manager or shell. Do not add the key to a tracked `.env` file or browser code. The deployment stores an unset key as `disabled`, so the app still deploys and the scene can use its caption/browser-speech fallback. `/healthz` reports `wizardScreenAudio` as `configured` or `unavailable` without exposing the key.
+
+After deploying with the secret, check all three character voices from a terminal. These are fixed scene line IDs; the requests do not contain the API key or arbitrary text:
+
+```sh
+for line in ron-sees-the-line hermione-sees-the-risk harry-sees-the-reply; do
+  printf '%s: ' "$line"
+  curl --silent --show-error --output /dev/null \
+    --write-out '%{http_code} %{content_type}\n' \
+    "https://<app-fqdn>/api/chess/wizard-audio/$line?locale=en-US"
+done
+```
+
+Each line should return `200 audio/mpeg`; open each URL on the display and listen once to verify Ron, Hermione, and Harry sound distinct and correspond to the expected lines. `wizardScreenAudio: configured` in `/healthz` confirms only that a key is present, not that these three voices are accessible to that ElevenLabs account. If a line fails, inspect the server's `[wizard-audio]` log entry for its fixed line ID, voice ID, upstream HTTP status, and reason. An upstream `401` returns `503 screen_audio_auth_failed` and pauses all provider requests for one minute while the display uses captions or browser speech; `503 screen_audio_not_configured` means the key is absent. Upstream `403`/`404` can indicate inaccessible voices and `429` can indicate rate limits or exhausted quota; these return `502` and cool down per line. `504` means the provider timed out. Logs deliberately omit the key, narration text, and provider response body.
 
 Provision a station-managed booth display from that tab: open `https://<app-fqdn>/operator`, authenticate with Google or the admin PIN, and select **Pair this tab as the big screen**. The same-origin action installs display access in `sessionStorage` and returns the tab to `/`. Staff never need to know the display capability, and it is never placed in a URL, page, notice, or visitor QR. Repeat the action for independent browser sessions because they do not inherit the authenticated tab's session storage. Standalone room `4821` does not use this pairing flow: with the event paused, keep only the intended eligible game display open before calling.
 

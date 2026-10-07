@@ -1,13 +1,13 @@
 # Asset Credits
 
-All in-game models below (vehicles and obstacles) are sourced from [Sketchfab](https://sketchfab.com)
-under the **Creative Commons Attribution 4.0 International (CC-BY 4.0)** license
-(<https://creativecommons.org/licenses/by/4.0/>), which permits use **with attribution**.
+Many models below come from [Sketchfab](https://sketchfab.com) under the **Creative Commons
+Attribution 4.0 International (CC-BY 4.0)** license
+(<https://creativecommons.org/licenses/by/4.0/>), which requires attribution. Other sections
+identify assets with different or unresolved rights.
 
-The committed `.glb` files in `assets/` are compressed derivatives (Draco geometry + WebP
-textures, resized to 1024px) of the original Sketchfab downloads. Raw originals are kept
-locally in `assets/_raw/` (gitignored). Per CC-BY, derivatives are permitted; attribution to
-the original authors is preserved below.
+Most committed `.glb` files in `assets/` are optimized derivatives of the original downloads.
+The Voice Chess character GLBs are unchanged copies. Source models and license details are listed
+below; raw originals for older Sketchfab assets are kept locally in gitignored `_raw/` directories.
 
 ## Voice Karaoke 3D models (CC-BY 4.0)
 
@@ -62,6 +62,26 @@ does not claim isolated-vocal pitch calibration.
 | Runtime file | Track | Source | Rights provenance |
 |---|---|---|---|
 | `client/public/audio/chess/the-marble-gambit.mp3` | The Marble Gambit | User-supplied `The_Marble_Gambit.mp3` | Distribution and reuse rights were not documented in this repository |
+
+## Voice Chess Wizard Chess models (CC-BY 4.0)
+
+The three character GLBs are unchanged copies of the user-supplied Sketchfab downloads. The four
+statue GLBs are derivatives simplified to about 5% of their original triangle counts, centered on
+their bases, joined into one mesh each, and Draco-compressed. The original author, title, source,
+and license are retained in each GLB's asset metadata.
+
+| Runtime file | Original model title | Author | Sketchfab source | License |
+|---|---|---|---|---|
+| `chess/wizard/harry.glb` | Harry Potter | [zack_graham](https://sketchfab.com/zack_graham) | https://sketchfab.com/3d-models/harry-potter-e3ec02b483044325b8de13c4cd64b673 | [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
+| `chess/wizard/ron.glb` | Ronald Weasley | [zack_graham](https://sketchfab.com/zack_graham) | https://sketchfab.com/3d-models/ronald-weasley-d3419667f6a345a09987a6c57d936d0a | [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
+| `chess/wizard/hermione.glb` | Hermione Granger | [zack_graham](https://sketchfab.com/zack_graham) | https://sketchfab.com/3d-models/hermione-granger-95714784f5bb4ac697040ec602b97932 | [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
+| `chess/wizard/king.glb` | Chess Harry Potter, King! | [Tror](https://sketchfab.com/Tror) | https://sketchfab.com/3d-models/chess-harry-potter-king-b881df835e4445a3befd825ceedb05c1 | [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
+| `chess/wizard/knight.glb` | Horse, Chess Harry Potter! | [Tror](https://sketchfab.com/Tror) | https://sketchfab.com/3d-models/horse-chess-harry-potter-3dfa9d3f09744fa1bf2517152fd47834 | [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
+| `chess/wizard/pawn.glb` | Pawn, Harry Potter Chess | [Tror](https://sketchfab.com/Tror) | https://sketchfab.com/3d-models/pawn-harry-potter-chess-8e159e5d817f412e9c5393f60c7955e3 | [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
+| `chess/wizard/queen.glb` | Queen, Chess Harry Potter! | [Tror](https://sketchfab.com/Tror) | https://sketchfab.com/3d-models/queen-chess-harry-potter-af3593b597994fab9674cc66330a66cb | [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
+
+The model metadata documents these files' licenses. It does not document rights to film dialogue,
+sound recordings, or actor performances.
 
 ## Voice Chess generated preview
 

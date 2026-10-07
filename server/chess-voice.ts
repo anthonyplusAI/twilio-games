@@ -1,10 +1,13 @@
 import { parseCrMessage } from './conversation-relay';
 import { parseChessIntent, describeChessMove, type ChessIntent } from '../shared/chess-intent';
-import type { ChessCommandResult, ChessEvent, ChessPieceType, ChessSquare, ChessState } from '../shared/chess-protocol';
+import type { ChessCommandResult, ChessEvent, ChessPieceType, ChessSquare, ChessState,
+  WizardChessSceneSnapshot } from '../shared/chess-protocol';
 import { DEFAULT_LOCALE, resolveLocale, type SupportedLocale } from '../shared/i18n/locales';
 import { formatList, normalizeForMatching } from '../shared/i18n/translate';
 import type { ChessVoiceMoveChoice } from './chess-room';
 import type { VoiceInterpretFact, VoiceInterpretResult } from './voice-interpreter';
+import { isWizardChessTrigger, parseWizardChessVoiceAction,
+  WIZARD_CHESS_VICTORY_AT_MS } from '../shared/wizard-chess-scene';
 
 export interface ChessVoiceInterpretContext {
   phase: ChessState['phase'];
@@ -15,6 +18,8 @@ export interface ChessVoiceInterpretContext {
   readOnlyInquiry: boolean;
   legalMoves: readonly ChessVoiceMoveChoice[];
   facts: readonly VoiceInterpretFact[];
+  wizardAvailable: boolean;
+  wizardScene: WizardChessSceneSnapshot | null;
 }
 
 export interface ChessVoiceDeps {
@@ -46,6 +51,7 @@ export class ChessVoiceSession {
   private turnEpoch = 0;
   private initiatingResetGameId: number | null = null;
   private announcedTerminalMoveKey: string | null = null;
+  private wizardFinaleTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly pendingSpeech = new Set<Promise<unknown>>();
 
   constructor(private readonly deps: ChessVoiceDeps) {}
@@ -70,7 +76,10 @@ export class ChessVoiceSession {
     if (!this.roomCode || !this.callSid) return;
     if (message.type === 'prompt') {
       if (message.last) this.handleFinalPrompt(message.voicePrompt);
-      else this.turnEpoch++; // the caller has begun speaking over any queued line
+      else {
+        this.turnEpoch++; // the caller has begun speaking over any queued line
+        if (message.voicePrompt.trim()) this.interruptWizardStory();
+      }
     } else if (message.type === 'dtmf') {
       const command = message.digit === '1' ? 'confirm'
         : message.digit === '0' ? 'cancel'
@@ -78,7 +87,15 @@ export class ChessVoiceSession {
       if (command) this.handleFinalPrompt(command);
     } else if (message.type === 'interrupt') {
       this.turnEpoch++;
+      this.interruptWizardStory();
     }
+  }
+
+  /** Relay reports speech before its final transcript. Stop screen narration at barge-in. */
+  private interruptWizardStory(): void {
+    if (!this.roomCode || !this.callSid
+      || this.deps.snapshot(this.roomCode)?.wizardScene?.phase !== 'story') return;
+    this.deps.command(this.roomCode, this.callSid, 'skip to the move', this.commandLocale);
   }
 
   onRoomEvents(events: readonly ChessEvent[]): void {
@@ -86,6 +103,7 @@ export class ChessVoiceSession {
     const reset = events.find(event => event.type === 'reset');
     if (reset?.type === 'reset') {
       this.turnEpoch++;
+      this.clearWizardFinaleTimer();
       this.announcedTerminalMoveKey = null;
       if (this.initiatingResetGameId === reset.gameId) {
         this.initiatingResetGameId = null;
@@ -120,12 +138,17 @@ export class ChessVoiceSession {
     while (this.pendingSpeech.size) await Promise.allSettled([...this.pendingSpeech]);
   }
 
-  handleReplaced(): void { this.active = false; this.turnEpoch++; }
+  handleReplaced(): void {
+    this.active = false;
+    this.turnEpoch++;
+    this.clearWizardFinaleTimer();
+  }
 
   handleClose(): void {
     if (!this.active) return;
     this.active = false;
     this.turnEpoch++;
+    this.clearWizardFinaleTimer();
     if (this.roomCode && this.playerId && this.callSid) {
       this.deps.leave(this.roomCode, this.playerId, this.callSid);
     }
@@ -149,6 +172,11 @@ export class ChessVoiceSession {
     this.callSid = callSid.trim();
     const state = this.deps.snapshot(roomCode);
     if (!state) return;
+    if (state.wizardScene) {
+      this.speak(this.wizardSceneLine(state.wizardScene));
+      if (state.wizardScene.phase === 'resolved') this.scheduleWizardFinale(state.wizardScene);
+      return;
+    }
     // A reconnect can land on a completed board. Give the result that is actually on screen;
     // asking for a move first makes the host sound as if the game is still in progress.
     if (state.phase === 'finished' && state.result) {
@@ -164,6 +192,25 @@ export class ChessVoiceSession {
   private handleFinalPrompt(spoken: string): void {
     if (!this.roomCode || !this.callSid || !spoken.trim()) return;
     this.turnEpoch++;
+    const before = this.deps.snapshot(this.roomCode);
+    if (before?.wizardScene) {
+      if (parseWizardChessVoiceAction(spoken, this.commandLocale) !== 'unknown'
+        || !this.deps.interpret || !this.deps.legalMoves) this.runCommand(spoken);
+      else {
+        // A caller can barge into the screen dialogue to ask a question or
+        // clarify a move. Stop that audio before speaking over the phone.
+        if (before.wizardScene.phase === 'story') {
+          this.deps.command(this.roomCode, this.callSid, 'skip to the move', this.commandLocale);
+        }
+        this.requestSemanticTurn(spoken,
+          isReadOnlyChessInquiry(spoken, this.commandLocale, parseChessIntent(spoken, this.commandLocale)));
+      }
+      return;
+    }
+    if (before?.wizardAvailable && isWizardChessTrigger(spoken, this.commandLocale)) {
+      this.runCommand(spoken);
+      return;
+    }
     const intent = parseChessIntent(spoken, this.commandLocale);
     // A request for advice is an action even when the caller phrases it as a question.
     // The room decides whether a hint is currently legal and owns the three-use budget.
@@ -223,6 +270,11 @@ export class ChessVoiceSession {
         : 'This call lost control of the board. Please call again.');
       return;
     }
+    if (result.code === 'wizard_resolved' && result.state.wizardScene) {
+      this.speak(result.message);
+      this.scheduleWizardFinale(result.state.wizardScene);
+      return;
+    }
     if (result.code === 'confirmed' && result.state.lastMove?.actor === 'human') {
       if (result.state.result) {
         const key = `${result.state.gameId}:${result.state.lastMove.revision}`;
@@ -238,6 +290,30 @@ export class ChessVoiceSession {
     }
   }
 
+  private scheduleWizardFinale(scene: WizardChessSceneSnapshot): void {
+    if (!this.roomCode || !this.callSid || scene.phase !== 'resolved' || scene.resolvedAt === null) return;
+    this.clearWizardFinaleTimer();
+    const roomCode = this.roomCode;
+    const callSid = this.callSid;
+    const delay = Math.max(0, scene.resolvedAt + WIZARD_CHESS_VICTORY_AT_MS - Date.now());
+    this.wizardFinaleTimer = setTimeout(() => {
+      this.wizardFinaleTimer = null;
+      const live = this.deps.snapshot(roomCode);
+      if (!this.active || this.roomCode !== roomCode || this.callSid !== callSid
+        || live?.wizardScene?.id !== scene.id || live.wizardScene.phase !== 'resolved'
+        || live.wizardScene.resolvedAt !== scene.resolvedAt) return;
+      this.speak(this.commandLocale === 'pt-BR'
+        ? 'Xeque-mate! O bispo do Harry captura a rainha. O Twilio Conversation Relay transformou sua jogada falada nesta vitória na tela. O xadrez normal volta em instantes.'
+        : 'Checkmate! Harry’s bishop captures the queen. Twilio Conversation Relay turned your spoken move into this on-screen victory. Normal chess returns shortly.');
+    }, delay);
+    this.wizardFinaleTimer.unref?.();
+  }
+
+  private clearWizardFinaleTimer(): void {
+    if (this.wizardFinaleTimer) clearTimeout(this.wizardFinaleTimer);
+    this.wizardFinaleTimer = null;
+  }
+
   private requestSemanticTurn(spoken: string, readOnlyInquiry: boolean): void {
     if (!this.roomCode || !this.callSid) return;
     if (!this.deps.legalMoves) {
@@ -250,22 +326,32 @@ export class ChessVoiceSession {
     const epoch = this.turnEpoch;
     const legalMoves = this.deps.legalMoves(roomCode, callSid, this.commandLocale);
     const facts = this.factsFor(before, legalMoves);
-    if (readOnlyInquiry) {
+    if (readOnlyInquiry && !before.wizardScene) {
       const direct = directLegalAnswer(spoken, this.commandLocale, before, legalMoves, facts);
       if (direct) { this.speak(direct); return; }
     }
     if (!this.deps.interpret) {
-      if (readOnlyInquiry) this.speak(this.legalQuestionHelp());
+      if (readOnlyInquiry) this.speak(before.wizardScene
+        ? this.wizardSceneLine(before.wizardScene) : this.legalQuestionHelp());
       return;
     }
     const context: ChessVoiceInterpretContext = {
       phase: before.phase, gameId: before.gameId, revision: before.revision,
       pendingMove: before.pendingMove !== null, readOnlyInquiry, legalMoves, facts,
+      wizardAvailable: before.wizardAvailable ?? false,
+      wizardScene: before.wizardScene ?? null,
     };
     const isCurrent = () => {
       const live = this.deps.snapshot(roomCode);
+      const sameScene = before.wizardScene
+        ? live?.wizardScene?.id === before.wizardScene.id
+          && (live.wizardScene.phase === before.wizardScene.phase
+            || (before.wizardScene.phase === 'story' && live.wizardScene.phase === 'ready'))
+        : !live?.wizardScene;
       return this.active && this.turnEpoch === epoch && live?.gameId === before.gameId
-        && live.revision === before.revision && live.phase === before.phase;
+        && live.revision === before.revision && live.phase === before.phase
+        && sameScene
+        && Boolean(live.wizardAvailable) === Boolean(before.wizardAvailable);
     };
     let pending!: Promise<unknown>;
     pending = this.deps.interpret(spoken, this.commandLocale, context, isCurrent)
@@ -278,14 +364,37 @@ export class ChessVoiceSession {
         }
         // The interpreter is advisory. A question cannot silently become a
         // move even if a model or compatible gateway returns an action ID.
-        if (readOnlyInquiry) { this.speak(this.legalQuestionHelp()); return; }
+        if (readOnlyInquiry) {
+          this.speak(before.wizardScene
+            ? this.wizardSceneLine(before.wizardScene) : this.legalQuestionHelp());
+          return;
+        }
         if (decision?.kind === 'clarify') {
-          this.speak(this.commandLocale === 'pt-BR'
-            ? 'Qual peça e casa você quer? Diga a jogada completa.'
-            : 'Which piece and square do you mean? Say the full move.');
+          this.speak(before.wizardScene
+            ? this.wizardSceneLine(before.wizardScene)
+            : this.commandLocale === 'pt-BR'
+              ? 'Qual peça e casa você quer? Diga a jogada completa.'
+              : 'Which piece and square do you mean? Say the full move.');
           return;
         }
         if (decision?.kind === 'action') {
+          if (decision.actionId === 'wizard_start' && before.wizardAvailable) {
+            this.runCommand('wizard chess'); return;
+          }
+          if (before.wizardScene) {
+            if (decision.actionId === 'wizard_final' && before.wizardScene.phase !== 'resolved') {
+              this.runCommand('knight to H3'); return;
+            }
+            if (decision.actionId === 'wizard_skip' && before.wizardScene.phase !== 'resolved') {
+              this.runCommand('skip to move'); return;
+            }
+            if (decision.actionId === 'wizard_hint' && before.wizardScene.phase !== 'resolved') {
+              this.runCommand('hint'); return;
+            }
+            if (decision.actionId === 'wizard_exit') { this.runCommand('exit wizard chess'); return; }
+            this.runCommand(spoken);
+            return;
+          }
           if (decision.actionId === 'propose_move' && decision.targetId) {
             const currentMoves = this.deps.legalMoves?.(roomCode, callSid, this.commandLocale) ?? [];
             if (!legalMoves.some(move => move.id === decision.targetId)
@@ -303,7 +412,8 @@ export class ChessVoiceSession {
       })
       .catch(() => {
         if (!isCurrent()) return;
-        if (readOnlyInquiry) this.speak(this.legalQuestionHelp());
+        if (readOnlyInquiry) this.speak(before.wizardScene
+          ? this.wizardSceneLine(before.wizardScene) : this.legalQuestionHelp());
         else this.runCommand(spoken);
       })
       .finally(() => this.pendingSpeech.delete(pending));
@@ -311,6 +421,12 @@ export class ChessVoiceSession {
   }
 
   private factsFor(state: ChessState, legalMoves: readonly ChessVoiceMoveChoice[]): VoiceInterpretFact[] {
+    if (state.wizardScene) return [
+      { id: 'wizard_scene', text: this.wizardSceneLine(state.wizardScene) },
+      { id: 'wizard_hint', text: this.commandLocale === 'pt-BR'
+        ? 'A jogada é o cavalo de Ron de G cinco para H três.'
+        : 'The move is Ron’s knight from G five to H three.' },
+    ];
     const ownTurn = state.turn === state.humanColor;
     const facts: VoiceInterpretFact[] = [
       { id: 'turn', text: this.commandLocale === 'pt-BR'
@@ -335,6 +451,15 @@ export class ChessVoiceSession {
     return this.commandLocale === 'pt-BR'
       ? 'Posso dizer se o roque é legal agora e para onde cada peça pode ir. Qual peça ou casa inicial você quer consultar?'
       : 'I can tell you whether castling is legal now and where each piece can move. Which piece or starting square do you mean?';
+  }
+
+  private wizardSceneLine(scene: WizardChessSceneSnapshot): string {
+    if (this.commandLocale === 'pt-BR') return scene.phase === 'resolved'
+      ? 'O final do xadrez bruxo está passando. O tabuleiro normal voltará em instantes.'
+      : 'Você está no xadrez bruxo. Diga a jogada do cavalo de Ron, peça uma dica, pule para a jogada ou diga sair.';
+    return scene.phase === 'resolved'
+      ? 'The wizard chess finale is playing. The ordinary board will return shortly.'
+      : 'You are in wizard chess. Call Ron’s knight move, ask for a hint, skip to the move, or say exit.';
   }
 
   private introduction(state: ChessState, resumed: boolean): string {
@@ -388,6 +513,8 @@ export class ChessVoiceSession {
       if (!this.active || epoch !== this.turnEpoch) return false;
       if (!current) return true;
       if (live?.gameId !== current.gameId) return false;
+      if ((live.wizardScene?.id ?? null) !== (current.wizardScene?.id ?? null)
+        || (live.wizardScene?.phase ?? null) !== (current.wizardScene?.phase ?? null)) return false;
       if (live.revision === current.revision && live.phase === current.phase) return true;
       // The computer responds after 900 ms, often before Relay has finished a human
       // move confirmation or the Black-side introduction. Both remain relevant on

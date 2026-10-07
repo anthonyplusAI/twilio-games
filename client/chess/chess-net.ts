@@ -16,10 +16,13 @@ export class ChessConnection {
   private stopped = false;
   private backoffMs = 500;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private clockTimer: ReturnType<typeof setInterval> | null = null;
+  private pendingWizardSkip: number | null = null;
   private stateListener?: (state: ChessState) => void;
   private eventListener?: (events: readonly ChessEvent[]) => void;
   private errorListener?: (code: string, message: string) => void;
   private connectionListener?: (status: ChessConnectionState) => void;
+  private clockListener?: (offsetMs: number) => void;
 
   constructor(private readonly url: string, private readonly roomCode: string,
     private readonly displayToken: string | null, private readonly locale: string) {
@@ -30,6 +33,7 @@ export class ChessConnection {
   onEvents(listener: (events: readonly ChessEvent[]) => void): void { this.eventListener = listener; }
   onError(listener: (code: string, message: string) => void): void { this.errorListener = listener; }
   onConnection(listener: (status: ChessConnectionState) => void): void { this.connectionListener = listener; }
+  onClockOffset(listener: (offsetMs: number) => void): void { this.clockListener = listener; }
 
   /** A result-menu tap is discarded while disconnected; replay must match the visible game ID. */
   replay(gameId: number): void {
@@ -37,10 +41,20 @@ export class ChessConnection {
     this.socket.send(JSON.stringify({ type: 'display_replay', roomCode: this.roomCode, gameId }));
   }
 
+  /** Keep this idempotent scene request until a server state confirms it. */
+  skipWizard(sceneId: number): void {
+    if (!Number.isSafeInteger(sceneId) || sceneId < 1 || this.stopped) return;
+    this.pendingWizardSkip = sceneId;
+    this.sendPendingWizardSkip();
+  }
+
   close(): void {
     this.stopped = true;
+    this.pendingWizardSkip = null;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    if (this.clockTimer) clearInterval(this.clockTimer);
+    this.clockTimer = null;
     try { this.socket?.close(); } catch { /* Connection may already be closed. */ }
     this.connectionListener?.('closed');
   }
@@ -55,7 +69,18 @@ export class ChessConnection {
       this.backoffMs = 500;
       // Display authorization must be sent before room subscription on station launches.
       if (this.displayToken) socket.send(JSON.stringify({ type: 'display_auth', roomCode: this.roomCode, token: this.displayToken }));
+      const synchronize = () => {
+        if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({
+          type: 'clock_sync', clientSentAtMs: Date.now(),
+        }));
+      };
+      // WebSocket frames are ordered. Synchronize before subscribing so a
+      // reconnecting display can time the scene before its first snapshot.
+      synchronize();
       socket.send(JSON.stringify({ type: 'spectate', roomCode: this.roomCode, locale: this.locale }));
+      this.sendPendingWizardSkip(socket);
+      if (this.clockTimer) clearInterval(this.clockTimer);
+      this.clockTimer = setInterval(synchronize, 30_000);
       this.connectionListener?.('connected');
     };
     socket.onmessage = event => {
@@ -70,13 +95,28 @@ export class ChessConnection {
       }
       if (!value || typeof value !== 'object' || !('type' in value)) return;
       const message = value as ChessServerMessage;
-      if (message.type === 'chess_state' && Array.isArray(message.pieces)) this.stateListener?.(message);
+      if (message.type === 'chess_state' && Array.isArray(message.pieces)) {
+        const pending = this.pendingWizardSkip;
+        if (pending !== null && (message.wizardScene?.id !== pending
+          || message.wizardScene.phase !== 'story')) this.pendingWizardSkip = null;
+        this.stateListener?.(message);
+      }
       else if (message.type === 'chess_events' && Array.isArray(message.events)) this.eventListener?.(message.events);
       else if (message.type === 'error') this.errorListener?.(message.code, message.message);
+      else if (message.type === 'clock_sync'
+        && Number.isFinite(message.clientSentAtMs) && Number.isFinite(message.serverNowMs)) {
+        const receivedAt = Date.now();
+        const elapsed = receivedAt - message.clientSentAtMs;
+        if (elapsed >= 0 && elapsed <= 5_000) {
+          this.clockListener?.(message.serverNowMs - (message.clientSentAtMs + elapsed / 2));
+        }
+      }
       // chess_capabilities is informational; the display has already sent its token first.
     };
     socket.onclose = event => {
       if (this.stopped || generation !== this.generation) return;
+      if (this.clockTimer) clearInterval(this.clockTimer);
+      this.clockTimer = null;
       if (event.code === 4001) {
         this.connectionListener?.('closed');
         return;
@@ -90,5 +130,13 @@ export class ChessConnection {
       }, delay);
     };
     socket.onerror = () => undefined;
+  }
+
+  private sendPendingWizardSkip(socket = this.socket): void {
+    if (this.pendingWizardSkip === null || socket?.readyState !== WebSocket.OPEN) return;
+    try {
+      socket.send(JSON.stringify({ type: 'display_wizard_skip',
+        roomCode: this.roomCode, sceneId: this.pendingWizardSkip }));
+    } catch { /* Keep the request for the next connection. */ }
   }
 }

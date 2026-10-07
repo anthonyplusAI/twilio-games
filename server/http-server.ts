@@ -13,6 +13,7 @@ import { KaraokeServer } from './karaoke-server';
 import { TriviaServer, type TriviaServerOptions } from './trivia-server';
 import { ChessServer } from './chess-server';
 import { ChessVoiceSession } from './chess-voice';
+import { WizardChessAudioError, WizardChessAudioService } from './wizard-chess-audio';
 import { TriviaVoiceSession, type TriviaVoiceSnapshot } from './trivia-voice';
 import { TriviaContentStore } from './trivia-content-store';
 import {
@@ -316,6 +317,7 @@ export class HttpServer {
   private readonly voiceRelayToken: string;
   private readonly karaokeCalibrationOffsetMs: number;
   private readonly deepgramConfigured: boolean;
+  private readonly wizardChessAudio: WizardChessAudioService;
   private readonly defaultLocale: SupportedLocale;
   private readonly standaloneVoiceEnabled: boolean;
   /** Cached selectable cars/maps for the lobby (refreshed from manifest + maps.json periodically). */
@@ -435,6 +437,7 @@ export class HttpServer {
     standaloneVoiceEnabled?: boolean;
     voiceRelayToken?: string;
     deepgramApiKey?: string;
+    wizardChessAudio?: WizardChessAudioService;
     karaokeCalibrationOffsetMs?: number;
     karaokeLyricRecognizerFactory?: KaraokeLyricRecognizerFactory;
   }) {
@@ -502,6 +505,7 @@ export class HttpServer {
     this.fighterPreviewDir = opts.fighterPreviewDir ?? 'data/fighter-previews';
     this.crVoice = relayVoiceForLocale('en-US');
     this.crVoicePtBr = relayVoiceForLocale('pt-BR');
+    this.wizardChessAudio = opts.wizardChessAudio ?? new WizardChessAudioService();
     this.voiceRelayToken = resolveVoiceRelayToken(
       this.publicBaseUrl,
       opts.voiceRelayToken ?? process.env.VOICE_RELAY_TOKEN,
@@ -2276,9 +2280,11 @@ export class HttpServer {
     if (game === 'chess') {
       const commands = locale === 'pt-BR'
         ? ['xadrez', 'peão', 'cavalo', 'bispo', 'torre', 'rainha', 'rei', 'para', 'de', 'capturar',
-          'roque', 'promover', 'confirmar', 'sim', 'cancelar', 'não', 'ajuda', 'dica', 'jogar novamente']
+          'roque', 'promover', 'confirmar', 'sim', 'cancelar', 'não', 'ajuda', 'dica', 'jogar novamente',
+          'xadrez dos bruxos', 'Harry Potter', 'Ron', 'cavalo para H3']
         : ['chess', 'pawn', 'knight', 'bishop', 'rook', 'queen', 'king', 'to', 'from', 'takes',
-          'castle', 'promote', 'confirm', 'yes', 'cancel', 'no', 'help', 'hint', 'play again'];
+          'castle', 'promote', 'confirm', 'yes', 'cancel', 'no', 'help', 'hint', 'play again',
+          'wizard chess', 'Harry Potter', 'Ron', 'knight to H3'];
       const files = 'ABCDEFGH'.split('');
       const squares = files.flatMap(file => Array.from({ length: 8 }, (_, index) => `${file.toLowerCase()}${index + 1}`));
       // A caller may identify a piece by file instead of its full starting
@@ -2320,7 +2326,8 @@ export class HttpServer {
       },
       command: (code, callSid, spoken, locale) => {
         const result = this.chess.voiceCommand(code, callSid, spoken, locale);
-        if (result && ['selected', 'proposed', 'confirmed', 'cancelled', 'help'].includes(result.code)) {
+        if (result && ['selected', 'proposed', 'confirmed', 'cancelled', 'help',
+          'wizard_started', 'wizard_resolved', 'wizard_skipped', 'wizard_exited', 'wizard_hint'].includes(result.code)) {
           this.analyticsObserver.voiceCommand('chess');
         }
         return result;
@@ -2330,28 +2337,40 @@ export class HttpServer {
         if (restarted) this.analyticsObserver.voiceCommand('chess');
         return restarted;
       },
-      snapshot: code => this.chess.findRoom(code)?.state() ?? null,
+      snapshot: code => this.chess.snapshot(code),
       legalMoves: (code, callSid, locale) => this.chess.voiceLegalMoves(code, callSid, locale),
       interpret: (spoken, locale, context, isCurrent) => {
         if (!isCurrent()) return Promise.resolve({ kind: 'none' as const });
-        const actions: VoiceInterpretAction[] = context.readOnlyInquiry ? [] : [
-          { id: 'help', description: 'Explain the current chess controls' },
-          { id: 'hint', description: 'Recommend one legal move without playing it, at most three hints per game' },
-        ];
-        if (!context.readOnlyInquiry && context.legalMoves.length) actions.push({
+        const actions: VoiceInterpretAction[] = [];
+        if (!context.readOnlyInquiry && context.wizardScene) {
+          if (context.wizardScene.phase === 'story' || context.wizardScene.phase === 'ready') {
+            actions.push({ id: 'wizard_final', description: 'Move Ron’s knight to H3 now; the player can interrupt the scene at any time' });
+            actions.push({ id: 'wizard_skip', description: 'Skip scene dialogue and go directly to the knight move prompt' });
+            actions.push({ id: 'wizard_hint', description: 'Give the caller a clue for Ron’s move without making the move' });
+          }
+          actions.push({ id: 'wizard_exit', description: 'Leave the wizard scene and resume normal chess' });
+        } else if (!context.readOnlyInquiry) {
+          actions.push({ id: 'help', description: 'Explain the current chess controls' });
+          actions.push({ id: 'hint', description: 'Recommend one legal move without playing it, at most three hints per game' });
+          if (context.wizardAvailable) actions.push({
+            id: 'wizard_start', description: 'Start the Wizard Chess Harry Potter inspired scene',
+          });
+        }
+        if (!context.readOnlyInquiry && !context.wizardScene && context.legalMoves.length) actions.push({
           id: 'propose_move', description: 'Propose a legal chess move; confirmation is still required',
           targetIds: context.legalMoves.map(move => move.id),
         });
-        if (!context.readOnlyInquiry && context.pendingMove) {
+        if (!context.readOnlyInquiry && !context.wizardScene && context.pendingMove) {
           actions.push({ id: 'confirm', description: 'Confirm the pending move' });
           actions.push({ id: 'cancel', description: 'Cancel the pending move' });
         }
-        if (!context.readOnlyInquiry && context.phase === 'finished' && !stationManaged()) {
+        if (!context.readOnlyInquiry && !context.wizardScene && context.phase === 'finished' && !stationManaged()) {
           actions.push({ id: 'reset', description: 'Start a new standalone game' });
         }
         return interpretVoiceTurn(this.llm, {
-          game: 'chess', phase: context.phase, locale, transcript: spoken, actions,
-          choices: context.legalMoves, facts: context.facts,
+          game: 'chess', phase: context.wizardScene ? `wizard_${context.wizardScene.phase}` : context.phase,
+          locale, transcript: spoken, actions,
+          choices: context.wizardScene ? [] : context.legalMoves, facts: context.facts,
         });
       },
       say,
@@ -4122,8 +4141,37 @@ export class HttpServer {
         karaokeMediaSessions: this.karaokeMedia.activeSessionCount,
         karaokeLyricRecognition: this.deepgramConfigured ? 'configured' : 'unavailable',
         semanticVoiceInterpretation: this.llm.enabled ? 'configured' : 'unavailable',
+        wizardScreenAudio: this.wizardChessAudio.configured ? 'configured' : 'unavailable',
         karaokeCalibrationOffsetMs: this.karaokeCalibrationOffsetMs,
       }));
+      return;
+    }
+    if (path.startsWith('/api/chess/wizard-audio/')) {
+      if (req.method !== 'GET') {
+        res.writeHead(405, { Allow: 'GET', 'Cache-Control': 'no-store' }).end();
+        return;
+      }
+      const lineId = path.slice('/api/chess/wizard-audio/'.length);
+      const locale = new URL(req.url ?? path, this.publicBaseUrl).searchParams.get('locale') ?? 'en-US';
+      if (!/^[a-z0-9-]{1,80}$/.test(lineId) || (locale !== 'en-US' && locale !== 'pt-BR')) {
+        res.writeHead(400, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+          .end('{"error":"invalid_scene_audio_request"}');
+        return;
+      }
+      try {
+        const audio = await this.wizardChessAudio.get(lineId, locale);
+        res.writeHead(200, {
+          'Content-Type': 'audio/mpeg',
+          'Content-Length': audio.length,
+          'Cache-Control': 'public, max-age=3600',
+          'X-Content-Type-Options': 'nosniff',
+        }).end(audio);
+      } catch (error) {
+        const failure = error instanceof WizardChessAudioError
+          ? error : new WizardChessAudioError(502, 'screen_audio_upstream_unavailable');
+        res.writeHead(failure.status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+          .end(JSON.stringify({ error: failure.code }));
+      }
       return;
     }
     if (req.method === 'GET' && path === '/auth/google') { this.analyticsAuth.begin(req, res); return; }
