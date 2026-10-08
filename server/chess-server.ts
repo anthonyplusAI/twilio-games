@@ -8,7 +8,7 @@ import { parseChessIntent } from '../shared/chess-intent';
 import type { ChessCommandResult as ChessCommandResponse, ChessState, WizardChessSceneSnapshot } from '../shared/chess-protocol';
 import {
   isWizardChessTrigger, parseWizardChessVoiceAction,
-  WIZARD_CHESS_RESOLVED_DURATION_MS, WIZARD_CHESS_STORY_DURATION_MS,
+  WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_RESOLVED_DURATION_MS, WIZARD_CHESS_STORY_DURATION_MS,
 } from '../shared/wizard-chess-scene';
 
 type ChessEvents = ReturnType<ChessRoom['drainEvents']>;
@@ -34,11 +34,14 @@ interface WizardSceneRuntime {
   gameId: number;
   callSid: string;
   storyTimer: ReturnType<typeof setTimeout> | null;
+  displayTimer: ReturnType<typeof setTimeout> | null;
   resolvedTimer: ReturnType<typeof setTimeout> | null;
   orphanTimer: ReturnType<typeof setTimeout> | null;
 }
 
 export const CHESS_RESULT_RECONNECT_GRACE_MS = 60_000;
+/** Let a briefly reconnecting screen resume the story before switching to a phone-only move cue. */
+export const CHESS_WIZARD_DISPLAY_GRACE_MS = 5_000;
 export const CHESS_WIZARD_ORPHAN_READY_MS = 10_000;
 
 export interface ChessServerOptions {
@@ -347,7 +350,12 @@ export class ChessServer {
     ws.on('message', data => this.onMessage(display, data.toString()));
     ws.on('close', () => {
       this.displays.delete(display);
-      if (display.roomCode) this.reap(display.roomCode);
+      if (display.roomCode) {
+        const code = display.roomCode;
+        this.reap(code);
+        const scene = this.wizardScenes.get(code);
+        if (scene) this.maybeScheduleWizardDisplayFallback(code, scene);
+      }
       if (!this.displays.size && this.heartbeat) {
         clearInterval(this.heartbeat);
         this.heartbeat = null;
@@ -376,9 +384,15 @@ export class ChessServer {
       if (previousCode && previousCode !== code) {
         display.roomCode = null;
         this.reap(previousCode);
+        const scene = this.wizardScenes.get(previousCode);
+        if (scene) this.maybeScheduleWizardDisplayFallback(previousCode, scene);
       }
       display.authenticatedRoomCode = code;
-      if (display.roomCode === code) this.onDisplayAuthenticated?.(display.ws);
+      if (display.roomCode === code) {
+        this.onDisplayAuthenticated?.(display.ws);
+        const scene = this.wizardScenes.get(code);
+        if (scene) this.cancelWizardDisplayFallback(scene);
+      }
       return;
     }
     if (message.type === 'spectate') {
@@ -400,7 +414,13 @@ export class ChessServer {
       display.roomCode = code;
       display.locale = resolveLocale(message.locale, DEFAULT_LOCALE);
       this.cancelResultReconnect(code);
-      if (previousCode && previousCode !== code) this.reap(previousCode);
+      if (previousCode && previousCode !== code) {
+        this.reap(previousCode);
+        const oldScene = this.wizardScenes.get(previousCode);
+        if (oldScene) this.maybeScheduleWizardDisplayFallback(previousCode, oldScene);
+      }
+      const scene = this.wizardScenes.get(code);
+      if (scene) this.cancelWizardDisplayFallback(scene);
       if (display.authenticatedRoomCode === code) this.onDisplayAuthenticated?.(display.ws);
       this.onDisplayRegistered?.(display.ws, code);
       this.flush(room);
@@ -412,7 +432,11 @@ export class ChessServer {
       const code = display.roomCode;
       display.roomCode = null;
       display.authenticatedRoomCode = null;
-      if (code) this.reap(code);
+      if (code) {
+        this.reap(code);
+        const scene = this.wizardScenes.get(code);
+        if (scene) this.maybeScheduleWizardDisplayFallback(code, scene);
+      }
       return;
     }
     if (message.type === 'display_wizard_skip') {
@@ -430,6 +454,23 @@ export class ChessServer {
         return;
       }
       this.skipWizardScene(code, scene);
+      return;
+    }
+    if (message.type === 'display_wizard_progress') {
+      const code = chessRoomCode(message.roomCode);
+      if (!code || !this.displayAuthorizedForRoom(display, code)) {
+        this.send(display, { type: 'error', code: 'bad_display_auth', message: 'Display is not viewing this room.' });
+        return;
+      }
+      const scene = this.wizardScenes.get(code);
+      const cursor = message.cursor;
+      if (!scene || !this.isCurrentWizardScene(code, scene) || scene.snapshot.phase !== 'story'
+        || !Number.isSafeInteger(message.sceneId) || message.sceneId !== scene.snapshot.id
+        || typeof cursor !== 'number' || !Number.isSafeInteger(cursor)
+        || cursor < 0 || cursor > WIZARD_CHESS_DIALOGUE.length) return;
+      if (cursor > (scene.snapshot.dialogueCursor ?? 0)) {
+        scene.snapshot = { ...scene.snapshot, dialogueCursor: cursor };
+      }
       return;
     }
     if (message.type === 'display_replay') {
@@ -487,6 +528,10 @@ export class ChessServer {
       && Boolean(binding?.connected) && !this.stationReplayForbidden(code);
   }
 
+  private hasLiveWizardDisplay(code: string): boolean {
+    return [...this.displays].some(display => this.displayAuthorizedForRoom(display, code));
+  }
+
   private displayAuthorizedForRoom(display: DisplayConnection, code: string): boolean {
     return display.roomCode === code && display.ws.readyState === WebSocket.OPEN
       && (!this.requiresDisplayAuth(code) || display.authenticatedRoomCode === code);
@@ -520,11 +565,12 @@ export class ChessServer {
     }
     this.cancelComputer(code);
     const now = Date.now();
+    const hasDisplay = this.hasLiveWizardDisplay(code);
     const scene: WizardSceneRuntime = {
       room, gameId: room.state().gameId, callSid,
       snapshot: { id: this.nextWizardSceneId++, phase: 'story', startedAt: now,
-        readyAt: null, resolvedAt: null },
-      storyTimer: null, resolvedTimer: null, orphanTimer: null,
+        readyAt: null, resolvedAt: null, dialogueCursor: 0 },
+      storyTimer: null, displayTimer: null, resolvedTimer: null, orphanTimer: null,
     };
     let used = this.wizardUsedCallSids.get(code);
     if (!used) { used = new Set(); this.wizardUsedCallSids.set(code, used); }
@@ -535,10 +581,13 @@ export class ChessServer {
     }, WIZARD_CHESS_STORY_DURATION_MS);
     timer.unref?.();
     scene.storyTimer = timer;
+    if (!hasDisplay) this.maybeScheduleWizardDisplayFallback(code, scene);
     this.pushState(code);
-    return this.wizardResult(code, 'wizard_started', locale === 'pt-BR'
-      ? 'O xadrez bruxo começou na tela. Aguarde sua vez de jogar.'
-      : 'Wizard chess is playing on screen. Wait for your turn.');
+    // An attended screen supplies the narration. If it is missing, acknowledge
+    // the caller now and quickly switch to the phone-guided move instead of silence.
+    return this.wizardResult(code, 'wizard_started', hasDisplay ? '' : locale === 'pt-BR'
+      ? 'Tela sem conexão. Avisarei sua vez.'
+      : 'Screen offline. I’ll cue your move.');
   }
 
   private handleWizardSceneCommand(code: string, scene: WizardSceneRuntime, spoken: string,
@@ -619,6 +668,7 @@ export class ChessServer {
     if (!this.isCurrentWizardScene(code, scene) || scene.snapshot.phase !== 'story') return false;
     if (scene.storyTimer) clearTimeout(scene.storyTimer);
     scene.storyTimer = null;
+    this.cancelWizardDisplayFallback(scene);
     scene.snapshot = { ...scene.snapshot, phase: 'ready', readyAt: Date.now() };
     this.maybeScheduleWizardOrphan(code, scene);
     this.pushState(code);
@@ -630,6 +680,23 @@ export class ChessServer {
     return this.wizardScenes.get(code) === scene && this.rooms.get(code) === scene.room
       && scene.room.state().gameId === scene.gameId
       && (!binding || binding.callSid === scene.callSid);
+  }
+
+  private maybeScheduleWizardDisplayFallback(code: string, scene: WizardSceneRuntime): void {
+    if (scene.snapshot.phase !== 'story' || scene.displayTimer || this.hasLiveWizardDisplay(code)) return;
+    const timer = setTimeout(() => {
+      scene.displayTimer = null;
+      if (!this.isCurrentWizardScene(code, scene) || scene.snapshot.phase !== 'story'
+        || this.hasLiveWizardDisplay(code)) return;
+      this.skipWizardScene(code, scene);
+    }, CHESS_WIZARD_DISPLAY_GRACE_MS);
+    timer.unref?.();
+    scene.displayTimer = timer;
+  }
+
+  private cancelWizardDisplayFallback(scene: WizardSceneRuntime): void {
+    if (scene.displayTimer) clearTimeout(scene.displayTimer);
+    scene.displayTimer = null;
   }
 
   private maybeScheduleWizardOrphan(code: string, scene: WizardSceneRuntime): void {
@@ -659,6 +726,7 @@ export class ChessServer {
     const scene = this.wizardScenes.get(code);
     if (!scene) return;
     if (scene.storyTimer) clearTimeout(scene.storyTimer);
+    this.cancelWizardDisplayFallback(scene);
     if (scene.resolvedTimer) clearTimeout(scene.resolvedTimer);
     if (scene.orphanTimer) clearTimeout(scene.orphanTimer);
     this.wizardScenes.delete(code);

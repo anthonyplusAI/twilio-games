@@ -2,8 +2,10 @@ import { Chess } from 'chess.js';
 import { describe, expect, it } from 'vitest';
 import {
   isWizardChessTrigger, parseWizardChessVoiceAction,
-  WIZARD_CHESS_CHARACTERS, WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_PRE_RON_FEN,
-  WIZARD_CHESS_SEQUENCE, WIZARD_CHESS_VOICE_IDS,
+  WIZARD_CHESS_CHARACTERS, WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_FINALE_CUES,
+  WIZARD_CHESS_PHONE_RECAP_AT_MS, WIZARD_CHESS_PRE_RON_FEN,
+  WIZARD_CHESS_RESOLVED_DURATION_MS, WIZARD_CHESS_SEQUENCE,
+  WIZARD_CHESS_VICTORY_AT_MS, WIZARD_CHESS_VOICE_IDS,
 } from '../shared/wizard-chess-scene';
 import { wizardPositionAfterMoves } from '../client/chess/wizard-scene-state';
 
@@ -38,18 +40,49 @@ describe('wizard chess scene', () => {
   it('plays the requested sacrifice exchange and leaves Ron’s move for the caller', () => {
     expect(WIZARD_CHESS_DIALOGUE.map(line => [line.speaker, line.text['en-US']])).toEqual([
       ['harry', 'Wait a minute!'],
-      ['ron', 'You understand why, Harry? Once I make my move, the queen will take me. Then you’re free to check the king.'],
+      ['ron', 'You understand why, Harry?'],
+      ['ron', 'Once I make my move, the queen will take me.'],
+      ['ron', 'Then you’re free to check the king.'],
       ['harry', 'No. Ron, no!'],
       ['hermione', 'What is it?'],
       ['harry', 'He’s going to sacrifice himself.'],
       ['hermione', 'No, you can’t! There must be another way.'],
-      ['ron', 'Do you want to stop Snape from getting that stone or not? Harry, it’s you that has to go on. I know it. Not me. Not Hermione. You.'],
+      ['ron', 'Do you want to stop Snape from getting that stone or not?'],
+      ['ron', 'Harry, it’s you that has to go on.'],
+      ['ron', 'I know it.'],
+      ['ron', 'Not me.'],
+      ['ron', 'Not Hermione.'],
+      ['ron', 'You.'],
     ]);
+    expect(WIZARD_CHESS_DIALOGUE.map(line => line.atMs)).toEqual(
+      [...WIZARD_CHESS_DIALOGUE.map(line => line.atMs)].sort((a, b) => a - b));
+    expect(WIZARD_CHESS_DIALOGUE.every(line => line.pauseAfterMs >= 250)).toBe(true);
+    expect(WIZARD_CHESS_DIALOGUE.some(line => line.pauseAfterMs >= 1_000)).toBe(true);
+    expect(WIZARD_CHESS_DIALOGUE.every(line => !/\b(?:knight to H3|H3)\b/i.test(line.text['en-US']))).toBe(true);
     for (const line of WIZARD_CHESS_DIALOGUE) {
       expect(line.id).toBeTruthy();
       expect(line.text['en-US']).toBeTruthy();
       expect(line.text['pt-BR']).toBeTruthy();
     }
+  });
+
+  it('reserves Ron’s cry and Harry’s reactions for the post-command finale', () => {
+    expect(WIZARD_CHESS_FINALE_CUES.map(cue => [cue.id, cue.speaker, cue.text['en-US']])).toEqual([
+      ['ron-scream', 'ron', 'AHHHH!'],
+      ['harry-ron', 'harry', 'Ron!'],
+      ['harry-checkmate', 'harry', 'Checkmate.'],
+    ]);
+    const allIds = [...WIZARD_CHESS_DIALOGUE, ...WIZARD_CHESS_FINALE_CUES].map(cue => cue.id);
+    expect(new Set(allIds).size).toBe(allIds.length);
+    const [, queenCapture, , , finalMove] = WIZARD_CHESS_SEQUENCE;
+    expect(WIZARD_CHESS_FINALE_CUES[0]!.atMs).toBeGreaterThan(queenCapture!.atMs);
+    expect(WIZARD_CHESS_FINALE_CUES[0]!.atMs).toBeLessThan(queenCapture!.atMs + 1_230);
+    expect(WIZARD_CHESS_FINALE_CUES[1]!.atMs).toBeGreaterThan(WIZARD_CHESS_FINALE_CUES[0]!.atMs);
+    expect(WIZARD_CHESS_FINALE_CUES[2]!.atMs).toBeLessThan(finalMove!.atMs);
+    expect(WIZARD_CHESS_VICTORY_AT_MS).toBeGreaterThan(finalMove!.atMs + 1_230);
+    expect(WIZARD_CHESS_PHONE_RECAP_AT_MS).toBeGreaterThan(WIZARD_CHESS_VICTORY_AT_MS);
+    expect(WIZARD_CHESS_RESOLVED_DURATION_MS - WIZARD_CHESS_PHONE_RECAP_AT_MS)
+      .toBeGreaterThanOrEqual(12_000);
   });
 
   it('recognizes natural summons and the one spoken final move without mistaking questions for commands', () => {

@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ChessServer } from '../server/chess-server';
+import { ChessServer, CHESS_WIZARD_DISPLAY_GRACE_MS } from '../server/chess-server';
 import { ChessVoiceSession, type ChessVoiceInterpretContext } from '../server/chess-voice';
 import type { VoiceInterpretResult } from '../server/voice-interpreter';
-import { WIZARD_CHESS_RESOLVED_DURATION_MS,
+import { WIZARD_CHESS_PHONE_RECAP_AT_MS, WIZARD_CHESS_RESOLVED_DURATION_MS,
   WIZARD_CHESS_STORY_DURATION_MS, WIZARD_CHESS_VICTORY_AT_MS } from '../shared/wizard-chess-scene';
 
 let server: ChessServer | null = null;
@@ -40,6 +40,142 @@ function harness(interpret?: (spoken: string, context: ChessVoiceInterpretContex
 }
 
 describe('wizard scene Conversation Relay routing', () => {
+  it('acts on a clear conversational H3 move without waiting for the semantic model', () => {
+    const interpret = vi.fn(async () => ({ kind: 'none' as const }));
+    const game = harness(interpret);
+    game.prompt('wizard chess');
+    game.prompt('skip to the move');
+    game.prompt('I think Ron should move his knight to H3');
+    expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('resolved');
+    expect(interpret).not.toHaveBeenCalled();
+    expect(game.calls.at(-1)).toBe('knight to H3');
+  });
+
+  it('lets an impatient caller skip the dialogue conversationally without playing H3 early', async () => {
+    const game = harness(async () => ({ kind: 'action', actionId: 'wizard_skip' }));
+    game.prompt('wizard chess');
+    game.prompt('Could we jump ahead to the move now?');
+    await game.session.whenSpeechSettled();
+    expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('ready');
+    expect(game.calls).toEqual(['wizard chess', 'skip to move']);
+  });
+
+  it('accepts a skip after a separate complaint about waiting, but not a negated skip', () => {
+    const game = harness();
+    game.prompt('wizard chess');
+    game.prompt('Don’t skip the story, I want to watch.');
+    expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('story');
+    game.prompt('I don’t want to wait any longer; please skip to the move.');
+    expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('ready');
+  });
+
+  it('uses scene-grounded interpretation for a conversational request to leave', async () => {
+    const game = harness(async () => ({ kind: 'action', actionId: 'wizard_exit' }));
+    game.prompt('wizard chess');
+    game.prompt('I would rather play regular chess now');
+    await game.session.whenSpeechSettled();
+    expect(game.server.snapshot('WIZ')?.wizardScene).toBeNull();
+    expect(game.calls).toEqual(['wizard chess', 'exit wizard chess']);
+  });
+
+  it('treats an explicit skip-and-move request as a skip, then waits for the caller move', () => {
+    const game = harness();
+    game.prompt('wizard chess');
+    game.prompt('Skip ahead and move Ron’s knight to H3');
+    expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('ready');
+    expect(game.calls).toEqual(['wizard chess', 'skip to move']);
+    game.prompt('knight to H3');
+    expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('resolved');
+  });
+
+  it('announces a move cue when the screen advances, including displayless fallback', () => {
+    vi.useFakeTimers();
+    const game = harness();
+    game.prompt('wizard chess');
+    expect(game.speech.at(-1)?.line).toMatch(/screen.*offline|display.*reconnect/i);
+    vi.advanceTimersByTime(CHESS_WIZARD_DISPLAY_GRACE_MS - 1);
+    expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('story');
+    vi.advanceTimersByTime(1_000);
+    expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('ready');
+    expect(game.speech.at(-1)?.line).toMatch(/your turn.*Ron/i);
+  });
+
+  it('announces a display-driven ready cue only once while leaving unrelated story talk quiet', () => {
+    vi.useFakeTimers();
+    const game = harness();
+    game.prompt('wizard chess');
+    const before = game.speech.length;
+    game.prompt('Don’t skip the scene; I want to watch.');
+    expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('story');
+    expect(game.speech).toHaveLength(before);
+    game.server.voiceCommand('WIZ', 'CA-voice', 'skip to move', 'en-US');
+    vi.advanceTimersByTime(1_000);
+    expect(game.speech).toHaveLength(before + 1);
+    expect(game.speech.at(-1)?.line).toMatch(/your turn.*Ron/i);
+    vi.advanceTimersByTime(1_000);
+    expect(game.speech).toHaveLength(before + 1);
+  });
+
+  it('keeps the phone quiet during the finale and avoids a second exit reply after reset', () => {
+    const game = harness();
+    game.server.setOnRoomEvents((_code, events) => game.session.onRoomEvents(events));
+    game.prompt('wizard chess');
+    game.prompt('skip to the move');
+    game.prompt('knight to H3');
+    const before = game.speech.length;
+    game.prompt('What powered that move?');
+    expect(game.speech).toHaveLength(before);
+    game.prompt('exit wizard chess');
+    expect(game.server.snapshot('WIZ')?.wizardScene).toBeNull();
+    expect(game.speech.slice(before).map(item => item.line)).toHaveLength(1);
+    expect(game.speech.at(-1)?.line).toMatch(/welcome to voice chess/i);
+  });
+
+  it('answers a technology question after the victory reveal without speaking over the action', async () => {
+    vi.useFakeTimers();
+    const game = harness(async () => ({ kind: 'answer', factId: 'wizard_technology' }));
+    game.prompt('wizard chess');
+    game.prompt('skip to the move');
+    game.prompt('knight to H3');
+    const before = game.speech.length;
+    game.prompt('How does Conversation Relay work here?');
+    await game.session.whenSpeechSettled();
+    expect(game.speech).toHaveLength(before);
+    vi.advanceTimersByTime(WIZARD_CHESS_VICTORY_AT_MS);
+    game.prompt('How does Conversation Relay work here?');
+    await game.session.whenSpeechSettled();
+    expect(game.speech.at(-1)?.line).toMatch(/conversation relay transcribed h three/i);
+  });
+
+  it('delivers a late-reconnect recap after reset rather than cutting it off at the countdown', () => {
+    vi.useFakeTimers();
+    const game = harness();
+    game.prompt('wizard chess');
+    game.prompt('skip to the move');
+    game.prompt('knight to H3');
+    game.session.handleReplaced();
+    game.server.voiceSetConnected('WIZ', 'CA-voice', false);
+    vi.advanceTimersByTime(WIZARD_CHESS_PHONE_RECAP_AT_MS + 1_000);
+
+    const reconnectedSpeech: string[] = [];
+    const resumed = new ChessVoiceSession({
+      bind: (code, name, callSid, locale) => game.server.voiceJoin(code, name, callSid, locale),
+      leave: (code, _playerId, callSid) => game.server.voiceLeave(code, callSid),
+      command: (code, callSid, text, locale) => game.server.voiceCommand(code, callSid, text, locale),
+      restart: (code, callSid) => game.server.voiceRestart(code, callSid),
+      snapshot: code => game.server.snapshot(code),
+      say: line => { reconnectedSpeech.push(line); },
+    });
+    game.server.setOnRoomEvents((_code, events) => resumed.onRoomEvents(events));
+    resumed.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-voice',
+      customParameters: { roomCode: 'WIZ', locale: 'en-US' } }));
+    expect(reconnectedSpeech).toHaveLength(1);
+    vi.advanceTimersByTime(WIZARD_CHESS_RESOLVED_DURATION_MS - WIZARD_CHESS_PHONE_RECAP_AT_MS - 1_000);
+    expect(reconnectedSpeech[1]).toMatch(/checkmate.*conversation relay/i);
+    expect(reconnectedSpeech[2]).toMatch(/welcome to voice chess/i);
+    resumed.handleReplaced();
+  });
+
   it('grounds a semantic summon and waits for the screen cue before interpreting Ron’s move', async () => {
     const contexts: ChessVoiceInterpretContext[] = [];
     const game = harness(async (_spoken, context) => {
@@ -61,10 +197,9 @@ describe('wizard scene Conversation Relay routing', () => {
     expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('ready');
     game.prompt('I think Ron should move his knight to H3');
     await game.session.whenSpeechSettled();
-    expect(contexts[1]).toMatchObject({ wizardAvailable: false,
-      wizardScene: { phase: 'ready' }, legalMoves: [] });
+    expect(contexts).toHaveLength(1); // A clear H3 command does not wait for the model.
     expect(game.calls).toEqual(['wizard chess', 'Ron should take the brave path now',
-      'skip to the move', 'knight to H3']);
+      'skip to move', 'knight to H3']);
     expect(game.server.snapshot('WIZ')).toMatchObject({ fen: ordinaryFen,
       wizardScene: { phase: 'resolved' }, phase: 'playing', result: null });
   });
@@ -74,7 +209,7 @@ describe('wizard scene Conversation Relay routing', () => {
     const game = harness(() => new Promise(resolve => { answer = resolve; }));
     game.prompt('wizard chess');
     const intro = game.speech[0]!;
-    expect(game.speech).toHaveLength(1); // Harry's first screen line starts immediately.
+    expect(game.speech).toHaveLength(2); // The displayless fallback adds one phone cue.
     expect(intro.guard?.()).toBe(false);
 
     game.prompt('skip to the move');
@@ -83,7 +218,7 @@ describe('wizard scene Conversation Relay routing', () => {
     expect(game.server.snapshot('WIZ')?.wizardScene).toBeNull();
     answer({ kind: 'action', actionId: 'wizard_final' });
     await game.session.whenSpeechSettled();
-    expect(game.calls).toEqual(['wizard chess', 'skip to the move', 'exit wizard chess']);
+    expect(game.calls).toEqual(['wizard chess', 'skip to move', 'exit wizard chess']);
     expect(game.server.findRoom('WIZ')!.state()).toMatchObject({ ply: 0, result: null });
   });
 
@@ -115,9 +250,16 @@ describe('wizard scene Conversation Relay routing', () => {
     vi.advanceTimersByTime(WIZARD_CHESS_VICTORY_AT_MS - 1);
     expect(game.speech.some(item => /checkmate/i.test(item.line))).toBe(false);
     vi.advanceTimersByTime(1);
+    expect(game.speech.some(item => /checkmate/i.test(item.line))).toBe(false);
+    vi.advanceTimersByTime(WIZARD_CHESS_PHONE_RECAP_AT_MS - WIZARD_CHESS_VICTORY_AT_MS);
     expect(game.speech.at(-1)?.line).toMatch(/checkmate.*conversation relay/i);
     expect(game.speech.at(-1)?.guard?.()).toBe(true);
-    vi.advanceTimersByTime(WIZARD_CHESS_RESOLVED_DURATION_MS - WIZARD_CHESS_VICTORY_AT_MS);
+    const recap = game.speech.at(-1)!.line;
+    const conservativePlaybackMs = Math.ceil(recap.length / 9 * 1_000)
+      + (recap.match(/[.!?;:]/g)?.length ?? 0) * 180 + 1_500;
+    expect(conservativePlaybackMs).toBeLessThan(WIZARD_CHESS_RESOLVED_DURATION_MS
+      - WIZARD_CHESS_PHONE_RECAP_AT_MS - 1_000);
+    vi.advanceTimersByTime(WIZARD_CHESS_RESOLVED_DURATION_MS - WIZARD_CHESS_PHONE_RECAP_AT_MS);
     expect(game.server.snapshot('WIZ')?.wizardScene).toBeNull();
   });
 
@@ -212,21 +354,9 @@ describe('wizard scene Conversation Relay routing', () => {
     game.prompt('skip to the move');
     game.prompt('knight to H3');
     game.prompt('exit wizard chess');
-    vi.advanceTimersByTime(WIZARD_CHESS_VICTORY_AT_MS);
+    vi.advanceTimersByTime(WIZARD_CHESS_PHONE_RECAP_AT_MS);
     expect(game.server.snapshot('WIZ')?.wizardScene).toBeNull();
     expect(game.speech.some(item => /checkmate/i.test(item.line))).toBe(false);
-  });
-
-  it('accepts a pending semantic final move once the scene is ready', async () => {
-    let answer!: (decision: VoiceInterpretResult) => void;
-    const game = harness(() => new Promise(resolve => { answer = resolve; }));
-    game.prompt('wizard chess');
-    game.prompt('skip to the move');
-    game.prompt('I think Ron should move his knight to H3');
-    expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('ready');
-    answer({ kind: 'action', actionId: 'wizard_final' });
-    await game.session.whenSpeechSettled();
-    expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('resolved');
   });
 
   it('requires the caller to name H3 even if the semantic model guesses the move', async () => {
@@ -236,7 +366,7 @@ describe('wizard scene Conversation Relay routing', () => {
     game.prompt('Ron should take the brave path now');
     await game.session.whenSpeechSettled();
     expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('ready');
-    expect(game.calls).toEqual(['wizard chess', 'skip to the move']);
+    expect(game.calls).toEqual(['wizard chess', 'skip to move']);
     expect(game.speech.at(-1)?.line).toMatch(/knight move/i);
     game.prompt('Don’t move Ron’s knight to H3');
     await game.session.whenSpeechSettled();
@@ -264,7 +394,8 @@ describe('wizard scene Conversation Relay routing', () => {
       const command = `I think Ron should move his knight to ${square}`;
       game.prompt(command);
       await game.session.whenSpeechSettled();
-      expect(interpreted).toEqual([command]);
+      expect(interpreted).toEqual([]); // Explicit H3 stays on the fast path.
+      expect(game.calls.at(-1)).toBe('knight to H3');
       expect(game.server.snapshot('WIZ')?.wizardScene?.phase).toBe('resolved');
     },
   );

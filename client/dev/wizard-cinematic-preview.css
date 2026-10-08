@@ -1,0 +1,50 @@
+.preview-app{background:#0b1524}
+.preview-app .scene-vignette{background:linear-gradient(180deg,rgba(4,9,18,.62),transparent 19%,transparent 68%,rgba(4,9,18,.66)),radial-gradient(ellipse at center,transparent 48%,rgba(4,9,18,.45))}
+.preview-brand{position:absolute;z-index:8;top:max(22px,env(safe-area-inset-top));left:max(24px,env(safe-area-inset-left));display:flex;align-items:center;gap:11px;pointer-events:none;text-shadow:0 2px 16px #000}
+.preview-brand-mark{color:#f34a64;font-size:32px;line-height:1;text-shadow:0 0 18px #e6405d}
+.preview-brand div{display:flex;flex-direction:column;gap:2px}
+.preview-brand strong{font:800 clamp(20px,2.3vw,30px)/1 "Twilio Sans Display",sans-serif}
+.preview-brand span:not(.preview-brand-mark){color:#efc8a2;font:11px/1.2 "Twilio Sans Mono",monospace}
+.preview-app[data-wizard="active"] .preview-brand{display:none}
+.preview-dock{position:absolute;z-index:10;top:max(82px,calc(env(safe-area-inset-top) + 72px));right:max(22px,env(safe-area-inset-right));width:min(260px,calc(100vw - 44px));padding:17px;border:1px solid rgba(250,214,173,.45);border-top:3px solid #ef3049;border-radius:5px;background:linear-gradient(145deg,rgba(14,25,41,.96),rgba(7,17,31,.94));box-shadow:0 20px 55px rgba(0,0,0,.38);color:#fff7ed;backdrop-filter:blur(14px)}
+.preview-dock-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.preview-eyebrow{color:#f8b9a0;font:700 10px/1.2 "Twilio Sans Mono",monospace;letter-spacing:.12em}
+.preview-toggle{flex:none;padding:2px 0;border:0;background:none;color:#ffe2c4;font:700 10px/1.2 "Twilio Sans Text",sans-serif;cursor:pointer;text-decoration:underline;text-underline-offset:2px}
+.preview-toggle:focus-visible{outline:2px solid #ffcf8c;outline-offset:3px}
+.preview-dock[data-collapsed="true"]{width:auto;max-width:calc(100vw - 44px);padding:10px 12px}
+.preview-dock[data-collapsed="true"] .preview-eyebrow,.preview-dock[data-collapsed="true"] #preview-dock-body{display:none}
+.preview-dock[data-collapsed="true"] .preview-toggle{font-size:11px;text-decoration:none}
+.preview-dock h1{margin:5px 0 8px;font:800 23px/1.05 "Twilio Sans Display",sans-serif}
+.preview-status{min-height:33px;margin:0 0 11px;color:#d9e5f5;font-size:12px;line-height:1.4}
+.preview-actions{display:grid;grid-template-columns:1fr 1fr;gap:7px}
+.preview-actions button{min-height:45px;padding:8px 7px;border:1px solid rgba(225,211,188,.45);border-radius:4px;background:rgba(255,255,255,.08);color:#fff7ec;font:700 11px/1.2 "Twilio Sans Text",sans-serif;cursor:pointer;touch-action:manipulation}
+.preview-actions button:hover{border-color:#ff7285;background:rgba(239,48,73,.24)}
+.preview-actions button:focus-visible{outline:3px solid #ffcf8c;outline-offset:2px}
+.preview-actions button:disabled{opacity:.45;cursor:default}
+.preview-actions #preview-move{border-color:#ff6176;background:#a92a42}
+.preview-actions #preview-move:hover{background:#d13852}
+.preview-note{margin:12px 0 0;padding-top:11px;border-top:1px solid rgba(225,211,188,.26);color:#bccbdc;font-size:10px;line-height:1.35}
+.preview-note code{color:#ffe6ba;font:10px "Twilio Sans Mono",monospace;overflow-wrap:anywhere}
+.preview-app .wizard-credits-link{display:none}
+.preview-app #wizard-scene-countdown{display:none!important}
+.preview-app .wizard-scene-controls,
+.preview-app .wizard-scene:has(#wizard-move-hint:not([hidden])) .wizard-scene-controls{top:max(18px,env(safe-area-inset-top));right:auto;left:max(24px,env(safe-area-inset-left))}
+@media(max-width:760px){
+  .preview-brand{top:10px;left:12px;gap:7px}
+  .preview-brand-mark{font-size:25px}
+  .preview-brand strong{font-size:18px}
+  .preview-brand span:not(.preview-brand-mark){font-size:9px}
+  .preview-dock{top:55px;right:10px;width:min(250px,calc(100vw - 20px));padding:10px}
+  .preview-dock h1{font-size:17px;margin:3px 0 5px}
+  .preview-status{min-height:0;margin:0 0 6px;font-size:10px}
+  .preview-actions{gap:5px}
+  .preview-actions button{min-height:38px;padding:5px;font-size:10px}
+  .preview-note{margin:7px 0 0;padding-top:7px;font-size:9px}
+  .preview-app .wizard-scene-controls,
+  .preview-app .wizard-scene:has(#wizard-move-hint:not([hidden])) .wizard-scene-controls{top:10px;left:10px}
+}
+@media(max-width:480px){
+  .preview-dock{top:53px;width:calc(100vw - 20px)}
+  .preview-note{display:none}
+  .preview-dock[data-collapsed="true"]{width:auto}
+}
