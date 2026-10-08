@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { HttpServer } from '../server/http-server';
 import { WizardChessAudioError, WizardChessAudioService } from '../server/wizard-chess-audio';
-import { WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_VOICE_IDS } from '../shared/wizard-chess-scene';
+import { WIZARD_CHESS_AUDIO_CUES, WIZARD_CHESS_DIALOGUE,
+  WIZARD_CHESS_FINALE_CUES, WIZARD_CHESS_VOICE_IDS } from '../shared/wizard-chess-scene';
 
 const ronLine = WIZARD_CHESS_DIALOGUE.find(line => line.speaker === 'ron')!;
 let server: HttpServer | null = null;
@@ -87,6 +88,27 @@ describe('Wizard Chess screen narration', () => {
     expect(await second).toBe(await first);
     expect(await audio.get(ronLine.id, 'en-US')).toBe(await first);
     expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
+  it('serves the three separate finale reactions from the matching character voices and disk cache', async () => {
+    const cacheDir = await temporaryCacheDirectory();
+    const upstream = vi.fn(async (_url: string, init?: RequestInit) =>
+      upstreamAudio(`ID3cue:${JSON.parse(String(init?.body)).text}`)) as unknown as typeof fetch;
+    const original = new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream, cacheDir });
+    for (const cue of WIZARD_CHESS_FINALE_CUES) {
+      expect((await original.get(cue.id, 'en-US')).toString()).toBe(`ID3cue:${cue.text['en-US']}`);
+      const [url, init] = vi.mocked(upstream).mock.calls.at(-1)!;
+      expect(url).toContain(`/text-to-speech/${WIZARD_CHESS_VOICE_IDS[cue.speaker]}`);
+      expect(JSON.parse(String(init?.body))).toMatchObject({ text: cue.text['en-US'] });
+    }
+    await vi.waitFor(async () => expect((await readdir(cacheDir)).filter(name => name.endsWith('.mp3')))
+      .toHaveLength(WIZARD_CHESS_FINALE_CUES.length));
+    const offline = vi.fn(async () => { throw new Error('provider should not be called'); }) as unknown as typeof fetch;
+    const restarted = new WizardChessAudioService({ apiKey: 'disabled', fetchImpl: offline, cacheDir });
+    for (const cue of WIZARD_CHESS_FINALE_CUES) {
+      expect((await restarted.get(cue.id, 'en-US')).toString()).toBe(`ID3cue:${cue.text['en-US']}`);
+    }
+    expect(offline).not.toHaveBeenCalled();
   });
 
   it('reuses downloaded scene audio across server instances even when the key is later unavailable', async () => {
@@ -210,11 +232,14 @@ describe('Wizard Chess screen narration', () => {
 
     await audio.prewarm();
 
-    expect(upstream).toHaveBeenCalledTimes(WIZARD_CHESS_DIALOGUE.length);
+    expect(upstream).toHaveBeenCalledTimes(WIZARD_CHESS_AUDIO_CUES.length);
+    expect(new Set(vi.mocked(upstream).mock.calls.map(([, init]) =>
+      JSON.parse(String(init?.body)).text as string)))
+      .toEqual(new Set(WIZARD_CHESS_AUDIO_CUES.map(cue => cue.text['en-US'])));
     expect(peak).toBeLessThanOrEqual(2);
     expect(peak).toBeGreaterThan(1);
     await audio.prewarm();
-    expect(upstream).toHaveBeenCalledTimes(WIZARD_CHESS_DIALOGUE.length);
+    expect(upstream).toHaveBeenCalledTimes(WIZARD_CHESS_AUDIO_CUES.length);
   });
 
   it('continues warming later lines when one earlier voice is slow', async () => {
@@ -374,11 +399,16 @@ describe('Wizard Chess screen narration', () => {
     expect(await response.text()).toBe('MP3DATA');
     expect(JSON.parse(String(vi.mocked(upstream).mock.calls[0]![1]!.body)).text)
       .toBe(ronLine.text['pt-BR']);
+    const finale = WIZARD_CHESS_FINALE_CUES[0]!;
+    const finaleResponse = await fetch(`${base}/api/chess/wizard-audio/${finale.id}?locale=en-US`);
+    expect(finaleResponse.status).toBe(200);
+    expect(JSON.parse(String(vi.mocked(upstream).mock.calls[1]![1]!.body)).text)
+      .toBe(finale.text['en-US']);
     const missing = await fetch(`${base}/api/chess/wizard-audio/custom-input?locale=en-US`);
     expect(missing.status).toBe(404);
     const invalidLocale = await fetch(`${base}/api/chess/wizard-audio/${ronLine.id}?locale=fr-FR`);
     expect(invalidLocale.status).toBe(400);
-    expect(upstream).toHaveBeenCalledTimes(1);
+    expect(upstream).toHaveBeenCalledTimes(2);
     expect(JSON.stringify(await missing.json())).not.toContain('private-test-key');
   });
 

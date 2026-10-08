@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#121b2a" />
+  <link rel="icon" href="data:," />
+  <link rel="stylesheet" href="../chess/chess.css" />
+  <link rel="stylesheet" href="../chess/wizard-cinema.css" />
+  <link rel="stylesheet" href="./wizard-cinematic-preview.css" />
+  <title>Wizard Chess · Local cinematic preview</title>
+</head>
+<body data-renderer="three">
+  <main id="app" class="chess-app preview-app">
+    <div id="board-stage" class="board-stage" aria-hidden="true"></div>
+    <div class="scene-vignette" aria-hidden="true"></div>
+
+    <header class="preview-brand">
+      <span class="preview-brand-mark" aria-hidden="true">✦</span>
+      <div><strong>Wizard Chess</strong><span>Cinematic scene preview · local only</span></div>
+    </header>
+
+    <section id="wizard-scene" class="wizard-scene" aria-labelledby="wizard-scene-title" hidden>
+      <div class="wizard-scene-shade" aria-hidden="true"></div>
+      <div class="wizard-scene-shell">
+        <div class="wizard-scene-heading">
+          <span class="wizard-scene-crest" aria-hidden="true">✦</span>
+          <h2 id="wizard-scene-title" tabindex="-1">The Wizard Chess chamber</h2>
+        </div>
+        <div class="wizard-scene-controls">
+          <button id="wizard-sound-toggle" class="wizard-sound-toggle" type="button" aria-label="Screen voices" aria-pressed="false">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4Z" /><path class="wizard-sound-waves" d="M16 8a6 6 0 0 1 0 8m2-11a10 10 0 0 1 0 14" /><path class="wizard-sound-slash" d="m4 4 16 16" /></svg>
+            <span>Screen voices</span>
+          </button>
+          <button id="wizard-skip-button" class="wizard-skip-button" type="button">Skip story</button>
+        </div>
+        <div id="wizard-transcript" class="wizard-transcript" role="log" aria-label="Character conversation" aria-live="polite" aria-relevant="additions" tabindex="0"></div>
+        <p id="wizard-move-hint" class="wizard-move-hint" role="status" aria-live="polite" tabindex="-1" hidden></p>
+        <div id="wizard-scene-victory" class="wizard-scene-victory" role="status" aria-live="polite" tabindex="-1" hidden>
+          <span class="wizard-victory-mark" aria-hidden="true">✦</span>
+          <div><h3>The chamber is won</h3><p>The path ahead is open.</p></div>
+        </div>
+        <p id="wizard-scene-countdown" class="wizard-scene-countdown" role="timer" aria-live="off" hidden></p>
+      </div>
+    </section>
+
+    <aside id="preview-dock" class="preview-dock" aria-labelledby="preview-title" data-collapsed="false">
+      <div class="preview-dock-head">
+        <span class="preview-eyebrow">LOCAL SCENE PLAYER</span>
+        <button id="preview-toggle" class="preview-toggle" type="button" aria-expanded="true" aria-controls="preview-dock-body">Hide controls</button>
+      </div>
+      <div id="preview-dock-body">
+        <h1 id="preview-title">Watch the scene</h1>
+        <p id="preview-status" class="preview-status" role="status">Board loading…</p>
+        <div class="preview-actions">
+          <button id="preview-story" type="button">Play / replay story</button>
+          <button id="preview-ready" type="button">Jump to your move</button>
+          <button id="preview-move" type="button">Say “Knight to H3”</button>
+          <button id="preview-finale" type="button">Replay finale</button>
+        </div>
+        <p class="preview-note">This page emulates the phone trigger locally. The real Twilio call path is unchanged. For character voices, set <code>ELEVENLABS_API_KEY</code> in the local server process; the GitHub Actions secret is not available locally. Without it, captions and visuals still play.</p>
+      </div>
+    </aside>
+  </main>
+  <script type="module" src="./wizard-cinematic-preview.ts"></script>
+</body>
+</html>

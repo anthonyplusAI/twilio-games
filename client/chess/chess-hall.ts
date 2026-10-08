@@ -21,6 +21,19 @@ const PALETTES = {
   },
 } as const;
 
+// The playable light theme stays bright. Film shots use a cooler chamber so
+// the characters and spell impacts read against the architecture.
+const CINEMATIC_LIGHT = {
+  ...PALETTES.light,
+  sky: 0x526b86, fog: 0x60738b, floor: 0x3c4a5a,
+  floorTile: 0x607185, floorAlternate: 0x40556c,
+  masonry: 0x8293a8, stoneShade: 0x4c6078,
+  glass: 0x3c8db6, seal: 0x9ad7ea,
+  ambientSky: 0xb6cde4, ambientGround: 0x3a4b61,
+  key: 0xd9e9f9, keyIntensity: 1.35, hemiIntensity: 0.94,
+  warmIntensity: 13, coolIntensity: 11,
+} as const;
+
 function pointedShape(width: number, height: number, foot = 0): THREE.Shape {
   const half = width / 2;
   const shoulder = height * 0.71;
@@ -65,7 +78,10 @@ interface CandleField {
 
 /** All scenery is procedural so the playable board needs no network assets. */
 export class ChessHall {
+  private theme: ChessTheme = 'light';
+  private cinematic = false;
   private readonly group = new THREE.Group();
+  private readonly cameraDirection = new THREE.Vector3();
   private readonly walls: HallWall[] = [];
   private readonly candleFields: CandleField[] = [];
   private readonly seals: THREE.Group[] = [];
@@ -139,9 +155,11 @@ export class ChessHall {
   }
 
   setTheme(theme: ChessTheme): void {
-    const palette = PALETTES[theme];
+    this.theme = theme;
+    const palette = theme === 'light' && this.cinematic ? CINEMATIC_LIGHT : PALETTES[theme];
     this.scene.background = new THREE.Color(palette.sky);
-    this.scene.fog = new THREE.FogExp2(palette.fog, theme === 'light' ? 0.009 : 0.018);
+    this.scene.fog = new THREE.FogExp2(palette.fog,
+      theme === 'dark' ? 0.018 : this.cinematic ? 0.012 : 0.009);
     this.floorMat.color.setHex(palette.floor);
     this.floorTileMat.color.setHex(palette.floorTile);
     this.floorAltMat.color.setHex(palette.floorAlternate);
@@ -158,9 +176,9 @@ export class ChessHall {
     this.flameMat.color.setHex(palette.flame);
     this.haloMat.color.setHex(palette.flame);
     this.dustMat.color.setHex(palette.dust);
-    this.floorLinesMat.color.setHex(theme === 'light' ? 0x376987 : 0x80c8e4);
-    this.floorGlowMat.color.setHex(theme === 'light' ? 0x3b9cba : 0x40b4e7);
-    this.floorGlowMat.opacity = theme === 'light' ? 0.20 : 0.31;
+    this.floorLinesMat.color.setHex(theme === 'light' ? this.cinematic ? 0x5f9cb8 : 0x376987 : 0x80c8e4);
+    this.floorGlowMat.color.setHex(theme === 'light' ? this.cinematic ? 0x61bad1 : 0x3b9cba : 0x40b4e7);
+    this.floorGlowMat.opacity = theme === 'light' ? this.cinematic ? 0.16 : 0.20 : 0.31;
     this.windowLightMat.color.setHex(palette.glass);
     this.windowLightMat.opacity = theme === 'light' ? 0.14 : 0.19;
     this.hemi.color.setHex(palette.ambientSky);
@@ -174,11 +192,23 @@ export class ChessHall {
     this.cool.intensity = palette.coolIntensity;
   }
 
+  setCinematic(enabled: boolean): void {
+    if (this.cinematic === enabled) return;
+    this.cinematic = enabled;
+    this.setTheme(this.theme);
+  }
+
   update(now: number, dt: number, camera: THREE.Camera): void {
-    // An open near side keeps the scene grand without scenery covering chess moves.
+    // The playable camera sits outside the chamber; film close-ups sit inside.
+    // In an interior shot, reveal the wall behind the subject along the lens
+    // direction rather than hiding it as the near wall and showing empty sky.
+    camera.getWorldDirection(this.cameraDirection);
     for (const wall of this.walls) {
       const cameraAxis = wall.axis === 'x' ? camera.position.x : camera.position.z;
-      wall.group.visible = wall.sign * cameraAxis < 0;
+      const directionAxis = wall.axis === 'x' ? this.cameraDirection.x : this.cameraDirection.z;
+      wall.group.visible = Math.abs(cameraAxis) < 7.5
+        ? wall.sign * directionAxis > 0.08
+        : wall.sign * cameraAxis < 0;
     }
     for (const candles of this.candleFields) {
       candles.group.visible = candles.direction.dot(camera.position) < 9;

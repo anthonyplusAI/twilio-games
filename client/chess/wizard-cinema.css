@@ -1,0 +1,291 @@
+/* The chamber plays like a scene: the board owns the frame, and one line at a
+   time is captioned over it. Keep the full log in the DOM for screen readers. */
+.wizard-scene,
+html[data-theme="light"] .wizard-scene {
+  --wizard-text: #fff7ec;
+  --wizard-muted: #e8dcc9;
+  --wizard-line: rgba(245, 211, 168, .52);
+  --wizard-accent: #f46a77;
+  --wizard-focus: #ffe09c;
+  color: var(--wizard-text);
+}
+
+.wizard-scene-shade,
+html[data-theme="light"] .wizard-scene-shade {
+  background:
+    linear-gradient(180deg, rgba(2, 5, 12, .66), transparent 22%, transparent 68%, rgba(2, 5, 12, .72)),
+    radial-gradient(ellipse at 50% 45%, transparent 35%, rgba(2, 5, 12, .28) 100%);
+  box-shadow: inset 0 9px rgba(2, 5, 12, .75), inset 0 -9px rgba(2, 5, 12, .75);
+}
+
+.wizard-scene-shell,
+html[data-theme="light"] .wizard-scene-shell {
+  inset: 0;
+  display: block;
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  max-height: none;
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  pointer-events: none;
+}
+
+.wizard-scene-heading {
+  position: absolute;
+  top: clamp(86px, 12vh, 116px);
+  left: max(28px, env(safe-area-inset-left));
+  display: inline-flex;
+  gap: 9px;
+  max-width: min(38vw, 400px);
+  padding: 9px 13px;
+  border: 1px solid rgba(245, 211, 168, .28);
+  border-left: 2px solid var(--wizard-accent);
+  border-radius: 2px;
+  background: rgba(6, 13, 25, .75);
+  box-shadow: 0 8px 25px rgba(0, 0, 0, .2);
+  pointer-events: none;
+}
+.wizard-scene-crest { font-size: 17px; }
+#wizard-scene-title { font-size: clamp(14px, 1.35vw, 18px); line-height: 1.15; }
+
+.wizard-scene-controls {
+  position: absolute;
+  top: clamp(86px, 12vh, 116px);
+  right: max(28px, env(safe-area-inset-right));
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: auto;
+}
+.wizard-scene-controls button,
+html[data-theme="light"] .wizard-scene-controls button {
+  min-height: 40px;
+  border-color: rgba(245, 211, 168, .45);
+  background: rgba(6, 13, 25, .84);
+  color: #fff7ec;
+  box-shadow: 0 8px 25px rgba(0, 0, 0, .18);
+}
+.wizard-scene-controls button:hover {
+  border-color: #ffb3af;
+  background: rgba(78, 30, 42, .92);
+}
+.wizard-scene-controls .wizard-sound-toggle[data-state="blocked"],
+html[data-theme="light"] .wizard-scene-controls .wizard-sound-toggle[data-state="blocked"] {
+  border: 2px solid #ffe09c;
+  background: #764214;
+  color: #fff9e9;
+}
+.wizard-scene-controls .wizard-sound-toggle[data-state="unavailable"],
+html[data-theme="light"] .wizard-scene-controls .wizard-sound-toggle[data-state="unavailable"] {
+  border-color: #f7a0a0;
+  background: #552b37;
+  color: #fff0f0;
+}
+.wizard-scene-controls .wizard-sound-toggle[data-state="partial"],
+html[data-theme="light"] .wizard-scene-controls .wizard-sound-toggle[data-state="partial"] {
+  border-color: #f9cb81;
+  background: #4d3928;
+  color: #fff3db;
+}
+.wizard-credits-link {
+  top: clamp(138px, calc(12vh + 52px), 168px);
+  right: max(28px, env(safe-area-inset-right));
+  min-height: 32px;
+  padding: 5px 9px;
+  border-color: rgba(245, 211, 168, .38);
+  background: rgba(6, 13, 25, .76);
+  color: #f8e8d2;
+}
+
+.wizard-transcript {
+  position: absolute;
+  right: 24px;
+  bottom: max(46px, calc(env(safe-area-inset-bottom) + 24px));
+  left: 24px;
+  display: block;
+  width: min(780px, calc(100vw - 48px));
+  height: auto;
+  max-height: 34vh;
+  min-height: 0;
+  margin: 0 auto;
+  padding: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+.wizard-transcript > [data-speaker]:not([data-current="true"]) {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+  animation: none;
+}
+.wizard-transcript > [data-speaker][data-current="true"],
+html[data-theme="light"] .wizard-transcript > [data-speaker][data-current="true"] {
+  padding: 15px 22px 17px;
+  border: 1px solid rgba(250, 225, 188, .46);
+  border-left: 4px solid var(--wizard-speaker);
+  border-radius: 3px 12px 12px 3px;
+  background: linear-gradient(105deg, rgba(4, 11, 23, .95), rgba(8, 16, 30, .82));
+  box-shadow: 0 18px 46px rgba(0, 0, 0, .38), inset 0 1px rgba(255, 255, 255, .08);
+  color: #fff7ec;
+  font-size: clamp(18px, 2.15vw, 25px);
+  line-height: 1.32;
+  text-align: left;
+  text-wrap: pretty;
+  animation: wizardSubtitleIn .3s ease-out both;
+}
+.wizard-transcript > [data-speaker="ron" i],
+html[data-theme="light"] .wizard-transcript > [data-speaker="ron" i] { --wizard-speaker: #f8be78; }
+.wizard-transcript > [data-speaker="hermione" i],
+html[data-theme="light"] .wizard-transcript > [data-speaker="hermione" i] { --wizard-speaker: #e0bbff; }
+.wizard-transcript > [data-speaker="harry" i],
+html[data-theme="light"] .wizard-transcript > [data-speaker="harry" i] { --wizard-speaker: #9bdcf5; }
+.wizard-message-speaker {
+  margin-bottom: 5px;
+  color: var(--wizard-speaker);
+  font: 700 11px/1.2 "Twilio Sans Mono", monospace;
+  letter-spacing: .15em;
+  text-transform: uppercase;
+}
+.wizard-scene[data-speaking="true"] .wizard-transcript > [data-current="true"] {
+  border-color: rgba(250, 225, 188, .72);
+  border-left-color: var(--wizard-speaker);
+}
+.wizard-transcript > :not([data-speaker]) { color: #fff7ec; }
+
+.wizard-scene[data-phase="ready"] .wizard-transcript,
+.wizard-scene[data-phase="resolved"]:has(#wizard-scene-victory:not([hidden])) .wizard-transcript {
+  opacity: 0;
+  pointer-events: none;
+}
+.wizard-move-hint {
+  position: absolute;
+  right: 24px;
+  bottom: max(43px, calc(env(safe-area-inset-bottom) + 20px));
+  left: 24px;
+  width: min(600px, calc(100vw - 48px));
+  margin: 0 auto;
+  padding: 16px 20px;
+  border: 1px solid #e5c189;
+  border-left: 4px solid #f9d69a;
+  border-radius: 3px 12px 12px 3px;
+  background: linear-gradient(110deg, rgba(15, 20, 29, .96), rgba(32, 24, 31, .88));
+  box-shadow: 0 18px 46px rgba(0, 0, 0, .42), 0 0 28px rgba(244, 181, 95, .17);
+  color: #fff7e3;
+  font: 700 clamp(17px, 1.8vw, 23px)/1.3 "Twilio Sans Text", sans-serif;
+  text-align: center;
+  pointer-events: auto;
+}
+.wizard-scene-victory,
+html[data-theme="light"] .wizard-scene-victory {
+  position: absolute;
+  right: 24px;
+  bottom: max(74px, calc(env(safe-area-inset-bottom) + 52px));
+  left: 24px;
+  justify-content: center;
+  width: min(560px, calc(100vw - 48px));
+  margin: 0 auto;
+  padding: 19px 22px;
+  border: 1px solid rgba(255, 220, 153, .82);
+  border-top: 3px solid #ffdc99;
+  border-radius: 4px;
+  background: linear-gradient(120deg, rgba(20, 22, 31, .96), rgba(43, 27, 37, .9));
+  box-shadow: 0 22px 60px rgba(0, 0, 0, .5), 0 0 44px rgba(239, 173, 86, .26);
+  color: #fff8e7;
+  pointer-events: auto;
+  animation: wizardVictoryIn .8s cubic-bezier(.14, .85, .2, 1) both;
+}
+.wizard-victory-mark { color: #ffdc99; font-size: 42px; }
+.wizard-scene-victory h3 { font-size: clamp(25px, 3vw, 38px); }
+.wizard-scene-victory p { color: #f2ddba; font-size: 15px; }
+.wizard-scene-countdown {
+  position: absolute;
+  right: 24px;
+  bottom: max(42px, calc(env(safe-area-inset-bottom) + 20px));
+  left: 24px;
+  margin: 0 auto;
+  color: #fff1d9;
+  font-size: 12px;
+  text-align: center;
+  text-shadow: 0 2px 10px #000;
+}
+
+@keyframes wizardSubtitleIn {
+  from { opacity: 0; transform: translateY(13px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes wizardVictoryIn {
+  from { opacity: 0; transform: translateY(24px) scale(.94); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@media (max-width: 720px) {
+  .wizard-scene:has(#wizard-move-hint:not([hidden])) .wizard-scene-shell {
+    inset: 0;
+    height: 100%;
+    max-height: none;
+  }
+  .wizard-scene-heading { top: 62px; left: 10px; max-width: 45vw; padding: 7px 9px; }
+  .wizard-scene:has(#wizard-move-hint:not([hidden])) .wizard-scene-heading {
+    min-height: 0;
+    padding-right: 9px;
+  }
+  #wizard-scene-title { font-size: 12px; }
+  .wizard-scene-crest { font-size: 14px; }
+  .wizard-scene-controls,
+  .wizard-scene:has(#wizard-move-hint:not([hidden])) .wizard-scene-controls {
+    top: 60px;
+    right: max(10px, env(safe-area-inset-right));
+    gap: 5px;
+  }
+  .wizard-scene-controls button { min-height: 38px; padding: 6px 8px; font-size: 11px; }
+  .wizard-credits-link { top: 110px; right: 10px; min-height: 30px; font-size: 10px; }
+  .wizard-transcript { right: 12px; bottom: 19px; left: 12px; width: calc(100vw - 24px); max-height: 33dvh; }
+  .wizard-transcript > [data-speaker][data-current="true"] { padding: 11px 14px 13px; font-size: clamp(15px, 4vw, 20px); }
+  .wizard-message-speaker { margin-bottom: 3px; font-size: 10px; }
+  .wizard-move-hint { right: 12px; bottom: 19px; left: 12px; width: calc(100vw - 24px); padding: 12px 14px; font-size: 16px; }
+  .wizard-scene-victory { right: 12px; bottom: 56px; left: 12px; width: calc(100vw - 24px); padding: 13px; }
+  .wizard-scene-victory h3 { font-size: 24px; }
+  .wizard-scene-victory p { font-size: 12px; }
+  .wizard-scene-countdown { bottom: 22px; }
+}
+@media (max-width: 480px) {
+  .wizard-scene-heading { display: none; }
+  .wizard-scene-controls button { min-height: 36px; }
+  .wizard-sound-toggle { width: 40px; min-width: 40px; padding: 0; }
+  .wizard-sound-toggle span { display: none; }
+  .wizard-scene .wizard-sound-toggle[data-state="blocked"] {
+    width: auto;
+    min-width: 0;
+    max-width: calc(100vw - 125px);
+    padding: 4px 8px;
+  }
+  .wizard-scene .wizard-sound-toggle[data-state="blocked"] span {
+    display: inline;
+    font-size: 10px;
+    line-height: 1.12;
+    white-space: normal;
+  }
+  .wizard-transcript > [data-speaker][data-current="true"] { font-size: 16px; line-height: 1.28; }
+}
+@media (max-height: 560px) and (min-width: 721px) {
+  .wizard-scene-heading, .wizard-scene-controls { top: 64px; }
+  .wizard-credits-link { top: 111px; }
+  .wizard-transcript { bottom: 20px; max-height: 40vh; }
+  .wizard-transcript > [data-speaker][data-current="true"] { padding: 10px 16px; font-size: 18px; }
+  .wizard-move-hint { bottom: 18px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .wizard-transcript > [data-speaker][data-current="true"], .wizard-scene-victory { animation: none; }
+}

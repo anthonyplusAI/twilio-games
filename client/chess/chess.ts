@@ -88,6 +88,7 @@ const wizardScene = new WizardSceneController(locale, {
   },
   setMusicVolume(volume) { music.setVolume(volume); },
   requestSkip(sceneId) { connection?.skipWizard(sceneId); },
+  reportProgress(sceneId, cursor) { connection?.reportWizardProgress(sceneId, cursor); },
 });
 
 let board: ChessBoardScene | null = null;

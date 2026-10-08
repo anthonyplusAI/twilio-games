@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ChessConnection } from '../client/chess/chess-net';
 import type { ChessState, WizardChessSceneSnapshot } from '../shared/chess-protocol';
+import { WIZARD_CHESS_DIALOGUE } from '../shared/wizard-chess-scene';
 
 class MockWebSocket {
   static OPEN = 1;
@@ -47,6 +48,77 @@ afterEach(() => {
 });
 
 describe('ChessConnection wizard scene control', () => {
+  it('resends the highest finished dialogue cursor after reconnect until server state confirms it', () => {
+    const connection = new ChessConnection('ws://chess', 'ROOM', 'display-token', 'en-US');
+    connection.reportWizardProgress(7, 1);
+    connection.reportWizardProgress(7, 2);
+    connection.reportWizardProgress(7, 1);
+    expect(sent(sockets[0]!)).toEqual([]);
+
+    sockets[0]!.open();
+    expect(sent(sockets[0]!)).toEqual([
+      { type: 'display_auth', roomCode: 'ROOM', token: 'display-token' },
+      { type: 'spectate', roomCode: 'ROOM', locale: 'en-US' },
+      { type: 'display_wizard_progress', roomCode: 'ROOM', sceneId: 7, cursor: 2 },
+    ]);
+
+    sockets[0]!.disconnect();
+    vi.advanceTimersByTime(500);
+    sockets[1]!.open();
+    expect(sent(sockets[1]!).at(-1)).toEqual({
+      type: 'display_wizard_progress', roomCode: 'ROOM', sceneId: 7, cursor: 2,
+    });
+    sockets[1]!.message(chessState({ id: 7, phase: 'story', dialogueCursor: 1,
+      startedAt: 0, readyAt: null, resolvedAt: null }));
+    sockets[1]!.disconnect();
+    vi.advanceTimersByTime(500);
+    sockets[2]!.open();
+    expect(sent(sockets[2]!).at(-1)).toEqual({
+      type: 'display_wizard_progress', roomCode: 'ROOM', sceneId: 7, cursor: 2,
+    });
+    sockets[2]!.message(chessState({ id: 7, phase: 'story', dialogueCursor: 2,
+      startedAt: 0, readyAt: null, resolvedAt: null }));
+    sockets[2]!.disconnect();
+    vi.advanceTimersByTime(500);
+    sockets[3]!.open();
+    expect(sent(sockets[3]!)).toEqual([
+      { type: 'display_auth', roomCode: 'ROOM', token: 'display-token' },
+      { type: 'spectate', roomCode: 'ROOM', locale: 'en-US' },
+    ]);
+    connection.close();
+  });
+
+  it('drops stale progress when the server has moved to another Wizard scene', () => {
+    const connection = new ChessConnection('ws://chess', 'ROOM', 'display-token', 'en-US');
+    connection.reportWizardProgress(7, 4);
+    sockets[0]!.open();
+    sockets[0]!.message(chessState({ id: 8, phase: 'story', dialogueCursor: 0,
+      startedAt: 0, readyAt: null, resolvedAt: null }));
+    sockets[0]!.disconnect();
+    vi.advanceTimersByTime(500);
+    sockets[1]!.open();
+    expect(sent(sockets[1]!)).toEqual([
+      { type: 'display_auth', roomCode: 'ROOM', token: 'display-token' },
+      { type: 'spectate', roomCode: 'ROOM', locale: 'en-US' },
+    ]);
+    connection.close();
+  });
+
+  it('does not transmit malformed dialogue progress', () => {
+    const connection = new ChessConnection('ws://chess', 'ROOM', 'display-token', 'en-US');
+    sockets[0]!.open();
+    connection.reportWizardProgress(0, 1);
+    connection.reportWizardProgress(7, -1);
+    connection.reportWizardProgress(7, 1.5);
+    connection.reportWizardProgress(7, WIZARD_CHESS_DIALOGUE.length + 1);
+    connection.reportWizardProgress(Number.MAX_SAFE_INTEGER + 1, 1);
+    expect(sent(sockets[0]!)).toEqual([
+      { type: 'display_auth', roomCode: 'ROOM', token: 'display-token' },
+      { type: 'spectate', roomCode: 'ROOM', locale: 'en-US' },
+    ]);
+    connection.close();
+  });
+
   it('queues a disconnected Skip, resends it after reconnect, and clears it after server acknowledgement', () => {
     const connection = new ChessConnection('ws://chess', 'ROOM', 'display-token', 'en-US');
     connection.skipWizard(7);

@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import type { SupportedLocale } from '../shared/i18n/locales';
 import {
   WIZARD_CHESS_AUDIO_MODEL_ID, WIZARD_CHESS_AUDIO_OUTPUT_FORMAT,
-  WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_VOICE_IDS,
+  WIZARD_CHESS_AUDIO_CUES, WIZARD_CHESS_DIALOGUE,
+  WIZARD_CHESS_FINALE_CUES, WIZARD_CHESS_VOICE_IDS,
 } from '../shared/wizard-chess-scene';
 
 const ELEVENLABS_URL = 'https://api.elevenlabs.io/v1/text-to-speech';
@@ -34,7 +35,7 @@ export class WizardChessAudioError extends Error {
   }
 }
 
-/** Synthesizes only the scene's published lines. The API key never reaches the browser. */
+/** Synthesizes only the scene's fixed story and finale cues. The API key stays on the server. */
 export class WizardChessAudioService {
   private readonly apiKey: string;
   private readonly fetchImpl: typeof fetch;
@@ -54,7 +55,7 @@ export class WizardChessAudioService {
   get configured(): boolean { return Boolean(this.apiKey); }
 
   async get(lineId: string, locale: SupportedLocale): Promise<Buffer> {
-    const line = WIZARD_CHESS_DIALOGUE.find(candidate => candidate.id === lineId);
+    const line = WIZARD_CHESS_AUDIO_CUES.find(candidate => candidate.id === lineId);
     if (!line) throw new WizardChessAudioError(404, 'unknown_line');
     if (locale !== 'en-US' && locale !== 'pt-BR') {
       throw new WizardChessAudioError(400, 'invalid_locale');
@@ -73,13 +74,18 @@ export class WizardChessAudioService {
     return request;
   }
 
-  /** Warm the fixed English scene without blocking startup or requesting more than two clips at once. */
+  /** Warm the opening and climax first, then the rest, without more than two provider requests at once. */
   async prewarm(): Promise<void> {
     if (!this.apiKey) return;
+    const prioritized = [
+      ...WIZARD_CHESS_DIALOGUE.slice(0, 2),
+      ...WIZARD_CHESS_FINALE_CUES,
+      ...WIZARD_CHESS_DIALOGUE.slice(2),
+    ];
     let next = 0;
     const warm = async () => {
-      while (next < WIZARD_CHESS_DIALOGUE.length) {
-        const line = WIZARD_CHESS_DIALOGUE[next++]!;
+      while (next < prioritized.length) {
+        const line = prioritized[next++]!;
         try { await this.get(line.id, 'en-US'); }
         catch { /* synthesize logs safe diagnostics; the scene keeps captions */ }
       }

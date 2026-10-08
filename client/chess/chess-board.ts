@@ -5,7 +5,7 @@ import { createChessPiece, pieceShardMaterial, pieceSpellColor,
   type ChessColor, type ChessPieceType } from './chess-pieces';
 import { ChessHall, type ChessTheme } from './chess-hall';
 import { WizardPieceLibrary } from './wizard-pieces';
-import type { WizardChessCharacter } from '../../shared/wizard-chess-scene';
+import { wizardCharacterAt, type WizardChessCharacter } from '../../shared/wizard-chess-scene';
 
 export interface BoardPiece {
   square: string;
@@ -25,6 +25,16 @@ export interface BoardMove {
   rookTo?: string | null;
   check?: boolean;
   checkmate?: boolean;
+}
+
+/** Camera cues are visual only; the scene controller owns dialogue and move timing. */
+export type WizardShot = 'wide' | 'board' | 'harry' | 'ron' | 'hermione'
+  | 'queen' | 'ron-impact' | 'king' | 'checkmate' | 'victory';
+
+export interface WizardShotOptions {
+  /** A cut is useful between speakers; otherwise the camera travels to its mark. */
+  cut?: boolean;
+  durationMs?: number;
 }
 
 interface PieceVisual extends BoardPiece { group: THREE.Group }
@@ -53,10 +63,25 @@ interface MoveAnimation {
   resolve: () => void;
 }
 
+interface FilmPose {
+  position: THREE.Vector3;
+  target: THREE.Vector3;
+  fov: number;
+}
+
+interface FilmTransition {
+  from: FilmPose;
+  to: FilmPose;
+  started: number;
+  duration: number;
+}
+
 const TOP = 0.405;
 const FILES = 'abcdefgh';
 const shardGeometry = new THREE.TetrahedronGeometry(0.1, 0);
-const sparkGeometry = new THREE.SphereGeometry(0.045, 7, 5);
+// Short crystal-like embers read as spell fragments in close-ups; spheres
+// looked like large white bubbles once additive blending stacked them.
+const sparkGeometry = new THREE.TetrahedronGeometry(0.034, 0);
 const ringGeometry = new THREE.TorusGeometry(0.38, 0.021, 7, 38);
 const slashGeometry = new THREE.TorusGeometry(0.37, 0.028, 7, 32, Math.PI * 1.2);
 const beamGeometry = new THREE.CylinderGeometry(0.035, 0.08, 1, 8);
@@ -145,6 +170,23 @@ export class ChessBoardScene {
   readonly canvas: HTMLCanvasElement;
   private readonly scene = new THREE.Scene();
   private readonly camera = new THREE.OrthographicCamera(-8, 8, 5, -5, 0.1, 100);
+  private readonly filmCamera = new THREE.PerspectiveCamera(43, 1, 0.07, 100);
+  private activeCamera: THREE.Camera = this.camera;
+  private readonly filmPosition = new THREE.Vector3();
+  private readonly filmTarget = new THREE.Vector3();
+  private readonly filmDirection = new THREE.Vector3();
+  private filmTransition: FilmTransition | null = null;
+  private filmShot: WizardShot | null = null;
+  private filmShotAt = 0;
+  private readonly filmKey = new THREE.PointLight(0xffe5bd, 0, 5.5, 2);
+  private readonly impactLight = new THREE.PointLight(0xffd5a0, 0, 5, 2);
+  private impactLightUntil = 0;
+  private impactLightPeak = 0;
+  private shakeStarted = 0;
+  private shakeUntil = 0;
+  private shakeStrength = 0;
+  private lastImpact: 'ron' | 'checkmate' | null = null;
+  private lastImpactAt = 0;
   private readonly renderer: THREE.WebGLRenderer;
   private readonly orbit: OrbitControls;
   private readonly cameraFramePoint = new THREE.Vector3();
@@ -177,6 +219,7 @@ export class ChessBoardScene {
   private wizardRefreshPending = false;
   private wizardSpeaker: WizardChessCharacter | null = null;
   private wizardSpeakerUntil = 0;
+  private fallenRon: THREE.Group | null = null;
   private cameraAdjusted = false;
   private ready = true;
   private onAvailability?: (available: boolean) => void;
@@ -228,6 +271,9 @@ export class ChessBoardScene {
     });
 
     this.hall = new ChessHall(this.scene, lowPowerDisplay, this.reducedMotion);
+    this.filmKey.position.set(0, 4, 4);
+    this.impactLight.position.set(0, 1, 0);
+    this.scene.add(this.filmKey, this.impactLight);
     this.createBoard();
     this.scene.add(this.board);
     this.scene.add(this.pieceLayer);
@@ -262,7 +308,8 @@ export class ChessBoardScene {
     this.theme = theme;
     this.hall.setTheme(theme);
     const light = theme === 'light';
-    this.renderer.toneMappingExposure = light ? 1.19 : 1.28;
+    this.renderer.toneMappingExposure = this.activeCamera === this.filmCamera
+      ? light ? 1.07 : 1.20 : light ? 1.19 : 1.28;
     this.boardMaterials.stone.color.setHex(this.wizardMode ? light ? 0x55525a : 0x26212b
       : light ? 0x273a54 : 0x142139);
     this.boardMaterials.underStone.color.setHex(this.wizardMode ? light ? 0x34323d : 0x13121c
@@ -282,6 +329,15 @@ export class ChessBoardScene {
   setWizardMode(enabled: boolean): void {
     if (this.wizardMode === enabled) return;
     this.cancelAnimation();
+    this.restoreWizardCamera();
+    if (this.fallenRon) {
+      this.scene.remove(this.fallenRon);
+      this.fallenRon = null;
+    }
+    this.impactLight.intensity = 0;
+    this.impactLightUntil = 0;
+    this.lastImpact = null;
+    if (!enabled) this.clearParticles();
     this.wizardMode = enabled;
     this.wizardRefreshPending = false;
     this.wizardSpeaker = null;
@@ -301,11 +357,95 @@ export class ChessBoardScene {
     if (enabled) this.wizardAssets.prefetch(true);
   }
 
+  /** Cue a low, perspective film shot. Repeating the active shot does not restart its push-in. */
+  setWizardShot(shot: WizardShot, options: WizardShotOptions = {}): void {
+    if (!this.wizardMode) return;
+    if (this.filmShot === shot && !options.cut) return;
+    const now = performance.now();
+    const pose = this.wizardShotPose(shot);
+    if (this.activeCamera === this.filmCamera) this.updateFilmCamera(now);
+    const wasFilming = this.activeCamera === this.filmCamera;
+    this.activeCamera = this.filmCamera;
+    this.orbit.enabled = false;
+    this.canvas.style.cursor = 'default';
+    this.hall.setCinematic(true);
+    this.renderer.toneMappingExposure = this.theme === 'light' ? 1.07 : 1.20;
+    this.filmShot = shot;
+    this.filmShotAt = now;
+    this.filmKey.intensity = this.theme === 'light' ? 8 : 10;
+    if (!wasFilming || options.cut || this.reducedMotion) {
+      this.filmTransition = null;
+      this.applyFilmPose(pose);
+      return;
+    }
+    this.filmTransition = {
+      from: { position: this.filmPosition.clone(), target: this.filmTarget.clone(),
+        fov: this.filmCamera.fov },
+      to: pose,
+      started: now,
+      duration: Math.max(180, Math.min(2_000, options.durationMs ?? 780)),
+    };
+  }
+
+  /** Return the display to the playable board view and its normal OrbitControls. */
+  restoreWizardCamera(): void {
+    if (this.activeCamera !== this.filmCamera) return;
+    this.activeCamera = this.camera;
+    this.filmShot = null;
+    this.filmTransition = null;
+    this.filmKey.intensity = 0;
+    this.hall.setCinematic(false);
+    this.renderer.toneMappingExposure = this.theme === 'light' ? 1.19 : 1.28;
+    this.orbit.enabled = true;
+    this.canvas.style.cursor = 'grab';
+    this.cameraAdjusted = false;
+    this.positionCamera();
+  }
+
+  /** A bounded burst for the two story impacts; repeated cue/update calls are idempotent. */
+  playWizardImpact(kind: 'ron' | 'checkmate'): void {
+    if (!this.wizardMode || this.reducedMotion || !this.ready) return;
+    const now = performance.now();
+    if (this.lastImpact === kind && now - this.lastImpactAt < 1_100) return;
+    this.lastImpact = kind;
+    this.lastImpactAt = now;
+    const point = kind === 'ron'
+      ? this.characterVisual('ron')?.group.position.clone() ?? squarePosition('h3')!
+      : squarePosition('e3')!;
+    const tint = new THREE.Color(kind === 'ron' ? 0xffbb68 : 0xffb45a);
+    const center = point.clone().setY(TOP + 0.1);
+    if (kind === 'ron') {
+      const ron = this.characterVisual('ron');
+      if (ron) this.spawnShatter(ron, new THREE.Color(0xb9d5ff));
+      this.spawnRing(center, new THREE.Color(0xd5eaff), 1.25, 110);
+      this.spawnSparks(center.clone().setY(1.3), tint, 18, 1.6);
+    } else {
+      for (let i = 0; i < 3; i++) this.spawnRing(center, tint, 1.55 + i * 0.34, i * 135);
+      const king = this.pieces.get('h8');
+      if (king) {
+        // Carry the final strike away from Harry toward the king instead of
+        // placing a bright vertical beam through the actor's face.
+        this.spawnBeam(center.clone().setY(1.35),
+          king.group.position.clone().add(new THREE.Vector3(0, 1.5, 0)), tint);
+        this.spawnRing(king.group.position, new THREE.Color(0xff395e), 1.05, 170);
+        this.spawnSparks(king.group.position.clone().setY(1.9), tint, 12, 0.8);
+      }
+      this.spawnSparks(center.clone().setY(1.2), tint, 24, 1.4);
+    }
+    this.impactLight.position.copy(center).setY(kind === 'ron' ? 1.5 : 2.1);
+    this.impactLight.color.copy(tint);
+    this.impactLightPeak = kind === 'ron' ? 17 : 19;
+    this.impactLightUntil = now + (kind === 'ron' ? 460 : 620);
+    this.shakeStarted = now;
+    this.shakeUntil = now + (kind === 'ron' ? 410 : 590);
+    this.shakeStrength = kind === 'ron' ? 0.075 : 0.12;
+  }
+
   /** Give the current speaker a small, readable gesture without rigging the GLBs. */
-  setWizardSpeaker(character: WizardChessCharacter): void {
+  setWizardSpeaker(character: WizardChessCharacter, durationMs = 1_800): void {
     if (!this.wizardMode || this.reducedMotion) return;
     this.wizardSpeaker = character;
-    this.wizardSpeakerUntil = performance.now() + 1_800;
+    this.wizardSpeakerUntil = performance.now() + Math.max(300, durationMs);
   }
 
   cancelAnimation(): void {
@@ -318,11 +458,16 @@ export class ChessBoardScene {
   get isAnimating(): boolean { return this.animation !== null; }
 
   resetCamera(): void {
+    if (this.activeCamera === this.filmCamera) {
+      this.restoreWizardCamera();
+      return;
+    }
     this.cameraAdjusted = false;
     this.positionCamera();
   }
 
   setPosition(next: readonly BoardPiece[]): void {
+    const ronBefore = this.wizardMode ? this.characterVisual('ron')?.group ?? null : null;
     const previous = new Map(this.pieces);
     let changed = false;
     this.pieces.clear();
@@ -335,7 +480,7 @@ export class ChessBoardScene {
           ? this.wizardAssets.createPiece(piece.square, piece.color, piece.type)
           : createChessPiece(piece.type, piece.color);
       const rotation = group.userData.faceAudience
-        ? this.characterFacingRotation(position) : piece.color === 'w' ? 0 : Math.PI;
+        ? this.characterFacingRotation() : piece.color === 'w' ? 0 : Math.PI;
       changed ||= group !== existing?.group || !group.position.equals(position)
         || group.rotation.y !== rotation || group.rotation.z !== 0 || !group.visible;
       if (existing && group !== existing.group) this.pieceLayer.remove(existing.group);
@@ -350,6 +495,23 @@ export class ChessBoardScene {
     for (const visual of previous.values()) {
       this.pieceLayer.remove(visual.group);
       changed = true;
+    }
+    if (this.wizardMode) {
+      const ronStanding = next.some(piece => wizardCharacterAt(piece.square, piece.color, piece.type) === 'ron');
+      if (ronStanding && this.fallenRon) {
+        this.scene.remove(this.fallenRon);
+        this.fallenRon = null;
+      } else if (!ronStanding && !this.fallenRon) {
+        // A display that reconnects after the capture still shows Ron safe on
+        // the board edge, even though he is no longer a playable piece.
+        this.fallenRon = ronBefore ?? this.wizardAssets.createPiece('h3', 'b', 'n');
+        this.pieceLayer.remove(this.fallenRon);
+        this.poseFallenRon(this.fallenRon);
+        this.scene.add(this.fallenRon);
+      }
+    }
+    if (changed && this.filmShot && !['wide', 'board', 'victory'].includes(this.filmShot)) {
+      this.reframeFilmShot();
     }
     if (changed) this.renderer.shadowMap.needsUpdate = true;
   }
@@ -411,6 +573,7 @@ export class ChessBoardScene {
   dispose(): void {
     cancelAnimationFrame(this.frame);
     this.cancelAnimation();
+    this.clearParticles();
     this.resizeObserver?.disconnect();
     window.removeEventListener('resize', this.resize);
     this.canvas.removeEventListener('dblclick', this.onCameraDoubleClick);
@@ -418,11 +581,10 @@ export class ChessBoardScene {
     this.orbit.removeEventListener('end', this.onCameraEnd);
     this.orbit.dispose();
     this.hall.dispose();
-    for (const particle of this.particles) {
-      this.scene.remove(particle.mesh);
-      particle.material.dispose();
-    }
-    this.particles.length = 0;
+    this.scene.remove(this.filmKey, this.impactLight);
+    this.filmKey.dispose();
+    this.impactLight.dispose();
+    if (this.fallenRon) this.scene.remove(this.fallenRon);
     const geometry = new Set<THREE.BufferGeometry>();
     const materials = new Set<THREE.Material>();
     for (const layer of [this.board, this.coordinateLayer, ...this.highlights.values()]) {
@@ -455,8 +617,162 @@ export class ChessBoardScene {
 
   private readonly onCameraDoubleClick = (event: MouseEvent): void => {
     event.preventDefault();
+    if (this.activeCamera === this.filmCamera) return;
     this.resetCamera();
   };
+
+  private characterVisual(character: WizardChessCharacter): PieceVisual | null {
+    for (const visual of this.pieces.values()) {
+      if (visual.group.userData.wizardCharacter === character) return visual;
+    }
+    return null;
+  }
+
+  private characterFocus(character: WizardChessCharacter, fallback: string): THREE.Vector3 {
+    const visual = this.characterVisual(character);
+    if (!visual) return squarePosition(fallback)!.add(new THREE.Vector3(0, 1.38, 0));
+    const bounds = new THREE.Box3().setFromObject(visual.group);
+    const height = bounds.max.y - bounds.min.y;
+    return new THREE.Vector3(visual.group.position.x,
+      Number.isFinite(height) && height > 0.1 ? bounds.min.y + height * 0.89 : TOP + 1.58,
+      visual.group.position.z);
+  }
+
+  private wizardShotPose(shot: WizardShot): FilmPose {
+    const here = (square: string, y = 0): THREE.Vector3 => squarePosition(square)!.add(new THREE.Vector3(0, y, 0));
+    const make = (position: THREE.Vector3, target: THREE.Vector3, fov: number): FilmPose =>
+      ({ position, target, fov });
+    const face = (character: WizardChessCharacter, fallback: string, side: number): FilmPose => {
+      const focus = this.characterFocus(character, fallback);
+      return make(focus.clone().add(new THREE.Vector3(side, 0.07, 1.74)),
+        focus.clone().add(new THREE.Vector3(0, -0.03, 0)), 36);
+    };
+    let pose: FilmPose;
+    switch (shot) {
+      case 'wide':
+        pose = make(new THREE.Vector3(8.1, 7.2, 11.5), new THREE.Vector3(0, 0.65, 0), 46);
+        break;
+      case 'board':
+        pose = make(new THREE.Vector3(-5.2, 4.1, 7.7), new THREE.Vector3(0, 0.85, 0), 47);
+        break;
+      case 'harry': pose = face('harry', 'a3', -0.24); break;
+      case 'ron': pose = face('ron', 'g5', 0.26); break;
+      case 'hermione': pose = face('hermione', 'f8', -0.26); break;
+      case 'queen': {
+        const queen = [...this.pieces.values()].find(piece => piece.type === 'q' && piece.color === 'w');
+        const focus = queen?.group.position.clone() ?? here('c3');
+        pose = make(focus.clone().add(new THREE.Vector3(1.35, 1.45, 1.8)),
+          focus.clone().add(new THREE.Vector3(0, 0.95, 0)), 39);
+        break;
+      }
+      case 'ron-impact': {
+        // Stage the queen behind Ron, then keep his fallen face above the
+        // lower-third caption instead of framing only the empty capture tile.
+        pose = make(new THREE.Vector3(6.35, 2.8, 0.15),
+          new THREE.Vector3(4.0, 1.0, 0.75), 48);
+        break;
+      }
+      case 'king': {
+        const focus = this.pieces.get('h8')?.group.position.clone() ?? here('h8');
+        pose = make(focus.clone().add(new THREE.Vector3(2.0, 1.45, 0.3)),
+          focus.clone().add(new THREE.Vector3(0, 1.06, 0)), 39);
+        break;
+      }
+      case 'checkmate': {
+        const focus = here('e3');
+        pose = make(focus.clone().add(new THREE.Vector3(1.25, 1.55, 2.15)),
+          focus.clone().add(new THREE.Vector3(0, 0.92, 0)), 43);
+        break;
+      }
+      case 'victory':
+        pose = make(new THREE.Vector3(4.4, 5.2, 10.4), new THREE.Vector3(0, 0.75, 0), 47);
+        break;
+    }
+    const aspect = this.container.clientWidth / Math.max(1, this.container.clientHeight);
+    if (aspect < 0.9) {
+      if (shot === 'wide' || shot === 'victory') {
+        pose.position.sub(pose.target).multiplyScalar(1.38).add(pose.target);
+        pose.fov += 7;
+      } else if (shot === 'board') {
+        pose.position.sub(pose.target).multiplyScalar(1.17).add(pose.target);
+        pose.fov += 5;
+      } else if (shot === 'ron-impact') {
+        pose.position.sub(pose.target).multiplyScalar(1.18).add(pose.target);
+        pose.fov += 6;
+      } else pose.fov += 6;
+    }
+    return pose;
+  }
+
+  private applyFilmPose(pose: FilmPose): void {
+    this.filmPosition.copy(pose.position);
+    this.filmTarget.copy(pose.target);
+    this.filmCamera.fov = pose.fov;
+    this.filmCamera.updateProjectionMatrix();
+    this.filmCamera.position.copy(this.filmPosition);
+    this.filmCamera.lookAt(this.filmTarget);
+  }
+
+  private reframeFilmShot(): void {
+    if (!this.filmShot || this.activeCamera !== this.filmCamera) return;
+    const now = performance.now();
+    this.updateFilmCamera(now);
+    const pose = this.wizardShotPose(this.filmShot);
+    if (pose.position.distanceTo(this.filmPosition) < 0.04
+      && pose.target.distanceTo(this.filmTarget) < 0.04
+      && Math.abs(pose.fov - this.filmCamera.fov) < 0.1) return;
+    if (this.reducedMotion) {
+      this.applyFilmPose(pose);
+      return;
+    }
+    this.filmTransition = {
+      from: { position: this.filmPosition.clone(), target: this.filmTarget.clone(),
+        fov: this.filmCamera.fov },
+      to: pose,
+      started: now,
+      duration: 520,
+    };
+  }
+
+  private updateFilmCamera(now: number): void {
+    if (this.activeCamera !== this.filmCamera) return;
+    const transition = this.filmTransition;
+    if (transition) {
+      const fraction = Math.min(1, Math.max(0, (now - transition.started) / transition.duration));
+      const eased = fraction * fraction * (3 - 2 * fraction);
+      this.filmPosition.copy(transition.from.position).lerp(transition.to.position, eased);
+      this.filmTarget.copy(transition.from.target).lerp(transition.to.target, eased);
+      this.filmCamera.fov = THREE.MathUtils.lerp(transition.from.fov, transition.to.fov, eased);
+      this.filmCamera.updateProjectionMatrix();
+      if (fraction >= 1) this.filmTransition = null;
+    }
+    this.filmCamera.position.copy(this.filmPosition);
+    if (!this.reducedMotion && !this.filmTransition && this.filmShot
+      && this.filmShot !== 'wide' && this.filmShot !== 'victory') {
+      // A restrained dolly keeps a held line alive without the cost of post-processing.
+      const push = Math.min(1, Math.max(0, (now - this.filmShotAt) / 4_500)) * 0.13;
+      this.filmDirection.copy(this.filmTarget).sub(this.filmPosition).normalize();
+      this.filmCamera.position.addScaledVector(this.filmDirection, push);
+    }
+    if (!this.reducedMotion && now < this.shakeUntil) {
+      const progress = (now - this.shakeStarted) / (this.shakeUntil - this.shakeStarted);
+      const amplitude = this.shakeStrength * Math.pow(1 - progress, 2);
+      this.filmCamera.position.x += Math.sin(progress * 71) * amplitude;
+      this.filmCamera.position.y += Math.sin(progress * 113) * amplitude * 0.65;
+    }
+    this.filmCamera.lookAt(this.filmTarget);
+    this.filmKey.position.copy(this.filmCamera.position).lerp(this.filmTarget, 0.58);
+    this.filmKey.position.y += 0.7;
+  }
+
+  private updateImpactLight(now: number): void {
+    if (now >= this.impactLightUntil || this.impactLightUntil <= this.lastImpactAt) {
+      this.impactLight.intensity = 0;
+      return;
+    }
+    const remaining = (this.impactLightUntil - now) / (this.impactLightUntil - this.lastImpactAt);
+    this.impactLight.intensity = this.impactLightPeak * remaining * remaining;
+  }
 
   private readonly resize = (): void => {
     const width = Math.max(1, this.container.clientWidth);
@@ -470,7 +786,15 @@ export class ChessBoardScene {
     this.camera.top = visibleHeight / 2;
     this.camera.bottom = -visibleHeight / 2;
     this.camera.updateProjectionMatrix();
-    if (this.cameraAdjusted) {
+    this.filmCamera.aspect = aspect;
+    this.filmCamera.updateProjectionMatrix();
+    if (this.activeCamera === this.filmCamera) {
+      // Keep the active close-up in frame when the display rotates or resizes.
+      if (this.filmShot) {
+        this.filmTransition = null;
+        this.applyFilmPose(this.wizardShotPose(this.filmShot));
+      }
+    } else if (this.cameraAdjusted) {
       this.orbit.update();
       this.constrainCameraFraming();
     } else this.positionCamera();
@@ -540,12 +864,14 @@ export class ChessBoardScene {
     const dt = Math.min(0.05, (now - (this.lastFrameAt || now)) / 1000);
     this.lastFrameAt = now;
     if (this.ready && !document.hidden) {
-      if (this.orbit.update()) this.constrainCameraFraming();
+      if (this.activeCamera === this.filmCamera) this.updateFilmCamera(now);
+      else if (this.orbit.update()) this.constrainCameraFraming();
+      this.updateImpactLight(now);
       this.updateAnimation(now);
       this.updateWizardCharacters(now);
       this.updateParticles(now, dt);
-      this.hall.update(now, dt, this.camera);
-      this.renderer.render(this.scene, this.camera);
+      this.hall.update(now, dt, this.activeCamera);
+      this.renderer.render(this.scene, this.activeCamera);
     }
     this.frame = requestAnimationFrame(this.tick);
   };
@@ -569,7 +895,7 @@ export class ChessBoardScene {
     const lunge = capture ? Math.max(0, 1 - Math.abs(t - 0.61) / 0.14) : 0;
     animation.attacker.group.rotation.z = animation.move.piece === 'n' ? -0.27 * lunge : 0;
     animation.attacker.group.rotation.y = (animation.attacker.group.userData.faceAudience
-      ? this.characterFacingRotation(animation.attacker.group.position)
+      ? this.characterFacingRotation()
       : animation.attacker.color === 'w' ? 0 : Math.PI)
       + (animation.move.piece === 'q' || animation.move.piece === 'b' ? Math.sin(Math.PI * t) * 0.55 : 0);
     if (animation.rook && animation.move.rookFrom && animation.move.rookTo) {
@@ -586,25 +912,29 @@ export class ChessBoardScene {
       animation.shattered = true;
       if (animation.victim) {
         if (this.wizardMode && animation.victim.group.userData.wizardCharacter) {
-          this.spawnSparks(animation.victim.group.position.clone().add(new THREE.Vector3(0, 0.6, 0)),
-            new THREE.Color(0xe7c783), 36, 1.1);
-          this.spawnRing(animation.victim.group.position, new THREE.Color(0xb788ff), 1.25);
+          this.playWizardImpact('ron');
         } else {
           animation.victim.group.visible = false;
           this.spawnShatter(animation.victim, spellColor(animation.move));
         }
       }
+      if (this.wizardMode && animation.move.checkmate) this.playWizardImpact('checkmate');
     }
     if (capture && animation.victim?.group.userData.wizardCharacter && t >= 0.66) {
       const fall = Math.min(1, (t - 0.66) / 0.34);
-      animation.victim.group.rotation.z = -fall * 1.1;
-      animation.victim.group.position.y = TOP - fall * 0.12;
+      const origin = squarePosition(animation.victim.square);
+      if (origin) animation.victim.group.position.copy(origin).add(new THREE.Vector3(
+        fall * 0.48, Math.sin(Math.PI * fall) * 0.38 + fall * 0.10, fall * 0.58));
+      animation.victim.group.rotation.x = -fall * 1.24;
+      animation.victim.group.rotation.z = -fall * 0.16;
     }
     if (t >= 1) this.finishAnimation(animation);
   }
 
-  private characterFacingRotation(position: THREE.Vector3): number {
-    return Math.atan2(this.camera.position.x - position.x, this.camera.position.z - position.z);
+  private characterFacingRotation(): number {
+    // Their feet stay planted as the film camera cuts around them; only a
+    // small breathing/gesture sway is applied in updateWizardCharacters.
+    return this.humanColor === 'w' ? 0.12 : Math.PI - 0.12;
   }
 
   private updateWizardCharacters(now: number): void {
@@ -618,7 +948,7 @@ export class ChessBoardScene {
         && now < this.wizardSpeakerUntil;
       const phase = now * 0.0025 + (character === 'ron' ? 0 : character === 'harry' ? 2 : 4);
       visual.group.position.copy(home);
-      visual.group.rotation.y = this.characterFacingRotation(home)
+      visual.group.rotation.y = this.characterFacingRotation()
         + (this.reducedMotion ? 0 : Math.sin(phase) * (speaking ? 0.09 : 0.018));
       visual.group.rotation.z = this.reducedMotion ? 0 : Math.sin(phase * 1.8) * (speaking ? 0.042 : 0.008);
       if (!this.reducedMotion) visual.group.position.y += Math.sin(phase * 1.25) * (speaking ? 0.025 : 0.009);
@@ -627,6 +957,14 @@ export class ChessBoardScene {
 
   private finishAnimation(animation: MoveAnimation): void {
     this.animation = null;
+    if (this.wizardMode && animation.victim?.group.userData.wizardCharacter === 'ron') {
+      // The knight is lost, but Ron remains visible after being thrown clear.
+      if (this.fallenRon) this.scene.remove(this.fallenRon);
+      this.fallenRon = animation.victim.group;
+      this.pieceLayer.remove(this.fallenRon);
+      this.scene.add(this.fallenRon);
+      this.poseFallenRon(this.fallenRon);
+    }
     this.setPosition(animation.next);
     this.setLastMove(animation.move.from, animation.move.to);
     if (animation.move.check || animation.move.checkmate) {
@@ -648,6 +986,29 @@ export class ChessBoardScene {
     this.pieceLayer.clear();
     this.pieces.clear();
     this.setPosition(position);
+    if (this.fallenRon?.userData.wizardFallbackName) {
+      const replacement = this.wizardAssets.createPiece('h3', 'b', 'n');
+      if (!replacement.userData.wizardFallbackName) {
+        this.scene.remove(this.fallenRon);
+        this.fallenRon = replacement;
+        this.poseFallenRon(replacement);
+        this.scene.add(replacement);
+      }
+    }
+  }
+
+  private poseFallenRon(group: THREE.Group): void {
+    group.visible = true;
+    group.position.set(3.98, TOP + 0.1, 2.08);
+    group.rotation.set(-1.24, this.characterFacingRotation(), -0.16);
+  }
+
+  private clearParticles(): void {
+    for (const particle of this.particles) {
+      this.scene.remove(particle.mesh);
+      particle.material.dispose();
+    }
+    this.particles.length = 0;
   }
 
   private updateParticles(now: number, dt: number): void {
@@ -728,12 +1089,13 @@ export class ChessBoardScene {
 
   private spawnSparks(origin: THREE.Vector3, color: THREE.Color, count: number, spread: number): void {
     const random = seededRandom(Math.floor(performance.now() * 17) ^ count);
+    const ember = color.clone().lerp(new THREE.Color(color.b > color.r ? 0x68aaff : 0xff7437), 0.53);
     for (let i = 0; i < count; i++) {
-      const material = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 1,
-        blending: THREE.AdditiveBlending, depthWrite: false });
+      const material = new THREE.MeshBasicMaterial({ color: ember, transparent: true, opacity: 0.88,
+        depthWrite: false, toneMapped: false });
       const spark = new THREE.Mesh(sparkGeometry, material);
       spark.position.copy(origin);
-      const size = 0.4 + random() * 1.4;
+      const size = 0.55 + random() * 1.0;
       spark.scale.setScalar(size);
       this.scene.add(spark);
       const angle = random() * Math.PI * 2;
@@ -755,8 +1117,13 @@ export class ChessBoardScene {
   private spawnBeam(from: THREE.Vector3, to: THREE.Vector3, color: THREE.Color): void {
     const direction = to.clone().sub(from);
     const effect = this.addFx(beamGeometry, color, from.clone().add(to).multiplyScalar(0.5), 330, 'beam');
+    effect.material.color.copy(color).lerp(
+      new THREE.Color(color.b > color.r ? 0x4d9dff : 0xff8238), 0.54);
+    effect.material.blending = THREE.NormalBlending;
+    effect.material.toneMapped = false;
+    effect.material.opacity = 0.76;
     effect.mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.clone().normalize());
-    effect.mesh.scale.set(1, direction.length(), 1);
+    effect.mesh.scale.set(0.42, direction.length(), 0.42);
     effect.baseScale.copy(effect.mesh.scale);
   }
 

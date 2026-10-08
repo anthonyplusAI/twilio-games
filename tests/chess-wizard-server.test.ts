@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ChessServer, CHESS_WIZARD_ORPHAN_READY_MS } from '../server/chess-server';
+import { ChessServer, CHESS_WIZARD_DISPLAY_GRACE_MS,
+  CHESS_WIZARD_ORPHAN_READY_MS } from '../server/chess-server';
 import { ChessRoom } from '../server/chess-room';
-import { WIZARD_CHESS_RESOLVED_DURATION_MS, WIZARD_CHESS_STORY_DURATION_MS } from '../shared/wizard-chess-scene';
+import { WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_RESOLVED_DURATION_MS,
+  WIZARD_CHESS_STORY_DURATION_MS } from '../shared/wizard-chess-scene';
 
 let chess: ChessServer | null = null;
 
@@ -35,6 +37,98 @@ function sendFakeDisplay(game: ChessServer, message: Record<string, unknown>): v
 }
 
 describe('Voice Chess wizard scene', () => {
+  it('restores the last finished dialogue line from the server after a display reconnect', () => {
+    const game = server();
+    const frames = attachFakeDisplay(game);
+    game.voiceJoin('WIZ', 'Ada', 'CA-wizard', 'en-US');
+    game.voiceCommand('WIZ', 'CA-wizard', 'wizard chess', 'en-US');
+    const scene = game.snapshot('WIZ')!.wizardScene!;
+    expect(scene.dialogueCursor).toBe(0);
+
+    const frameCount = frames.length;
+    sendFakeDisplay(game, { type: 'display_wizard_progress', roomCode: 'WIZ',
+      sceneId: scene.id, cursor: 3 });
+    expect(game.snapshot('WIZ')?.wizardScene?.dialogueCursor).toBe(3);
+    expect(frames).toHaveLength(frameCount);
+
+    sendFakeDisplay(game, { type: 'leave' });
+    sendFakeDisplay(game, { type: 'spectate', roomCode: 'WIZ', locale: 'en-US' });
+    expect(frames.at(-1)).toMatchObject({ type: 'chess_state',
+      wizardScene: { id: scene.id, phase: 'story', dialogueCursor: 3 } });
+    sendFakeDisplay(game, { type: 'display_wizard_progress', roomCode: 'WIZ',
+      sceneId: scene.id, cursor: WIZARD_CHESS_DIALOGUE.length });
+    expect(game.snapshot('WIZ')?.wizardScene?.dialogueCursor).toBe(WIZARD_CHESS_DIALOGUE.length);
+  });
+
+  it('keeps progress monotonic and ignores invalid or stale story checkpoints', () => {
+    const game = server();
+    const frames = attachFakeDisplay(game);
+    game.voiceJoin('WIZ', 'Ada', 'CA-wizard', 'en-US');
+    game.voiceCommand('WIZ', 'CA-wizard', 'wizard chess', 'en-US');
+    const sceneId = game.snapshot('WIZ')!.wizardScene!.id;
+    const report = (scene: number, cursor: unknown, roomCode = 'WIZ') =>
+      sendFakeDisplay(game, { type: 'display_wizard_progress', roomCode,
+        sceneId: scene, cursor });
+
+    report(sceneId, 3);
+    expect(game.snapshot('WIZ')?.wizardScene?.dialogueCursor).toBe(3);
+    const stateFrameCount = frames.filter(frame => frame.type === 'chess_state').length;
+    for (const cursor of [0, 3, -1, 3.5, '4', null, WIZARD_CHESS_DIALOGUE.length + 1,
+      Number.MAX_SAFE_INTEGER + 1]) report(sceneId, cursor);
+    report(sceneId + 1, 4);
+    report(Number.MAX_SAFE_INTEGER + 1, 4);
+    report(sceneId, 4, 'OTHER');
+    expect(game.snapshot('WIZ')?.wizardScene?.dialogueCursor).toBe(3);
+    expect(frames.filter(frame => frame.type === 'chess_state')).toHaveLength(stateFrameCount);
+
+    sendFakeDisplay(game, { type: 'display_wizard_skip', roomCode: 'WIZ', sceneId });
+    report(sceneId, 4);
+    expect(game.snapshot('WIZ')?.wizardScene).toMatchObject({
+      phase: 'ready', dialogueCursor: 3,
+    });
+  });
+
+  it('requires station display authentication before recording story progress', () => {
+    const game = server();
+    game.setDisplayAuthenticationRequirement(code => code === 'WIZ');
+    const frames = attachFakeDisplay(game);
+    game.voiceJoin('WIZ', 'Ada', 'CA-station', 'en-US', true);
+    game.voiceCommand('WIZ', 'CA-station', 'wizard chess', 'en-US');
+    const sceneId = game.snapshot('WIZ')!.wizardScene!.id;
+
+    sendFakeDisplay(game, { type: 'display_wizard_progress', roomCode: 'WIZ',
+      sceneId, cursor: 2 });
+    expect(game.snapshot('WIZ')?.wizardScene?.dialogueCursor).toBe(0);
+    expect(frames.at(-1)).toMatchObject({ type: 'error', code: 'bad_display_auth' });
+
+    const display = [...(game as unknown as { displays: Set<{ authenticatedRoomCode: string | null }> }).displays][0]!;
+    display.authenticatedRoomCode = 'WIZ';
+    sendFakeDisplay(game, { type: 'display_wizard_progress', roomCode: 'WIZ',
+      sceneId, cursor: 2 });
+    expect(game.snapshot('WIZ')?.wizardScene?.dialogueCursor).toBe(2);
+  });
+
+  it('holds the story across a brief display dropout, then cues the phone if the screen stays gone', () => {
+    vi.useFakeTimers();
+    const game = server();
+    attachFakeDisplay(game);
+    game.voiceJoin('WIZ', 'Ada', 'CA-wizard', 'en-US');
+    game.voiceCommand('WIZ', 'CA-wizard', 'wizard chess', 'en-US');
+    vi.advanceTimersByTime(CHESS_WIZARD_DISPLAY_GRACE_MS + 1);
+    expect(game.snapshot('WIZ')?.wizardScene?.phase).toBe('story');
+
+    sendFakeDisplay(game, { type: 'leave' });
+    vi.advanceTimersByTime(CHESS_WIZARD_DISPLAY_GRACE_MS - 1);
+    expect(game.snapshot('WIZ')?.wizardScene?.phase).toBe('story');
+    sendFakeDisplay(game, { type: 'spectate', roomCode: 'WIZ', locale: 'en-US' });
+    vi.advanceTimersByTime(CHESS_WIZARD_DISPLAY_GRACE_MS + 1);
+    expect(game.snapshot('WIZ')?.wizardScene?.phase).toBe('story');
+
+    sendFakeDisplay(game, { type: 'leave' });
+    vi.advanceTimersByTime(CHESS_WIZARD_DISPLAY_GRACE_MS);
+    expect(game.snapshot('WIZ')?.wizardScene?.phase).toBe('ready');
+  });
+
   it('lets a caller summon the scene once at the opening, then restores a fresh ordinary board after the finale', () => {
     vi.useFakeTimers();
     const game = server();

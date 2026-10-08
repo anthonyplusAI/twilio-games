@@ -11,6 +11,8 @@ export type ChessCastleSide = 'king' | 'queen';
 export interface WizardChessSceneSnapshot {
   id: number;
   phase: 'story' | 'ready' | 'resolved';
+  /** Number of dialogue lines whose playback has fully finished. */
+  dialogueCursor?: number;
   /** Server clock timestamps in milliseconds; clients can align them with clock_sync. */
   startedAt: number;
   readyAt: number | null;
@@ -161,6 +163,7 @@ export type ChessClientMessage =
   | { type: 'display_auth'; roomCode: string; token: string }
   | { type: 'clock_sync'; clientSentAtMs: number }
   | { type: 'display_wizard_skip'; roomCode: string; sceneId: number }
+  | { type: 'display_wizard_progress'; roomCode: string; sceneId: number; cursor: number }
   | { type: 'display_replay'; roomCode: string; gameId: number };
 export type ChessServerMessage =
   | { type: 'chess_capabilities'; displayAuth: boolean }

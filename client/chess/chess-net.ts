@@ -1,4 +1,5 @@
 import type { ChessEvent, ChessServerMessage, ChessState } from '../../shared/chess-protocol';
+import { WIZARD_CHESS_DIALOGUE } from '../../shared/wizard-chess-scene';
 import { withDisplaySession } from '../display-session';
 
 export type ChessConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'closed';
@@ -18,6 +19,7 @@ export class ChessConnection {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private clockTimer: ReturnType<typeof setInterval> | null = null;
   private pendingWizardSkip: number | null = null;
+  private pendingWizardProgress: { sceneId: number; cursor: number } | null = null;
   private stateListener?: (state: ChessState) => void;
   private eventListener?: (events: readonly ChessEvent[]) => void;
   private errorListener?: (code: string, message: string) => void;
@@ -48,9 +50,20 @@ export class ChessConnection {
     this.sendPendingWizardSkip();
   }
 
+  /** Keep the latest finished line until a server snapshot confirms it. */
+  reportWizardProgress(sceneId: number, cursor: number): void {
+    if (!Number.isSafeInteger(sceneId) || sceneId < 1 || !Number.isSafeInteger(cursor)
+      || cursor < 0 || cursor > WIZARD_CHESS_DIALOGUE.length || this.stopped) return;
+    const pending = this.pendingWizardProgress;
+    if (pending?.sceneId === sceneId && pending.cursor >= cursor) return;
+    this.pendingWizardProgress = { sceneId, cursor };
+    this.sendPendingWizardProgress();
+  }
+
   close(): void {
     this.stopped = true;
     this.pendingWizardSkip = null;
+    this.pendingWizardProgress = null;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     if (this.clockTimer) clearInterval(this.clockTimer);
@@ -79,6 +92,7 @@ export class ChessConnection {
       synchronize();
       socket.send(JSON.stringify({ type: 'spectate', roomCode: this.roomCode, locale: this.locale }));
       this.sendPendingWizardSkip(socket);
+      this.sendPendingWizardProgress(socket);
       if (this.clockTimer) clearInterval(this.clockTimer);
       this.clockTimer = setInterval(synchronize, 30_000);
       this.connectionListener?.('connected');
@@ -99,6 +113,12 @@ export class ChessConnection {
         const pending = this.pendingWizardSkip;
         if (pending !== null && (message.wizardScene?.id !== pending
           || message.wizardScene.phase !== 'story')) this.pendingWizardSkip = null;
+        const progress = this.pendingWizardProgress;
+        if (progress && (message.wizardScene?.id !== progress.sceneId
+          || message.wizardScene.phase !== 'story'
+          || (message.wizardScene.dialogueCursor ?? 0) >= progress.cursor)) {
+          this.pendingWizardProgress = null;
+        }
         this.stateListener?.(message);
       }
       else if (message.type === 'chess_events' && Array.isArray(message.events)) this.eventListener?.(message.events);
@@ -138,5 +158,14 @@ export class ChessConnection {
       socket.send(JSON.stringify({ type: 'display_wizard_skip',
         roomCode: this.roomCode, sceneId: this.pendingWizardSkip }));
     } catch { /* Keep the request for the next connection. */ }
+  }
+
+  private sendPendingWizardProgress(socket = this.socket): void {
+    const progress = this.pendingWizardProgress;
+    if (!progress || socket?.readyState !== WebSocket.OPEN) return;
+    try {
+      socket.send(JSON.stringify({ type: 'display_wizard_progress',
+        roomCode: this.roomCode, sceneId: progress.sceneId, cursor: progress.cursor }));
+    } catch { /* Keep the checkpoint for the next connection. */ }
   }
 }
