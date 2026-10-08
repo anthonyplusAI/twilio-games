@@ -5602,8 +5602,7 @@ function normalizeRelayPlaybackText(value: string): string {
   return value.replace(/<[^>]*>/g, ' ')
     .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
     .normalize('NFKC').toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
-    .replace(/\btwill ee oo\b/g, 'twilio');
+    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 }
 
 function relayEstimatedSpeechMs(text: string, locale: SupportedLocale): number {
@@ -5728,12 +5727,12 @@ export function relayTextChunks(text: string, locale: SupportedLocale = DEFAULT_
   return chunks;
 }
 
-export function relaySpeechMarkup(text: string, locale: SupportedLocale = DEFAULT_LOCALE): string {
-  // The default ElevenLabs Flash 2.5 voice can ignore inline phoneme tags.
-  // Spell the brand as syllables only in the Relay token; screen text stays canonical.
-  return locale === 'en-US'
-    ? text.replace(/\bTwilio\b/gi, 'Twill-ee-oo')
-    : text;
+export function relaySpeechMarkup(text: string, locale: SupportedLocale = DEFAULT_LOCALE,
+                                  voice = relayVoiceForLocale(locale)): string {
+  // Twilio supports this IPA example with English ElevenLabs Flash v2 or Turbo v2.
+  // An explicit voice override may select a model that ignores phoneme tags.
+  if (locale !== 'en-US' || !/-(?:flash_v2|turbo_v2)(?:-|$)/.test(voice)) return text;
+  return text.replace(/\bTwilio\b/gi, '<phoneme alphabet="ipa" ph="ˈtwɪlioʊ">Twilio</phoneme>');
 }
 
 function selectionNumberHints(locale: SupportedLocale): string[] {
