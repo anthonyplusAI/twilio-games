@@ -315,8 +315,18 @@ html[lang="pt-BR"] .wizard-credits-pt{display:inline}
 .wizard-scene-controls button:hover{border-color:var(--wizard-accent);background:var(--wizard-prompt)}
 .wizard-scene-controls button:focus-visible,.wizard-transcript:focus-visible,.wizard-move-hint:focus-visible,.wizard-scene-victory:focus-visible{outline:3px solid var(--wizard-focus);outline-offset:2px}
 .wizard-sound-toggle{flex:1;min-width:0}
+.wizard-sound-toggle[data-state="blocked"]{
+  border:2px solid #ffd06f;
+  background:#754218;
+  color:#fff8e9;
+  box-shadow:0 0 0 3px rgba(255,208,111,.22),0 0 22px rgba(255,179,61,.3);
+  animation:wizardVoiceAttention 1.2s ease-in-out infinite alternate;
+}
+@keyframes wizardVoiceAttention{to{box-shadow:0 0 0 6px rgba(255,208,111,.32),0 0 28px rgba(255,179,61,.5)}}
+@media(prefers-reduced-motion:reduce){.wizard-sound-toggle[data-state="blocked"]{animation:none}}
 .wizard-sound-toggle svg{display:block;flex:none;width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 .wizard-sound-toggle[aria-pressed="true"]{border-color:var(--wizard-accent);background:var(--wizard-prompt)}
+.wizard-sound-toggle[data-state="unavailable"]{border-color:#f7a0a0;background:#552b37;color:#fff0f0}
 .wizard-sound-toggle .wizard-sound-waves{display:none}
 .wizard-sound-toggle[aria-pressed="true"] .wizard-sound-waves{display:block}
 .wizard-sound-toggle[aria-pressed="true"] .wizard-sound-slash{display:none}

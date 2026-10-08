@@ -449,12 +449,19 @@ function renderStatus(): void {
       : 'Say a piece and square on your call, then confirm the move.';
   } else if (state.wizardScene) {
     const resolved = state.wizardScene.phase === 'resolved';
+    const ready = state.wizardScene.phase === 'ready';
     title = isPortuguese ? 'Xadrez bruxo' : 'Wizard Chess';
     detail = resolved
       ? isPortuguese ? 'A jogada do Ron abriu o caminho para Harry.' : 'Ron’s move opened the path for Harry.'
-      : isPortuguese ? 'O tabuleiro espera a jogada do cavalo do Ron.' : 'The board awaits Ron’s knight move.';
+      : ready
+        ? isPortuguese ? 'É sua vez de anunciar a jogada do cavalo do Ron.' : 'It is your turn to call Ron’s knight move.'
+        : isPortuguese ? 'A cena está passando na tela.' : 'The scene is playing on screen.';
     label = isPortuguese ? 'Cena especial' : 'Special scene';
-    hint = isPortuguese ? 'Você pode falar no telefone a qualquer momento.' : 'You can speak on the phone at any time.';
+    hint = resolved
+      ? isPortuguese ? 'O tabuleiro normal voltará em instantes.' : 'The normal board will return shortly.'
+      : ready
+        ? isPortuguese ? 'Diga cavalo para H3 no telefone.' : 'Say knight to H3 on the phone.'
+        : isPortuguese ? 'Aguarde a indicação de sua vez na tela.' : 'Wait for the move cue on screen.';
   } else if (connectionState !== 'connected') {
     title = isPortuguese ? 'Reconectando' : 'Reconnecting';
     detail = isPortuguese ? 'A posição atual continua no tabuleiro.' : 'Your last known position remains on the board.';

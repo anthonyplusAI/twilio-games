@@ -3,7 +3,7 @@ import { WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_VOICE_IDS } from '../shared/wizard-
 
 const ELEVENLABS_URL = 'https://api.elevenlabs.io/v1/text-to-speech';
 const MAX_AUDIO_BYTES = 1_500_000;
-const REQUEST_TIMEOUT_MS = 6_000;
+const REQUEST_TIMEOUT_MS = 20_000;
 const FAILURE_RETRY_MS = 15_000;
 const AUTH_FAILURE_RETRY_MS = 60_000;
 

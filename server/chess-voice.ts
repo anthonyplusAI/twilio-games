@@ -9,6 +9,10 @@ import type { VoiceInterpretFact, VoiceInterpretResult } from './voice-interpret
 import { isWizardChessTrigger, parseWizardChessVoiceAction,
   WIZARD_CHESS_VICTORY_AT_MS } from '../shared/wizard-chess-scene';
 
+const WIZARD_FINAL_ONLY_READY_GRACE_MS = 700;
+type WizardUtteranceStart = { sceneId: number; phase: WizardChessSceneSnapshot['phase'];
+  source: 'interrupt' | 'partial' };
+
 export interface ChessVoiceInterpretContext {
   phase: ChessState['phase'];
   gameId: number;
@@ -52,6 +56,9 @@ export class ChessVoiceSession {
   private initiatingResetGameId: number | null = null;
   private announcedTerminalMoveKey: string | null = null;
   private wizardFinaleTimer: ReturnType<typeof setTimeout> | null = null;
+  private wizardUtteranceStart: WizardUtteranceStart | null = null;
+  private explicitWizardSkipSceneId: number | null = null;
+  private lastWizardStoryReply: { sceneId: number; at: number } | null = null;
   private readonly pendingSpeech = new Set<Promise<unknown>>();
 
   constructor(private readonly deps: ChessVoiceDeps) {}
@@ -75,10 +82,14 @@ export class ChessVoiceSession {
     }
     if (!this.roomCode || !this.callSid) return;
     if (message.type === 'prompt') {
-      if (message.last) this.handleFinalPrompt(message.voicePrompt);
+      if (message.last) {
+        const utteranceStart = this.wizardUtteranceStart;
+        this.wizardUtteranceStart = null;
+        this.handleFinalPrompt(message.voicePrompt, utteranceStart);
+      }
       else {
         this.turnEpoch++; // the caller has begun speaking over any queued line
-        if (message.voicePrompt.trim()) this.interruptWizardStory();
+        if (message.voicePrompt.trim()) this.rememberWizardUtteranceStart('partial');
       }
     } else if (message.type === 'dtmf') {
       const command = message.digit === '1' ? 'confirm'
@@ -87,15 +98,24 @@ export class ChessVoiceSession {
       if (command) this.handleFinalPrompt(command);
     } else if (message.type === 'interrupt') {
       this.turnEpoch++;
-      this.interruptWizardStory();
+      this.rememberWizardUtteranceStart('interrupt');
     }
   }
 
-  /** Relay reports speech before its final transcript. Stop screen narration at barge-in. */
-  private interruptWizardStory(): void {
-    if (!this.roomCode || !this.callSid
-      || this.deps.snapshot(this.roomCode)?.wizardScene?.phase !== 'story') return;
-    this.deps.command(this.roomCode, this.callSid, 'skip to the move', this.commandLocale);
+  /** Keep the first transcript phase; an interrupt alone is only a tentative start. */
+  private rememberWizardUtteranceStart(source: WizardUtteranceStart['source']): void {
+    const scene = this.roomCode ? this.deps.snapshot(this.roomCode)?.wizardScene : null;
+    if (!scene) return;
+    const start = this.wizardUtteranceStart;
+    if (!start || start.sceneId !== scene.id
+      || (source === 'partial' && start.source === 'interrupt' && start.phase !== scene.phase)) {
+      // Relay's interrupt describes cut-off TTS, not a caller transcript. If no
+      // partial arrived until ready, this partial begins a new observable turn.
+      this.wizardUtteranceStart = { sceneId: scene.id, phase: scene.phase, source };
+    } else if (source === 'partial' && start.source === 'interrupt') {
+      // A story partial is positive evidence that this turn began before ready.
+      start.source = 'partial';
+    }
   }
 
   onRoomEvents(events: readonly ChessEvent[]): void {
@@ -104,6 +124,9 @@ export class ChessVoiceSession {
     if (reset?.type === 'reset') {
       this.turnEpoch++;
       this.clearWizardFinaleTimer();
+      this.wizardUtteranceStart = null;
+      this.explicitWizardSkipSceneId = null;
+      this.lastWizardStoryReply = null;
       this.announcedTerminalMoveKey = null;
       if (this.initiatingResetGameId === reset.gameId) {
         this.initiatingResetGameId = null;
@@ -142,6 +165,7 @@ export class ChessVoiceSession {
     this.active = false;
     this.turnEpoch++;
     this.clearWizardFinaleTimer();
+    this.wizardUtteranceStart = null;
   }
 
   handleClose(): void {
@@ -149,6 +173,7 @@ export class ChessVoiceSession {
     this.active = false;
     this.turnEpoch++;
     this.clearWizardFinaleTimer();
+    this.wizardUtteranceStart = null;
     if (this.roomCode && this.playerId && this.callSid) {
       this.deps.leave(this.roomCode, this.playerId, this.callSid);
     }
@@ -189,22 +214,39 @@ export class ChessVoiceSession {
     }
   }
 
-  private handleFinalPrompt(spoken: string): void {
+  private handleFinalPrompt(spoken: string,
+    utteranceStart: WizardUtteranceStart | null = null): void {
     if (!this.roomCode || !this.callSid || !spoken.trim()) return;
     this.turnEpoch++;
     const before = this.deps.snapshot(this.roomCode);
     if (before?.wizardScene) {
-      if (parseWizardChessVoiceAction(spoken, this.commandLocale) !== 'unknown'
-        || !this.deps.interpret || !this.deps.legalMoves) this.runCommand(spoken);
-      else {
-        // A caller can barge into the screen dialogue to ask a question or
-        // clarify a move. Stop that audio before speaking over the phone.
-        if (before.wizardScene.phase === 'story') {
-          this.deps.command(this.roomCode, this.callSid, 'skip to the move', this.commandLocale);
+      const action = parseWizardChessVoiceAction(spoken, this.commandLocale);
+      if (before.wizardScene.phase === 'ready' && action !== 'exit' && action !== 'skip') {
+        const observedStart = utteranceStart?.sceneId === before.wizardScene.id
+          ? utteranceStart.phase : null;
+        const explicitH3 = action === 'final'
+          || isExplicitWizardH3Move(spoken, this.commandLocale);
+        // Relay gives no speech-start timestamp on a final-only prompt. Close the
+        // short boundary after the screen cue, while accepting observed new speech.
+        const ambiguousFinalOnly = observedStart === null
+          && this.explicitWizardSkipSceneId !== before.wizardScene.id
+          && before.wizardScene.readyAt !== null
+          && Date.now() < before.wizardScene.readyAt + WIZARD_FINAL_ONLY_READY_GRACE_MS
+          && explicitH3;
+        if (observedStart === 'story' || ambiguousFinalOnly) {
+          if (explicitH3) this.speak(this.commandLocale === 'pt-BR'
+            ? 'Diga essa jogada novamente agora.' : 'Please say that move again now.');
+          return;
         }
-        this.requestSemanticTurn(spoken,
-          isReadOnlyChessInquiry(spoken, this.commandLocale, parseChessIntent(spoken, this.commandLocale)));
       }
+      if (before.wizardScene.phase === 'story') {
+        // A phone utterance never advances the screen dialogue implicitly.
+        // Explicit skip and exit remain available; ordinary talk stays quiet.
+        this.runCommand(spoken, action === 'unknown');
+      } else if (action !== 'unknown' || !this.deps.interpret || !this.deps.legalMoves) {
+        this.runCommand(spoken);
+      } else this.requestSemanticTurn(spoken,
+        isReadOnlyChessInquiry(spoken, this.commandLocale, parseChessIntent(spoken, this.commandLocale)));
       return;
     }
     if (before?.wizardAvailable && isWizardChessTrigger(spoken, this.commandLocale)) {
@@ -261,7 +303,7 @@ export class ChessVoiceSession {
     }
   }
 
-  private runCommand(spoken: string): void {
+  private runCommand(spoken: string, silentStoryWait = false): void {
     if (!this.roomCode || !this.callSid) return;
     const result = this.deps.command(this.roomCode, this.callSid, spoken, this.commandLocale);
     if (!result) {
@@ -269,6 +311,16 @@ export class ChessVoiceSession {
         ? 'A ligação perdeu o controle do tabuleiro. Tente ligar novamente.'
         : 'This call lost control of the board. Please call again.');
       return;
+    }
+    // Harry starts on the screen as soon as the scene opens. A phone acknowledgement
+    // here would overlap his first line, and the visible scene confirms the command.
+    if (result.code === 'wizard_started') return;
+    if (result.code === 'wizard_waiting' && result.state.wizardScene?.phase === 'story') {
+      if (!silentStoryWait) this.speakWizardStoryWait(result.state.wizardScene.id, result.message);
+      return;
+    }
+    if (result.code === 'wizard_skipped' && result.state.wizardScene) {
+      this.explicitWizardSkipSceneId = result.state.wizardScene.id;
     }
     if (result.code === 'wizard_resolved' && result.state.wizardScene) {
       this.speak(result.message);
@@ -288,6 +340,14 @@ export class ChessVoiceSession {
     } else {
       this.speak(result.message);
     }
+  }
+
+  private speakWizardStoryWait(sceneId: number, line: string): void {
+    const now = Date.now();
+    if (this.lastWizardStoryReply?.sceneId === sceneId
+      && now - this.lastWizardStoryReply.at < 8_000) return;
+    this.lastWizardStoryReply = { sceneId, at: now };
+    this.speak(line);
   }
 
   private scheduleWizardFinale(scene: WizardChessSceneSnapshot): void {
@@ -345,8 +405,7 @@ export class ChessVoiceSession {
       const live = this.deps.snapshot(roomCode);
       const sameScene = before.wizardScene
         ? live?.wizardScene?.id === before.wizardScene.id
-          && (live.wizardScene.phase === before.wizardScene.phase
-            || (before.wizardScene.phase === 'story' && live.wizardScene.phase === 'ready'))
+          && live.wizardScene.phase === before.wizardScene.phase
         : !live?.wizardScene;
       return this.active && this.turnEpoch === epoch && live?.gameId === before.gameId
         && live.revision === before.revision && live.phase === before.phase
@@ -382,13 +441,15 @@ export class ChessVoiceSession {
             this.runCommand('wizard chess'); return;
           }
           if (before.wizardScene) {
-            if (decision.actionId === 'wizard_final' && before.wizardScene.phase !== 'resolved') {
-              this.runCommand('knight to H3'); return;
+            if (decision.actionId === 'wizard_final' && before.wizardScene.phase === 'ready') {
+              if (isExplicitWizardH3Move(spoken, this.commandLocale)) this.runCommand('knight to H3');
+              else this.speak(this.wizardSceneLine(before.wizardScene));
+              return;
             }
-            if (decision.actionId === 'wizard_skip' && before.wizardScene.phase !== 'resolved') {
+            if (decision.actionId === 'wizard_skip' && before.wizardScene.phase === 'story') {
               this.runCommand('skip to move'); return;
             }
-            if (decision.actionId === 'wizard_hint' && before.wizardScene.phase !== 'resolved') {
+            if (decision.actionId === 'wizard_hint' && before.wizardScene.phase === 'ready') {
               this.runCommand('hint'); return;
             }
             if (decision.actionId === 'wizard_exit') { this.runCommand('exit wizard chess'); return; }
@@ -421,12 +482,17 @@ export class ChessVoiceSession {
   }
 
   private factsFor(state: ChessState, legalMoves: readonly ChessVoiceMoveChoice[]): VoiceInterpretFact[] {
-    if (state.wizardScene) return [
-      { id: 'wizard_scene', text: this.wizardSceneLine(state.wizardScene) },
-      { id: 'wizard_hint', text: this.commandLocale === 'pt-BR'
-        ? 'A jogada é o cavalo de Ron de G cinco para H três.'
-        : 'The move is Ron’s knight from G five to H three.' },
-    ];
+    if (state.wizardScene) {
+      const facts: VoiceInterpretFact[] = [
+        { id: 'wizard_scene', text: this.wizardSceneLine(state.wizardScene) },
+      ];
+      if (state.wizardScene.phase === 'ready') facts.push({
+        id: 'wizard_hint', text: this.commandLocale === 'pt-BR'
+          ? 'A jogada é o cavalo de Ron de G cinco para H três.'
+          : 'The move is Ron’s knight from G five to H three.',
+      });
+      return facts;
+    }
     const ownTurn = state.turn === state.humanColor;
     const facts: VoiceInterpretFact[] = [
       { id: 'turn', text: this.commandLocale === 'pt-BR'
@@ -456,10 +522,14 @@ export class ChessVoiceSession {
   private wizardSceneLine(scene: WizardChessSceneSnapshot): string {
     if (this.commandLocale === 'pt-BR') return scene.phase === 'resolved'
       ? 'O final do xadrez bruxo está passando. O tabuleiro normal voltará em instantes.'
-      : 'Você está no xadrez bruxo. Diga a jogada do cavalo de Ron, peça uma dica, pule para a jogada ou diga sair.';
+      : scene.phase === 'ready'
+        ? 'É sua vez. Diga a jogada do cavalo de Ron ou peça uma dica.'
+        : 'Acompanhe a cena do xadrez bruxo. A tela avisará quando for sua vez.';
     return scene.phase === 'resolved'
       ? 'The wizard chess finale is playing. The ordinary board will return shortly.'
-      : 'You are in wizard chess. Call Ron’s knight move, ask for a hint, skip to the move, or say exit.';
+      : scene.phase === 'ready'
+        ? 'Your turn. Call Ron’s knight move or ask for a hint.'
+        : 'Watch the wizard chess scene. The screen will cue your move.';
   }
 
   private introduction(state: ChessState, resumed: boolean): string {
@@ -535,6 +605,33 @@ function spokenMoveFromId(id: string): string {
   const to = id.slice(2, 4).toUpperCase();
   const promotion: Record<string, string> = { q: 'queen', r: 'rook', b: 'bishop', n: 'knight' };
   return `${from} to ${to}${promotion[id[4] ?? ''] ? ` promote to ${promotion[id[4]!]}` : ''}`;
+}
+
+/** The semantic model may understand natural phrasing, but cannot invent Ron's destination. */
+function isExplicitWizardH3Move(spoken: string, locale: SupportedLocale): boolean {
+  const text = normalizeForMatching(spoken, locale).replace(/['-]/g, ' ').replace(/\s+/g, ' ').trim();
+  const clearH3 = /\b(?:h\s*(?:3|three|tree|tres)|aitch\s*(?:3|three|tree|tres))\b/.exec(text);
+  // These ASR variants are too ambiguous without a named Ron/knight move.
+  const asrH3 = clearH3 ? null : /\b(?:age\s*(?:3|three|tree)|(?:h|aitch)\s*free)\b/.exec(text);
+  const h3 = clearH3 ?? asrH3;
+  if (!h3) return false;
+  if (/\b(?:don t|do not|didn t|not|never|wait|hold|nao|nunca|espere|espera)\b/.test(text)) return false;
+  if (/^(?:what|why|how|who|where|when|is|are|can|could|would|should|tell me|explain|o que|por que|como|quem|onde|quando|posso|poderia)\b/.test(text)) return false;
+  if (/\b(?:right|correct|isn t it)\s*$/.test(text)) return false;
+  const intent = parseChessIntent(spoken, locale);
+  if (clearH3 && intent.kind === 'move') return intent.query.to === 'h3'
+    && (intent.query.piece === undefined || intent.query.piece === 'n');
+  if (clearH3 && intent.kind !== 'unknown') return false;
+  if (asrH3 && intent.kind === 'move' && intent.query.to && intent.query.to !== 'h3') return false;
+  const before = text.slice(0, h3.index);
+  const after = text.slice(h3.index + h3[0].length);
+  if (/\b(?:from|off|away from|out of|de|do|da|fora de)\s*$/.test(before)
+    || /\b[a-h]\s*(?:[1-8]|one|two|three|four|five|six|seven|eight|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito)\b/.test(after)
+    || /\b(?:queen|bishop|rook|pawn|king|rainha|dama|bispo|torre|peao|rei)\b/.test(text)) return false;
+  const namedKnight = /\b(?:ron|knight|night|horse|cavalo)\b/.test(text);
+  const moveVerb = /\b(?:move|play|send|put|place|push|go|mova|mover|jogue|joga|jogar|coloque|ponha|leve)\b/.test(text);
+  const namedKnightToSquare = /\b(?:ron|knight|night|horse|cavalo)\b.*\b(?:to|toward|towards|into|on|at|para|pra|em)\s*$/.test(before);
+  return namedKnight && (moveVerb || Boolean(asrH3 && namedKnightToSquare));
 }
 
 interface LegalChessMove {

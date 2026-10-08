@@ -39,53 +39,65 @@ export interface WizardChessDialogueLine {
   text: Readonly<Record<SupportedLocale, string>>;
 }
 
-/** Original dialogue for this interactive homage, not a film transcript. */
+/** The caller supplies Ron's final move after this fixed exchange. The original
+ * English scene is used in both locales so the selected character voices read
+ * the same requested lines. atMs is only a reconnect/caption estimate; live
+ * narration advances as soon as each voice clip ends. */
 export const WIZARD_CHESS_DIALOGUE: readonly WizardChessDialogueLine[] = [
   {
-    id: 'ron-sees-the-line', speaker: 'ron', atMs: 6_000,
+    id: 'harry-wait', speaker: 'harry', atMs: 0,
     text: {
-      'en-US': 'Once I make my move, the queen will have to answer.',
-      'pt-BR': 'Assim que eu fizer minha jogada, a rainha terá de responder.',
+      'en-US': 'Wait a minute!',
+      'pt-BR': 'Wait a minute!',
     },
   },
   {
-    id: 'hermione-sees-the-risk', speaker: 'hermione', atMs: 12_000,
+    id: 'ron-sacrifice', speaker: 'ron', atMs: 1_600,
     text: {
-      'en-US': 'She can take your knight, Ron. Are you sure?',
-      'pt-BR': 'Ela pode capturar seu cavalo, Ron. Você tem certeza?',
+      'en-US': 'You understand why, Harry? Once I make my move, the queen will take me. Then you’re free to check the king.',
+      'pt-BR': 'You understand why, Harry? Once I make my move, the queen will take me. Then you’re free to check the king.',
     },
   },
   {
-    id: 'ron-accepts-the-risk', speaker: 'ron', atMs: 18_000,
+    id: 'harry-no', speaker: 'harry', atMs: 10_400,
     text: {
-      'en-US': 'I see it. Watch where she lands after the capture.',
-      'pt-BR': 'Eu sei. Observem onde ela vai parar depois da captura.',
+      'en-US': 'No. Ron, no!',
+      'pt-BR': 'No. Ron, no!',
     },
   },
   {
-    id: 'harry-sees-the-reply', speaker: 'harry', atMs: 24_000,
+    id: 'hermione-asks', speaker: 'hermione', atMs: 12_100,
     text: {
-      'en-US': 'That opens a line for the bishop. We have a reply.',
-      'pt-BR': 'Isso abre uma linha para o bispo. Temos uma resposta.',
+      'en-US': 'What is it?',
+      'pt-BR': 'What is it?',
     },
   },
   {
-    id: 'hermione-calls-for-help', speaker: 'hermione', atMs: 30_000,
+    id: 'harry-realizes', speaker: 'harry', atMs: 13_500,
     text: {
-      'en-US': 'The board is waiting for us. Someone has to call it.',
-      'pt-BR': 'O tabuleiro está esperando. Alguém precisa anunciar a jogada.',
+      'en-US': 'He’s going to sacrifice himself.',
+      'pt-BR': 'He’s going to sacrifice himself.',
     },
   },
   {
-    id: 'ron-invites-the-caller', speaker: 'ron', atMs: 36_000,
+    id: 'hermione-pleads', speaker: 'hermione', atMs: 15_600,
     text: {
-      'en-US': 'Your turn. Guide my knight where the queen must follow.',
-      'pt-BR': 'Sua vez. Guie meu cavalo para onde a rainha terá de segui-lo.',
+      'en-US': 'No, you can’t! There must be another way.',
+      'pt-BR': 'No, you can’t! There must be another way.',
+    },
+  },
+  {
+    id: 'ron-final-appeal', speaker: 'ron', atMs: 19_300,
+    text: {
+      'en-US': 'Do you want to stop Snape from getting that stone or not? Harry, it’s you that has to go on. I know it. Not me. Not Hermione. You.',
+      'pt-BR': 'Do you want to stop Snape from getting that stone or not? Harry, it’s you that has to go on. I know it. Not me. Not Hermione. You.',
     },
   },
 ];
 
-export const WIZARD_CHESS_STORY_DURATION_MS = 42_000;
+/** Safety timeout for a disconnected/muted display. The active screen normally
+ * advances to ready as soon as the final narration or caption finishes. */
+export const WIZARD_CHESS_STORY_DURATION_MS = 60_000;
 export const WIZARD_CHESS_RESOLVED_DURATION_MS = 26_000;
 
 /** Silman's composed five-move endgame, including the moves cut from the film edit. */
@@ -125,7 +137,13 @@ export function isWizardChessTrigger(spoken: string, locale: SupportedLocale): b
 
 /** Scene-only commands are checked before ordinary chess intent parsing. */
 export function parseWizardChessVoiceAction(spoken: string, locale: SupportedLocale): WizardChessVoiceAction {
-  const text = normalizedSpeech(spoken, locale);
+  const heard = normalizedSpeech(spoken, locale);
+  // Relay may transcribe the spoken letter H as an ordinary word, especially
+  // across accents. Keep these aliases within this one, phase-gated scene move.
+  const asrH3 = /\b(?:(?:age|aga|haych)\s*(?:3|three|tree|free|tres)|(?:h|aitch)\s*free)\b/g;
+  const usedAsrAlias = asrH3.test(heard);
+  asrH3.lastIndex = 0;
+  const text = heard.replace(asrH3, 'h3');
   // Corrections and information questions need the conversational interpreter.
   // A word like "exit" in "don't exit; move Ron" must never run as a command.
   if (/\b(?:don t|do not|not|never|wait|hold|nao|nunca|espere|espera)\b/.test(text)) return 'unknown';
@@ -149,6 +167,8 @@ export function parseWizardChessVoiceAction(spoken: string, locale: SupportedLoc
     const shortCommand = /^(?:(?:ron(?: s)?(?: knight)?|(?:my |the )?(?:knight|night|horse|cavalo)|g\s*(?:5|five|cinco)|gee\s*(?:5|five|cinco))\s+(?:(?:from|de)\s+(?:g\s*(?:5|five|cinco)|gee\s*(?:5|five|cinco))\s+)?(?:(?:to|on|at|into|para|em)\s+)?)(?:h\s*(?:3|three|tree|tres)|aitch\s*(?:3|three|tree|tres))(?: please)?$/.test(text);
     const otherPiece = /\b(?:queen|bishop|rook|pawn|king|rainha|dama|bispo|torre|peao|rei)\b/.test(text);
     if ((standalone || directRequest || shortCommand) && (exit || otherPiece)) return 'unknown';
+    if (usedAsrAlias && !standalone
+      && !/\b(?:ron|knight|night|horse|cavalo)\b/.test(heard)) return 'unknown';
     if (standalone || directRequest || shortCommand) return 'final';
   }
   if (exit) return 'exit';

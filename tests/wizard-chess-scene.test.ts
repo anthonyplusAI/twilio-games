@@ -35,9 +35,16 @@ describe('wizard chess scene', () => {
     expect(board.isCheckmate()).toBe(true); // The full composed line, not H3 alone, is mate.
   });
 
-  it('provides fixed bilingual original dialogue for all three voices', () => {
-    expect(WIZARD_CHESS_DIALOGUE[0]?.text['en-US']).toMatch(/^Once I make my move,/);
-    expect(new Set(WIZARD_CHESS_DIALOGUE.map(line => line.speaker))).toEqual(new Set(['ron', 'hermione', 'harry']));
+  it('plays the requested sacrifice exchange and leaves Ron’s move for the caller', () => {
+    expect(WIZARD_CHESS_DIALOGUE.map(line => [line.speaker, line.text['en-US']])).toEqual([
+      ['harry', 'Wait a minute!'],
+      ['ron', 'You understand why, Harry? Once I make my move, the queen will take me. Then you’re free to check the king.'],
+      ['harry', 'No. Ron, no!'],
+      ['hermione', 'What is it?'],
+      ['harry', 'He’s going to sacrifice himself.'],
+      ['hermione', 'No, you can’t! There must be another way.'],
+      ['ron', 'Do you want to stop Snape from getting that stone or not? Harry, it’s you that has to go on. I know it. Not me. Not Hermione. You.'],
+    ]);
     for (const line of WIZARD_CHESS_DIALOGUE) {
       expect(line.id).toBeTruthy();
       expect(line.text['en-US']).toBeTruthy();
@@ -54,7 +61,8 @@ describe('wizard chess scene', () => {
     expect(isWizardChessTrigger('Do not play Harry Potter chess', 'en-US')).toBe(false);
     expect(isWizardChessTrigger('xadrez de bruxo', 'pt-BR')).toBe(true);
     for (const speech of ['knight to H3', 'Ron to H three', 'move Ron’s knight from G5 to H3',
-      'H3', 'Knight to H-three', 'G five to H three']) {
+      'H3', 'Knight to H-three', 'G five to H three', 'age three',
+      'move Ron’s knight to age three', 'send Ron’s knight to H free']) {
       expect(parseWizardChessVoiceAction(speech, 'en-US')).toBe('final');
     }
     expect(parseWizardChessVoiceAction('What happens if the knight goes to H3?', 'en-US')).toBe('unknown');
@@ -71,6 +79,8 @@ describe('wizard chess scene', () => {
     expect(parseWizardChessVoiceAction('Help me move Ron’s knight to H3', 'en-US')).toBe('final');
     expect(parseWizardChessVoiceAction('Skip ahead and move Ron’s knight to H3', 'en-US')).toBe('final');
     expect(parseWizardChessVoiceAction('Move my queen to H3', 'en-US')).toBe('unknown');
+    expect(parseWizardChessVoiceAction('Move to age three', 'en-US')).toBe('unknown');
+    expect(parseWizardChessVoiceAction('What happened when Ron was age three?', 'en-US')).toBe('unknown');
     expect(parseWizardChessVoiceAction('The exit button is red', 'en-US')).toBe('unknown');
     expect(parseWizardChessVoiceAction('The skip button is visible', 'en-US')).toBe('unknown');
     expect(parseWizardChessVoiceAction('Can you skip to the move?', 'en-US')).toBe('skip');
@@ -78,5 +88,6 @@ describe('wizard chess scene', () => {
     expect(parseWizardChessVoiceAction('back to normal chess', 'en-US')).toBe('exit');
     expect(parseWizardChessVoiceAction('dica', 'pt-BR')).toBe('hint');
     expect(parseWizardChessVoiceAction('mova o cavalo do Ron para H três', 'pt-BR')).toBe('final');
+    expect(parseWizardChessVoiceAction('mova o cavalo do Ron para agá três', 'pt-BR')).toBe('final');
   });
 });
