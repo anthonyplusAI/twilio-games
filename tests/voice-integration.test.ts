@@ -218,7 +218,7 @@ describe('voice integration (fake Conversation Relay client)', () => {
         expect(spoken.join(' ')).toMatch(/won first place.*seconds/i);
         expect(spoken.join(' ')).toMatch(/rank .* on the leaderboard/i);
         expect(spoken.join(' ')).toMatch(/Conversation Relay transcribed your phone commands/i);
-        expect(spoken.join(' ')).toMatch(/Twill-ee-oo/i);
+        expect(spoken.join(' ')).toMatch(/<phoneme alphabet="ipa" ph="ˈtwɪlioʊ">Twilio<\/phoneme>/i);
         expect(spoken.join(' ')).toMatch(/game server steered the car on this screen/i);
       }, { timeout: 2_000 });
       const resultSpeech = spoken.join(' ');

@@ -12,6 +12,9 @@ type WizardAsset = ChessPieceType | ModelAsset;
 const MODEL_PATH = '/assets/chess/wizard/';
 // The three players should appear as soon as the scene opens, even while the armies finish loading.
 const MODEL_FILES: readonly ModelAsset[] = ['ron', 'harry', 'hermione', 'knight', 'queen', 'king', 'pawn'];
+const MAX_ACTIVE_MODEL_LOADS = 3;
+const MODEL_DOWNLOAD_TIMEOUT_MS = 45_000;
+const ACTIVATION_RETRY_DELAY_MS = 1_500;
 const PIECE_MODEL: Partial<Record<ChessPieceType, ModelAsset>> = {
   k: 'king', n: 'knight', p: 'pawn', q: 'queen',
 };
@@ -43,7 +46,7 @@ export class WizardPieceLibrary {
   private readonly loader = new GLTFLoader();
   private readonly draco = new DRACOLoader();
   private readonly templates = new Map<ModelAsset, THREE.Group>();
-  private readonly inFlight = new Map<ModelAsset, { promise: Promise<void>; activation: boolean }>();
+  private readonly inFlight = new Map<ModelAsset, Promise<void>>();
   private readonly failed = new Set<ModelAsset>();
   private readonly stoneWhite = new THREE.MeshStandardMaterial({
     color: 0xf2e8d9, roughness: 0.58, metalness: 0.08,
@@ -98,9 +101,20 @@ export class WizardPieceLibrary {
       while (cursor < keys.length && !this.disposed) {
         const key = keys[cursor++]!;
         await this.load(key, retryFailed);
+        if (!retryFailed && isCharacter(key) && this.failed.has(key)) {
+          // Keep a slot open for an imminent activation retry instead of
+          // filling every slot with slower army files.
+          break;
+        }
+        if (retryFailed && this.failed.has(key) && !this.disposed) {
+          // Retry this actor or piece before its worker advances. A failed
+          // character cannot be stranded behind a stalled king or pawn.
+          await new Promise(resolve => setTimeout(resolve, ACTIVATION_RETRY_DELAY_MS));
+          if (!this.disposed) await this.load(key, true);
+        }
       }
     };
-    const pass = Promise.all([worker(), worker()]).then(() => {});
+    const pass = Promise.all(Array.from({ length: MAX_ACTIVE_MODEL_LOADS }, () => worker())).then(() => {});
     if (retryFailed) {
       this.activationPass = pass;
       void pass.finally(() => { if (this.activationPass === pass) this.activationPass = null; });
@@ -156,19 +170,17 @@ export class WizardPieceLibrary {
     if (this.disposed || this.templates.has(key) || (this.failed.has(key) && !retryFailed)) return;
     const current = this.inFlight.get(key);
     if (current) {
-      await current.promise;
-      // Activation may arrive while the QR prefetch is still in flight. If that first
-      // attempt timed out, make one fresh request before settling for the procedural figure.
-      if (retryFailed && !current.activation && !this.disposed && !this.templates.has(key)) {
-        await this.load(key, true);
-      }
+      await current;
       return;
     }
     const promise = (async () => {
       await this.acquireLoadSlot(retryFailed);
       const controller = new AbortController();
       this.pendingControllers.add(controller);
-      const timeout = setTimeout(() => controller.abort(), 11_000);
+      // The deployed static stream can deliver 200 headers quickly and then
+      // take longer than eleven seconds to finish a model body on a cold link.
+      // Limit the download, not the subsequent texture/Draco parsing work.
+      const timeout = setTimeout(() => controller.abort(), MODEL_DOWNLOAD_TIMEOUT_MS);
       try {
         if (this.disposed) return;
         const response = await fetch(`${MODEL_PATH}${key}.glb`, {
@@ -176,6 +188,7 @@ export class WizardPieceLibrary {
         });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const bytes = await response.arrayBuffer();
+        clearTimeout(timeout);
         const loaded = await this.loader.parseAsync(bytes, MODEL_PATH);
         const normalized = this.normalize(loaded.scene, key);
         if (this.disposed) {
@@ -199,12 +212,12 @@ export class WizardPieceLibrary {
         this.releaseLoadSlot();
       }
     })();
-    this.inFlight.set(key, { promise, activation: retryFailed });
+    this.inFlight.set(key, promise);
     return promise;
   }
 
   private acquireLoadSlot(activation: boolean): Promise<void> {
-    if (this.activeLoads < 2) {
+    if (this.activeLoads < MAX_ACTIVE_MODEL_LOADS) {
       this.activeLoads++;
       return Promise.resolve();
     }

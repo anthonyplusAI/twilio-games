@@ -114,6 +114,33 @@ svg { display:block; }
 .architecture-row h3 { margin:0 0 7px;font:800 25px/1.1 'Twilio Sans Display',sans-serif; }
 .architecture-row p { max-width:70ch;margin:0;color:var(--soft);font-size:15px;line-height:1.48; }
 .architecture-row code { display:block;padding:14px 16px;border-left:3px solid var(--twilio);border-radius:0 8px 8px 0;color:#DDE8F7;background:#152442;font:400 12px/1.65 'Twilio Sans Mono',monospace;overflow-wrap:anywhere; }
+.code-tour { margin-top:32px;overflow:hidden;border:1px solid #5B6F8E;border-radius:15px;background:linear-gradient(135deg,#142746 0%,#101C39 75%); }
+.code-tour summary { display:grid;grid-template-columns:54px minmax(0,1fr) 32px;align-items:center;gap:17px;padding:20px 24px;list-style:none;cursor:pointer; }
+.code-tour summary::-webkit-details-marker { display:none; }
+.code-tour summary::marker { content:''; }
+.code-tour summary:hover { background:rgba(115,150,203,.1); }
+.code-tour[open] summary { border-bottom:1px solid #49607E; }
+.code-tour-icon { width:54px;height:54px;display:grid;place-items:center;border:1px solid #A3627D;border-radius:12px;color:#FFBAC3;background:rgba(239,34,58,.14);font:700 17px/1 'Twilio Sans Mono',monospace; }
+.code-tour-heading { min-width:0;display:flex;flex-direction:column;gap:3px; }
+.code-tour-heading strong { color:#fff;font:800 clamp(21px,2.2vw,28px)/1.12 'Twilio Sans Display',sans-serif; }
+.code-tour-heading small { color:#C8D5E8;font-size:13px; }
+.code-tour-toggle { width:31px;height:31px;display:grid;place-items:center;border:1px solid #6E829F;border-radius:7px;color:#fff;font:400 25px/1 'Twilio Sans Text',sans-serif;transition:transform .18s ease; }
+.code-tour[open] .code-tour-toggle { transform:rotate(45deg); }
+.code-tour-body { padding:23px 24px 25px; }
+.code-tour-intro,.code-tour-note { margin:0;color:#D8E2F0;font-size:14px;line-height:1.5; }
+.code-tour-intro { max-width:82ch; }
+.code-tour-scroll-tip { display:none; }
+.code-samples { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:24px;margin:22px 0; }
+.code-sample { display:flex;min-width:0;flex-direction:column;align-items:flex-start;border-top:1px solid #6A7C98;padding-top:16px; }
+.code-sample-heading { display:flex;align-items:baseline;flex-wrap:wrap;gap:6px 13px; }
+.code-sample-heading span { color:#FFAFBA;font:400 11px/1.2 'Twilio Sans Mono',monospace;white-space:nowrap; }
+.code-sample-heading h3 { margin:0;color:#fff;font:800 20px/1.2 'Twilio Sans Display',sans-serif; }
+.code-sample p { max-width:54ch;min-height:63px;margin:9px 0 0;color:#D8E2F0;font-size:13px;line-height:1.45; }
+.code-sample pre { width:100%;max-width:100%;min-height:196px;margin:14px 0 11px;padding:15px 17px;overflow-x:auto;border:1px solid #49617F;border-radius:9px;color:#ECF4FF;background:#06142B;font:400 12px/1.5 'Twilio Sans Mono',monospace;tab-size:2; }
+.code-sample pre code { white-space:pre; }
+.code-sample a { margin-top:auto;color:#FFACB8;font-size:13px;font-weight:700;text-decoration-color:#FFACB8;text-underline-offset:4px; }
+.code-sample a:hover { color:#fff; }
+.code-tour-note { border-top:1px solid #49607E;padding-top:18px; }
 .entry-branch { display:grid;grid-template-columns:minmax(0,.7fr) minmax(0,1.3fr);align-items:center;gap:clamp(24px,4vw,60px);margin-top:42px;padding:27px 30px;border:1px solid #526583;border-radius:14px;color:#fff;background:#132340; }
 .entry-branch h3 { margin:0 0 7px;font:800 25px/1.1 'Twilio Sans Display',sans-serif; }
 .entry-branch p { max-width:35ch;margin:0;color:#C8D3E6;font-size:14px; }
@@ -166,6 +193,17 @@ html[data-theme="light"] :is(.hero-marker,.section-cue,.row-number) { color:#B10
 html[data-theme="light"] :is(.demo-example strong,.hero-foot strong) { color:var(--text); }
 html[data-theme="light"] .hero-foot,html[data-theme="light"] .architecture-rows,html[data-theme="light"] .architecture-row,html[data-theme="light"] .features,html[data-theme="light"] .feature-list,html[data-theme="light"] .feature-list article,html[data-theme="light"] .game-list li { border-color:#BABECC; }
 html[data-theme="light"] .feature-mark { border-color:#B10F23;color:#B10F23; }
+html[data-theme="light"] .code-tour { border-color:#B9C5D9;background:linear-gradient(135deg,#F8FAFE,#EFF3F9); }
+html[data-theme="light"] .code-tour summary:hover { background:rgba(34,66,115,.06); }
+html[data-theme="light"] .code-tour[open] summary,html[data-theme="light"] .code-tour-note { border-color:#C3CEDD; }
+html[data-theme="light"] .code-tour-icon { border-color:#D88294;color:#9F0C22;background:#FFE9ED; }
+html[data-theme="light"] .code-tour-heading strong,html[data-theme="light"] .code-sample-heading h3 { color:#142340; }
+html[data-theme="light"] .code-tour-heading small,html[data-theme="light"] .code-tour-intro,html[data-theme="light"] .code-sample p,html[data-theme="light"] .code-tour-note { color:#394865; }
+html[data-theme="light"] .code-tour-toggle { border-color:#9EAEC6;color:#142340; }
+html[data-theme="light"] .code-sample { border-color:#C3CEDD; }
+html[data-theme="light"] .code-sample-heading span { color:#A41027; }
+html[data-theme="light"] .code-sample a { color:#A41027;text-decoration-color:#A41027; }
+html[data-theme="light"] .code-sample a:hover { color:#6D091A; }
 html[data-theme="light"] .karaoke-lane .section-cue { color:#FFA6B1; }
 html[data-theme="light"] .game-list li:nth-child(-n+3) { border-top-color:#EF223A; }
 
@@ -192,6 +230,9 @@ html[data-theme="light"] .game-list li:nth-child(-n+3) { border-top-color:#EF223
   .route-node p { grid-column:2;grid-row:2;font-size:13px; }
   .architecture-row { grid-template-columns:60px 1fr;align-items:start; }
   .architecture-row code { grid-column:2; }
+  .code-samples { grid-template-columns:1fr;gap:27px; }
+  .code-sample p { min-height:0; }
+  .code-sample pre { min-height:0; }
   .entry-branch { grid-template-columns:1fr; }
   .features { grid-template-columns:1fr;gap:28px; }
   .feature-intro { position:static; }
@@ -226,6 +267,14 @@ html[data-theme="light"] .game-list li:nth-child(-n+3) { border-top-color:#EF223
   .section-intro h2 { font-size:clamp(36px,9vw,48px); }
   .architecture-row { grid-template-columns:1fr;gap:10px;padding:23px 0; }
   .architecture-row code { grid-column:1; }
+  .code-tour summary { grid-template-columns:43px minmax(0,1fr) 28px;gap:12px;padding:17px; }
+  .code-tour-icon { width:43px;height:43px;font-size:13px; }
+  .code-tour-heading strong { font-size:21px; }
+  .code-tour-toggle { width:27px;height:27px;font-size:22px; }
+  .code-tour-body { padding:19px 17px 21px; }
+  .code-sample pre { font-size:11px; }
+  .code-tour-scroll-tip { display:block;margin:9px 0 0;color:#FFBAC3;font:400 11px/1.4 'Twilio Sans Mono',monospace; }
+  html[data-theme="light"] .code-tour-scroll-tip { color:#9F0C22; }
   .row-number { font-size:39px; }
   .entry-branch { padding:23px 20px; }
   .entry-branch ol { grid-template-columns:1fr; }

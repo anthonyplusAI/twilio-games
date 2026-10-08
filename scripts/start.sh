@@ -8,6 +8,7 @@ set -e
 #   - data/trivia-questions.json - the live protected Trivia question bank, seeded from the image's
 #                                  content/trivia/questions.json on first boot
 #   - data/analytics.json   — bounded daily activation analytics rollups
+#   - data/wizard-chess-audio/*.mp3 — fixed character narration reused across calls and deploys
 #   - data/maps.json        — LIVE level configs authored in the editor (seeded once from the
 #                             image's assets/maps/maps.json on first boot; see http-server.seedMapsFile)
 # The app uses normal fs calls (writeFileAtomic mkdir's data/); we just make data/ resolve to the share.

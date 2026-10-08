@@ -318,6 +318,7 @@ export class HttpServer {
   private readonly karaokeCalibrationOffsetMs: number;
   private readonly deepgramConfigured: boolean;
   private readonly wizardChessAudio: WizardChessAudioService;
+  private readonly prewarmWizardChessAudio: boolean;
   private readonly defaultLocale: SupportedLocale;
   private readonly standaloneVoiceEnabled: boolean;
   /** Cached selectable cars/maps for the lobby (refreshed from manifest + maps.json periodically). */
@@ -505,7 +506,9 @@ export class HttpServer {
     this.fighterPreviewDir = opts.fighterPreviewDir ?? 'data/fighter-previews';
     this.crVoice = relayVoiceForLocale('en-US');
     this.crVoicePtBr = relayVoiceForLocale('pt-BR');
-    this.wizardChessAudio = opts.wizardChessAudio ?? new WizardChessAudioService();
+    this.prewarmWizardChessAudio = !opts.wizardChessAudio && process.env.NODE_ENV === 'production';
+    this.wizardChessAudio = opts.wizardChessAudio
+      ?? new WizardChessAudioService({ cacheDir: 'data/wizard-chess-audio' });
     this.voiceRelayToken = resolveVoiceRelayToken(
       this.publicBaseUrl,
       opts.voiceRelayToken ?? process.env.VOICE_RELAY_TOKEN,
@@ -5282,6 +5285,14 @@ export class HttpServer {
       });
     });
     await this.arcadeApi?.activateMessagingDelivery();
+    if (this.prewarmWizardChessAudio) {
+      // A new revision serves HTTP immediately while its first two fixed scene
+      // lines warm, then the remaining lines. The Azure Files cache is shared
+      // with later revisions, so they normally perform no provider requests.
+      void this.wizardChessAudio.prewarm().catch(() => {
+        console.warn('[wizard-audio] reason=prewarm_failed');
+      });
+    }
     return listeningPort;
   }
 
@@ -5602,8 +5613,7 @@ function normalizeRelayPlaybackText(value: string): string {
   return value.replace(/<[^>]*>/g, ' ')
     .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
     .normalize('NFKC').toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
-    .replace(/\btwill ee oo\b/g, 'twilio');
+    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 }
 
 function relayEstimatedSpeechMs(text: string, locale: SupportedLocale): number {
@@ -5728,12 +5738,12 @@ export function relayTextChunks(text: string, locale: SupportedLocale = DEFAULT_
   return chunks;
 }
 
-export function relaySpeechMarkup(text: string, locale: SupportedLocale = DEFAULT_LOCALE): string {
-  // The default ElevenLabs Flash 2.5 voice can ignore inline phoneme tags.
-  // Spell the brand as syllables only in the Relay token; screen text stays canonical.
-  return locale === 'en-US'
-    ? text.replace(/\bTwilio\b/gi, 'Twill-ee-oo')
-    : text;
+export function relaySpeechMarkup(text: string, locale: SupportedLocale = DEFAULT_LOCALE,
+                                  voice = relayVoiceForLocale(locale)): string {
+  // Twilio supports this IPA example with English ElevenLabs Flash v2 or Turbo v2.
+  // An explicit voice override may select a model that ignores phoneme tags.
+  if (locale !== 'en-US' || !/-(?:flash_v2|turbo_v2)(?:-|$)/.test(voice)) return text;
+  return text.replace(/\bTwilio\b/gi, '<phoneme alphabet="ipa" ph="ˈtwɪlioʊ">Twilio</phoneme>');
 }
 
 function selectionNumberHints(locale: SupportedLocale): string[] {

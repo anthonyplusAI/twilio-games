@@ -112,6 +112,57 @@
           <code>/game · /battle · /fighter<br>/karaoke · /trivia · /chess</code>
         </article>
       </div>
+      <details class="code-tour">
+        <summary>
+          <span class="code-tour-icon" aria-hidden="true">&lt;/&gt;</span>
+          <span class="code-tour-heading">
+            <span class="section-cue" data-copy="codeCue">For curious builders</span>
+            <strong data-copy="codeTitle">See the Twilio code behind a voice turn</strong>
+            <small data-copy="codeTeaser">Two short excerpts from the live call path</small>
+          </span>
+          <span class="code-tour-toggle" aria-hidden="true">+</span>
+        </summary>
+        <div class="code-tour-body">
+          <p class="code-tour-intro" data-copy="codeIntro">These are shortened excerpts from this app’s server. The URL and room code are examples; the English ElevenLabs voice, interruption settings, and reply fields match the current flow.</p>
+          <p class="code-tour-scroll-tip" data-copy="codeScrollTip">Swipe a code block sideways to read a full line.</p>
+          <div class="code-samples">
+            <article class="code-sample">
+              <div class="code-sample-heading"><span>01 / TwiML</span><h3 data-copy="codeConnectTitle">Connect the caller</h3></div>
+              <p data-copy="codeConnectBody">The incoming-call webhook returns instructions that open Conversation Relay. These settings let players cut into greetings and replies.</p>
+              <pre><code>&lt;Connect
+  action="https://example.com/voice/session-ended"&gt;
+  &lt;ConversationRelay
+    url="wss://example.com/voice"
+    transcriptionProvider="Deepgram"
+    speechModel="flux"
+    ttsProvider="ElevenLabs"
+    voice="SA7eD52NRr8WAehitVt1-flash_v2"
+    partialPrompts="true"
+    interruptible="any"
+    welcomeGreetingInterruptible="any"
+    reportInputDuringAgentSpeech="any"&gt;
+    &lt;Parameter name="roomCode" value="ABCD" /&gt;
+  &lt;/ConversationRelay&gt;
+&lt;/Connect&gt;</code></pre>
+              <a href="https://github.com/anthonyplusAI/twilio-games/blob/main/server/twiml.ts" target="_blank" rel="noopener noreferrer" data-copy="codeConnectSource">View TwiML source ↗</a>
+            </article>
+            <article class="code-sample">
+              <div class="code-sample-heading"><span>02 / WebSocket</span><h3 data-copy="codeReplyTitle">Speak the response</h3></div>
+              <p data-copy="codeReplyBody">Relay sends the caller’s transcript as a prompt. After the game checks the action, the server sends reply text for Twilio to speak.</p>
+              <pre><code>ws.send(JSON.stringify({
+  type: 'text',
+  token: wireTokens[index],
+  last: index === wireTokens.length - 1,
+  lang: locale,
+  interruptible: true,
+  preemptible: true,
+}));</code></pre>
+              <a href="https://github.com/anthonyplusAI/twilio-games/blob/main/server/http-server.ts" target="_blank" rel="noopener noreferrer" data-copy="codeReplySource">View voice reply source ↗</a>
+            </article>
+          </div>
+          <p class="code-tour-note" data-copy="codeNote">The display gets the validated room state over a separate game WebSocket, so what players hear and see comes from the same action.</p>
+        </div>
+      </details>
       <div class="entry-branch">
         <div><h3 data-copy="entryTitle">How players reach the call</h3><p data-copy="entryBody">Both entry paths lead to the same live voice connection.</p></div>
         <ol>
