@@ -49,8 +49,22 @@ describe('Voice Chess wizard scene', () => {
     expect(game.findRoom('WIZ')!.state()).toMatchObject({ fen: before.fen, revision: before.revision,
       ply: before.ply, phase: 'playing', result: null });
     expect(game.voiceCommand('WIZ', 'CA-wizard', 'pawn from E2 to E4', 'en-US')).toMatchObject({
-      code: 'wizard_waiting', state: { fen: before.fen, pendingMove: null },
+      code: 'wizard_waiting', state: { fen: before.fen, pendingMove: null,
+        wizardScene: { phase: 'story' } },
     });
+    const early = game.voiceCommand('WIZ', 'CA-wizard', 'Ron to H three', 'en-US');
+    expect(early).toMatchObject({ code: 'wizard_waiting', state: {
+      fen: before.fen, revision: before.revision, ply: before.ply,
+      wizardScene: { phase: 'story' },
+    } });
+    expect(early?.message).not.toMatch(/H\s*three|H3|G\s*five|G5/i);
+    expect(game.voiceCommand('WIZ', 'CA-wizard', 'hint', 'en-US')).toMatchObject({
+      code: 'wizard_waiting', state: { hintsRemaining: 3, wizardScene: { phase: 'story' } },
+    });
+    const sceneId = game.snapshot('WIZ')!.wizardScene!.id;
+    const frames = attachFakeDisplay(game);
+    sendFakeDisplay(game, { type: 'display_wizard_skip', roomCode: 'WIZ', sceneId });
+    expect(frames.at(-1)).toMatchObject({ type: 'chess_state', wizardScene: { phase: 'ready' } });
     expect(game.voiceCommand('WIZ', 'CA-wizard', 'hint', 'en-US')).toMatchObject({
       code: 'wizard_hint', state: { hintsRemaining: 3, wizardScene: { phase: 'ready' } },
     });
@@ -150,7 +164,7 @@ describe('Voice Chess wizard scene', () => {
     expect(game.snapshot('WIZ')?.wizardScene?.phase).toBe('ready');
     expect(game.voiceJoin('WIZ', 'Ada', 'CA-black', 'en-US')).toMatchObject({ resumed: true });
     expect(game.snapshot('WIZ')?.wizardScene?.phase).toBe('ready');
-    expect(game.voiceCommand('WIZ', 'CA-black', 'skip to the move', 'en-US')?.code).toBe('wizard_skipped');
+    expect(game.voiceCommand('WIZ', 'CA-black', 'skip to the move', 'en-US')?.code).toBe('wizard_waiting');
     expect(game.voiceCommand('WIZ', 'CA-black', 'knight to H3', 'en-US')?.code).toBe('wizard_resolved');
     expect(game.findRoom('WIZ')!.state()).toMatchObject({ fen: before.fen,
       revision: before.revision, ply: 1, result: null });
@@ -162,6 +176,7 @@ describe('Voice Chess wizard scene', () => {
     attachFakeDisplay(game);
     game.voiceJoin('WIZ', 'Ada', 'CA-old', 'en-US');
     game.voiceCommand('WIZ', 'CA-old', 'wizard chess', 'en-US');
+    game.voiceCommand('WIZ', 'CA-old', 'skip to the move', 'en-US');
     game.voiceCommand('WIZ', 'CA-old', 'knight to H3', 'en-US');
     game.voiceLeave('WIZ', 'CA-old');
     game.voiceJoin('WIZ', 'Grace', 'CA-new', 'en-US');
@@ -198,6 +213,7 @@ describe('Voice Chess wizard scene', () => {
     game.voiceJoin('WIZ', 'Ada', 'CA-old', 'en-US');
     const before = game.snapshot('WIZ')!;
     game.voiceCommand('WIZ', 'CA-old', 'wizard chess', 'en-US');
+    game.voiceCommand('WIZ', 'CA-old', 'skip to the move', 'en-US');
     game.voiceCommand('WIZ', 'CA-old', 'H3', 'en-US');
     game.voiceLeave('WIZ', 'CA-old');
     vi.advanceTimersByTime(WIZARD_CHESS_RESOLVED_DURATION_MS - 1);

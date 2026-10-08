@@ -295,6 +295,8 @@ export class ChessBoardScene {
     this.setCheck(null);
     this.appliedTheme = null;
     this.setTheme(this.theme);
+    this.cameraAdjusted = false;
+    this.positionCamera();
     this.renderer.shadowMap.needsUpdate = true;
     if (enabled) this.wizardAssets.prefetch(true);
   }
@@ -491,6 +493,21 @@ export class ChessBoardScene {
     this.camera.position.set(sign * (narrow ? 0.45 : 8.5), (narrow ? 18.5 : 13.1) + shift,
       sign * (narrow ? 14.4 : 13.4));
     this.orbit.target.set(0, 0.3 + shift, 0);
+    // Keep the spoken scene's figures visible beside the dialogue panel on
+    // desktop, or above the bottom sheet on phones.
+    if (this.wizardMode) {
+      this.camera.lookAt(this.orbit.target);
+      if (width > 720) {
+        const offset = Math.min(3, Math.max(0, (1_150 - width) / 125));
+        const right = new THREE.Vector3(1, 0, 0).applyQuaternion(this.camera.quaternion);
+        this.camera.position.addScaledVector(right, -offset);
+        this.orbit.target.addScaledVector(right, -offset);
+      } else {
+        const up = new THREE.Vector3(0, 1, 0).applyQuaternion(this.camera.quaternion);
+        this.camera.position.addScaledVector(up, -2.3);
+        this.orbit.target.addScaledVector(up, -2.3);
+      }
+    }
     this.orbit.cursor.copy(this.orbit.target);
     this.camera.lookAt(this.orbit.target);
     this.camera.updateProjectionMatrix();

@@ -7,9 +7,10 @@ const nextTurn = () => new Promise<void>(resolve => setImmediate(resolve));
 afterEach(() => vi.useRealTimers());
 
 describe('relayTextChunks', () => {
-  it('uses Twilio official SSML pronunciation only for English Relay speech', () => {
-    expect(relaySpeechMarkup('Powered by Twilio Conversation Relay.', 'en-US')).toContain('<phoneme alphabet="ipa" ph="ˈtwɪlioʊ">Twilio</phoneme>');
-    expect(relaySpeechMarkup('TWILIO', 'en-US')).toContain('>Twilio</phoneme>');
+  it('spells Twilio for the English ElevenLabs voice without changing the visible text', () => {
+    expect(relaySpeechMarkup('Powered by Twilio Conversation Relay.', 'en-US'))
+      .toBe('Powered by Twill-ee-oo Conversation Relay.');
+    expect(relaySpeechMarkup('TWILIO', 'en-US')).toBe('Twill-ee-oo');
     expect(relaySpeechMarkup('Tecnologia Twilio Conversation Relay.', 'pt-BR')).toBe('Tecnologia Twilio Conversation Relay.');
   });
   it('splits long Voice Racer control instructions into paced chunks', () => {
@@ -67,7 +68,7 @@ describe('relayTextChunks', () => {
     expect(sent.map(message => message.token.replace(/[\u200B\u2060]/g, '')).join('')).toBe(prompt);
   });
 
-  it('accepts a playback receipt after Relay strips the invisible cue marker and SSML', async () => {
+  it('accepts a playback receipt after Relay strips the invisible cue marker', async () => {
     const sent: Array<{ token: string }> = [];
     const socket = { OPEN: 1, readyState: 1,
       send(value: string, callback?: (error?: Error) => void) {
@@ -76,8 +77,24 @@ describe('relayTextChunks', () => {
     } as unknown as WebSocket;
     const delivery = sendRelayTextOutcome(socket, 'Twilio Conversation Relay speaks your answer.');
     await nextTurn();
+    expect(sent.at(-1)!.token).toContain('Twill-ee-oo Conversation Relay');
+    const spoken = sent.at(-1)!.token.replace(/[\u200B\u2060]/g, '');
+    handleRelayPlaybackEvent(socket, JSON.stringify({ type: 'info', name: 'tokensPlayed', value: spoken }));
+    expect(await Promise.race([delivery, nextTurn().then(() => 'still pending')])).toBe('played');
+  });
+
+  it('recognizes a canonical Twilio playback receipt for the phonetic wire text', async () => {
+    const sent: Array<{ token: string }> = [];
+    const socket = { OPEN: 1, readyState: 1,
+      send(value: string, callback?: (error?: Error) => void) {
+        sent.push(JSON.parse(value)); callback?.();
+      },
+    } as unknown as WebSocket;
+    const delivery = sendRelayTextOutcome(socket, 'Twilio Conversation Relay is ready.');
+    await nextTurn();
+    expect(sent.at(-1)!.token).toContain('Twill-ee-oo');
     const spoken = sent.at(-1)!.token
-      .replace(/<phoneme[^>]*>(.*?)<\/phoneme>/g, '$1')
+      .replace('Twill-ee-oo', 'Twilio')
       .replace(/[\u200B\u2060]/g, '');
     handleRelayPlaybackEvent(socket, JSON.stringify({ type: 'info', name: 'tokensPlayed', value: spoken }));
     expect(await Promise.race([delivery, nextTurn().then(() => 'still pending')])).toBe('played');

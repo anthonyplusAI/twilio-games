@@ -2,7 +2,7 @@ import type { WizardChessSceneSnapshot } from '../../shared/chess-protocol';
 import type { SupportedLocale } from '../../shared/i18n/locales';
 import {
   WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_RESOLVED_DURATION_MS,
-  WIZARD_CHESS_SEQUENCE, WIZARD_CHESS_STORY_DURATION_MS, WIZARD_CHESS_VICTORY_AT_MS,
+  WIZARD_CHESS_SEQUENCE, WIZARD_CHESS_VICTORY_AT_MS,
   WIZARD_CHESS_VOICE_IDS,
   type WizardChessDialogueLine,
 } from '../../shared/wizard-chess-scene';
@@ -20,8 +20,9 @@ function audioVersion(locale: SupportedLocale): string {
 const lineUrl = (id: string, locale: SupportedLocale): string =>
   `/api/chess/wizard-audio/${encodeURIComponent(id)}?locale=${encodeURIComponent(locale)}&v=${audioVersion(locale)}`;
 const element = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
-const VOICE_END_GUARD_MS = 500;
-const BROWSER_SPEECH_RATE = 1.3;
+const BETWEEN_LINES_MS = 150;
+const AUDIO_WAIT_MS = 6_000;
+const RECONNECT_REPLAY_WINDOW_MS = 8_000;
 
 interface WizardSceneHooks {
   renderPosition: (position: readonly BoardPiece[], scene: WizardChessSceneSnapshot) => void;
@@ -44,7 +45,6 @@ export class WizardSceneController {
   private readonly audio = new Audio();
   private readonly audioUrls = new Map<string, string>();
   private readonly audioRequests = new Map<string, Promise<string | null>>();
-  private readonly audioDurations = new Map<string, Promise<number | null>>();
   private readonly prefetchedLines = new Set<string>();
   private readonly shownLines = new Set<string>();
   private board: ChessBoardScene | null = null;
@@ -52,9 +52,14 @@ export class WizardSceneController {
   private currentPosition: BoardPiece[] = wizardPositionAfterMoves(0);
   private latestLine: WizardChessDialogueLine | null = null;
   private audioSourceLine: WizardChessDialogueLine | null = null;
-  private browserUtterance: SpeechSynthesisUtterance | null = null;
-  private queuedLine: WizardChessDialogueLine | null = null;
   private activeAudio = false;
+  private linePending = false;
+  private lineStartedAt = 0;
+  private nextDialogueIndex = 0;
+  private storyInitialized = false;
+  private storyCompletionRequested = false;
+  private focusMoveHintWhenReady = false;
+  private lineTimer: ReturnType<typeof setTimeout> | null = null;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private soundEnabled = true;
   private soundNeedsGesture = false;
@@ -64,6 +69,7 @@ export class WizardSceneController {
   private resolutionNextIndex = 0;
   private clockOffsetMs = 0;
   private audioUnavailable = false;
+  private voiceFailed = false;
   private disposed = false;
 
   constructor(private readonly locale: SupportedLocale, private readonly hooks: WizardSceneHooks) {
@@ -78,9 +84,11 @@ export class WizardSceneController {
 
   get active(): boolean { return this.snapshot !== null; }
 
-  /** Warm only Ron's opening line while the join QR is displayed. */
+  /** Warm Harry's opening and Ron's reply while the join QR is displayed. */
   prefetchOpeningVoice(): void {
-    if (!this.disposed) this.prefetchLine(WIZARD_CHESS_DIALOGUE[0]!);
+    if (this.disposed) return;
+    this.prefetchLine(WIZARD_CHESS_DIALOGUE[0]!);
+    this.prefetchLine(WIZARD_CHESS_DIALOGUE[1]!);
   }
 
   attachBoard(board: ChessBoardScene): void {
@@ -107,13 +115,16 @@ export class WizardSceneController {
     const previousPhase = this.snapshot?.id === snapshot.id ? this.snapshot.phase : null;
     if (this.snapshot?.id !== snapshot.id) this.enter(snapshot);
     this.snapshot = snapshot;
-    if (snapshot.phase !== 'story') this.rebuildCaptions(snapshot);
+    if (snapshot.phase !== 'story' && previousPhase === null) this.rebuildCaptions();
     if (snapshot.phase === 'ready') {
       if (previousPhase !== 'ready') {
         this.storySkipped = true;
+        // The server can also advance at its safety timeout. Stop any in-flight
+        // line so the audible scene and the newly enabled phone move agree.
         this.stopVoice();
       }
-      this.revealMoveHint();
+      this.revealMoveHint(this.focusMoveHintWhenReady);
+      this.focusMoveHintWhenReady = false;
     }
     if (snapshot.phase === 'resolved') {
       this.stopVoice();
@@ -134,7 +145,6 @@ export class WizardSceneController {
     this.audio.removeEventListener('ended', this.onAudioEnded);
     this.audioUrls.forEach(url => URL.revokeObjectURL(url));
     this.audioUrls.clear();
-    this.audioDurations.clear();
   }
 
   private enter(snapshot: WizardChessSceneSnapshot): void {
@@ -144,7 +154,15 @@ export class WizardSceneController {
     this.resolutionStarted = false;
     this.resolutionNextIndex = 0;
     this.shownLines.clear();
+    this.prefetchedLines.clear();
     this.latestLine = null;
+    this.nextDialogueIndex = 0;
+    this.storyInitialized = false;
+    this.storyCompletionRequested = false;
+    this.focusMoveHintWhenReady = false;
+    this.audioUnavailable = false;
+    this.voiceFailed = false;
+    this.renderSoundToggle();
     this.currentPosition = wizardPositionAfterMoves(0);
     this.transcript.replaceChildren();
     this.overlay.hidden = false;
@@ -188,23 +206,26 @@ export class WizardSceneController {
   }
 
   private renderStory(scene: WizardChessSceneSnapshot): void {
-    const elapsed = Math.max(0, Math.min(WIZARD_CHESS_STORY_DURATION_MS,
-      this.serverNow() - scene.startedAt));
-    const due = WIZARD_CHESS_DIALOGUE.filter(line => line.atMs <= elapsed);
-    const upcoming = WIZARD_CHESS_DIALOGUE[due.length];
-    if (upcoming) this.prefetchLine(upcoming);
-    for (const line of due) {
-      if (this.shownLines.has(line.id)) continue;
-      this.appendLine(line);
-      this.latestLine = line;
+    if (this.storyCompletionRequested || this.linePending || this.lineTimer) return;
+    if (!this.storyInitialized) {
+      this.storyInitialized = true;
+      const elapsed = Math.max(0, this.serverNow() - scene.startedAt);
+      if (elapsed > RECONNECT_REPLAY_WINDOW_MS) {
+        const upcoming = WIZARD_CHESS_DIALOGUE.findIndex(line => line.atMs > elapsed);
+        this.nextDialogueIndex = upcoming < 0 ? WIZARD_CHESS_DIALOGUE.length
+          : Math.max(0, upcoming - 1);
+        for (let index = 0; index < this.nextDialogueIndex; index++) {
+          const line = WIZARD_CHESS_DIALOGUE[index]!;
+          this.appendLine(line);
+          this.latestLine = line;
+        }
+      }
     }
-    // A reconnect should rebuild captions, not play every missed line in quick succession.
-    const newest = due.at(-1);
-    if (newest && !this.shownLines.has(`spoken:${newest.id}`)
-      && elapsed - newest.atMs < 1_900) {
-      this.shownLines.add(`spoken:${newest.id}`);
-      this.queueVoice(newest);
+    if (this.nextDialogueIndex >= WIZARD_CHESS_DIALOGUE.length) {
+      this.requestMoveCue(scene.id);
+      return;
     }
+    this.startNextLine();
   }
 
   private appendLine(line: WizardChessDialogueLine): void {
@@ -223,12 +244,12 @@ export class WizardSceneController {
     this.transcript.scrollTop = this.transcript.scrollHeight;
   }
 
-  private rebuildCaptions(scene: WizardChessSceneSnapshot): void {
-    const transitionAt = scene.readyAt ?? scene.resolvedAt ?? scene.startedAt;
-    const elapsed = Math.max(0, Math.min(WIZARD_CHESS_STORY_DURATION_MS,
-      transitionAt - scene.startedAt));
+  private rebuildCaptions(): void {
+    // Dialogue timing follows real audio durations, so fixed atMs estimates
+    // cannot reconstruct which lines were spoken on a reloaded ready display.
+    // Show the complete scene script there, including Ron's final appeal.
     for (const line of WIZARD_CHESS_DIALOGUE) {
-      if (line.atMs <= elapsed && !this.shownLines.has(line.id)) {
+      if (!this.shownLines.has(line.id)) {
         this.appendLine(line);
         this.latestLine = line;
       }
@@ -237,8 +258,8 @@ export class WizardSceneController {
 
   private revealMoveHint(focus = false): void {
     const copy = this.locale === 'pt-BR'
-      ? 'Dica: diga no telefone “mova o cavalo do Ron para H3”. Você pode falar a qualquer momento.'
-      : 'Hint: say “move Ron’s knight to H3” on the phone. You can speak at any time.';
+      ? 'Sua vez: diga “cavalo para H3” no telefone agora.'
+      : 'Your turn: say “Knight to H3” on the phone now.';
     if (this.moveHint.textContent !== copy) this.moveHint.textContent = copy;
     this.moveHint.hidden = false;
     this.skipButton.hidden = true;
@@ -290,7 +311,7 @@ export class WizardSceneController {
   }
 
   private renderBoardHints(): void {
-    if (!this.snapshot || this.snapshot.phase === 'resolved') {
+    if (this.snapshot?.phase !== 'ready') {
       this.board?.setHint(null, null);
       return;
     }
@@ -301,8 +322,12 @@ export class WizardSceneController {
 
   private prefetchAudio(): void {
     if (this.snapshot?.phase === 'story' && !this.storySkipped) {
-      this.prefetchLine(WIZARD_CHESS_DIALOGUE[0]!);
+      this.prefetchAround(0);
     }
+  }
+
+  private prefetchAround(index: number, count = 2): void {
+    for (const line of WIZARD_CHESS_DIALOGUE.slice(index, index + count)) this.prefetchLine(line);
   }
 
   private prefetchLine(line: WizardChessDialogueLine): void {
@@ -321,208 +346,199 @@ export class WizardSceneController {
       .then(async response => {
         if (!response.ok || !response.headers.get('content-type')?.includes('audio/')) {
           if (response.status === 503) this.audioUnavailable = true;
+          this.voiceFailed = true;
+          this.renderSoundToggle();
           return null;
         }
         const blob = await response.blob();
-        if (blob.size === 0 || this.disposed) return null;
+        if (blob.size === 0 || this.disposed) {
+          this.voiceFailed = true;
+          this.renderSoundToggle();
+          return null;
+        }
         const url = URL.createObjectURL(blob);
         this.audioUrls.set(line.id, url);
-        // Decode metadata while the next caption is still approaching. Blob
-        // URLs are local, so this does not consume another network request.
-        void this.audioDuration(line, url);
         return url;
-      }).catch(() => null).finally(() => this.audioRequests.delete(line.id));
+      }).catch(() => {
+        this.voiceFailed = true;
+        this.renderSoundToggle();
+        return null;
+      }).finally(() => this.audioRequests.delete(line.id));
     this.audioRequests.set(line.id, request);
     return request;
   }
 
-  private queueVoice(line: WizardChessDialogueLine): void {
-    if (!this.soundEnabled || this.storySkipped || this.snapshot?.phase !== 'story') return;
-    this.queuedLine = line;
+  private startNextLine(): void {
+    const line = WIZARD_CHESS_DIALOGUE[this.nextDialogueIndex++];
+    if (!line) return;
+    this.appendLine(line);
+    this.latestLine = line;
+    this.linePending = true;
+    this.lineStartedAt = Date.now();
+    // Ron's first reply gives the four short exchanges time to synthesize
+    // before their quick handoffs; the final long line warms a little later.
+    this.prefetchAround(this.nextDialogueIndex, line.id === 'ron-sacrifice' ? 4 : 2);
     const token = ++this.speechToken;
-    if (!this.activeAudio && !this.browserUtterance) void this.playQueuedLine(line, token);
+    if (!this.soundEnabled || this.audioUnavailable) this.scheduleCaptionEnd(line, token);
+    else void this.playLineAudio(line, token);
   }
 
-  private async playQueuedLine(line: WizardChessDialogueLine, token: number): Promise<void> {
-    if (!this.canSpeak(line, token)) return;
+  private async waitForAudio(line: WizardChessDialogueLine): Promise<string | null> {
     const cached = this.audioUrls.get(line.id);
-    const url = cached ?? await Promise.race([
-      this.fetchAudio(line), new Promise<null>(resolve => setTimeout(() => resolve(null), 2_400)),
-    ]);
-    if (!this.canSpeak(line, token)) return;
-    if (this.activeAudio || this.browserUtterance) return;
-    if (url) {
-      const durationMs = await this.audioDuration(line, url);
-      if (!this.canSpeak(line, token)) return;
-      if (this.activeAudio || this.browserUtterance) return;
-      if (durationMs !== null) {
-        this.queuedLine = null;
-        if (this.fitsVoiceWindow(line, durationMs)) this.startAudio(url, line);
-        return;
-      }
-    }
-    this.queuedLine = null;
-    this.speakBrowser(line);
-  }
-
-  private canSpeak(line: WizardChessDialogueLine, token: number): boolean {
-    return token === this.speechToken && this.queuedLine?.id === line.id
-      && this.soundEnabled && !this.storySkipped && this.snapshot?.phase === 'story'
-      && this.remainingVoiceWindowMs(line) > VOICE_END_GUARD_MS;
-  }
-
-  private remainingVoiceWindowMs(line: WizardChessDialogueLine): number {
-    const scene = this.snapshot;
-    if (!scene || scene.phase !== 'story') return 0;
-    const index = WIZARD_CHESS_DIALOGUE.findIndex(candidate => candidate.id === line.id);
-    if (index < 0) return 0;
-    const nextCue = WIZARD_CHESS_DIALOGUE[index + 1]?.atMs ?? WIZARD_CHESS_STORY_DURATION_MS;
-    const deadline = Math.min(scene.startedAt + nextCue, scene.readyAt ?? Infinity);
-    return deadline - this.serverNow();
-  }
-
-  private fitsVoiceWindow(line: WizardChessDialogueLine, durationMs: number): boolean {
-    return Number.isFinite(durationMs) && durationMs > 0
-      && durationMs + VOICE_END_GUARD_MS <= this.remainingVoiceWindowMs(line);
-  }
-
-  private audioDuration(line: WizardChessDialogueLine, url: string): Promise<number | null> {
-    const existing = this.audioDurations.get(line.id);
-    if (existing) return existing;
-    const duration = new Promise<number | null>(resolve => {
-      const probe = new Audio();
-      probe.preload = 'metadata';
-      let finished = false;
-      let timeout: ReturnType<typeof setTimeout> | null = null;
-      const finish = (measured: number | null) => {
-        if (finished) return;
-        finished = true;
-        if (timeout) clearTimeout(timeout);
-        probe.removeEventListener('loadedmetadata', read);
-        probe.removeEventListener('durationchange', read);
-        probe.removeEventListener('error', fail);
-        probe.pause();
-        probe.removeAttribute('src');
-        probe.load();
-        resolve(measured);
+    if (cached) return cached;
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = (url: string | null) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(url);
       };
-      const read = () => {
-        const seconds = Number.isFinite(probe.duration) ? probe.duration
-          : probe.seekable?.length ? probe.seekable.end(probe.seekable.length - 1) : NaN;
-        if (Number.isFinite(seconds) && seconds > 0) finish(seconds * 1_000);
-      };
-      const fail = () => finish(null);
-      probe.addEventListener('loadedmetadata', read);
-      probe.addEventListener('durationchange', read);
-      probe.addEventListener('error', fail);
-      timeout = setTimeout(fail, 1_200);
-      probe.src = url;
-      probe.load();
-      read();
+      const timeout = setTimeout(() => finish(null), AUDIO_WAIT_MS);
+      void this.fetchAudio(line).then(finish, () => finish(null));
     });
-    this.audioDurations.set(line.id, duration);
-    return duration;
   }
 
-  private startAudio(url: string, line: WizardChessDialogueLine): void {
+  private async playLineAudio(line: WizardChessDialogueLine, token: number): Promise<void> {
+    const url = await this.waitForAudio(line);
+    if (!this.isCurrentLine(line, token) || !this.soundEnabled) return;
+    if (!url) {
+      this.voiceFailed = true;
+      this.renderSoundToggle();
+      this.scheduleCaptionEnd(line, token);
+      return;
+    }
     this.audioSourceLine = line;
     this.activeAudio = true;
     this.audio.src = url;
     void this.audio.play().catch((reason: unknown) => {
-      if (this.audioSourceLine?.id !== line.id) return;
+      if (!this.isCurrentLine(line, token) || this.audioSourceLine?.id !== line.id) return;
       const name = reason && typeof reason === 'object' && 'name' in reason ? reason.name : null;
-      if (name === 'NotAllowedError' || name === 'SecurityError') {
-        this.soundNeedsGesture = true;
-        this.soundEnabled = false;
-        this.renderSoundToggle();
-        this.stopVoice();
-      } else this.onAudioError();
+      this.failCurrentAudio(line, token, name === 'NotAllowedError' || name === 'SecurityError');
     });
   }
 
-  private speakBrowser(line: WizardChessDialogueLine): void {
-    if (!this.soundEnabled || this.storySkipped || this.snapshot?.phase !== 'story'
-      || !('speechSynthesis' in window)) return;
-    // SpeechSynthesis has no duration metadata. Estimate conservatively and
-    // keep it playing through a later caption cue if this browser runs slower.
-    const words = line.text[this.locale].match(/\p{L}+(?:['’]\p{L}+)?/gu)?.length ?? 0;
-    const pauses = line.text[this.locale].match(/[,.!?;:]/g)?.length ?? 0;
-    if (!this.fitsVoiceWindow(line, 100 + words * 315 + pauses * 150)) return;
-    try {
-      const utterance = new SpeechSynthesisUtterance(line.text[this.locale]);
-      utterance.lang = this.locale;
-      utterance.rate = BROWSER_SPEECH_RATE;
-      utterance.onend = utterance.onerror = () => {
-        if (this.browserUtterance !== utterance) return;
-        this.browserUtterance = null;
-        this.flushQueuedVoice();
-      };
-      this.browserUtterance = utterance;
-      window.speechSynthesis.speak(utterance);
-    } catch {
-      this.browserUtterance = null;
-      // Captions remain available without screen audio.
-    }
+  private isCurrentLine(line: WizardChessDialogueLine, token: number): boolean {
+    return this.linePending && this.latestLine?.id === line.id && token === this.speechToken
+      && this.snapshot?.phase === 'story' && !this.storySkipped;
   }
 
-  private flushQueuedVoice(): void {
-    if (this.queuedLine && !this.activeAudio && !this.browserUtterance) {
-      void this.playQueuedLine(this.queuedLine, this.speechToken);
-    }
+  private scheduleCaptionEnd(line: WizardChessDialogueLine, token: number): void {
+    if (this.lineTimer) clearTimeout(this.lineTimer);
+    const words = line.text[this.locale].match(/\p{L}+(?:['’]\p{L}+)?/gu)?.length ?? 0;
+    const pauses = line.text[this.locale].match(/[,.!?;:]/g)?.length ?? 0;
+    const readingMs = Math.max(1_100, 200 + words * 330 + pauses * 120);
+    const remainingMs = Math.max(250, readingMs - (Date.now() - this.lineStartedAt));
+    this.lineTimer = setTimeout(() => {
+      this.lineTimer = null;
+      if (this.isCurrentLine(line, token)) this.finishLine();
+    }, remainingMs);
+  }
+
+  private finishLine(): void {
+    this.linePending = false;
+    this.audioSourceLine = null;
+    this.activeAudio = false;
+    if (this.storySkipped || this.snapshot?.phase !== 'story') return;
+    this.lineTimer = setTimeout(() => {
+      this.lineTimer = null;
+      const scene = this.snapshot;
+      if (!scene || scene.phase !== 'story' || this.storySkipped) return;
+      if (this.nextDialogueIndex >= WIZARD_CHESS_DIALOGUE.length) this.requestMoveCue(scene.id);
+      else this.renderStory(scene);
+    }, BETWEEN_LINES_MS);
+  }
+
+  private requestMoveCue(sceneId: number): void {
+    if (this.storyCompletionRequested || this.snapshot?.phase !== 'story') return;
+    this.storyCompletionRequested = true;
+    this.hooks.requestSkip(sceneId);
+  }
+
+  private failCurrentAudio(line: WizardChessDialogueLine, token: number, blocked: boolean): void {
+    this.audioSourceLine = null;
+    this.activeAudio = false;
+    this.audio.pause();
+    this.audio.removeAttribute('src');
+    this.audio.load();
+    if (blocked) {
+      this.soundNeedsGesture = true;
+      this.soundEnabled = false;
+    } else this.voiceFailed = true;
+    this.renderSoundToggle();
+    this.scheduleCaptionEnd(line, token);
   }
 
   private stopVoice(): void {
     this.speechToken += 1;
-    this.queuedLine = null;
+    if (this.lineTimer) clearTimeout(this.lineTimer);
+    this.lineTimer = null;
+    this.linePending = false;
     this.audioSourceLine = null;
     this.activeAudio = false;
-    this.browserUtterance = null;
     this.audio.pause();
     this.audio.removeAttribute('src');
     this.audio.load();
-    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
   }
 
   private readonly onAudioError = (): void => {
     const failedLine = this.audioSourceLine;
-    if (!failedLine) return;
-    this.audioSourceLine = null;
-    this.activeAudio = false;
-    if (!this.queuedLine && this.latestLine?.id === failedLine.id) this.speakBrowser(failedLine);
-    this.flushQueuedVoice();
+    if (failedLine) this.failCurrentAudio(failedLine, this.speechToken, false);
   };
 
   private readonly onAudioEnded = (): void => {
     if (!this.activeAudio || !this.audio.ended) return;
-    this.audioSourceLine = null;
-    this.activeAudio = false;
-    this.flushQueuedVoice();
+    this.finishLine();
   };
 
   private readonly onSoundToggle = (): void => {
-    this.soundEnabled = !this.soundEnabled;
+    const retryFailed = this.audioUnavailable || this.voiceFailed;
+    if (retryFailed) {
+      this.audioUnavailable = false;
+      this.voiceFailed = false;
+      this.prefetchedLines.clear();
+      this.soundEnabled = true;
+    } else this.soundEnabled = !this.soundEnabled;
     this.soundNeedsGesture = false;
     this.renderSoundToggle();
-    if (!this.soundEnabled) this.stopVoice();
-    else if (this.latestLine && this.snapshot?.phase === 'story' && !this.storySkipped)
-      this.queueVoice(this.latestLine);
+    if (this.snapshot?.phase !== 'story' || !this.linePending || !this.latestLine) return;
+    if (this.lineTimer) clearTimeout(this.lineTimer);
+    this.lineTimer = null;
+    if (this.activeAudio) {
+      this.audio.pause();
+      this.audio.removeAttribute('src');
+      this.audio.load();
+      this.audioSourceLine = null;
+      this.activeAudio = false;
+    }
+    const token = ++this.speechToken;
+    if (this.soundEnabled) {
+      this.lineStartedAt = Date.now();
+      void this.playLineAudio(this.latestLine, token);
+    } else this.scheduleCaptionEnd(this.latestLine, token);
   };
 
   private readonly onSkip = (event: MouseEvent): void => {
     if (!this.snapshot || this.snapshot.phase !== 'story') return;
     this.storySkipped = true;
+    this.focusMoveHintWhenReady = event.detail === 0;
     this.stopVoice();
-    this.revealMoveHint(event.detail === 0);
+    this.skipButton.hidden = true;
     this.hooks.requestSkip(this.snapshot.id);
   };
 
   private renderSoundToggle(): void {
     this.soundToggle.setAttribute('aria-pressed', String(this.soundEnabled));
     this.soundToggle.dataset.state = this.soundNeedsGesture ? 'blocked'
-      : this.soundEnabled ? 'on' : 'off';
+      : this.audioUnavailable || this.voiceFailed ? 'unavailable'
+        : this.soundEnabled ? 'on' : 'off';
     const label = this.locale === 'pt-BR'
-      ? this.soundNeedsGesture ? 'Toque para ativar as vozes' : this.soundEnabled ? 'Vozes na tela' : 'Ativar vozes'
-      : this.soundNeedsGesture ? 'Tap to enable voices' : this.soundEnabled ? 'Screen voices on' : 'Enable screen voices';
+      ? this.soundNeedsGesture ? 'Toque para ativar as vozes dos personagens'
+        : this.audioUnavailable || this.voiceFailed ? 'Vozes indisponíveis · tentar novamente'
+          : this.soundEnabled ? 'Vozes dos personagens ativadas' : 'Ativar vozes dos personagens'
+      : this.soundNeedsGesture ? 'Tap to enable character voices'
+        : this.audioUnavailable || this.voiceFailed ? 'Character voices unavailable · retry'
+          : this.soundEnabled ? 'Character voices on' : 'Enable character voices';
     this.soundLabel.textContent = label;
     this.soundToggle.setAttribute('aria-label', label);
     this.soundToggle.title = label;

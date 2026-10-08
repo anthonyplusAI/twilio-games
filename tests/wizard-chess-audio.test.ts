@@ -40,6 +40,23 @@ async function startHttp(audio: WizardChessAudioService): Promise<string> {
 }
 
 describe('Wizard Chess screen narration', () => {
+  it('routes Harry, Ron, and Hermione to their selected ElevenLabs voice IDs', async () => {
+    const upstream = vi.fn(async () => upstreamAudio()) as unknown as typeof fetch;
+    const audio = new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream });
+    const selected = [
+      ['harry', 'llNlEi50DSCIEuoOIaH7'],
+      ['ron', 'bDTlr4ICxntY9qVWyL0o'],
+      ['hermione', 'nDJIICjR9zfJExIFeSCN'],
+    ] as const;
+
+    for (const [speaker, voiceId] of selected) {
+      const line = WIZARD_CHESS_DIALOGUE.find(candidate => candidate.speaker === speaker)!;
+      await audio.get(line.id, 'en-US');
+      const url = vi.mocked(upstream).mock.calls.at(-1)![0];
+      expect(url).toContain(`/text-to-speech/${voiceId}`);
+    }
+  });
+
   it('selects the supplied character voice and fixed localized line, then deduplicates and caches audio', async () => {
     let release!: (response: Response) => void;
     const upstream = vi.fn(() => new Promise<Response>(resolve => { release = resolve; })) as unknown as typeof fetch;
@@ -69,6 +86,28 @@ describe('Wizard Chess screen narration', () => {
       status: 404, code: 'unknown_line',
     });
     expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('allows a longer character line to finish synthesizing after six seconds', async () => {
+    vi.useFakeTimers();
+    try {
+      const upstream = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+        const timer = setTimeout(() => resolve(upstreamAudio()), 7_000);
+        init?.signal?.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(new Error('aborted'));
+        });
+      })) as unknown as typeof fetch;
+      const audio = new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream });
+
+      const result = audio.get(ronLine.id, 'en-US')
+        .then(body => body.toString(), (error: WizardChessAudioError) => error.code);
+      await vi.advanceTimersByTimeAsync(7_000);
+
+      expect(await result).toBe('MP3DATA');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('treats a missing or disabled key as optional and fails closed on bad upstream audio', async () => {

@@ -537,8 +537,8 @@ export class ChessServer {
     scene.storyTimer = timer;
     this.pushState(code);
     return this.wizardResult(code, 'wizard_started', locale === 'pt-BR'
-      ? 'O xadrez bruxo começou na tela. Anuncie a jogada do Ron quando quiser.'
-      : 'Wizard chess is on screen. Call Ron’s move whenever you’re ready.');
+      ? 'O xadrez bruxo começou na tela. Aguarde sua vez de jogar.'
+      : 'Wizard chess is playing on screen. Wait for your turn.');
   }
 
   private handleWizardSceneCommand(code: string, scene: WizardSceneRuntime, spoken: string,
@@ -564,13 +564,24 @@ export class ChessServer {
         : 'The scene has closed. Continue your ordinary chess game.');
     }
     if (action === 'skip') {
-      this.skipWizardScene(code, scene);
-      return this.wizardResult(code, 'wizard_skipped', locale === 'pt-BR'
-        ? 'A cena avançou até a jogada. Diga a jogada de Ron ou peça uma dica.'
-        : 'The scene has skipped to the move. Call Ron’s move or ask for a hint.');
+      const skipped = this.skipWizardScene(code, scene);
+      return this.wizardResult(code, skipped ? 'wizard_skipped' : 'wizard_waiting',
+        locale === 'pt-BR'
+          ? 'Sua vez. Diga a jogada de Ron ou peça uma dica.'
+          : 'Your turn. Call Ron’s move or ask for a hint.');
+    }
+    if (scene.snapshot.phase === 'story') {
+      const waiting = action === 'final'
+        ? locale === 'pt-BR' ? 'Aguarde essa jogada. Ron vai precisar de você em um instante.'
+          : 'Hold that move. Ron needs you in a moment.'
+        : action === 'hint'
+          ? locale === 'pt-BR' ? 'Aguarde sua vez. A tela mostrará uma dica.'
+            : 'Wait for your turn. The screen will show a hint.'
+          : locale === 'pt-BR' ? 'Acompanhe a cena. A tela avisará quando for sua vez.'
+            : 'Watch the scene. The screen will cue your move.';
+      return this.wizardResult(code, 'wizard_waiting', waiting);
     }
     if (action === 'hint') {
-      this.skipWizardScene(code, scene);
       return this.wizardResult(code, 'wizard_hint', locale === 'pt-BR'
         ? 'Dica: mova o cavalo de Ron de G cinco para H três. Diga cavalo para H três.'
         : 'Hint: move Ron’s knight from G five to H three. Say knight to H three.');
@@ -592,10 +603,9 @@ export class ChessServer {
         ? 'Cavalo de Ron para H três, xeque! Veja o tabuleiro.'
         : 'Ron’s knight to H three, check! Watch the board.');
     }
-    this.skipWizardScene(code, scene);
     return this.wizardResult(code, 'wizard_waiting', locale === 'pt-BR'
-      ? 'Nesta cena, você pode pedir uma dica, pular para a jogada, anunciar a jogada de Ron ou dizer sair.'
-      : 'In this scene, you can ask for a hint, skip to the move, call Ron’s move, or say exit.');
+      ? 'Sua vez. Anuncie a jogada de Ron ou peça uma dica.'
+      : 'Your turn. Call Ron’s move or ask for a hint.');
   }
 
   private wizardResult(code: string, resultCode: ChessCommandResponse['code'],

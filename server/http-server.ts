@@ -2343,9 +2343,11 @@ export class HttpServer {
         if (!isCurrent()) return Promise.resolve({ kind: 'none' as const });
         const actions: VoiceInterpretAction[] = [];
         if (!context.readOnlyInquiry && context.wizardScene) {
-          if (context.wizardScene.phase === 'story' || context.wizardScene.phase === 'ready') {
-            actions.push({ id: 'wizard_final', description: 'Move Ron’s knight to H3 now; the player can interrupt the scene at any time' });
+          if (context.wizardScene.phase === 'story') {
             actions.push({ id: 'wizard_skip', description: 'Skip scene dialogue and go directly to the knight move prompt' });
+          }
+          if (context.wizardScene.phase === 'ready') {
+            actions.push({ id: 'wizard_final', description: 'Move Ron’s knight to H3 after the screen cues the caller' });
             actions.push({ id: 'wizard_hint', description: 'Give the caller a clue for Ron’s move without making the move' });
           }
           actions.push({ id: 'wizard_exit', description: 'Leave the wizard scene and resume normal chess' });
@@ -5600,7 +5602,8 @@ function normalizeRelayPlaybackText(value: string): string {
   return value.replace(/<[^>]*>/g, ' ')
     .replace(/[\u200B-\u200D\u2060\uFEFF]/g, '')
     .normalize('NFKC').toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    .replace(/[^\p{L}\p{N}]+/gu, ' ').trim()
+    .replace(/\btwill ee oo\b/g, 'twilio');
 }
 
 function relayEstimatedSpeechMs(text: string, locale: SupportedLocale): number {
@@ -5726,8 +5729,10 @@ export function relayTextChunks(text: string, locale: SupportedLocale = DEFAULT_
 }
 
 export function relaySpeechMarkup(text: string, locale: SupportedLocale = DEFAULT_LOCALE): string {
+  // The default ElevenLabs Flash 2.5 voice can ignore inline phoneme tags.
+  // Spell the brand as syllables only in the Relay token; screen text stays canonical.
   return locale === 'en-US'
-    ? text.replace(/\bTwilio\b/gi, '<phoneme alphabet="ipa" ph="ˈtwɪlioʊ">Twilio</phoneme>')
+    ? text.replace(/\bTwilio\b/gi, 'Twill-ee-oo')
     : text;
 }
 

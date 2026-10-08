@@ -954,7 +954,7 @@ describe('Voice Trivia central runtime', () => {
       const stationResult = await waitForRelaySpeech(callers[index]!, resultSpeechOffsets[index]!, text => (
         /Ada wins\. [\d,.]+ points/i.test(text)
       ));
-      expect(stationResult).toMatch(/Twilio Conversation Relay.*transcribed phone answers.*scored.*screen.*spoke results.*Check messages.*coins.*replay/i);
+      expect(stationResult).toMatch(/Twill-ee-oo Conversation Relay.*transcribed phone answers.*scored.*screen.*spoke results.*Check messages.*coins.*replay/i);
       expect(stationResult).toContain(`${result.players[index]!.correctCount} correct`);
       expect(stationResult.trim().split(/\s+/).length).toBeLessThanOrEqual(32);
       const resultSpeech = callers[index]!.speech.slice(resultSpeechOffsets[index]!).join(' ');

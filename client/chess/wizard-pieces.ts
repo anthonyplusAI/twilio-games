@@ -18,16 +18,6 @@ const PIECE_MODEL: Partial<Record<ChessPieceType, ModelAsset>> = {
 const CHARACTER_NAMES: Readonly<Record<WizardChessCharacter, string>> = {
   ron: 'Ron', hermione: 'Hermione', harry: 'Harry',
 };
-// The supplied GLBs separate their modern tops and trousers into these named
-// meshes. Recolor only clothing; keep faces, hair, hands, shoes, wands and Harry's glasses.
-const CHARACTER_GARMENTS: Readonly<Record<WizardChessCharacter, {
-  outer: string; trousers: string;
-}>> = {
-  ron: { outer: 'Object_7', trousers: 'Object_2' },
-  harry: { outer: 'Object_9', trousers: 'Object_8' },
-  hermione: { outer: 'Object_8', trousers: 'Object_6' },
-};
-
 export function wizardAssetForPiece(square: string, color: ChessColor,
   type: ChessPieceType): WizardAsset {
   return wizardCharacterAt(square, color, type) ?? PIECE_MODEL[type] ?? type;
@@ -35,7 +25,7 @@ export function wizardAssetForPiece(square: string, color: ChessColor,
 
 const targetHeight: Record<ModelAsset, number> = {
   king: 1.52, knight: 1.42, pawn: 0.88, queen: 1.49,
-  harry: 1.57, ron: 1.6, hermione: 1.55,
+  harry: 1.9, ron: 1.9, hermione: 1.9,
 };
 
 function mesh(geometry: THREE.BufferGeometry, material: THREE.Material, parent: THREE.Group,
@@ -69,12 +59,6 @@ export class WizardPieceLibrary {
     color: 0x8cc5d1, roughness: 0.24, metalness: 0.2,
     emissive: 0x2c7398, emissiveIntensity: 0.45,
   });
-  private readonly cloak = new THREE.MeshStandardMaterial({
-    color: 0x202a46, roughness: 0.94, side: THREE.DoubleSide,
-  });
-  private readonly robeTrim = new THREE.MeshStandardMaterial({
-    color: 0x77303e, roughness: 0.88, side: THREE.DoubleSide,
-  });
   private readonly glasses = new THREE.MeshStandardMaterial({
     color: 0x121118, roughness: 0.46, metalness: 0.28,
   });
@@ -106,7 +90,7 @@ export class WizardPieceLibrary {
   prefetch(retryFailed = false): void {
     if (this.disposed || (!retryFailed && this.warmed) || (retryFailed && this.activationPass)) return;
     this.warmed = true;
-    const keys = this.lowDetail
+    const keys = this.lowDetail && !retryFailed
       ? MODEL_FILES.filter(key => key !== 'pawn' && key !== 'king')
       : MODEL_FILES;
     let cursor = 0;
@@ -137,7 +121,7 @@ export class WizardPieceLibrary {
       if (!isCharacter(key)) object.material = color === 'w' ? this.stoneWhite : this.stoneBlack;
     });
     if (isCharacter(key)) {
-      this.dressLoadedCharacter(piece, key);
+      // Keep the supplied character textures and silhouette visible.
       this.styleCharacter(piece, key, true);
     }
     else this.addStoneSigil(piece, color);
@@ -164,7 +148,7 @@ export class WizardPieceLibrary {
       map?.dispose();
       item.dispose();
     });
-    for (const item of [this.stoneWhite, this.stoneBlack, this.gold, this.rune, this.cloak, this.robeTrim,
+    for (const item of [this.stoneWhite, this.stoneBlack, this.gold, this.rune,
       this.glasses, this.skin, this.uniform, ...Object.values(this.hair)]) item.dispose();
   }
 
@@ -246,7 +230,7 @@ export class WizardPieceLibrary {
     const root = new THREE.Group();
     if (!Number.isFinite(size.y) || size.y <= 0.001) throw new Error(`Empty ${key} model`);
     const maxWidth = Math.max(size.x, size.z, 0.001);
-    const maxFootprint = isCharacter(key) ? 0.64 : 0.83;
+    const maxFootprint = isCharacter(key) ? 0.74 : 0.83;
     const scale = Math.min(targetHeight[key] / size.y, maxFootprint / maxWidth);
     original.position.set(-center.x, -bounds.min.y, -center.z);
     root.scale.setScalar(scale);
@@ -271,43 +255,9 @@ export class WizardPieceLibrary {
     const ring = mesh(this.geometry('avatar-ring', () => new THREE.TorusGeometry(0.37, 0.018, 6, 32)), this.gold,
       piece, 0, 0.102, 0);
     ring.rotation.x = Math.PI / 2;
-    if (modelLoaded) this.addSchoolRobe(piece);
     // The supplied Harry GLB already includes glasses. Add a pair only to the
     // generated offline figure, fitted to that figure's actual face position.
     if (character === 'harry' && !modelLoaded) this.addHarryGlasses(piece);
-  }
-
-  private dressLoadedCharacter(piece: THREE.Group, character: WizardChessCharacter): void {
-    const garments = CHARACTER_GARMENTS[character];
-    piece.traverse(object => {
-      if (!(object instanceof THREE.Mesh)) return;
-      if (object.name === garments.outer) object.material = this.cloak;
-      else if (object.name === garments.trousers) object.material = this.uniform;
-    });
-  }
-
-  private addSchoolRobe(piece: THREE.Group): void {
-    // A front-open, flared cape follows the figures' silhouettes. Their recolored
-    // clothing forms the dark school uniform visible through the opening.
-    const body = mesh(this.geometry('avatar-robe-body', () => new THREE.CylinderGeometry(
-      0.25, 0.34, 1.08, 20, 5, true, 1.05, Math.PI * 2 - 2.1,
-    )), this.cloak, piece, 0, 0.68, 0);
-    body.scale.z = 0.82;
-    const shoulders = mesh(this.geometry('avatar-robe-shoulders', () => new THREE.CylinderGeometry(
-      0.21, 0.26, 0.20, 18, 1, true, 0.95, Math.PI * 2 - 1.9,
-    )), this.cloak, piece, 0, 1.12, 0);
-    shoulders.scale.z = 0.83;
-    for (const side of [-1, 1]) {
-      mesh(this.geometry(`avatar-robe-edge-${side}`, () => new THREE.TubeGeometry(
-        new THREE.CatmullRomCurve3([
-          new THREE.Vector3(side * 0.22, 1.22, 0.105),
-          new THREE.Vector3(side * 0.238, 1.02, 0.11),
-          new THREE.Vector3(side * 0.25, 0.82, 0.115),
-        ]), 8, 0.011, 5,
-      )), this.robeTrim, piece, 0, 0, 0);
-      mesh(this.geometry('avatar-robe-clasp', () => new THREE.OctahedronGeometry(0.025)),
-        this.gold, piece, side * 0.21, 1.08, 0.13);
-    }
   }
 
   private addHarryGlasses(piece: THREE.Group): void {
