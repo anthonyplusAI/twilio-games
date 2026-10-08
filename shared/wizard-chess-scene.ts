@@ -32,6 +32,10 @@ export const WIZARD_CHESS_VOICE_IDS: Readonly<Record<WizardChessCharacter, strin
   harry: 'llNlEi50DSCIEuoOIaH7',
 };
 
+/** Included in both the server audio cache key and browser URL version. */
+export const WIZARD_CHESS_AUDIO_MODEL_ID = 'eleven_flash_v2_5';
+export const WIZARD_CHESS_AUDIO_OUTPUT_FORMAT = 'mp3_44100_128';
+
 export interface WizardChessDialogueLine {
   id: string;
   speaker: WizardChessCharacter;

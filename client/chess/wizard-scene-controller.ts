@@ -1,6 +1,7 @@
 import type { WizardChessSceneSnapshot } from '../../shared/chess-protocol';
 import type { SupportedLocale } from '../../shared/i18n/locales';
 import {
+  WIZARD_CHESS_AUDIO_MODEL_ID, WIZARD_CHESS_AUDIO_OUTPUT_FORMAT,
   WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_RESOLVED_DURATION_MS,
   WIZARD_CHESS_SEQUENCE, WIZARD_CHESS_VICTORY_AT_MS,
   WIZARD_CHESS_VOICE_IDS,
@@ -12,6 +13,7 @@ import { wizardMoveAt, wizardPositionAfterMoves } from './wizard-scene-state';
 const characters = { ron: 'Ron', harry: 'Harry', hermione: 'Hermione' } as const;
 function audioVersion(locale: SupportedLocale): string {
   const content = JSON.stringify({ voices: WIZARD_CHESS_VOICE_IDS,
+    model: WIZARD_CHESS_AUDIO_MODEL_ID, format: WIZARD_CHESS_AUDIO_OUTPUT_FORMAT,
     lines: WIZARD_CHESS_DIALOGUE.map(line => [line.id, line.speaker, line.text[locale]]) });
   let hash = 2166136261;
   for (let i = 0; i < content.length; i++) hash = Math.imul(hash ^ content.charCodeAt(i), 16777619);

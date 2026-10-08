@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { HttpServer } from '../server/http-server';
@@ -9,17 +9,27 @@ import { WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_VOICE_IDS } from '../shared/wizard-
 const ronLine = WIZARD_CHESS_DIALOGUE.find(line => line.speaker === 'ron')!;
 let server: HttpServer | null = null;
 let directory = '';
+const cacheDirectories: string[] = [];
 
 afterEach(async () => {
   await server?.stop();
   server = null;
   if (directory) await rm(directory, { recursive: true, force: true });
   directory = '';
+  for (const cacheDirectory of cacheDirectories.splice(0)) {
+    await rm(cacheDirectory, { recursive: true, force: true });
+  }
   vi.restoreAllMocks();
 });
 
 function upstreamAudio(body = 'MP3DATA') {
   return new Response(body, { status: 200, headers: { 'Content-Type': 'audio/mpeg' } });
+}
+
+async function temporaryCacheDirectory(): Promise<string> {
+  const cacheDirectory = await mkdtemp(join(tmpdir(), 'wizard-audio-cache-'));
+  cacheDirectories.push(cacheDirectory);
+  return cacheDirectory;
 }
 
 async function startHttp(audio: WizardChessAudioService): Promise<string> {
@@ -77,6 +87,152 @@ describe('Wizard Chess screen narration', () => {
     expect(await second).toBe(await first);
     expect(await audio.get(ronLine.id, 'en-US')).toBe(await first);
     expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
+  it('reuses downloaded scene audio across server instances even when the key is later unavailable', async () => {
+    const cacheDir = await temporaryCacheDirectory();
+    const upstream = vi.fn(async () => upstreamAudio('ID3DOWNLOADED-RON')) as unknown as typeof fetch;
+    const first = new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream, cacheDir });
+    expect((await first.get(ronLine.id, 'en-US')).toString()).toBe('ID3DOWNLOADED-RON');
+
+    await vi.waitFor(async () => expect((await readdir(cacheDir)).filter(file => file.endsWith('.mp3'))).toHaveLength(1));
+    const files = (await readdir(cacheDir)).filter(file => file.endsWith('.mp3'));
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/^[a-f0-9]{64}\.mp3$/);
+    expect((await readFile(join(cacheDir, files[0]!))).toString()).toBe('ID3DOWNLOADED-RON');
+    expect(files[0]).not.toContain('local-test-key');
+
+    const offline = vi.fn(async () => { throw new Error('provider should not be called'); }) as unknown as typeof fetch;
+    const restarted = new WizardChessAudioService({ apiKey: 'disabled', fetchImpl: offline, cacheDir });
+    expect((await restarted.get(ronLine.id, 'en-US')).toString()).toBe('ID3DOWNLOADED-RON');
+    // The displayed Portuguese scene currently uses the same English text and voice.
+    expect((await restarted.get(ronLine.id, 'pt-BR')).toString()).toBe('ID3DOWNLOADED-RON');
+    expect(upstream).toHaveBeenCalledTimes(1);
+    expect(offline).not.toHaveBeenCalled();
+  });
+
+  it('invalidates downloaded audio when a fixed line changes voice or text', async () => {
+    const cacheDir = await temporaryCacheDirectory();
+    const upstream = vi.fn(async (_url: string, init?: RequestInit) => {
+      const text = JSON.parse(String(init?.body)).text as string;
+      return upstreamAudio(`ID3clip-${text.length}`);
+    }) as unknown as typeof fetch;
+    const voiceIds = WIZARD_CHESS_VOICE_IDS as Record<'ron' | 'harry' | 'hermione', string>;
+    const text = ronLine.text as Record<'en-US' | 'pt-BR', string>;
+    const originalVoice = voiceIds.ron;
+    const originalText = text['en-US'];
+    try {
+      await new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream, cacheDir })
+        .get(ronLine.id, 'en-US');
+      voiceIds.ron = 'another-ron-voice-id';
+      await new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream, cacheDir })
+        .get(ronLine.id, 'en-US');
+      text['en-US'] = `${originalText} A revised line.`;
+      await new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream, cacheDir })
+        .get(ronLine.id, 'en-US');
+
+      expect(upstream).toHaveBeenCalledTimes(3);
+      await vi.waitFor(async () => expect((await readdir(cacheDir)).filter(file => file.endsWith('.mp3'))).toHaveLength(3));
+    } finally {
+      voiceIds.ron = originalVoice;
+      text['en-US'] = originalText;
+    }
+  });
+
+  it('treats a truncated cached file as a miss and replaces it with fresh audio', async () => {
+    const cacheDir = await temporaryCacheDirectory();
+    const upstream = vi.fn()
+      .mockResolvedValueOnce(upstreamAudio('ID3ORIGINAL-CLIP'))
+      .mockResolvedValueOnce(upstreamAudio('ID3REPAIRED-CLIP')) as unknown as typeof fetch;
+    await new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream, cacheDir })
+      .get(ronLine.id, 'en-US');
+    await vi.waitFor(async () => expect((await readdir(cacheDir)).filter(file => file.endsWith('.mp3'))).toHaveLength(1));
+    const [file] = (await readdir(cacheDir)).filter(name => name.endsWith('.mp3'));
+    await writeFile(join(cacheDir, file!), 'truncated');
+
+    const restarted = new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream, cacheDir });
+    expect((await restarted.get(ronLine.id, 'en-US')).toString()).toBe('ID3REPAIRED-CLIP');
+    await vi.waitFor(async () => expect((await readFile(join(cacheDir, file!))).toString()).toBe('ID3REPAIRED-CLIP'));
+    expect((await readFile(join(cacheDir, file!))).toString()).toBe('ID3REPAIRED-CLIP');
+    expect(upstream).toHaveBeenCalledTimes(2);
+  });
+
+  it('still narrates when persistent storage cannot be written', async () => {
+    const directory = await temporaryCacheDirectory();
+    const cacheDir = join(directory, 'not-a-directory');
+    await writeFile(cacheDir, 'occupied');
+    const upstream = vi.fn(async () => upstreamAudio()) as unknown as typeof fetch;
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const audio = new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream, cacheDir });
+
+    expect((await audio.get(ronLine.id, 'en-US')).toString()).toBe('MP3DATA');
+    expect((await audio.get(ronLine.id, 'en-US')).toString()).toBe('MP3DATA');
+    expect(upstream).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(warning.mock.calls.some(call => String(call[0]).includes('cache_write_failed'))).toBe(true));
+  });
+
+  it('serves generated narration without waiting for a stalled persistent write', async () => {
+    const cacheDir = await temporaryCacheDirectory();
+    const upstream = vi.fn(async () => upstreamAudio('ID3READY-NOW')) as unknown as typeof fetch;
+    const audio = new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream, cacheDir });
+    let releaseWrite!: () => void;
+    const blockedWrite = new Promise<void>(resolve => { releaseWrite = resolve; });
+    const storage = audio as unknown as {
+      saveDownloaded: (key: string, lineId: string, bytes: Buffer) => Promise<void>;
+    };
+    const write = vi.spyOn(storage, 'saveDownloaded').mockReturnValue(blockedWrite);
+    let returned = false;
+    const request = audio.get(ronLine.id, 'en-US').then(clip => {
+      returned = true;
+      return clip;
+    });
+    try {
+      await vi.waitFor(() => expect(write).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(returned).toBe(true), { timeout: 300 });
+    } finally {
+      releaseWrite();
+      await request;
+    }
+    expect((await request).toString()).toBe('ID3READY-NOW');
+  });
+
+  it('prewarms fixed dialogue with no more than two concurrent provider requests', async () => {
+    let active = 0;
+    let peak = 0;
+    const upstream = vi.fn(async () => {
+      active += 1;
+      peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      active -= 1;
+      return upstreamAudio();
+    }) as unknown as typeof fetch;
+    const audio = new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream });
+
+    await audio.prewarm();
+
+    expect(upstream).toHaveBeenCalledTimes(WIZARD_CHESS_DIALOGUE.length);
+    expect(peak).toBeLessThanOrEqual(2);
+    expect(peak).toBeGreaterThan(1);
+    await audio.prewarm();
+    expect(upstream).toHaveBeenCalledTimes(WIZARD_CHESS_DIALOGUE.length);
+  });
+
+  it('continues warming later lines when one earlier voice is slow', async () => {
+    let releaseRon!: (response: Response) => void;
+    const slowRon = new Promise<Response>(resolve => { releaseRon = resolve; });
+    const upstream = vi.fn(async (_url: string, init?: RequestInit) => {
+      const text = JSON.parse(String(init?.body)).text as string;
+      return text === ronLine.text['en-US'] ? slowRon : upstreamAudio();
+    }) as unknown as typeof fetch;
+    const audio = new WizardChessAudioService({ apiKey: 'local-test-key', fetchImpl: upstream });
+    const warming = audio.prewarm();
+    try {
+      await vi.waitFor(() => expect(upstream).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(vi.mocked(upstream).mock.calls.length).toBeGreaterThan(2), { timeout: 300 });
+    } finally {
+      releaseRon(upstreamAudio());
+      await warming;
+    }
   });
 
   it('never sends arbitrary text or an unknown line to the provider', async () => {

@@ -1,11 +1,32 @@
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { SupportedLocale } from '../shared/i18n/locales';
-import { WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_VOICE_IDS } from '../shared/wizard-chess-scene';
+import {
+  WIZARD_CHESS_AUDIO_MODEL_ID, WIZARD_CHESS_AUDIO_OUTPUT_FORMAT,
+  WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_VOICE_IDS,
+} from '../shared/wizard-chess-scene';
 
 const ELEVENLABS_URL = 'https://api.elevenlabs.io/v1/text-to-speech';
 const MAX_AUDIO_BYTES = 1_500_000;
 const REQUEST_TIMEOUT_MS = 20_000;
 const FAILURE_RETRY_MS = 15_000;
 const AUTH_FAILURE_RETRY_MS = 60_000;
+
+function cacheKey(lineId: string, text: string, voiceId: string): string {
+  // The key never contains the API credential. Changing a line, voice, model, or
+  // output format creates a new file without serving stale narration after deploy.
+  return createHash('sha256')
+    .update(JSON.stringify([lineId, text, voiceId,
+      WIZARD_CHESS_AUDIO_MODEL_ID, WIZARD_CHESS_AUDIO_OUTPUT_FORMAT]))
+    .digest('hex');
+}
+
+function isMp3(audio: Buffer): boolean {
+  if (audio.length < 4 || audio.length > MAX_AUDIO_BYTES) return false;
+  return (audio.length >= 10 && audio.subarray(0, 3).toString('ascii') === 'ID3')
+    || (audio[0] === 0xff && (audio[1]! & 0xe0) === 0xe0);
+}
 
 export class WizardChessAudioError extends Error {
   constructor(public readonly status: number, public readonly code: string) {
@@ -17,15 +38,17 @@ export class WizardChessAudioError extends Error {
 export class WizardChessAudioService {
   private readonly apiKey: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly cacheDir?: string;
   private readonly cache = new Map<string, Buffer>();
   private readonly inFlight = new Map<string, Promise<Buffer>>();
   private readonly recentFailures = new Map<string, { error: WizardChessAudioError; retryAt: number }>();
   private authFailure: { error: WizardChessAudioError; retryAt: number } | null = null;
 
-  constructor(options: { apiKey?: string; fetchImpl?: typeof fetch } = {}) {
+  constructor(options: { apiKey?: string; fetchImpl?: typeof fetch; cacheDir?: string } = {}) {
     const configuredKey = (options.apiKey ?? process.env.ELEVENLABS_API_KEY ?? '').trim();
     this.apiKey = configuredKey === 'disabled' ? '' : configuredKey;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.cacheDir = options.cacheDir;
   }
 
   get configured(): boolean { return Boolean(this.apiKey); }
@@ -36,33 +59,105 @@ export class WizardChessAudioService {
     if (locale !== 'en-US' && locale !== 'pt-BR') {
       throw new WizardChessAudioError(400, 'invalid_locale');
     }
-    if (!this.apiKey) throw new WizardChessAudioError(503, 'screen_audio_not_configured');
-
-    const cacheKey = `${line.id}:${locale}`;
-    const cached = this.cache.get(cacheKey);
+    const text = line.text[locale];
+    const voiceId = WIZARD_CHESS_VOICE_IDS[line.speaker];
+    const key = cacheKey(line.id, text, voiceId);
+    const cached = this.cache.get(key);
     if (cached) return cached;
+    const pending = this.inFlight.get(key);
+    if (pending) return pending;
+
+    const request = this.loadOrSynthesize(key, line.id, text, voiceId)
+      .finally(() => { this.inFlight.delete(key); });
+    this.inFlight.set(key, request);
+    return request;
+  }
+
+  /** Warm the fixed English scene without blocking startup or requesting more than two clips at once. */
+  async prewarm(): Promise<void> {
+    if (!this.apiKey) return;
+    let next = 0;
+    const warm = async () => {
+      while (next < WIZARD_CHESS_DIALOGUE.length) {
+        const line = WIZARD_CHESS_DIALOGUE[next++]!;
+        try { await this.get(line.id, 'en-US'); }
+        catch { /* synthesize logs safe diagnostics; the scene keeps captions */ }
+      }
+    };
+    await Promise.all([warm(), warm()]);
+  }
+
+  private async loadOrSynthesize(key: string, lineId: string, text: string, voiceId: string): Promise<Buffer> {
+    // Disk comes before key and provider cooldown checks so already-downloaded
+    // clips still play if ElevenLabs is later unavailable or the key is removed.
+    if (this.cacheDir) {
+      const downloaded = await this.readDownloaded(key, lineId);
+      if (downloaded) {
+        this.cache.set(key, downloaded);
+        return downloaded;
+      }
+    }
+    if (!this.apiKey) throw new WizardChessAudioError(503, 'screen_audio_not_configured');
     if (this.authFailure) {
       if (this.authFailure.retryAt > Date.now()) throw this.authFailure.error;
       this.authFailure = null;
     }
-    const pending = this.inFlight.get(cacheKey);
-    if (pending) return pending;
-    const failed = this.recentFailures.get(cacheKey);
+    const failed = this.recentFailures.get(key);
     if (failed && failed.retryAt > Date.now()) throw failed.error;
-    this.recentFailures.delete(cacheKey);
+    this.recentFailures.delete(key);
 
-    const request = this.synthesize(line.id, line.text[locale], WIZARD_CHESS_VOICE_IDS[line.speaker])
-      .then(audio => {
-        this.cache.set(cacheKey, audio);
-        return audio;
-      })
-      .catch((error: WizardChessAudioError) => {
-        this.recentFailures.set(cacheKey, { error, retryAt: Date.now() + FAILURE_RETRY_MS });
-        throw error;
-      })
-      .finally(() => { this.inFlight.delete(cacheKey); });
-    this.inFlight.set(cacheKey, request);
-    return request;
+    try {
+      const audio = await this.synthesize(lineId, text, voiceId);
+      this.cache.set(key, audio);
+      // Azure Files can be slow. A cache write must never postpone the first
+      // audible line or keep same-process callers waiting on storage I/O.
+      if (this.cacheDir) {
+        void this.saveDownloaded(key, lineId, audio).catch(() => {
+          console.warn(`[wizard-audio] lineId=${lineId} reason=cache_write_failed`);
+        });
+      }
+      return audio;
+    } catch (error) {
+      if (error instanceof WizardChessAudioError) {
+        this.recentFailures.set(key, { error, retryAt: Date.now() + FAILURE_RETRY_MS });
+      }
+      throw error;
+    }
+  }
+
+  private async readDownloaded(key: string, lineId: string): Promise<Buffer | null> {
+    const file = join(this.cacheDir!, `${key}.mp3`);
+    try {
+      const info = await stat(file);
+      if (info.size > MAX_AUDIO_BYTES || info.size < 4) {
+        console.warn(`[wizard-audio] lineId=${lineId} reason=cache_invalid`);
+        return null;
+      }
+      const audio = await readFile(file);
+      if (isMp3(audio)) return audio;
+      console.warn(`[wizard-audio] lineId=${lineId} reason=cache_invalid`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        console.warn(`[wizard-audio] lineId=${lineId} reason=cache_read_failed`);
+      }
+    }
+    return null;
+  }
+
+  private async saveDownloaded(key: string, lineId: string, audio: Buffer): Promise<void> {
+    const file = join(this.cacheDir!, `${key}.mp3`);
+    const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await mkdir(this.cacheDir!, { recursive: true });
+      await writeFile(temporary, audio, { flag: 'wx', mode: 0o600 });
+      await rename(temporary, file);
+    } catch {
+      // A cache outage must not turn an otherwise successful scene voice into a
+      // failed HTTP response. RAM still deduplicates subsequent calls this run.
+      console.warn(`[wizard-audio] lineId=${lineId} reason=cache_write_failed`);
+    } finally {
+      await rm(temporary, { force: true }).catch(() => {});
+    }
   }
 
   private async synthesize(lineId: string, text: string, voiceId: string): Promise<Buffer> {
@@ -73,7 +168,7 @@ export class WizardChessAudioService {
     let failureReason = 'request_failed';
     try {
       const response = await this.fetchImpl(
-        `${ELEVENLABS_URL}/${encodeURIComponent(voiceId)}?output_format=mp3_44100_128`,
+        `${ELEVENLABS_URL}/${encodeURIComponent(voiceId)}?output_format=${WIZARD_CHESS_AUDIO_OUTPUT_FORMAT}`,
         {
           method: 'POST',
           headers: {
@@ -81,7 +176,7 @@ export class WizardChessAudioService {
             'Content-Type': 'application/json',
             Accept: 'audio/mpeg',
           },
-          body: JSON.stringify({ text, model_id: 'eleven_flash_v2_5' }),
+          body: JSON.stringify({ text, model_id: WIZARD_CHESS_AUDIO_MODEL_ID }),
           signal: controller.signal,
         },
       );
