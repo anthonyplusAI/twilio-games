@@ -725,6 +725,9 @@ describe('Voice Trivia central runtime', () => {
     expect(new Set(bindingPlayerIds).size).toBe(4);
     expect(bindingPlayerIds).toEqual(initialState.players.map(player => player.playerId));
 
+    // A greeting can arrive before the callers' lobby audio has finished and the shared menu advances.
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
+
     const categoryFinals = ['Science', 'History please', 'I vote for science', 'category number two'];
     const expectedVotes = [
       { science: 1, history: 0 },
@@ -741,6 +744,8 @@ describe('Voice Trivia central runtime', () => {
       });
       expect(room.state().categoryVoteCounts).toMatchObject(expectedVotes[index]!);
     }
+    // The final vote is counted before every caller's category confirmation has finished playing.
+    await waitFor(() => room.phase === 'loading' ? true : undefined);
     expect(room.state()).toMatchObject({
       phase: 'loading',
       category: 'science',
