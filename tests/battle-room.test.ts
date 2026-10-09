@@ -37,6 +37,323 @@ describe('BattleRoom', () => {
     expect(r.canControlSetup(b.playerId)).toBe(true);
   });
 
+  it('holds a two-caller lobby until each named caller says ready', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Challenger', 'a', false) as { playerId: string };
+    const bo = r.addPlayer('Challenger', 'b', false) as { playerId: string };
+    r.setPlayerInfo(ada.playerId, { name: 'Ada' });
+    r.setPlayerInfo(bo.playerId, { name: 'Bo' });
+
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.phase).toBe('lobby');
+    expect(r.lobbyPlayers()).toMatchObject([
+      { name: 'Ada', nameConfirmed: true, setupReady: true },
+      { name: 'Bo', nameConfirmed: true, setupReady: false },
+    ]);
+    expect(r.advance(bo.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');
+    expect(r.isSetupReady(ada.playerId)).toBe(false);
+    expect(r.isSetupReady(bo.playerId)).toBe(false);
+  });
+
+  it('waits for both phone menu cues after both callers confirm lobby and monster selection', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = r.addPlayer('Bo', 'b') as { playerId: string };
+    const lobbyAda = r.beginVoiceMenuSpeech(ada.playerId, 'lobby')!;
+    const lobbyBo = r.beginVoiceMenuSpeech(bo.playerId, 'lobby')!;
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.advance(bo.playerId)).toBe(true);
+    expect(r.phase).toBe('lobby');
+    lobbyAda(true);
+    expect(r.phase).toBe('lobby');
+    lobbyBo(true);
+    expect(r.phase).toBe('monster_select');
+
+    const selectAda = r.beginVoiceMenuSpeech(ada.playerId, 'monster_select')!;
+    const selectBo = r.beginVoiceMenuSpeech(bo.playerId, 'monster_select')!;
+    r.selectMonster(ada.playerId, M0);
+    r.selectMonster(bo.playerId, M1);
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.advance(bo.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');
+    selectBo(true);
+    expect(r.phase).toBe('monster_select');
+    selectAda(true);
+    expect(r.phase).toBe('battle');
+  });
+
+  it('records one named caller as ready while the other caller is still joining and naming', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Ada', 'a') as { playerId: string };
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.phase).toBe('lobby');
+    expect(r.isSetupReady(ada.playerId)).toBe(true);
+    const bo = r.addPlayer('Challenger', 'b', false) as { playerId: string };
+    expect(r.advance(bo.playerId)).toBe(false);
+    r.setPlayerInfo(bo.playerId, { name: 'Bo' });
+    expect(r.advance(bo.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');
+  });
+
+  it('lets a caller confirm their monster before the other caller chooses', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = r.addPlayer('Bo', 'b') as { playerId: string };
+    r.advance(ada.playerId); r.advance(bo.playerId);
+    r.selectMonster(ada.playerId, M0);
+    expect(r.canStart()).toBe(false);
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');
+    expect(r.isSetupReady(ada.playerId)).toBe(true);
+    r.selectMonster(bo.playerId, M1);
+    expect(r.advance(bo.playerId)).toBe(true);
+    expect(r.phase).toBe('battle');
+  });
+
+  it('holds monster selection for both callers and clears readiness when a choice changes', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = r.addPlayer('Bo', 'b') as { playerId: string };
+    r.advance(ada.playerId); r.advance(bo.playerId);
+    r.selectMonster(ada.playerId, M0); r.selectMonster(bo.playerId, M1);
+
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');
+    expect(r.isSetupReady(ada.playerId)).toBe(true);
+    r.selectMonster(ada.playerId, M1);
+    expect(r.isSetupReady(ada.playerId)).toBe(false);
+    expect(r.advance(bo.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.phase).toBe('battle');
+  });
+
+  it('treats Back in a two-caller selection as changing only the caller’s own pick', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = r.addPlayer('Bo', 'b') as { playerId: string };
+    r.advance(ada.playerId); r.advance(bo.playerId);
+    r.selectMonster(ada.playerId, M0); r.selectMonster(bo.playerId, M1);
+    r.advance(bo.playerId);
+
+    expect(r.back(ada.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');
+    expect(r.lobbyPlayers()).toMatchObject([
+      { name: 'Ada', monsterId: null, setupReady: false },
+      { name: 'Bo', monsterId: M1, setupReady: true },
+    ]);
+    expect(r.back(ada.playerId)).toBe(false);
+  });
+
+  it('asks a remaining caller to reconfirm after the other caller leaves setup', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = r.addPlayer('Bo', 'b') as { playerId: string };
+    r.advance(ada.playerId); r.advance(bo.playerId);
+    r.selectMonster(ada.playerId, M0);
+    r.advance(ada.playerId);
+    expect(r.isSetupReady(ada.playerId)).toBe(true);
+    r.removePlayer(bo.playerId);
+    expect(r.phase).toBe('monster_select');
+    expect(r.isSetupReady(ada.playerId)).toBe(false);
+    expect(r.lobbyPlayers()[0]?.monsterId).toBe(M0);
+  });
+
+  it('seeds the first human turn and alternates the opener on the next battle', () => {
+    const r = new BattleRoom('FAIR', 43);
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = r.addPlayer('Bo', 'b') as { playerId: string };
+    const start = () => {
+      r.advance(ada.playerId); r.advance(bo.playerId);
+      r.selectMonster(ada.playerId, M0); r.selectMonster(bo.playerId, M1);
+      r.advance(ada.playerId); r.advance(bo.playerId);
+    };
+
+    start();
+    expect(r.activeSide()).toBe('b');
+    r.reset();
+    start();
+    expect(r.activeSide()).toBe('a');
+  });
+
+  it('waits for both finished callers to request a rematch before clearing the result', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = r.addPlayer('Bo', 'b') as { playerId: string };
+    r.advance(ada.playerId); r.advance(bo.playerId);
+    r.selectMonster(ada.playerId, M0); r.selectMonster(bo.playerId, M1);
+    r.advance(ada.playerId); r.advance(bo.playerId);
+    for (let i = 0; i < 200 && r.phase === 'battle'; i++) {
+      const snap = r.snapshot()!;
+      const side = r.activeSide();
+      if (side === 'a') r.chooseMove(ada.playerId, snap.a.moves[0]!.id);
+      if (side === 'b') r.chooseMove(bo.playerId, snap.b.moves[0]!.id);
+    }
+    expect(r.phase).toBe('results');
+    expect([r.snapshot()?.a.id, r.snapshot()?.b.id]).toEqual([ada.playerId, bo.playerId]);
+    r.acknowledgeResultsPresented(r.generation);
+    const result = r.result();
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.phase).toBe('results');
+    expect(r.result()).toEqual(result);
+    expect(r.isSetupReady(ada.playerId)).toBe(true);
+    expect(r.isSetupReady(bo.playerId)).toBe(false);
+    expect(r.advance(bo.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');
+    expect(r.isSetupReady(ada.playerId)).toBe(false);
+  });
+
+  it('clears a waiting rematch vote when the other finished caller leaves', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = r.addPlayer('Bo', 'b') as { playerId: string };
+    r.advance(ada.playerId); r.advance(bo.playerId);
+    r.selectMonster(ada.playerId, M0); r.selectMonster(bo.playerId, M1);
+    r.advance(ada.playerId); r.advance(bo.playerId);
+    for (let index = 0; index < 200 && r.phase === 'battle'; index++) {
+      const snapshot = r.snapshot()!;
+      if (r.activeSide() === 'a') r.chooseMove(ada.playerId, snapshot.a.moves[0]!.id);
+      else r.chooseMove(bo.playerId, snapshot.b.moves[0]!.id);
+    }
+    expect(r.phase).toBe('results');
+    r.acknowledgeResultsPresented(r.generation);
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.isSetupReady(ada.playerId)).toBe(true);
+    r.removePlayer(bo.playerId);
+    expect(r.isSetupReady(ada.playerId)).toBe(false);
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');
+  });
+
+  it('retains finished standings while a replacement caller’s result cue has not played', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = r.addPlayer('Bo', 'b') as { playerId: string };
+    r.advance(ada.playerId); r.advance(bo.playerId);
+    r.selectMonster(ada.playerId, M0); r.selectMonster(bo.playerId, M1);
+    r.advance(ada.playerId); r.advance(bo.playerId);
+    for (let index = 0; index < 200 && r.phase === 'battle'; index++) {
+      const snap = r.snapshot()!;
+      if (r.activeSide() === 'a') r.chooseMove(ada.playerId, snap.a.moves[0]!.id);
+      else r.chooseMove(bo.playerId, snap.b.moves[0]!.id);
+    }
+    expect(r.phase).toBe('results');
+    r.acknowledgeResultsPresented(r.generation);
+    const finalStandings = r.result();
+    r.removePlayer(bo.playerId);
+    const replacement = r.addPlayer('Cy', 'b') as { playerId: string };
+    r.expectHumanPlayers(2, false);
+    const interruptedCue = r.beginVoiceMenuSpeech(replacement.playerId, 'results')!;
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.advance(replacement.playerId)).toBe(true);
+    expect(r.phase).toBe('results');
+    expect(r.result()).toEqual(finalStandings);
+    interruptedCue(false);
+    expect(r.phase).toBe('results');
+
+    const replayedCue = r.beginVoiceMenuSpeech(replacement.playerId, 'results')!;
+    replayedCue(true);
+    expect(r.phase).toBe('monster_select');
+  });
+
+  it('keeps the display’s two-caller reservation after the first caller leaves setup', () => {
+    const r = room();
+    expect(r.configureDisplayPlayers(2)).toBe(true);
+    const first = r.addPlayer('Ada') as { playerId: string };
+    r.removePlayer(first.playerId);
+    expect(r.expectedPlayerCount).toBe(2);
+    const replacement = r.addPlayer('Bo') as { playerId: string };
+    expect(r.advance(replacement.playerId)).toBe(true);
+    expect(r.phase).toBe('lobby');
+    expect(r.isSetupReady(replacement.playerId)).toBe(true);
+  });
+
+  it('accepts a reconnecting display’s same player count without changing an active setup', () => {
+    const r = room();
+    r.configureDisplayPlayers(2);
+    r.addPlayer('Ada');
+    expect(r.configureDisplayPlayers(2)).toBe(true);
+    expect(r.configureDisplayPlayers(1)).toBe(false);
+    expect(r.expectedPlayerCount).toBe(2);
+  });
+
+  it('accepts a first two-caller display setup after one caller joins but before lobby advances', () => {
+    const r = room();
+    const ada = r.addPlayer('Ada') as { playerId: string };
+    const finishAda = r.beginVoiceMenuSpeech(ada.playerId, 'lobby')!;
+    expect(r.configureDisplayPlayers(2)).toBe(true);
+    expect(r.expectedPlayerCount).toBe(2);
+    expect(r.requiresIndividualSetupReady).toBe(true);
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.phase).toBe('lobby');
+    expect(r.isSetupReady(ada.playerId)).toBe(true);
+    const bo = r.addPlayer('Bo') as { playerId: string };
+    expect(r.advance(bo.playerId)).toBe(true);
+    expect(r.phase).toBe('lobby');
+    finishAda(true);
+    expect(r.phase).toBe('monster_select');
+  });
+
+  it('does not change display mode after setup has progressed', () => {
+    const r = room();
+    const ada = r.addPlayer('Ada') as { playerId: string };
+    expect(r.advance(ada.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');
+    expect(r.configureDisplayPlayers(2)).toBe(false);
+    expect(r.expectedPlayerCount).toBe(1);
+  });
+
+  it('does not let a late display lower a room already expecting two callers', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    r.addPlayer('Ada');
+    expect(r.configureDisplayPlayers(1)).toBe(false);
+    expect(r.expectedPlayerCount).toBe(2);
+  });
+
+  it('will not start a two-caller battle while a late caller still needs to give a name', () => {
+    const r = room();
+    const ada = r.addPlayer('Ada') as { playerId: string };
+    r.advance(ada.playerId);
+    const bo = r.addPlayer('Challenger', 'b', false) as { playerId: string };
+    r.expectHumanPlayers(2, false);
+    r.selectMonster(ada.playerId, M0);
+    r.selectMonster(bo.playerId, M1);
+    expect(r.canStart()).toBe(false);
+    r.setPlayerInfo(bo.playerId, { name: 'Bo' });
+    expect(r.lobbyPlayers().find(player => player.playerId === bo.playerId)?.monsterId).toBeNull();
+    r.selectMonster(bo.playerId, M1);
+    expect(r.canStart()).toBe(true);
+  });
+
+  it('does not assign a monster to an unnamed caller in a shared two-seat menu', () => {
+    const r = room();
+    r.expectHumanPlayers(2);
+    const ada = r.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = r.addPlayer('Challenger', 'b', false) as { playerId: string };
+    r.setPlayerInfo(bo.playerId, { name: 'Bo' });
+    r.advance(ada.playerId); r.advance(bo.playerId);
+    // A replacement arriving at an already-open shared menu still has to name themselves.
+    r.removePlayer(bo.playerId);
+    const late = r.addPlayer('Challenger', 'b', false) as { playerId: string };
+    expect(r.phase).toBe('monster_select');
+    expect(r.selectMonster(late.playerId, M1)).toBe(false);
+    r.setPlayerInfo(late.playerId, { name: 'Bo' });
+    expect(r.selectMonster(late.playerId, M1)).toBe(true);
+  });
+
   it('advances lobby → monster_select and records each pick', () => {
     const r = room();
     const a = r.addPlayer('Ada') as { playerId: string };
@@ -88,12 +405,14 @@ describe('BattleRoom', () => {
     expect(r.phase).toBe('lobby');
     const a=r.addPlayer('Ada','a') as {playerId:string};
     expect(r.phase).toBe('lobby');expect(r.advance()).toBe(false);expect(r.advance(a.playerId)).toBe(true);
+    expect(r.phase).toBe('lobby');expect(r.advance(b.playerId)).toBe(true);
     expect(r.phase).toBe('monster_select');
     r.back();expect(r.phase).toBe('monster_select');
     r.selectMonster(b.playerId,M1);
     expect(r.canStart()).toBe(false);
     r.selectMonster(a.playerId,M0);
     expect(r.phase).toBe('monster_select');expect(r.advance()).toBe(false);expect(r.advance(b.playerId)).toBe(true);
+    expect(r.phase).toBe('monster_select');expect(r.advance(a.playerId)).toBe(true);
     expect(r.phase).toBe('battle');
     expect(r.canStart()).toBe(false);
     expect(r.snapshot()).toMatchObject({
@@ -136,9 +455,9 @@ describe('BattleRoom', () => {
   it('shows monster selection before restarting an interrupted standalone battle against AI', () => {
     const r=room();r.expectHumanPlayers(2,false);
     const a=r.addPlayer('Ada') as {playerId:string};const b=r.addPlayer('Bo') as {playerId:string};
-    r.advance(a.playerId);
+    r.advance(a.playerId);r.advance(b.playerId);
     r.selectMonster(a.playerId,M0);r.selectMonster(b.playerId,M1);
-    r.advance(a.playerId);
+    r.advance(a.playerId);r.advance(b.playerId);
     expect(r.phase).toBe('battle');
     r.removePlayer(b.playerId);
     expect(r.phase).toBe('monster_select');
@@ -152,7 +471,7 @@ describe('BattleRoom', () => {
   it.each(['count-first','remove-first'] as const)('keeps monster selection gated when a no-show is dropped %s',order=>{
     const r=room();r.expectHumanPlayers(2);
     const a=r.addPlayer('Ada','a') as {playerId:string};const b=r.addPlayer('Bo','b') as {playerId:string};
-    r.advance(a.playerId);
+    r.advance(a.playerId);r.advance(b.playerId);
     r.selectMonster(a.playerId,M0);
     if(order==='count-first')r.expectHumanPlayers(1);
     r.removePlayer(b.playerId);
@@ -269,10 +588,10 @@ describe('BattleRoom', () => {
     const ada = r.addPlayer('Ada') as { playerId: string };
     const bo = r.addPlayer('Bo') as { playerId: string };
     r.expectHumanPlayers(2, false);
-    r.advance(ada.playerId);
+    r.advance(ada.playerId);r.advance(bo.playerId);
     r.selectMonster(ada.playerId, 'embertail');
     r.selectMonster(bo.playerId, 'thornling');
-    r.advance(bo.playerId);
+    r.advance(bo.playerId);r.advance(ada.playerId);
     for (let i = 0; i < 100 && r.phase === 'battle'; i++) {
       const snapshot = r.snapshot()!;
       if (r.activeSide() === 'a') r.chooseMove(ada.playerId, snapshot.a.moves[1]!.id);
@@ -294,7 +613,7 @@ describe('BattleRoom', () => {
     expect(r.snapshot()?.b.name).toBe('Rival');
   });
 
-  it('lets only a finished-battle participant request its rematch', () => {
+  it('requires both current callers to request a rematch after a late join', () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
@@ -313,7 +632,7 @@ describe('BattleRoom', () => {
       vi.advanceTimersByTime(r.rematchReadyInMs + 1);
       expect(r.resultsPresentationTimedOut).toBe(true);
 
-      expect(r.advance(newcomer.playerId)).toBe(false);
+      expect(r.advance(newcomer.playerId)).toBe(true);
       expect(r.advance('stale-player')).toBe(false);
       expect(r.phase).toBe('results');
       expect(r.result()).toEqual(result);
@@ -335,14 +654,16 @@ describe('BattleRoom', () => {
     expect(r.acknowledgeResultsPresented(r.generation)).toBe(true);
     const result = r.result();
     const waiting = r.addPlayer('Bo') as { playerId: string };
-    expect(r.canStartNextRound(waiting.playerId)).toBe(false);
-    expect(r.advance(waiting.playerId)).toBe(false);
+    expect(r.canStartNextRound(waiting.playerId)).toBe(true);
+    expect(r.advance(waiting.playerId)).toBe(true);
+    expect(r.phase).toBe('results');
     expect(r.result()).toEqual(result);
 
     r.removePlayer(original.playerId);
     expect(r.phase).toBe('results');
     expect(r.result()).toEqual(result);
     expect(r.canStartNextRound(waiting.playerId)).toBe(true);
+    expect(r.isSetupReady(waiting.playerId)).toBe(false);
     expect(r.advance(waiting.playerId)).toBe(true);
     expect(r.phase).toBe('monster_select');
     expect(r.result()).toBeNull();
@@ -411,7 +732,10 @@ describe('BattleRoom', () => {
       expect(r.phase).toBe('results');
       const late = r.addPlayer('Challenger', undefined, false); if ('error' in late) throw new Error(late.error);
       vi.advanceTimersByTime(r.rematchReadyInMs + 1);
-      r.advance();
+      expect(r.advance()).toBe(false);
+      expect(r.advance(a.playerId)).toBe(true);
+      expect(r.phase).toBe('results');
+      expect(r.advance(late.playerId)).toBe(true);
       expect(r.phase).toBe('lobby');
       expect(r.hasConfirmedName(late.playerId)).toBe(false);
     } finally { vi.useRealTimers(); }

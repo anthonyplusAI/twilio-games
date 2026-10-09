@@ -45,6 +45,63 @@ const context = {
 };
 
 describe('Voice Trivia display DOM projection', () => {
+  it('shows each caller waiting for phone setup and a named replay seat', () => {
+    const lobby = renderTriviaView(state({
+      phase: 'lobby',
+      players: [
+        { ...players[1]!, playerOrder: 1, setupStatus: 'name' },
+        { ...players[0]!, playerOrder: 0, setupStatus: 'phone' },
+      ],
+    }), context);
+    expect(lobby.html.indexOf('Ada')).toBeLessThan(lobby.html.indexOf('Grace'));
+    expect(lobby.html).toContain('Finishing phone prompt');
+    expect(lobby.html).toContain('Confirming name');
+
+    const categories = renderTriviaView(state({
+      phase: 'category_select', categoryVotingSeat: null,
+      categoryVoteCounts: {
+        general: 0, science: 1, geography: 0, history: 1, entertainment: 0,
+        sports: 0, technology: 0, twilio: 0, mixed: 0,
+      },
+      players: [
+        { ...players[0]!, setupStatus: 'ready', categoryVoted: true },
+        { ...players[1]!, setupStatus: 'phone', categoryVoted: true },
+      ],
+    }), context);
+    expect(categories.html).toContain('Waiting for callers to hear their category choice');
+    expect(categories.html).toContain('Grace');
+    expect(categories.html).toContain('Finishing phone prompt');
+
+    const result = {
+      resultId: 'shared-1', generation: 1, category: 'science' as const, contentRevision: 'rev-1', completedAtMs: 30_000,
+      players: players.map((player, index) => ({
+        playerId: player.playerId, name: player.name, playerOrder: player.playerOrder,
+        rank: index + 1, rawScore: player.rawScore, normalizedScore: player.rawScore,
+        correctCount: player.correctCount, bestStreak: player.bestStreak, cumulativeCorrectTimeMs: 0,
+      })),
+    };
+    const waiting = renderTriviaView(state({
+      phase: 'results', result, replayVotingSeat: null,
+      players: [
+        { ...players[0]!, setupStatus: 'replay_ready', replayReady: true },
+        { ...players[1]!, setupStatus: 'phone', replayReady: false },
+      ],
+    }), { ...context, canReplay: true });
+    expect(waiting.html).toContain('Ready to replay');
+    expect(waiting.html).toContain('Waiting for callers</button>');
+    expect(waiting.html).toContain('id="trivia-replay" class="primary-action" type="button" disabled');
+
+    const ready = renderTriviaView(state({
+      phase: 'results', result, replayVotingSeat: { playerId: 'p2', name: 'Grace' },
+      players: [
+        { ...players[0]!, setupStatus: 'replay_ready', replayReady: true },
+        { ...players[1]!, setupStatus: 'replay', replayReady: false },
+      ],
+    }), { ...context, canReplay: true });
+    expect(ready.html).toContain('Play again for Grace');
+    expect(ready.html).not.toContain('id="trivia-replay" class="primary-action" type="button" disabled');
+  });
+
   it('shows the configured call QR and a dial link in the standalone lobby', () => {
     const rendered = renderTriviaView(state({ phase: 'lobby', players: [] }), {
       ...context,

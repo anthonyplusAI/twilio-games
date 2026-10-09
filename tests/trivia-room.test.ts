@@ -97,6 +97,335 @@ function finishRound(room: TriviaRoom, playerId: string, now: { value: number })
 }
 
 describe('authoritative trivia room', () => {
+  it('lets a first phone caller wait in the lobby while the display selects multiple seats', () => {
+    const room = new TriviaRoom('PHONE-FIRST-SEATS', { bank });
+    expect(room.expectHumanPlayers(1, true, { allowReplay: true })).toBe(true);
+    const first = joined(room, 'Ada');
+    expect(room.registerVoicePlayer(first)).toBe(true);
+    const oldSpeech = room.beginSetupSpeech(first, 'lobby')!;
+
+    expect(room.configureStandaloneSeats(3)).toBe(true);
+    oldSpeech(true);
+    expect(room.state()).toMatchObject({
+      phase: 'lobby', expectedPlayerCount: 3, hasExpectedPlayers: false,
+      players: [{ playerId: first, setupStatus: 'phone' }],
+    });
+    room.beginSetupSpeech(first, 'lobby')!(true);
+    expect(room.state().players[0]?.setupStatus).toBe('ready');
+    expect(room.advance(first)).toBe(false);
+
+    expect(joined(room, 'Grace')).toBeTruthy();
+    expect(joined(room, 'Lin')).toBeTruthy();
+    expect(room.configureStandaloneSeats(2)).toBe(false);
+  });
+
+  it('lets a new standalone display choose a different count in an empty lobby', () => {
+    const room = new TriviaRoom('DISPLAY-HANDOFF', { bank });
+    expect(room.configureStandaloneSeats(1)).toBe(true);
+    expect(room.configureStandaloneSeats(3)).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'lobby', expectedPlayerCount: 3, automaticSetup: true });
+    const first = joined(room, 'Ada');
+    expect(room.configureStandaloneSeats(2)).toBe(false);
+    expect(room.state().expectedPlayerCount).toBe(3);
+    expect(first).toBeTruthy();
+  });
+
+  it('keeps a standalone display seat target through departures and a fresh session', () => {
+    const room = new TriviaRoom('FIXED-SEATS', { bank });
+    expect(room.configureStandaloneSeats(3)).toBe(true);
+    expect(room.state()).toMatchObject({ expectedPlayerCount: 3, automaticSetup: true });
+    const first = joined(room, 'Ada');
+    expect(room.configureStandaloneSeats(2)).toBe(false);
+    expect(room.configureStandaloneSeats(3)).toBe(true);
+    expect(room.permanentlyRemovePlayer(first)).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'lobby', expectedPlayerCount: 3, automaticSetup: true });
+    expect(joined(room, 'Grace')).toBeTruthy();
+    expect(joined(room, 'Lin')).toBeTruthy();
+    expect(joined(room, 'Katherine')).toBeTruthy();
+    expect(room.addPlayer('Extra')).toEqual({ error: 'room_full' });
+  });
+
+  it.each([2, 3, 4] as const)(
+    'recovers a %i-caller standalone category menu after a caller leaves',
+    count => {
+      const room = new TriviaRoom(`REPLACE-CATEGORY-${count}`, { bank });
+      expect(room.configureStandaloneSeats(count)).toBe(true);
+      const names = ['Ada', 'Grace', 'Linus', 'Katherine'];
+      const ids = names.slice(0, count).map(name => joined(room, name));
+      for (const id of ids) {
+        room.registerVoicePlayer(id);
+        room.beginSetupSpeech(id, 'lobby')!(true);
+      }
+      expect(room.advance(ids[0])).toBe(true);
+      expect(room.voteCategory(ids[0]!, 'science')).toBe(true);
+      const staleCategorySpeech = room.beginSetupSpeech(ids[0]!, 'category_select')!;
+      expect(room.voteCategory(ids[1]!, 'history')).toBe(true);
+
+      expect(room.permanentlyRemovePlayer(ids[1]!)).toBe(true);
+      expect(room.state()).toMatchObject({
+        phase: 'lobby', expectedPlayerCount: count, hasExpectedPlayers: false,
+        categoryVoteCounts: { science: 0, history: 0 },
+      });
+      expect(room.state().players.map(player => [player.playerId, player.name, player.playerOrder]))
+        .toEqual(ids.filter(id => id !== ids[1]).map(id => [
+          id, names[ids.indexOf(id)], ids.indexOf(id),
+        ]));
+      staleCategorySpeech(true);
+      expect(room.advance(ids[0])).toBe(false);
+
+      const replacement = joined(room, 'Nadia');
+      room.registerVoicePlayer(replacement);
+      expect(room.state().players.map(player => player.playerOrder)).toEqual(
+        Array.from({ length: count }, (_, index) => index),
+      );
+      for (const id of [...ids.filter(id => id !== ids[1]), replacement]) {
+        room.beginSetupSpeech(id, 'lobby')!(true);
+      }
+      expect(room.advance(ids[0])).toBe(true);
+      expect(room.phase).toBe('category_select');
+    },
+  );
+
+  it.each([2, 3, 4] as const)(
+    'invalidates stale loading readiness and replaces a departed %i-caller standalone seat',
+    count => {
+      const room = new TriviaRoom(`REPLACE-LOADING-${count}`, { bank });
+      expect(room.configureStandaloneSeats(count)).toBe(true);
+      const ids = ['Ada', 'Grace', 'Linus', 'Katherine'].slice(0, count)
+        .map(name => joined(room, name));
+      for (const id of ids) {
+        room.registerVoicePlayer(id);
+        room.beginSetupSpeech(id, 'lobby')!(true);
+      }
+      expect(room.advance(ids[0])).toBe(true);
+      for (const id of ids) {
+        expect(room.voteCategory(id, 'science')).toBe(true);
+        room.beginSetupSpeech(id, 'category_select')!(true);
+      }
+      expect(room.advance(ids[0])).toBe(true);
+      const staleGeneration = room.state().loadingGeneration;
+
+      expect(room.permanentlyRemovePlayer(ids[1]!)).toBe(true);
+      expect(room.state()).toMatchObject({
+        phase: 'lobby', expectedPlayerCount: count, hasExpectedPlayers: false,
+        category: null, displayReady: false,
+        categoryVoteCounts: { science: 0 },
+      });
+      expect(room.ready(staleGeneration)).toBe(false);
+      const replacement = joined(room, 'Nadia');
+      room.registerVoicePlayer(replacement);
+      for (const id of [...ids.filter(id => id !== ids[1]), replacement]) {
+        room.beginSetupSpeech(id, 'lobby')!(true);
+      }
+      expect(room.advance(ids[0])).toBe(true);
+      for (const id of [...ids.filter(id => id !== ids[1]), replacement]) {
+        expect(room.voteCategory(id, 'history')).toBe(true);
+        room.beginSetupSpeech(id, 'category_select')!(true);
+      }
+      expect(room.advance(ids[0])).toBe(true);
+      expect(room.state().loadingGeneration).toBeGreaterThan(staleGeneration);
+      expect(room.ready(staleGeneration)).toBe(false);
+    },
+  );
+
+  it('waits for both callers to finish their own menu audio, including a display category vote', () => {
+    const room = new TriviaRoom('VOICE-SETUP', { bank });
+    expect(room.configureStandaloneSeats(2)).toBe(true);
+    const first = joined(room, 'Player 1', false);
+    const second = joined(room, 'Player 2', false);
+    room.registerVoicePlayer(first);
+    room.registerVoicePlayer(second);
+    expect(room.setName(first, 'Ada')).toBe(true);
+    expect(room.setName(second, 'Grace')).toBe(true);
+    const firstLobby = room.beginSetupSpeech(first, 'lobby')!;
+    const secondLobby = room.beginSetupSpeech(second, 'lobby')!;
+    expect(room.state().players.map(player => player.setupStatus)).toEqual(['phone', 'phone']);
+    firstLobby(true);
+    expect(room.advance(first)).toBe(false);
+    secondLobby(true);
+    expect(room.advance(first)).toBe(true);
+    expect(room.phase).toBe('category_select');
+    expect(room.state().players.map(player => player.setupStatus)).toEqual(['category', 'category']);
+
+    expect(room.voteCategory(first, 'science')).toBe(true);
+    expect(room.voteCategoryFromDisplay(second, 'history')).toBe(true);
+    const firstVote = room.beginSetupSpeech(first, 'category_select')!;
+    const failedVote = room.beginSetupSpeech(second, 'category_select')!;
+    firstVote(true);
+    failedVote(false);
+    expect(room.advance(first)).toBe(false);
+    expect(room.state().players.map(player => player.setupStatus)).toEqual(['ready', 'phone']);
+    const retry = room.beginSetupSpeech(second, 'category_select')!;
+    firstLobby(true); // A late callback from the previous menu cannot release this one.
+    expect(room.advance(first)).toBe(false);
+    retry(true);
+    expect(room.advance(first)).toBe(true);
+    expect(room.phase).toBe('loading');
+  });
+
+  it('holds lobby and category progression for a caller asking a follow-up question', () => {
+    const room = new TriviaRoom('MENU-TURNS', { bank });
+    room.configureStandaloneSeats(2);
+    const ada = joined(room, 'Ada');
+    const grace = joined(room, 'Grace');
+    room.registerVoicePlayer(ada);
+    room.registerVoicePlayer(grace);
+    room.beginSetupSpeech(ada, 'lobby')!(true);
+    room.beginSetupSpeech(grace, 'lobby')!(true);
+    const lobbyAnswer = room.beginMenuTurn(ada, 'lobby')!;
+    expect(room.state().players.find(player => player.playerId === ada)?.setupStatus).toBe('phone');
+    expect(room.advance(grace)).toBe(false);
+    lobbyAnswer();
+    expect(room.state().players.find(player => player.playerId === ada)?.setupStatus).toBe('ready');
+    expect(room.advance(grace)).toBe(true);
+
+    room.voteCategory(ada, 'science');
+    room.voteCategory(grace, 'history');
+    room.beginSetupSpeech(ada, 'category_select')!(true);
+    room.beginSetupSpeech(grace, 'category_select')!(true);
+    const categoryAnswer = room.beginMenuTurn(ada, 'category_select')!;
+    expect(room.state().players.find(player => player.playerId === ada)?.setupStatus).toBe('phone');
+    expect(room.advance(grace)).toBe(false);
+    categoryAnswer();
+    expect(room.state().players.find(player => player.playerId === ada)?.setupStatus).toBe('ready');
+    expect(room.advance(grace)).toBe(true);
+    expect(room.phase).toBe('loading');
+  });
+
+  it('holds result replay for an already ready caller until their standings answer finishes', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('RESULT-TURNS', { bank, now: () => now.value });
+    room.configureStandaloneSeats(2);
+    const ada = joined(room, 'Ada');
+    const grace = joined(room, 'Grace');
+    room.registerVoicePlayer(ada);
+    room.registerVoicePlayer(grace);
+    room.beginSetupSpeech(ada, 'lobby')!(true);
+    room.beginSetupSpeech(grace, 'lobby')!(true);
+    room.advance(ada);
+    room.voteCategory(ada, 'science');
+    room.voteCategory(grace, 'science');
+    room.beginSetupSpeech(ada, 'category_select')!(true);
+    room.beginSetupSpeech(grace, 'category_select')!(true);
+    room.advance(ada);
+    room.ready(room.state().loadingGeneration);
+    now.value = room.state().countdownEndsAtMs!;
+    room.tick();
+    for (let index = 0; index < 8; index++) {
+      settlePrompt(room, now);
+      room.answer(ada, correctChoice(room));
+      room.answer(grace, correctChoice(room));
+      now.value = room.state().revealEndsAtMs!;
+      room.tick();
+    }
+    expect(room.phase).toBe('results');
+    room.beginSetupSpeech(ada, 'results')!(true);
+    room.beginSetupSpeech(grace, 'results')!(true);
+    expect(room.advance(ada)).toBe(true);
+    const standingsAnswer = room.beginMenuTurn(ada, 'results')!;
+    expect(room.state().players.find(player => player.playerId === ada)?.setupStatus).toBe('phone');
+    expect(room.advance(grace)).toBe(true);
+    expect(room.phase).toBe('results');
+    expect(room.state().players.find(player => player.playerId === grace)?.replayReady).toBe(true);
+    standingsAnswer();
+    expect(room.phase).toBe('category_select');
+  });
+
+  it('does not let an old menu-turn release clear a reconnecting caller\'s new turn', () => {
+    const room = new TriviaRoom('RECONNECTED-TURN', { bank });
+    room.configureStandaloneSeats(2);
+    const ada = joined(room, 'Ada');
+    const grace = joined(room, 'Grace');
+    room.registerVoicePlayer(ada);
+    room.registerVoicePlayer(grace);
+    room.beginSetupSpeech(ada, 'lobby')!(true);
+    room.beginSetupSpeech(grace, 'lobby')!(true);
+    const oldTurn = room.beginMenuTurn(ada, 'lobby')!;
+    room.setPlayerConnected(ada, false);
+    room.setPlayerConnected(ada, true);
+    room.beginSetupSpeech(ada, 'lobby')!(true);
+    const newTurn = room.beginMenuTurn(ada, 'lobby')!;
+    oldTurn();
+    expect(room.state().players.find(player => player.playerId === ada)?.setupStatus).toBe('phone');
+    expect(room.advance(grace)).toBe(false);
+    newTurn();
+    expect(room.advance(grace)).toBe(true);
+  });
+
+  it('requires each caller to request another shared round after the result recap', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('REPLAY-SEATS', { bank, now: () => now.value });
+    room.configureStandaloneSeats(2);
+    const first = joined(room, 'Ada');
+    const second = joined(room, 'Grace');
+    room.registerVoicePlayer(first);
+    room.registerVoicePlayer(second);
+    room.beginSetupSpeech(first, 'lobby')!(true);
+    room.beginSetupSpeech(second, 'lobby')!(true);
+    expect(room.advance(first)).toBe(true);
+    room.voteCategory(first, 'science');
+    room.voteCategory(second, 'science');
+    room.beginSetupSpeech(first, 'category_select')!(true);
+    room.beginSetupSpeech(second, 'category_select')!(true);
+    expect(room.advance(first)).toBe(true);
+    room.ready(room.state().loadingGeneration);
+    now.value += TRIVIA_COUNTDOWN_MS;
+    room.tick();
+    for (let index = 0; index < 8; index++) {
+      settlePrompt(room, now);
+      room.answer(first, correctChoice(room));
+      room.answer(second, correctChoice(room));
+      now.value = room.state().revealEndsAtMs!;
+      room.tick();
+    }
+    expect(room.phase).toBe('results');
+    const firstRecap = room.beginSetupSpeech(first, 'results')!;
+    const secondRecap = room.beginSetupSpeech(second, 'results')!;
+    firstRecap(true);
+    expect(room.advance(first)).toBe(true);
+    expect(room.phase).toBe('results');
+    expect(room.state().players.find(player => player.playerId === first)?.replayReady).toBe(true);
+    secondRecap(true);
+    expect(room.advance(first)).toBe(false);
+    expect(room.phase).toBe('results');
+    expect(room.state().replayVotingSeat?.playerId).toBe(second);
+    expect(room.state().players.find(player => player.playerId === first)?.setupStatus).toBe('replay_ready');
+    expect(room.advance(second)).toBe(true);
+    expect(room.phase).toBe('category_select');
+  });
+
+  it('preserves a result on same-count reconnect and lets a fresh display choose a new target', () => {
+    const now = { value: 0 };
+    const room = new TriviaRoom('RESULT-RECONFIG', { bank, now: () => now.value });
+    room.configureStandaloneSeats(2);
+    const first = joined(room, 'Ada');
+    const second = joined(room, 'Grace');
+    room.advance(first);
+    room.voteCategory(first, 'science');
+    room.voteCategory(second, 'science');
+    room.advance(first);
+    room.ready(room.state().loadingGeneration);
+    now.value += TRIVIA_COUNTDOWN_MS;
+    room.tick();
+    for (let index = 0; index < 8; index++) {
+      settlePrompt(room, now);
+      room.answer(first, correctChoice(room));
+      room.answer(second, correctChoice(room));
+      now.value = room.state().revealEndsAtMs!;
+      room.tick();
+    }
+    expect(room.phase).toBe('results');
+    const result = room.state().result;
+    room.setPlayerConnected(first, false);
+    room.setPlayerConnected(second, false);
+    expect(room.configureStandaloneSeats(2)).toBe(true);
+    expect(room.state().result).toEqual(result);
+    expect(room.configureStandaloneSeats(4)).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'lobby', expectedPlayerCount: 4, automaticSetup: true, result: null });
+    expect(joined(room, 'New caller')).toBeTruthy();
+    expect(room.state()).toMatchObject({ expectedPlayerCount: 4, hasExpectedPlayers: false });
+  });
+
   it('starts the shared answer clock before choice audio finishes and scores a spoken choice during it', () => {
     const now = { value: 10_000 };
     const room = new TriviaRoom('CHOICES-CLOCK', { bank, now: () => now.value });

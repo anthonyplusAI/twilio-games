@@ -15,6 +15,256 @@ function readyFightRoom(now: () => number = Date.now): FighterRoom {
 }
 
 describe('fighter room', () => {
+  it('holds shared menu votes through both callers’ current phone audio, then advances automatically', () => {
+    const room = new FighterRoom('SPOKEN-MENU', 5);
+    room.configureStandaloneSeats(2);
+    const ada = room.addPlayer('Ada'), bo = room.addPlayer('Bo');
+    if ('error' in ada || 'error' in bo) throw new Error('join failed');
+    room.registerVoicePlayer(ada.playerId);
+    room.registerVoicePlayer(bo.playerId);
+    const finishAdaLobby = room.beginMenuAudio(ada.playerId, 'lobby');
+    const finishBoLobby = room.beginMenuAudio(bo.playerId, 'lobby');
+
+    room.advance(ada.playerId);
+    room.advance(bo.playerId);
+    expect(room.phase).toBe('lobby');
+    finishAdaLobby();
+    expect(room.completeSharedDecisionIfReady()).toBe(false);
+    expect(room.phase).toBe('lobby');
+    finishBoLobby();
+    expect(room.completeSharedDecisionIfReady()).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+
+    room.selectFighter(ada.playerId, 'nyx');
+    room.selectFighter(bo.playerId, 'wraith');
+    const finishAdaFighter = room.beginMenuAudio(ada.playerId, 'fighter_select');
+    const finishBoFighter = room.beginMenuAudio(bo.playerId, 'fighter_select');
+    room.advance(ada.playerId);
+    room.advance(bo.playerId);
+    expect(room.phase).toBe('fighter_select');
+    finishAdaFighter();
+    expect(room.completeSharedDecisionIfReady()).toBe(false);
+    finishBoFighter();
+    expect(room.completeSharedDecisionIfReady()).toBe(true);
+    expect(room.phase).toBe('map_select');
+
+    room.selectMap(ada.playerId, 'void');
+    room.selectMap(bo.playerId, 'void');
+    const finishAdaMap = room.beginMenuAudio(ada.playerId, 'map_select');
+    const finishBoMap = room.beginMenuAudio(bo.playerId, 'map_select');
+    room.advance(ada.playerId);
+    room.advance(bo.playerId);
+    expect(room.phase).toBe('map_select');
+    finishAdaMap();
+    expect(room.completeSharedDecisionIfReady()).toBe(false);
+    finishBoMap();
+    expect(room.completeSharedDecisionIfReady()).toBe(true);
+    expect(room.phase).toBe('loading');
+
+    room.ready(room.state().loadingGeneration); room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    const world = room.state().world!; world.status = 'finished'; world.winner = 'p1';
+    room.tick(.1); room.tick(FIGHTER_VICTORY_SECONDS);
+    room.acknowledgePresentation('results', room.state().loadingGeneration);
+    const finishAdaResult = room.beginMenuAudio(ada.playerId, 'results');
+    const finishBoResult = room.beginMenuAudio(bo.playerId, 'results');
+    room.advance(ada.playerId);
+    room.advance(bo.playerId);
+    expect(room.phase).toBe('results');
+    finishAdaResult();
+    expect(room.completeSharedDecisionIfReady()).toBe(false);
+    finishBoResult();
+    expect(room.completeSharedDecisionIfReady()).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+  });
+
+  it('keeps shared votes pending after failed audio until that caller hears a fresh menu cue', () => {
+    const room = new FighterRoom('RETRY-CUE', 5);
+    room.configureStandaloneSeats(2);
+    const ada = room.addPlayer('Ada'), bo = room.addPlayer('Bo');
+    if ('error' in ada || 'error' in bo) throw new Error('join failed');
+    room.registerVoicePlayer(ada.playerId);
+    room.registerVoicePlayer(bo.playerId);
+    const failedAdaCue = room.beginMenuAudio(ada.playerId, 'lobby');
+    const boCue = room.beginMenuAudio(bo.playerId, 'lobby');
+    room.advance(ada.playerId);
+    room.advance(bo.playerId);
+    failedAdaCue(false);
+    boCue(true);
+    expect(room.completeSharedDecisionIfReady()).toBe(false);
+    expect(room.state()).toMatchObject({ phase: 'lobby',
+      phoneRetryPlayerIds: [ada.playerId], advanceReadyPlayerIds: [ada.playerId, bo.playerId] });
+
+    room.beginMenuAudio(ada.playerId, 'lobby')();
+    expect(room.completeSharedDecisionIfReady()).toBe(false);
+    const retry = room.beginMenuAudio(ada.playerId, 'lobby', true);
+    retry(true);
+    expect(room.completeSharedDecisionIfReady()).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+  });
+
+  it.each(['stale first', 'replacement first'] as const)(
+    'accepts a newer overlapping menu cue after an obsolete cue is skipped (%s)', order => {
+      const room = new FighterRoom('REPLACED-CUE', 5);
+      room.configureStandaloneSeats(2);
+      const ada = room.addPlayer('Ada'), bo = room.addPlayer('Bo');
+      if ('error' in ada || 'error' in bo) throw new Error('join failed');
+      room.registerVoicePlayer(ada.playerId);
+      room.registerVoicePlayer(bo.playerId);
+      const stale = room.beginMenuAudio(ada.playerId, 'lobby');
+      const replacement = room.beginMenuAudio(ada.playerId, 'lobby');
+      const finishBo = room.beginMenuAudio(bo.playerId, 'lobby');
+      room.advance(ada.playerId);
+      room.advance(bo.playerId);
+      finishBo(true);
+
+      if (order === 'stale first') {
+        stale(false);
+        expect(room.completeSharedDecisionIfReady()).toBe(false);
+        replacement(true);
+      } else {
+        replacement(true);
+        expect(room.completeSharedDecisionIfReady()).toBe(false);
+        stale(false);
+      }
+
+      expect(room.state().phoneRetryPlayerIds).toEqual([]);
+      expect(room.completeSharedDecisionIfReady()).toBe(true);
+      expect(room.phase).toBe('fighter_select');
+    },
+  );
+
+  it('keeps shared votes pending if the newest overlapping menu cue itself fails', () => {
+    const room = new FighterRoom('LATEST-CUE-FAILED', 5);
+    room.configureStandaloneSeats(2);
+    const ada = room.addPlayer('Ada'), bo = room.addPlayer('Bo');
+    if ('error' in ada || 'error' in bo) throw new Error('join failed');
+    room.registerVoicePlayer(ada.playerId);
+    room.registerVoicePlayer(bo.playerId);
+    const older = room.beginMenuAudio(ada.playerId, 'lobby');
+    const latest = room.beginMenuAudio(ada.playerId, 'lobby');
+    room.beginMenuAudio(bo.playerId, 'lobby')(true);
+    room.advance(ada.playerId);
+    room.advance(bo.playerId);
+    older(true);
+    latest(false);
+
+    expect(room.completeSharedDecisionIfReady()).toBe(false);
+    expect(room.state().phoneRetryPlayerIds).toEqual([ada.playerId]);
+    room.beginMenuAudio(ada.playerId, 'lobby', true)(true);
+    expect(room.completeSharedDecisionIfReady()).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+  });
+
+  it('holds an already recorded shared vote while a caller is speaking before final ASR', () => {
+    const room = new FighterRoom('INPUT-TURN', 5);
+    room.configureStandaloneSeats(2);
+    const ada = room.addPlayer('Ada'), bo = room.addPlayer('Bo');
+    if ('error' in ada || 'error' in bo) throw new Error('join failed');
+    room.registerVoicePlayer(ada.playerId);
+    room.registerVoicePlayer(bo.playerId);
+    room.beginMenuAudio(ada.playerId, 'lobby')();
+    room.beginMenuAudio(bo.playerId, 'lobby')();
+
+    const finishBoInput = room.beginMenuTurn(bo.playerId, 'lobby');
+    room.advance(ada.playerId);
+    room.advance(bo.playerId);
+    expect(room.phase).toBe('lobby');
+    expect(room.completeSharedDecisionIfReady()).toBe(false);
+    finishBoInput();
+    expect(room.completeSharedDecisionIfReady()).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+  });
+
+  it('reserves a fixed one-caller match against a second caller', () => {
+    const room = new FighterRoom('SOLO-RESERVATION', 1);
+    expect(room.configureStandaloneSeats(1)).toBe(true);
+    const first = room.addPlayer('Ada');
+    if ('error' in first) throw new Error(first.error);
+
+    expect(room.addPlayer('Bo')).toEqual({ error: 'room_full' });
+    expect(room.state()).toMatchObject({ phase: 'lobby', expectedPlayerCount: 1,
+      players: [expect.objectContaining({ name: 'Ada' })] });
+  });
+
+  it('treats a reconnecting display’s unchanged caller count as a no-op mid-menu', () => {
+    const room = new FighterRoom('REJOIN-COUNT', 1);
+    const ada = room.addPlayer('Ada');
+    if ('error' in ada) throw new Error(ada.error);
+    room.advance(ada.playerId);
+    expect(room.phase).toBe('fighter_select');
+    expect(room.configureStandaloneSeats(1)).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+    expect(room.configureStandaloneSeats(2)).toBe(false);
+    expect(room.state().expectedPlayerCount).toBe(1);
+  });
+
+  it('forgets a temporarily disconnected caller’s shared menu consent', () => {
+    const room = new FighterRoom('HOLD-VOTE', 2);
+    room.configureStandaloneSeats(2);
+    const ada = room.addPlayer('Ada'), bo = room.addPlayer('Bo');
+    if ('error' in ada || 'error' in bo) throw new Error('join failed');
+
+    room.advance(ada.playerId);
+    expect(room.state().advanceReadyPlayerIds).toEqual([ada.playerId]);
+    (room as FighterRoom & { suspendPlayer?: (id: string) => void }).suspendPlayer?.(ada.playerId);
+    expect(room.state().advanceReadyPlayerIds).toEqual([]);
+    room.advance(bo.playerId);
+    expect(room.phase).toBe('lobby');
+
+    room.advance(ada.playerId);
+    expect(room.phase).toBe('fighter_select');
+    room.back(ada.playerId);
+    expect(room.state().backReadyPlayerIds).toEqual([ada.playerId]);
+    (room as FighterRoom & { suspendPlayer?: (id: string) => void }).suspendPlayer?.(ada.playerId);
+    expect(room.state().backReadyPlayerIds).toEqual([]);
+    room.back(bo.playerId);
+    expect(room.phase).toBe('fighter_select');
+  });
+
+  it('holds the two-caller result until a suspended caller returns and votes again', () => {
+    const room = new FighterRoom('RESULT-HOLD-VOTE', 3);
+    room.configureStandaloneSeats(2);
+    const ada = room.addPlayer('Ada'), bo = room.addPlayer('Bo');
+    if ('error' in ada || 'error' in bo) throw new Error('join failed');
+    room.advance(ada.playerId); room.advance(bo.playerId);
+    room.selectFighter(ada.playerId, 'nyx'); room.selectFighter(bo.playerId, 'wraith');
+    room.advance(ada.playerId); room.advance(bo.playerId);
+    room.selectMap(ada.playerId, 'void'); room.selectMap(bo.playerId, 'void');
+    room.advance(ada.playerId); room.advance(bo.playerId);
+    room.ready(room.state().loadingGeneration); room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    const world = room.state().world!; world.status = 'finished'; world.winner = 'p1';
+    room.tick(.1); room.tick(FIGHTER_VICTORY_SECONDS);
+    room.acknowledgePresentation('results', room.state().loadingGeneration);
+
+    room.advance(ada.playerId);
+    expect(room.state().advanceReadyPlayerIds).toEqual([ada.playerId]);
+    (room as FighterRoom & { suspendPlayer?: (id: string) => void }).suspendPlayer?.(ada.playerId);
+    room.advance(bo.playerId);
+    expect(room.state()).toMatchObject({ phase: 'results', result: { winnerName: 'Ada' } });
+    expect(room.state().advanceReadyPlayerIds).toEqual([bo.playerId]);
+    room.advance(ada.playerId);
+    expect(room.phase).toBe('fighter_select');
+  });
+
+  it('changes the fixed caller count only for an unattended completed standalone result', () => {
+    const room = new FighterRoom('NEXT-COUNT', 4);
+    room.configureStandaloneSeats(1);
+    const ada = room.addPlayer('Ada');
+    if ('error' in ada) throw new Error(ada.error);
+    room.advance(ada.playerId); room.selectFighter(ada.playerId, 'nyx'); room.advance(ada.playerId);
+    room.selectMap(ada.playerId, 'void'); room.advance(ada.playerId);
+    room.ready(room.state().loadingGeneration); room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    const world = room.state().world!; world.status = 'finished'; world.winner = 'p1';
+    room.tick(.1); room.tick(FIGHTER_VICTORY_SECONDS); room.removePlayer(ada.playerId);
+    expect(room.state()).toMatchObject({ phase: 'results', expectedPlayerCount: 1,
+      result: { winnerName: 'Ada' } });
+
+    expect(room.configureStandaloneSeats(1)).toBe(true);
+    expect(room.phase).toBe('results');
+    expect(room.configureStandaloneSeats(2)).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'lobby', expectedPlayerCount: 2, result: null });
+  });
+
   it('keeps standalone Fighter in lobby until a named caller explicitly advances', () => {
     const room = new FighterRoom('NAMES', 1);
     room.expectHumanPlayers(1);
@@ -119,10 +369,12 @@ describe('fighter room', () => {
     const a=room.addPlayer('A','p1');if('error' in a)throw new Error(a.error);
     expect(room.state()).toMatchObject({ expectedPlayerCount: 2, hasExpectedPlayers: true });
     expect(room.phase).toBe('lobby');expect(room.advance()).toBe(false);expect(room.advance(a.playerId)).toBe(true);
+    expect(room.phase).toBe('lobby');expect(room.advance(b.playerId)).toBe(true);
     expect(room.back()).toBe(false);expect(room.phase).toBe('fighter_select');
     room.selectFighter(b.playerId,'wraith');
     room.selectFighter(a.playerId,'nyx');expect(room.phase).toBe('fighter_select');expect(room.advance()).toBe(false);
-    expect(room.advance(a.playerId)).toBe(true);expect(room.phase).toBe('map_select');
+    expect(room.advance(a.playerId)).toBe(true);expect(room.phase).toBe('fighter_select');
+    expect(room.advance(b.playerId)).toBe(true);expect(room.phase).toBe('map_select');
     expect(room.lobbyPlayers()).toEqual(expect.arrayContaining([
       expect.objectContaining({playerId:a.playerId,side:'p1',fighterId:'nyx'}),
       expect.objectContaining({playerId:b.playerId,side:'p2',fighterId:'wraith'}),
@@ -131,7 +383,75 @@ describe('fighter room', () => {
     expect(room.state()).toMatchObject({phase:'map_select',mapVotesByPlayerId:{[b.playerId]:'void'}});
     expect(room.selectMap(a.playerId,'foundry')).toBe(true);
     expect(room.phase).toBe('map_select');expect(room.advance()).toBe(false);
-    expect(room.advance(b.playerId)).toBe(true);expect(room.phase).toBe('loading');
+    expect(room.advance(b.playerId)).toBe(true);expect(room.phase).toBe('map_select');
+    expect(room.advance(a.playerId)).toBe(true);expect(room.phase).toBe('loading');
+  });
+
+  it('requires both callers to confirm each shared menu before it moves', () => {
+    const room = new FighterRoom('BOTH-READY', 7);
+    room.expectHumanPlayers(2);
+    const ada = room.addPlayer('Ada', 'p1');
+    const bo = room.addPlayer('Bo', 'p2');
+    if ('error' in ada || 'error' in bo) throw new Error('join failed');
+
+    expect(room.advance(ada.playerId)).toBe(true);
+    expect(room.phase).toBe('lobby');
+    expect(room.state().advanceReadyPlayerIds).toEqual([ada.playerId]);
+    expect(room.advance(bo.playerId)).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+    expect(room.state().advanceReadyPlayerIds).toEqual([]);
+
+    room.selectFighter(ada.playerId, 'nyx');
+    room.selectFighter(bo.playerId, 'wraith');
+    expect(room.advance(ada.playerId)).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+    room.selectFighter(bo.playerId, 'cinder-capone');
+    expect(room.state().advanceReadyPlayerIds).toEqual([]);
+    expect(room.advance(bo.playerId)).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+    expect(room.advance(ada.playerId)).toBe(true);
+    expect(room.phase).toBe('map_select');
+
+    room.selectMap(ada.playerId, 'void');
+    room.selectMap(bo.playerId, 'foundry');
+    expect(room.advance(ada.playerId)).toBe(true);
+    expect(room.phase).toBe('map_select');
+    expect(room.advance(bo.playerId)).toBe(true);
+    expect(room.phase).toBe('loading');
+  });
+
+  it('waits for both callers before rewinding a shared menu', () => {
+    const room = new FighterRoom('BOTH-BACK', 11);
+    room.expectHumanPlayers(2);
+    const ada = room.addPlayer('Ada', 'p1');
+    const bo = room.addPlayer('Bo', 'p2');
+    if ('error' in ada || 'error' in bo) throw new Error('join failed');
+    room.advance(ada.playerId); room.advance(bo.playerId);
+    room.selectFighter(ada.playerId, 'nyx'); room.selectFighter(bo.playerId, 'wraith');
+    room.advance(ada.playerId); room.advance(bo.playerId);
+
+    expect(room.back(ada.playerId)).toBe(true);
+    expect(room.phase).toBe('map_select');
+    expect(room.state().backReadyPlayerIds).toEqual([ada.playerId]);
+    expect(room.back(bo.playerId)).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+    expect(room.state().backReadyPlayerIds).toEqual([]);
+  });
+
+  it('shows when arena votes tie and clears the tie after a vote changes', () => {
+    const room = new FighterRoom('TIE', 17);
+    room.expectHumanPlayers(2);
+    const ada = room.addPlayer('Ada', 'p1');
+    const bo = room.addPlayer('Bo', 'p2');
+    if ('error' in ada || 'error' in bo) throw new Error('join failed');
+    room.advance(ada.playerId); room.advance(bo.playerId);
+    room.selectFighter(ada.playerId, 'nyx'); room.selectFighter(bo.playerId, 'wraith');
+    room.advance(ada.playerId); room.advance(bo.playerId);
+    room.selectMap(ada.playerId, 'void'); room.selectMap(bo.playerId, 'foundry');
+    expect(room.state().mapVoteTied).toBe(true);
+    expect(['void', 'foundry']).toContain(room.state().selectedMap);
+    room.selectMap(bo.playerId, 'void');
+    expect(room.state()).toMatchObject({ mapVoteTied: false, selectedMap: 'void' });
   });
 
   it('lets a lone retained player continue through explicit gates after a no-show drop', () => {
@@ -159,11 +479,11 @@ describe('fighter room', () => {
   it('rebuilds standalone loading setup when one caller disconnects', () => {
     const room=new FighterRoom('LOADING-DROP');room.expectHumanPlayers(2,false);
     const a=room.addPlayer('Ada'),b=room.addPlayer('Bo');if('error' in a||'error' in b)throw new Error('join failed');
-    room.advance(a.playerId);
+    room.advance(a.playerId);room.advance(b.playerId);
     room.selectFighter(a.playerId,'nyx');room.selectFighter(b.playerId,'wraith');
-    room.advance(a.playerId);
+    room.advance(a.playerId);room.advance(b.playerId);
     room.selectMap(a.playerId,'void');room.selectMap(b.playerId,'void');
-    room.advance(a.playerId);
+    room.advance(a.playerId);room.advance(b.playerId);
     expect(room.phase).toBe('loading');
     room.removePlayer(b.playerId);
     expect(room.phase).toBe('fighter_select');
@@ -213,8 +533,9 @@ describe('fighter room', () => {
   it('reopens fighter selection for a replacement when a player leaves arena voting',()=>{
     const room=new FighterRoom('4821');room.expectHumanPlayers(2);
     const a=room.addPlayer('A','p1'),b=room.addPlayer('B','p2');if('error'in a||'error'in b)throw new Error('join failed');
-    room.advance(a.playerId);
-    room.selectFighter(a.playerId,'nyx');room.selectFighter(b.playerId,'wraith');room.advance(a.playerId);expect(room.phase).toBe('map_select');
+    room.advance(a.playerId);room.advance(b.playerId);
+    room.selectFighter(a.playerId,'nyx');room.selectFighter(b.playerId,'wraith');
+    room.advance(a.playerId);room.advance(b.playerId);expect(room.phase).toBe('map_select');
     room.selectMap(a.playerId,'void');room.removePlayer(b.playerId);
     expect(room.state()).toMatchObject({phase:'fighter_select',selectedMap:null,mapVotesByPlayerId:{}});
     expect(room.addPlayer('C','p2')).toEqual(expect.objectContaining({playerId:expect.any(String)}));
@@ -223,8 +544,9 @@ describe('fighter room', () => {
   it.each(['count-first','remove-first'] as const)('keeps arena voting gated when a no-show is dropped %s',order=>{
     const room=new FighterRoom('4821');room.expectHumanPlayers(2);
     const a=room.addPlayer('A','p1'),b=room.addPlayer('B','p2');if('error'in a||'error'in b)throw new Error('join failed');
-    room.advance(a.playerId);
-    room.selectFighter(a.playerId,'nyx');room.selectFighter(b.playerId,'wraith');room.advance(a.playerId);room.selectMap(a.playerId,'void');
+    room.advance(a.playerId);room.advance(b.playerId);
+    room.selectFighter(a.playerId,'nyx');room.selectFighter(b.playerId,'wraith');
+    room.advance(a.playerId);room.advance(b.playerId);room.selectMap(a.playerId,'void');
     if(order==='count-first')room.expectHumanPlayers(1);
     room.removePlayer(b.playerId);
     if(order==='remove-first')room.expectHumanPlayers(1);

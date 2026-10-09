@@ -1,10 +1,9 @@
 import { RaceWorld } from '../shared/race-world';
 import { Lobby } from '../shared/lobby';
 import { MAX_PLAYERS, LANES } from '../shared/constants';
-import type { Intent, WorldSnapshot, Phase, GameEvent, LobbyPlayer, RaceResult } from '../shared/types';
+import type { Intent, WorldSnapshot, Phase, GameEvent, LobbyPlayer, RaceResult, RacerSetupStatus } from '../shared/types';
 
 const COLORS = ['#36d1dc','#f22f46','#ffcf5c','#36e08a','#a06bff','#ff8a5c','#5c8aff','#ff5ca8'];
-const SETUP_CROSSTALK_MS = 1_000;
 
 /** Accept only a safe CSS color (hex or simple rgb/hsl), else fall back. Colors are interpolated
  *  into style="..." on the display, so an unvalidated value is a stored-XSS vector — reject anything
@@ -37,15 +36,16 @@ export class Room {
   private raceMap: string | null = null;
   private carNames: string[] = [];
   private expectedHumanPlayers = 1;
+  private fixedStandaloneSeats = false;
   private stationManaged = false;
   private stationSlots = new Map<number, string>();
   private confirmedPlayerNames = new Set<string>();
+  private voiceMenus = new Map<string, { connected: boolean; phase: Phase; pending: number;
+    prompted: boolean; generation: number }>();
+  private replayReadyPlayerIds = new Set<string>();
   /** A caller joining after the finish waits for the current roster to replay. Their slot is
    * reserved without replacing the results that the players are still looking at. */
   private nextRoundPlayers = new Map<string, { name: string; color: string }>();
-  private recentSetupChoice: {
-    phase: 'car_select' | 'map_select'; choice: string; playerId: string; at: number;
-  } | null = null;
 
   constructor(code: string, seed: number, config?: RoomConfig) {
     this.code = code;
@@ -74,32 +74,116 @@ export class Room {
   get selectedMap(): string | null { return this.raceMap ?? this.lobby.selectedMap; }
   get mapChoices(): string[] { return this.lobby.mapChoices; }
   get usesStationSetup():boolean{return this.stationManaged;}
+  get humanPlayerTarget():number { return this.expectedHumanPlayers; }
+  /** A shared result needs each current phone caller's explicit replay request. */
+  get sharedVoiceReplayRequired(): boolean {
+    return this.requiredHumanPlayers >= 2
+      && this.lobby.players().some(player => this.voiceMenus.has(player.id));
+  }
+  /** The standalone display fixes the number of seats before anyone starts choosing. */
+  configureStandaloneSeats(count: 1 | 2): boolean {
+    if (this.stationManaged) return false;
+    // A reconnected display repeats its original configuration after spectating. The same
+    // target is harmless even when callers are already choosing, racing, or viewing results.
+    if (count === this.expectedHumanPlayers && this._phase !== 'lobby') return true;
+    if (this._phase === 'results' || this._phase === 'finished') {
+      if (this.playerCount > 0) return count === this.expectedHumanPlayers;
+      if (count !== this.expectedHumanPlayers) this.reset();
+      else return true;
+    }
+    // A phone caller can enter before the display socket sends its first two-seat choice. While
+    // still in the lobby, expand that initially unconfigured room without erasing the caller's
+    // name or pending voice cue. An explicit one-seat setup stays locked once play has begun.
+    const firstTwoSeatChoice = !this.fixedStandaloneSeats && this._phase === 'lobby'
+      && this.lobby.playerCount === 1 && this.expectedHumanPlayers === 1 && count === 2;
+    if (this._phase !== 'lobby'
+      || (this.lobby.playerCount > 0 && count !== this.expectedHumanPlayers && !firstTwoSeatChoice)) return false;
+    this.expectedHumanPlayers = count;
+    this.fixedStandaloneSeats = true;
+    return true;
+  }
   private get requiredHumanPlayers():number { return Math.max(this.expectedHumanPlayers,Math.min(2,this.lobby.playerCount)); }
   canControlSetup(playerId: string): boolean {
     return this.lobby.players().some(player=>player.id===playerId);
   }
+  /** A Relay caller's menu remains pending until the current phase's speech has played. */
+  registerVoicePlayer(playerId: string): void {
+    if (!this.canControlSetup(playerId)) return;
+    this.replayReadyPlayerIds.delete(playerId);
+    const previous = this.voiceMenus.get(playerId);
+    this.voiceMenus.set(playerId, { connected: true, phase: this._phase, pending: 0,
+      prompted: false, generation: (previous?.generation ?? 0) + 1 });
+  }
+  disconnectVoicePlayer(playerId: string): void {
+    const state = this.voiceMenus.get(playerId);
+    if (!state) return;
+    this.replayReadyPlayerIds.delete(playerId);
+    state.connected = false;
+    state.pending = 0;
+    state.prompted = false;
+    state.generation += 1;
+  }
+  beginMenuAudio(playerId: string, phase: string): () => void {
+    const state = this.voiceMenus.get(playerId);
+    if (!state || !state.connected || phase !== this._phase
+      || (!this.inPreRace && phase !== 'results' && phase !== 'finished')) return () => {};
+    if (state.phase !== this._phase) {
+      state.phase = this._phase;
+      state.pending = 0;
+      state.prompted = false;
+      state.generation += 1;
+    }
+    state.pending += 1;
+    state.prompted = true;
+    const generation = state.generation;
+    let finished = false;
+    return () => {
+      if (finished) return;
+      finished = true;
+      if (state.generation === generation) state.pending = Math.max(0, state.pending - 1);
+    };
+  }
+  private voiceMenuReady(playerId: string): boolean {
+    const state = this.voiceMenus.get(playerId);
+    return !state || (state.connected && state.phase === this._phase && state.prompted && state.pending === 0);
+  }
+  private setupStatus(playerId: string, carIndex: number | null): RacerSetupStatus {
+    if (!this.confirmedPlayerNames.has(playerId)) return 'name';
+    const voice = this.voiceMenus.get(playerId);
+    if (voice && !voice.connected) return 'reconnecting';
+    if (!this.voiceMenuReady(playerId)) return 'phone';
+    if (this._phase === 'car_select' && carIndex === null) return 'car';
+    if (this._phase === 'map_select' && !this.lobby.hasPlayerVoted(playerId)) return 'map';
+    return 'ready';
+  }
+  private resetVoiceMenuPhase(): void {
+    for (const state of this.voiceMenus.values()) {
+      state.phase = this._phase;
+      state.pending = 0;
+      state.prompted = false;
+      state.generation += 1;
+    }
+  }
   isWaitingForNextRound(playerId: string): boolean { return this.nextRoundPlayers.has(playerId); }
   hasMapVote(playerId:string):boolean { return this.lobby.hasPlayerVoted(playerId); }
   canSelectCar(playerId:string,allowRevision=false):boolean {
-    if(!this.stationManaged)return this.lobby.players().some(player=>player.id===playerId);
-    if(allowRevision&&this.lobby.players().some(player=>player.id===playerId&&player.carIndex!==null))return true;
-    return this.lobby.players().find(player=>player.carIndex===null)?.id===playerId;
+    const player = this.lobby.players().find(row => row.id === playerId);
+    return Boolean(player && (!this.stationManaged || allowRevision || player.carIndex === null));
   }
   canSelectMap(playerId:string,allowRevision=false):boolean {
-    if(!this.stationManaged)return this.lobby.players().some(player=>player.id===playerId);
-    if(allowRevision&&this.lobby.hasPlayerVoted(playerId))return true;
-    return this.lobby.players().find(player=>!this.lobby.hasPlayerVoted(player.id))?.id===playerId;
+    return this.canControlSetup(playerId)
+      && (!this.stationManaged || allowRevision || !this.lobby.hasPlayerVoted(playerId));
   }
   /** The only caller seat a shared-screen selection currently represents. A station display
    * stops accepting selection taps once everyone has chosen; callers can still revise by voice. */
   touchSelectionTarget(): string | null {
     const players = this.lobby.players();
     if (this._phase === 'car_select')
-      return players.find(player => player.carIndex === null)?.id
-        ?? (this.stationManaged ? null : players[0]?.id ?? null);
+      return players.find(player => player.carIndex === null && this.voiceMenuReady(player.id))?.id
+        ?? (this.stationManaged || this.fixedStandaloneSeats ? null : players[0]?.id ?? null);
     if (this._phase === 'map_select')
-      return players.find(player => !this.lobby.hasPlayerVoted(player.id))?.id
-        ?? (this.stationManaged ? null : players[0]?.id ?? null);
+      return players.find(player => !this.lobby.hasPlayerVoted(player.id) && this.voiceMenuReady(player.id))?.id
+        ?? (this.stationManaged || this.fixedStandaloneSeats ? null : players[0]?.id ?? null);
     return null;
   }
   get allCarChoicesComplete():boolean { return this.lobby.playerCount >= this.expectedHumanPlayers && this.lobby.allPicked(); }
@@ -114,14 +198,22 @@ export class Room {
   lobbyPlayers(): LobbyPlayer[] {
     // Lane is assigned by join order (mod LANES) for the sim; surface it for color/positioning.
     return this.lobby.players().map((p, i) => ({
-      playerId: p.id, name: p.name, color: p.color, lane: i % LANES,
-      carIndex: p.carIndex, ready: p.ready,
+      playerId: p.id, name: p.name, color: p.color,
+      lane: [...this.stationSlots].find(([, id]) => id === p.id)?.[0] ?? i % LANES,
+      carIndex: p.carIndex, ready: p.ready, setupStatus: this.setupStatus(p.id, p.carIndex),
     }));
   }
 
   addPlayer(name: string, color?: string, preferredIndex?: number, nameConfirmed = true): { playerId: string; lane: number } | { error: string } {
-    // A fresh caller must not erase the previous group's results, even if the room is full.
+    // Keep a finished group's results visible while any member still occupies a seat.
+    if (this.fixedStandaloneSeats && (this._phase === 'results' || this._phase === 'finished')) {
+      // A fixed group does not mix new callers into a finished group's roster. Once its last
+      // caller leaves, the first new call starts at a fresh lobby with the same seat target.
+      if (this.playerCount > 0) return { error: 'room_full' };
+      this.reset();
+    }
     if (this.playerCount >= MAX_PLAYERS) return { error: 'room_full' };
+    if (this.fixedStandaloneSeats && this.playerCount >= this.expectedHumanPlayers) return { error: 'room_full' };
     if (this.stationManaged && (this._phase === 'finished' || this._phase === 'results')) return { error: 'room_full' };
     const stationIndex = preferredIndex === 0 || preferredIndex === 1 ? preferredIndex : undefined;
     if (stationIndex !== undefined && this.stationSlots.has(stationIndex)) return { error: 'room_full' };
@@ -151,10 +243,12 @@ export class Room {
     }
     this.lobby.removePlayer(playerId);
     this.confirmedPlayerNames.delete(playerId);
+    this.voiceMenus.delete(playerId);
+    this.replayReadyPlayerIds.delete(playerId);
     for (const [index, id] of this.stationSlots) if (id === playerId) this.stationSlots.delete(index);
-    if (this.recentSetupChoice?.playerId === playerId) this.recentSetupChoice = null;
     this.world?.removeCar(playerId);
-    if (!this.stationManaged && this.lobby.playerCount > 0) this.expectedHumanPlayers = this.lobby.playerCount;
+    if (!this.stationManaged && !this.fixedStandaloneSeats && this.lobby.playerCount > 0)
+      this.expectedHumanPlayers = this.lobby.playerCount;
     // Keep the completed scoreboard on a connected display after the final caller hangs up.
     // The display or the next caller can then start a fresh round without losing the result.
     // A room with no display is still reaped by GameServer when its last caller leaves.
@@ -164,9 +258,11 @@ export class Room {
   }
 
   expectHumanPlayers(count:number,stationManaged=true):void {
+    if (!stationManaged && this.fixedStandaloneSeats) return;
     this.expectedHumanPlayers = count >= 2 ? 2 : 1;
     if(stationManaged){
       this.stationManaged=true;
+      this.fixedStandaloneSeats=false;
       this.lobby.retainMapVotes(new Set(this.lobby.players().map(player=>player.id)));
     }
   }
@@ -200,20 +296,15 @@ export class Room {
   // ── Pre-race flow (delegates to Lobby) ─────────────────────────────────────────────────────────
   selectCar(playerId:string,carIndex:number,allowRevision=false):boolean {
     if(!this.canSelectCar(playerId,allowRevision))return false;
-    if(!allowRevision&&this.isSetupCrosstalk('car_select',String(carIndex),playerId))return false;
-    const selected=this.lobby.selectCar(playerId,carIndex);
-    if(selected)this.rememberSetupChoice('car_select',String(carIndex),playerId);
-    return selected;
+    return this.lobby.selectCar(playerId,carIndex);
   }
   /** Cast a map VOTE. voterId = the player casting it (so each player's vote is one; changing it
    *  replaces the prior). The winning map (selectedMap) is the vote leader, ties broken deterministically. */
   selectMap(map:string,voterId?:string,allowRevision=false):boolean {
-    if(this.stationManaged&&(!voterId||!this.lobby.players().some(player=>player.id===voterId)))return false;
+    if((this.stationManaged || this.requiredHumanPlayers >= 2)
+      &&(!voterId||!this.lobby.players().some(player=>player.id===voterId)))return false;
     if(voterId&&!this.canSelectMap(voterId,allowRevision))return false;
-    if(voterId&&!allowRevision&&this.isSetupCrosstalk('map_select',map,voterId))return false;
-    const selected=this.lobby.selectMap(map,voterId);
-    if(selected&&voterId)this.rememberSetupChoice('map_select',map,voterId);
-    return selected;
+    return this.lobby.selectMap(map,voterId);
   }
   /** Live map-vote tallies + tie flag, for the selection-screen UI. */
   mapVotes(): { counts: Record<string, number>; tie: boolean } {
@@ -223,7 +314,7 @@ export class Room {
   /** Host advances the flow. lobby→car_select→map_select, then map_select→start the race.
    *  From a finished race (results/finished), "advance" means PLAY AGAIN: keep the roster, clear
    *  their picks, and jump straight to car-select so they just re-choose. */
-  canAdvance(playerId?:string): boolean {
+  canAdvance(playerId?:string, voiceActor = false): boolean {
     const showingResults=this._phase==='results'||this._phase==='finished';
     // A caller who arrived during results cannot erase the current players' standings. Once those
     // players all leave, that waiting caller may start their own round by voice.
@@ -231,8 +322,15 @@ export class Room {
       &&Boolean(playerId&&this.nextRoundPlayers.has(playerId));
     if(playerId&&!this.canControlSetup(playerId)&&!nextRoundCaller)return false;
     if(this.stationManaged&&(!playerId||!this.canControlSetup(playerId)))return false;
-    if(showingResults)return this.lobby.playerCount>0||this.nextRoundPlayers.size>0;
+    if(showingResults)return !this.sharedVoiceReplayRequired
+      && (this.lobby.playerCount>0||this.nextRoundPlayers.size>0);
     if(this.stationManaged&&this.lobby.playerCount<this.expectedHumanPlayers)return false;
+    if(this.fixedStandaloneSeats&&this.lobby.playerCount<this.expectedHumanPlayers)return false;
+    if (this.requiredHumanPlayers >= 2 && this.inPreRace
+      && !this.lobby.players().every(player =>
+        (voiceActor && player.id === playerId) || this.voiceMenuReady(player.id))) return false;
+    if ((this.stationManaged || this.fixedStandaloneSeats) && this.requiredHumanPlayers >= 2
+      && !this.allNamesConfirmed()) return false;
     if(this._phase==='lobby')return this.lobby.playerCount>0&&this.allNamesConfirmed();
     if(this._phase==='car_select')return this.lobby.anyPicked()
       &&(!this.stationManaged||this.lobby.allPicked())
@@ -243,29 +341,59 @@ export class Room {
       &&(this.requiredHumanPlayers<2||this.lobby.allPlayersVoted());
     return false;
   }
-  advance(playerId?: string): boolean {
+  advance(playerId?: string, voiceActor = false): boolean {
     const before = this._phase;
-    if(!this.canAdvance(playerId))return false;
+    if ((before === 'results' || before === 'finished') && this.sharedVoiceReplayRequired) {
+      if (!playerId || !this.canControlSetup(playerId)) return false;
+      this.replayReadyPlayerIds.add(playerId);
+      return this.completeSharedReplayIfReady();
+    }
+    if(!this.canAdvance(playerId, voiceActor))return false;
     if (this._phase === 'results' || this._phase === 'finished') {
-      this.world = null; this.lastResults = []; this.raceMap = null;
-      this.lobby.reset();           // back to lobby with cleared cars/map, same players
-      const hadWaitingPlayers = this.nextRoundPlayers.size > 0;
-      this.admitNextRoundPlayers();
-      if (!hadWaitingPlayers && this.allNamesConfirmed()) this.lobby.advance(); // → car_select
-      this._phase = this.lobby.phase;
-      this.recentSetupChoice=null;
+      this.replayRound();
+      return this._phase !== before;
+    }
+    if (this._phase === 'map_select' && this.lobby.canStart()) {
+      this.start(voiceActor ? playerId : undefined);
       return this._phase!==before;
     }
-    if (this._phase === 'map_select' && this.lobby.canStart()) { this.start(); return this._phase!==before; }
     if (this.inPreRace) { this.lobby.advance(); this._phase = this.lobby.phase; }
-    if(this._phase!==before)this.recentSetupChoice=null;
+    if(this._phase!==before)this.resetVoiceMenuPhase();
     return this._phase!==before;
+  }
+
+  /** Called again as Relay playback settles, so the second replay vote never needs repeating. */
+  completeSharedReplayIfReady(): boolean {
+    if (!['results', 'finished'].includes(this._phase) || !this.sharedVoiceReplayRequired
+      || this.lobby.playerCount < this.requiredHumanPlayers) return false;
+    const players = this.lobby.players();
+    if (!players.every(player => this.replayReadyPlayerIds.has(player.id)
+      && this.voiceMenuReady(player.id))) return false;
+    this.replayRound();
+    return true;
+  }
+
+  hasReplayConsent(playerId: string): boolean { return this.replayReadyPlayerIds.has(playerId); }
+
+  private replayRound(): void {
+    this.world = null; this.lastResults = []; this.raceMap = null;
+    this.replayReadyPlayerIds.clear();
+    this.lobby.reset();
+    const hadWaitingPlayers = this.nextRoundPlayers.size > 0;
+    this.admitNextRoundPlayers();
+    if (!hadWaitingPlayers && this.allNamesConfirmed()) this.lobby.advance();
+    this._phase = this.lobby.phase;
+    this.resetVoiceMenuPhase();
   }
 
   /** Host steps back one selection phase (no-op once racing). */
   back(): void {
-    if(this.stationManaged)return;
-    if (this.inPreRace) { this.lobby.back(); this._phase = this.lobby.phase; }
+    if(this.stationManaged || this.requiredHumanPlayers >= 2)return;
+    if (this.inPreRace) {
+      const before = this._phase;
+      this.lobby.back(); this._phase = this.lobby.phase;
+      if (this._phase !== before) this.resetVoiceMenuPhase();
+    }
   }
 
   reset(): void {
@@ -274,8 +402,9 @@ export class Room {
     this.admitNextRoundPlayers();
     this.lastResults = [];
     this.raceMap = null;
+    this.replayReadyPlayerIds.clear();
     this._phase = 'lobby';
-    this.recentSetupChoice = null;
+    this.resetVoiceMenuPhase();
   }
 
   private admitNextRoundPlayers(): void {
@@ -283,10 +412,12 @@ export class Room {
     this.nextRoundPlayers.clear();
   }
 
-  start(): boolean {
+  start(voiceActorId?: string): boolean {
     // Lobby onboarding confirms names before its first advance. A later caller may join while
     // choices are already on screen, and their generated display name must not rewind the menu or
     // block a race after everyone has picked. They can still introduce themselves explicitly.
+    if (this.fixedStandaloneSeats && this.expectedHumanPlayers >= 2 && (this._phase !== 'map_select'
+      || !this.canAdvance(voiceActorId ?? this.lobby.players()[0]?.id, Boolean(voiceActorId)))) return false;
     if (this.lobby.playerCount < this.requiredHumanPlayers
       || (this._phase === 'lobby' && !this.allNamesConfirmed())) return false;
     // Evolve the seed each start so every race gets a NEW (deterministic-per-race) course.
@@ -309,6 +440,8 @@ export class Room {
     if (wp === 'finished' && this._phase === 'racing') {
       this.lastResults = this.captureResults();
       this._phase = 'results';
+      this.replayReadyPlayerIds.clear();
+      this.resetVoiceMenuPhase();
     } else if (this._phase === 'racing' || this._phase === 'countdown') {
       this._phase = wp;
     }
@@ -328,17 +461,4 @@ export class Room {
 
   snapshot(): WorldSnapshot | null { return this.world ? this.world.snapshot() : null; }
   drainEvents(): GameEvent[] { return this.world ? this.world.drainEvents() : []; }
-  private isSetupCrosstalk(
-    phase:'car_select'|'map_select',choice:string,playerId:string,
-  ):boolean {
-    const recent=this.recentSetupChoice;
-    return Boolean(this.stationManaged&&recent&&recent.phase===phase&&recent.choice===choice
-      &&recent.playerId!==playerId&&Date.now()-recent.at<SETUP_CROSSTALK_MS);
-  }
-
-  private rememberSetupChoice(
-    phase:'car_select'|'map_select',choice:string,playerId:string,
-  ):void {
-    if(this.stationManaged)this.recentSetupChoice={phase,choice,playerId,at:Date.now()};
-  }
 }

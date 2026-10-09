@@ -3,6 +3,18 @@ import { FIGHTER_MAPS, FIGHTER_ROSTER, type FighterMapEntry } from '../shared/fi
 import { FIGHTER_INTRO_SECONDS, type FighterLobbyPlayer, type FighterPhase, type FighterState } from '../shared/fighter-protocol';
 
 interface Player { playerId: string; name: string; nameConfirmed: boolean; fighterId: string | null; side: FighterId; }
+interface VoiceMenuState {
+  connected: boolean;
+  phase: FighterPhase;
+  pending: number;
+  turns: Set<symbol>;
+  prompted: boolean;
+  /** Failed cues map to the newest replacement that was already queued when they failed. */
+  failedCues: Map<number, number>;
+  generation: number;
+  cueSequence: number;
+  latestPlayedCueSequence: number;
+}
 interface QueuedFighterCommand { command: FighterCommand; queuedAt: number; requestId: string; sequenceId: string | null; }
 export interface FighterVoiceCommandOutcome {
   requestId: string;
@@ -25,6 +37,9 @@ export class FighterRoom {
   private events: FighterEvent[] = [];
   private selectedMap: string | null = null;
   private mapVotes=new Map<string,string>();
+  private advanceReady = new Set<string>();
+  private backReady = new Set<string>();
+  private voiceMenus = new Map<string, VoiceMenuState>();
   private nextPlayer = 1;
   private aiNext = 0;
   private aiFighterId: string | null = null;
@@ -45,26 +60,40 @@ export class FighterRoom {
   private automaticSetup=false;
   private fixedExpectedHumanPlayers=false;
   private rng: number;
+  private readonly mapTieSeed: number;
 
   constructor(readonly code: string, seed = 0x12345678, private maps: FighterMapEntry[] = FIGHTER_MAPS,
-    private readonly now:()=>number=Date.now) { this.rng = seed >>> 0; }
+    private readonly now:()=>number=Date.now) { this.rng = seed >>> 0; this.mapTieSeed = seed >>> 0; }
   setMaps(maps: FighterMapEntry[]): void { if (maps.length) this.maps = maps; }
 
   addPlayer(name: string, preferredSide?: FighterId, nameConfirmed = true): { playerId: string } | { error: string } {
-    // A new standalone call is an explicit handoff from an otherwise retained final screen.
-    // Fixed station results stay put until their station lifecycle advances them.
-    if ((this.phase === 'victory' || this.phase === 'results') && this.players.length === 0
-      && this.world?.winner && !this.fixedExpectedHumanPlayers)
-      this.resetResultsForNewRound();
-    if (this.players.length >= 2 || !['lobby', 'fighter_select'].includes(this.phase)) return { error: 'room_full' };
+    // Direct room callers retain the legacy solo reset. The server separately permits
+    // a fixed standalone display to start its next group without resetting station results.
+    if (!this.fixedExpectedHumanPlayers) this.prepareForNewStandaloneCaller();
+    if (this.players.length >= 2
+      || (this.fixedExpectedHumanPlayers && this.players.length >= this.expectedHumanPlayers)
+      || !['lobby', 'fighter_select'].includes(this.phase)) return { error: 'room_full' };
     const side: FighterId = preferredSide ?? (this.players.some(player => player.side === 'p1') ? 'p2' : 'p1');
     if (this.players.some(player => player.side === side)) return { error: 'room_full' };
     const player = { playerId: `f${this.nextPlayer++}`, name: cleanName(name), nameConfirmed, fighterId: null, side };
     this.players.push(player);this.players.sort((left,right)=>left.side.localeCompare(right.side));
+    this.clearSetupVotes();
     return { playerId: player.playerId };
   }
+  /** Keep the final screen until the first caller of a fresh standalone group joins. */
+  prepareForNewStandaloneCaller(): boolean {
+    if ((this.phase !== 'victory' && this.phase !== 'results')
+      || this.players.length !== 0 || !this.world?.winner) return false;
+    this.resetResultsForNewRound();
+    return true;
+  }
   expectHumanPlayers(count: number, fixed = true): void {
-    this.expectedHumanPlayers = count >= 2 ? 2 : 1;
+    // A display or station can reserve two seats before the first call arrives. Ordinary
+    // name confirmation and join updates must not silently shrink that reservation.
+    if (this.fixedExpectedHumanPlayers && !fixed && count < this.expectedHumanPlayers) return;
+    const target = count >= 2 ? 2 : 1;
+    if (target !== this.expectedHumanPlayers) this.clearSetupVotes();
+    this.expectedHumanPlayers = target;
     if (fixed) this.fixedExpectedHumanPlayers = true;
     this.automaticSetup=true;
     if (this.expectedHumanPlayers !== 1 || this.players.length !== 1) this.aiFighterId = null;
@@ -75,14 +104,123 @@ export class FighterRoom {
       this.players[0]!.side = 'p1';
     }
   }
+  /** The local display chooses its caller count before setup leaves the lobby. */
+  configureStandaloneSeats(count: 1 | 2): boolean {
+    if (this.expectedHumanPlayers === count) {
+      if (!this.fixedExpectedHumanPlayers && this.phase === 'lobby') this.expectHumanPlayers(count, true);
+      else this.fixedExpectedHumanPlayers = true;
+      return true;
+    }
+    if (this.phase !== 'lobby' && !this.prepareForNewStandaloneCaller()) return false;
+    if (this.players.length > count) return false;
+    this.expectHumanPlayers(count, true);
+    return true;
+  }
+  /** Keep a reconnecting caller's seat, but require a fresh menu or rematch decision. */
+  suspendPlayer(id: string): void {
+    if (!this.hasPlayer(id)) return;
+    this.advanceReady.delete(id);
+    this.backReady.delete(id);
+    const menu = this.voiceMenus.get(id);
+    if (menu) {
+      menu.connected = false;
+      menu.pending = 0;
+      menu.turns.clear();
+      menu.prompted = false;
+      menu.failedCues.clear();
+      menu.generation++;
+    }
+    this.rejectPendingVoiceCommands(id, 'player_left');
+  }
+  /** Every connected phone must finish its current menu cue before shared votes move the display. */
+  registerVoicePlayer(id: string): void {
+    if (!this.hasPlayer(id)) return;
+    const previous = this.voiceMenus.get(id);
+    this.voiceMenus.set(id, { connected: true, phase: this.phase, pending: 0,
+      turns: new Set(), prompted: false, failedCues: new Map(),
+      generation: (previous?.generation ?? 0) + 1,
+      cueSequence: 0, latestPlayedCueSequence: 0 });
+  }
+  private menuForPhase(id: string, phase: FighterPhase): VoiceMenuState | null {
+    const menu = this.voiceMenus.get(id);
+    if (!menu?.connected || !this.isSharedMenuPhase(phase) || phase !== this.phase) return null;
+    if (menu.phase !== phase) {
+      menu.phase = phase;
+      menu.pending = 0;
+      menu.turns.clear();
+      menu.prompted = false;
+      menu.failedCues.clear();
+      menu.generation++;
+      menu.cueSequence = 0;
+      menu.latestPlayedCueSequence = 0;
+    }
+    return menu;
+  }
+  beginMenuAudio(id: string, phase: FighterPhase, recovery = false): (played?: boolean) => void {
+    const menu = this.menuForPhase(id, phase);
+    if (!menu) return () => {};
+    menu.pending++;
+    menu.prompted = true;
+    const generation = menu.generation;
+    const cueSequence = ++menu.cueSequence;
+    let finished = false;
+    return (played = true) => {
+      if (finished) return;
+      finished = true;
+      if (menu.generation !== generation) return;
+      menu.pending = Math.max(0, menu.pending - 1);
+      if (!played) {
+        // A stale queued cue may report an interruption after a newer cue has
+        // already played. That older failure no longer describes the phone.
+        if (cueSequence > menu.latestPlayedCueSequence)
+          menu.failedCues.set(cueSequence, menu.cueSequence);
+      } else {
+        menu.latestPlayedCueSequence = Math.max(menu.latestPlayedCueSequence, cueSequence);
+        for (const [failedSequence, queuedThrough] of menu.failedCues) {
+          // A normal cue replaces only older audio that was already in flight
+          // when it failed. A genuinely failed current cue still needs replay.
+          if (cueSequence > failedSequence && (recovery || cueSequence <= queuedThrough))
+            menu.failedCues.delete(failedSequence);
+        }
+      }
+    };
+  }
+  /** Reserve the caller's partial/final ASR and AI turn before a peer's vote can advance. */
+  beginMenuTurn(id: string, phase: FighterPhase): () => void {
+    const menu = this.menuForPhase(id, phase);
+    if (!menu) return () => {};
+    const token = Symbol('fighter menu turn');
+    const generation = menu.generation;
+    menu.turns.add(token);
+    return () => {
+      if (menu.generation === generation) menu.turns.delete(token);
+    };
+  }
+  /** Called when Relay playback or a pending menu interpretation settles. */
+  completeSharedDecisionIfReady(): boolean {
+    if (!this.requiresSharedSetupConsent || !this.isSharedMenuPhase(this.phase)
+      || this.players.length < this.expectedHumanPlayers
+      || !this.players.every(player => this.voiceMenuReady(player.playerId))) return false;
+    const previousPhase = this.phase;
+    const voter = this.players[0]?.playerId;
+    if (!voter) return false;
+    if (this.players.every(player => this.advanceReady.has(player.playerId))) this.advance(voter);
+    else if (this.players.every(player => this.backReady.has(player.playerId))) this.back(voter);
+    return this.phase !== previousPhase;
+  }
   removePlayer(id: string): void {
+    if (!this.hasPlayer(id)) return;
     if ((this.phase === 'victory' || this.phase === 'results') && this.world?.winner) this.captureResult();
     this.rejectPendingVoiceCommands(id, 'player_left');
     this.players = this.players.filter((player) => player.playerId !== id);
+    this.voiceMenus.delete(id);
+    this.clearSetupVotes();
     this.mapVotes.delete(id);if(this.phase==='map_select')this.selectedMap=this.mapVoteWinner();
     if (!this.players.length) {
       if ((this.phase === 'victory' || this.phase === 'results') && this.world?.winner) return;
-      this.phase = 'lobby'; this.world = null; this.selectedMap = null;this.mapVotes.clear();this.aiFighterId = null;this.automaticSetup=false;this.expectedHumanPlayers=1;this.fixedExpectedHumanPlayers=false;this.invalidatePresentation();this.resultsPresentationDeadline=0;
+      this.phase = 'lobby'; this.world = null; this.selectedMap = null;this.mapVotes.clear();this.aiFighterId = null;
+      if (!this.fixedExpectedHumanPlayers) { this.automaticSetup=false;this.expectedHumanPlayers=1; }
+      this.invalidatePresentation();this.resultsPresentationDeadline=0;
     }
     else {
       if(!this.fixedExpectedHumanPlayers)this.expectedHumanPlayers=this.players.length;
@@ -99,34 +237,47 @@ export class FighterRoom {
         this.aiFighterId = this.chooseSoloAiFighter();
     }
   }
-  setName(id: string, name: string): void { const player = this.players.find(p => p.playerId === id); if (player) { player.name = cleanName(name);player.nameConfirmed=true; } }
+  setName(id: string, name: string): void { const player = this.players.find(p => p.playerId === id); if (player) {
+    if (!player.nameConfirmed || player.name !== cleanName(name)) this.clearSetupVotes();
+    player.name = cleanName(name);player.nameConfirmed=true;
+  } }
   hasConfirmedName(id:string):boolean{return this.players.find(player=>player.playerId===id)?.nameConfirmed===true;}
   selectFighter(id: string, fighterId: string): boolean {
     if (this.phase !== 'fighter_select' || !FIGHTER_ROSTER.some(f => f.id === fighterId)) return false;
     const player = this.players.find(p => p.playerId === id);
     if (!player || this.players.some(p => p !== player && p.fighterId === fighterId)) return false;
+    if (player.fighterId !== fighterId) this.clearSetupVotes();
     player.fighterId=fighterId;this.aiFighterId=null;return true;
   }
   nextUnselectedPlayerId(): string | null { return this.players.find(player => !player.fighterId)?.playerId ?? null; }
   selectMap(playerId:string,mapId: string): boolean {
     if (this.phase !== 'map_select' || !this.maps.some(map => map.id === mapId)) return false;
     if(!this.players.some(player=>player.playerId===playerId))return false;
+    if (this.mapVotes.get(playerId) !== mapId) this.clearSetupVotes();
     this.mapVotes.set(playerId,mapId);this.selectedMap=this.mapVoteWinner();return true;
   }
   advance(playerId?: string): boolean {
     if(this.automaticSetup&&['lobby','fighter_select','map_select'].includes(this.phase)
       &&(!playerId||!this.hasPlayer(playerId)))return false;
     if (this.phase === 'lobby' && this.players.length >= this.expectedHumanPlayers
-      && this.players.every(player=>player.nameConfirmed)) { this.phase = 'fighter_select'; return true; }
+      && this.players.every(player=>player.nameConfirmed)) {
+      if (!this.confirmSharedAdvance(playerId)) return this.hasAdvanceVote(playerId);
+      this.phase = 'fighter_select'; this.clearSetupVotes(); return true;
+    }
     if (this.phase === 'fighter_select' && this.players.length >= this.expectedHumanPlayers && this.players.every(p => p.fighterId)) {
+      if (!this.confirmSharedAdvance(playerId)) return this.hasAdvanceVote(playerId);
       this.aiFighterId=this.players.length===1?this.chooseSoloAiFighter():null;
-      this.phase = 'map_select';this.selectedMap=this.mapVoteWinner();return true;
+      this.phase = 'map_select';this.selectedMap=this.mapVoteWinner();this.clearSetupVotes();return true;
     }
     if (this.phase === 'map_select' && this.selectedMap && this.players.length >= this.expectedHumanPlayers
-      && (!this.automaticSetup||this.players.every(player=>this.mapVotes.has(player.playerId))))return this.beginLoading();
+      && (!this.automaticSetup||this.players.every(player=>this.mapVotes.has(player.playerId)))) {
+      if (!this.confirmSharedAdvance(playerId)) return this.hasAdvanceVote(playerId);
+      this.clearSetupVotes(); return this.beginLoading();
+    }
     if (this.phase === 'results') {
       if (playerId && !this.hasPlayer(playerId)) return false;
       if (!this.resultsPresented && !this.resultsPresentationTimedOut) return false;
+      if (!this.confirmSharedAdvance(playerId)) return this.hasAdvanceVote(playerId);
       this.resetResultsForNewRound();
       return true;
     }
@@ -134,9 +285,18 @@ export class FighterRoom {
   }
   back(playerId?: string): boolean {
     if(this.automaticSetup && (!playerId || !this.hasPlayer(playerId)))return false;
-    if (this.phase === 'fighter_select') { this.phase = 'lobby'; return true; }
-    if (this.phase === 'map_select') { this.phase = 'fighter_select'; this.selectedMap = null;this.mapVotes.clear();this.aiFighterId=null;return true; }
-    if (this.phase === 'loading') { this.phase = 'map_select'; this.world = null; this.countdown = 0; this.loadingElapsed = 0; this.invalidatePresentation(); return true; }
+    if (this.phase === 'fighter_select') {
+      if (!this.confirmSharedBack(playerId)) return this.hasBackVote(playerId);
+      this.phase = 'lobby'; this.clearSetupVotes(); return true;
+    }
+    if (this.phase === 'map_select') {
+      if (!this.confirmSharedBack(playerId)) return this.hasBackVote(playerId);
+      this.phase = 'fighter_select'; this.selectedMap = null;this.mapVotes.clear();this.aiFighterId=null;
+      this.clearSetupVotes(); return true;
+    }
+    if (this.phase === 'loading' && !this.requiresSharedSetupConsent) {
+      this.phase = 'map_select'; this.world = null; this.countdown = 0; this.loadingElapsed = 0; this.invalidatePresentation(); return true;
+    }
     return false;
   }
   ready(generation: number): boolean {
@@ -317,11 +477,29 @@ export class FighterRoom {
   }
   state(): FighterState {
     const winner = this.world?.winner ?? null;
+    const sharedMenu = this.isSharedMenuPhase(this.phase);
     return { roomCode: this.code, phase: this.phase,
       players: (this.phase === 'victory' || this.phase === 'results') && this.resultPlayers ? this.resultPlayers : this.lobbyPlayers(),
       aiFighterId: this.players.length === 1 ? this.aiFighterId : null,
       selectedMap: this.selectedMap,
       mapVotesByPlayerId:Object.fromEntries(this.mapVotes),
+      mapVoteTied: this.mapVoteTied,
+      advanceReadyPlayerIds: [...this.advanceReady], backReadyPlayerIds: [...this.backReady],
+      phonePendingPlayerIds: sharedMenu ? this.players.filter(player => {
+        const menu = this.voiceMenus.get(player.playerId);
+        return menu?.connected && !this.voiceMenuReady(player.playerId);
+      }).map(player => player.playerId) : [],
+      phoneTurnPendingPlayerIds: sharedMenu ? this.players.filter(player =>
+        (this.voiceMenus.get(player.playerId)?.turns.size ?? 0) > 0)
+        .map(player => player.playerId) : [],
+      phoneRetryPlayerIds: sharedMenu ? this.players.filter(player => {
+        const menu = this.voiceMenus.get(player.playerId);
+        return menu?.connected && menu.phase === this.phase && menu.failedCues.size > 0;
+      }).map(player => player.playerId) : [],
+      phoneDisconnectedPlayerIds: sharedMenu ? this.players.filter(player => {
+        const menu = this.voiceMenus.get(player.playerId);
+        return menu && !menu.connected;
+      }).map(player => player.playerId) : [],
       world:this.world,expectedPlayerCount:this.expectedHumanPlayers,hasExpectedPlayers:this.hasExpectedPlayers,automaticSetup:this.automaticSetup,
       loadingGeneration: this.loadingGeneration, intro: this.phase === 'intro' ? this.intro : null,
       countdown: this.phase === 'countdown' ? this.countdown : null,
@@ -334,6 +512,38 @@ export class FighterRoom {
   get expectedPlayerCount(): number { return this.expectedHumanPlayers; }
   get hasExpectedPlayers(): boolean { return this.players.length >= this.expectedHumanPlayers; }
   get isEmpty(): boolean { return this.players.length === 0; }
+
+  private get requiresSharedSetupConsent(): boolean {
+    return this.automaticSetup && this.expectedHumanPlayers === 2;
+  }
+  private isSharedMenuPhase(phase: FighterPhase): boolean {
+    return phase === 'lobby' || phase === 'fighter_select' || phase === 'map_select'
+      || phase === 'results';
+  }
+  private voiceMenuReady(id: string): boolean {
+    const menu = this.voiceMenus.get(id);
+    return !menu || (menu.connected && menu.phase === this.phase
+      && menu.prompted && menu.pending === 0 && menu.turns.size === 0 && menu.failedCues.size === 0);
+  }
+  private clearSetupVotes(): void { this.advanceReady.clear(); this.backReady.clear(); }
+  private hasAdvanceVote(id?: string): boolean { return Boolean(id && this.advanceReady.has(id)); }
+  private hasBackVote(id?: string): boolean { return Boolean(id && this.backReady.has(id)); }
+  private confirmSharedAdvance(id?: string): boolean {
+    if (!this.requiresSharedSetupConsent) return true;
+    if (!id || !this.hasPlayer(id)) return false;
+    this.backReady.clear();
+    this.advanceReady.add(id);
+    return this.players.every(player => this.advanceReady.has(player.playerId)
+      && this.voiceMenuReady(player.playerId));
+  }
+  private confirmSharedBack(id?: string): boolean {
+    if (!this.requiresSharedSetupConsent) return true;
+    if (!id || !this.hasPlayer(id)) return false;
+    this.advanceReady.clear();
+    this.backReady.add(id);
+    return this.players.every(player => this.backReady.has(player.playerId)
+      && this.voiceMenuReady(player.playerId));
+  }
 
   private activeVoiceCommands(playerId:string):QueuedFighterCommand[]{
     const queued=this.voiceCommands.get(playerId)??[];
@@ -352,12 +562,13 @@ export class FighterRoom {
   }
   private resetResultsForNewRound(): void {
     this.rejectAllPendingVoiceCommands('match_over');
+    this.clearSetupVotes();
     this.phase = this.players.length ? 'fighter_select' : 'lobby';
     this.world = null; this.selectedMap = null; this.mapVotes.clear(); this.aiFighterId = null;
     this.resultPlayers = null; this.resultWinnerName = null;
     this.events = [];
     this.intro = 0; this.countdown = 0; this.victory = 0; this.loadingElapsed = 0;
-    if (!this.players.length) { this.automaticSetup = false; this.expectedHumanPlayers = 1; this.fixedExpectedHumanPlayers = false; }
+    if (!this.players.length && !this.fixedExpectedHumanPlayers) { this.automaticSetup = false; this.expectedHumanPlayers = 1; }
     this.invalidatePresentation(); this.resultsPresentationDeadline = 0;
     for (const player of this.players) player.fighterId = null;
   }
@@ -366,10 +577,24 @@ export class FighterRoom {
     return (this.resultPlayers ?? this.lobbyPlayers()).find(player => player.side === side)?.name ?? 'Rival';
   }
   private mapVoteWinner():string|null {
+    const ranked=[...this.mapVoteCounts()].sort((left,right)=>right[1]-left[1]
+      ||this.mapTiePriority(left[0])-this.mapTiePriority(right[0])||left[0].localeCompare(right[0]));
+    return ranked[0]?.[0]??null;
+  }
+  private mapVoteCounts():Map<string,number>{
     const counts=new Map<string,number>();
     for(const mapId of this.mapVotes.values())counts.set(mapId,(counts.get(mapId)??0)+1);
-    const ranked=[...counts].sort((left,right)=>right[1]-left[1]||left[0].localeCompare(right[0]));
-    return ranked[0]?.[0]??null;
+    return counts;
+  }
+  private get mapVoteTied():boolean{
+    const counts=[...this.mapVoteCounts().values()];
+    const lead=Math.max(0,...counts);
+    return lead>0&&counts.filter(count=>count===lead).length>1;
+  }
+  private mapTiePriority(mapId:string):number{
+    let value=this.mapTieSeed;
+    for(const char of mapId)value=Math.imul(value^char.charCodeAt(0),16777619)>>>0;
+    return value;
   }
   private chooseSoloAiFighter(): string {
     const human = this.players[0]?.fighterId;

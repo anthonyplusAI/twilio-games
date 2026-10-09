@@ -18,10 +18,21 @@ export function parseClientMessage(raw: string): ParseResult {
     case 'join':
       if (typeof obj.roomCode !== 'string' || typeof obj.name !== 'string')
         return err('bad_join', 'roomCode and name required');
+      if (obj.keyboardSession !== undefined && (!obj.keyboardSession
+        || !/^[0-9a-f]{32}$/.test(obj.keyboardSession.id)
+        || !Number.isSafeInteger(obj.keyboardSession.generation)
+        || obj.keyboardSession.generation < 1
+        || (obj.keyboardSession.seats !== undefined && obj.keyboardSession.seats !== 1
+          && obj.keyboardSession.seats !== 2)))
+        return err('bad_join', 'invalid keyboard session');
       return { type: 'join', roomCode: obj.roomCode, name: obj.name,
                ...(typeof obj.color === 'string' ? { color: obj.color } : {}),
                ...(isSupportedLocale(obj.locale) ? { locale: obj.locale } : {}),
-               ...(obj.rendererReadyGate === true ? { rendererReadyGate: true } : {}) };
+               ...(obj.rendererReadyGate === true ? { rendererReadyGate: true } : {}),
+               ...(obj.keyboardSession ? { keyboardSession: {
+                 id: obj.keyboardSession.id, generation: obj.keyboardSession.generation,
+                 ...(obj.keyboardSession.seats ? { seats: obj.keyboardSession.seats } : {}),
+               } } : {}) };
     case 'intent':
       if (!INTENTS.includes(obj.intent)) return err('bad_intent', 'unknown intent');
       return { type: 'intent', intent: obj.intent };
@@ -29,10 +40,25 @@ export function parseClientMessage(raw: string): ParseResult {
     case 'restart': return { type: 'restart' };
     case 'spectate':
       if (typeof obj.roomCode !== 'string') return err('bad_spectate', 'roomCode required');
+      if (obj.count !== undefined && obj.count !== 1 && obj.count !== 2)
+        return err('bad_seat_count', 'one or two seats required');
       return { type: 'spectate', roomCode: obj.roomCode,
         ...(isSupportedLocale(obj.locale) ? { locale: obj.locale } : {}),
-        ...(typeof obj.displayToken === 'string' ? { displayToken: obj.displayToken } : {}) };
+        ...(typeof obj.displayToken === 'string' ? { displayToken: obj.displayToken } : {}),
+        ...(obj.count === 1 || obj.count === 2 ? { count: obj.count } : {}) };
+    case 'configure_seats':
+      if (typeof obj.roomCode !== 'string' || (obj.count !== 1 && obj.count !== 2))
+        return err('bad_seat_count', 'roomCode and one or two seats required');
+      return { type: 'configure_seats', roomCode: obj.roomCode, count: obj.count };
     case 'leave':   return { type: 'leave' };
+    case 'release_keyboard_session':
+      if (typeof obj.roomCode !== 'string' || !obj.keyboardSession
+        || !/^[0-9a-f]{32}$/.test(obj.keyboardSession.id)
+        || !Number.isSafeInteger(obj.keyboardSession.generation)
+        || obj.keyboardSession.generation < 1)
+        return err('bad_keyboard_release', 'roomCode and keyboard session required');
+      return { type: 'release_keyboard_session', roomCode: obj.roomCode,
+        keyboardSession: { id: obj.keyboardSession.id, generation: obj.keyboardSession.generation } };
     case 'select_car':
       if (!Number.isInteger(obj.carIndex)) return err('bad_select_car', 'carIndex (int) required');
       return { type: 'select_car', carIndex: obj.carIndex };
@@ -75,12 +101,18 @@ export const RACER_STANDALONE_RENDER_READY_TIMEOUT_MS = 16_000;
 const RACER_LOBBY_BROADCAST_HZ = 2;
 
 interface Conn { ws: WebSocket; roomCode?: string; playerId?: string; locale?: SupportedLocale;
-  stationDisplay?: boolean; hostAuthorized?: boolean; rendererReadyGate?: boolean; }
+  stationDisplay?: boolean; hostAuthorized?: boolean; rendererReadyGate?: boolean;
+  keyboardSessionId?: string; }
+
+interface KeyboardSeat { generation: number; playerId?: string; lane?: number; conn?: Conn;
+  released: boolean; }
 
 export class GameServer {
   private wss: WebSocketServer | null = null;
   private rooms = new RoomManager();
   private conns = new Set<Conn>();
+  /** Per-room ownership records reject old joins even after a keyboard tester leaves. */
+  private keyboardSeats = new WeakMap<Room, Map<string, KeyboardSeat>>();
   private loop: ReturnType<typeof setInterval> | null = null;
   private broadcastAccum = 0;
   private roomAccum = new Map<Room, number>();
@@ -193,6 +225,7 @@ export class GameServer {
         }
       }
       if (roomCode && conn.playerId) {
+        this.unbindKeyboardSeat(conn, false);
         const room=this.rooms.find(roomCode);if(room){const before=room.phase;room.removePlayer(conn.playerId);this.reportAbandonedIfReset(room);this.publishSetupMutation(room,before);}
       }
       this.conns.delete(conn);
@@ -215,15 +248,135 @@ export class GameServer {
           return this.send(conn, { type: 'error', code: 'station_voice_only', message: 'station_voice_only' });
         }
         const room = this.room(msg.roomCode);
+        const keyboard = msg.keyboardSession;
+        let keyboardSeat: KeyboardSeat | undefined;
+        if (keyboard) {
+          let seats = this.keyboardSeats.get(room);
+          if (!seats) { seats = new Map(); this.keyboardSeats.set(room, seats); }
+          keyboardSeat = seats.get(keyboard.id);
+          if (keyboardSeat && (keyboard.generation < keyboardSeat.generation
+            || (keyboard.generation === keyboardSeat.generation && keyboardSeat.released))) {
+            return this.send(conn, { type: 'error', code: 'stale_keyboard_join', message: 'stale_keyboard_join' });
+          }
+          // The display and keyboard use separate sockets. Its selected target must be installed
+          // before this keyboard player fills a seat, regardless of which socket opens first.
+          if (keyboard.seats && !room.configureStandaloneSeats(keyboard.seats)) {
+            return this.send(conn, { type: 'error', code: 'setup_locked', message: 'setup_locked' });
+          }
+          // A room may have reset while a browser was disconnected. Never rebind a player that the
+          // room no longer has; the token may still create a fresh seat if capacity permits.
+          if (keyboardSeat?.playerId && !room.lobbyPlayers().some(player => player.playerId === keyboardSeat!.playerId)
+            && !room.isWaitingForNextRound(keyboardSeat.playerId)) {
+            if (keyboardSeat.conn) {
+              keyboardSeat.conn.playerId = undefined;
+              keyboardSeat.conn.keyboardSessionId = undefined;
+            }
+            keyboardSeat.playerId = undefined;
+            keyboardSeat.lane = undefined;
+            keyboardSeat.conn = undefined;
+          }
+          if (keyboardSeat?.playerId && keyboardSeat.conn) {
+            if (conn.playerId && conn !== keyboardSeat.conn) {
+              return this.send(conn, { type: 'error', code: 'already_joined', message: 'already_joined' });
+            }
+            const previous = keyboardSeat.conn;
+            if (previous !== conn) {
+              this.releasePreviousBinding(conn, msg.roomCode);
+              previous.playerId = undefined;
+              previous.keyboardSessionId = undefined;
+              previous.rendererReadyGate = false;
+              previous.hostAuthorized = false;
+            }
+            keyboardSeat.generation = keyboard.generation;
+            keyboardSeat.conn = conn;
+            keyboardSeat.released = false;
+            conn.roomCode = msg.roomCode;
+            conn.playerId = keyboardSeat.playerId;
+            conn.keyboardSessionId = keyboard.id;
+            conn.rendererReadyGate = msg.rendererReadyGate === true;
+            this.clearResultReconnectTimer(msg.roomCode);
+            this.send(conn, { type: 'joined', playerId: keyboardSeat.playerId,
+              lane: keyboardSeat.lane!, roomCode: msg.roomCode });
+            if (['countdown', 'racing'].includes(room.phase)) this.send(conn, anyItems(room));
+            this.pushLobby(msg.roomCode);
+            if (previous !== conn) previous.ws.close(4001, 'keyboard session replaced');
+            break;
+          }
+          if (!keyboardSeat) {
+            keyboardSeat = { generation: keyboard.generation, released: false };
+            seats.set(keyboard.id, keyboardSeat);
+          } else {
+            keyboardSeat.generation = keyboard.generation;
+            keyboardSeat.released = false;
+          }
+        }
         const res = room.addPlayer(msg.name, msg.color);
         if ('error' in res) return this.send(conn, { type: 'error', code: res.error, message: res.error });
         this.clearResultReconnectTimer(msg.roomCode);
         this.releasePreviousBinding(conn, msg.roomCode);
         conn.roomCode = msg.roomCode; conn.playerId = res.playerId;
         conn.rendererReadyGate = msg.rendererReadyGate === true;
+        if (keyboard && keyboardSeat) {
+          keyboardSeat.playerId = res.playerId;
+          keyboardSeat.lane = res.lane;
+          keyboardSeat.conn = conn;
+          conn.keyboardSessionId = keyboard.id;
+        }
         this.send(conn, { type: 'joined', playerId: res.playerId, lane: res.lane, roomCode: msg.roomCode });
         if(['countdown','racing'].includes(room.phase))this.send(conn,anyItems(room));
         this.pushLobby(msg.roomCode);   // update every conn's roster instantly
+        break;
+      }
+      case 'configure_seats': {
+        if (!conn.hostAuthorized || conn.playerId || conn.stationDisplay
+          || conn.roomCode !== msg.roomCode) {
+          this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'bad_display_auth' });
+          break;
+        }
+        if (!this.voiceConfigureStandaloneSeats(msg.roomCode, msg.count))
+          this.send(conn, { type: 'error', code: 'setup_locked', message: 'setup_locked' });
+        break;
+      }
+      case 'release_keyboard_session': {
+        const room = this.rooms.find(msg.roomCode);
+        if (!room || conn.roomCode !== msg.roomCode || conn.playerId || conn.stationDisplay
+          || !conn.hostAuthorized) {
+          this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'bad_display_auth' });
+          break;
+        }
+        let seats = this.keyboardSeats.get(room);
+        if (!seats) { seats = new Map(); this.keyboardSeats.set(room, seats); }
+        const { id, generation } = msg.keyboardSession;
+        let seat = seats.get(id);
+        if (!seat) {
+          seat = { generation, released: true };
+          seats.set(id, seat);
+        } else if (generation >= seat.generation) {
+          const playerId = seat.playerId;
+          const owner = seat.conn;
+          seat.generation = generation;
+          seat.playerId = undefined;
+          seat.lane = undefined;
+          seat.conn = undefined;
+          seat.released = true;
+          if (owner && owner.keyboardSessionId === id && owner.playerId === playerId) {
+            owner.playerId = undefined;
+            owner.keyboardSessionId = undefined;
+            owner.roomCode = undefined;
+            owner.rendererReadyGate = false;
+            owner.hostAuthorized = false;
+            owner.ws.close(4001, 'keyboard session released');
+          }
+          if (playerId) {
+            const before = room.phase;
+            room.removePlayer(playerId);
+            this.reportAbandonedIfReset(room);
+            this.publishSetupMutation(room, before);
+            this.reapRoomIfEmpty(msg.roomCode);
+          }
+        }
+        this.send(conn, { type: 'keyboard_session_released', roomCode: msg.roomCode,
+          keyboardSession: msg.keyboardSession });
         break;
       }
       case 'ready': {
@@ -249,6 +402,10 @@ export class GameServer {
           }
           if (room && this.stationResultsLocked(room)) {
             this.send(conn, { type: 'error', code: 'station_requeue_required', message: 'station_requeue_required' });
+            break;
+          }
+          if (room && this.hasSharedRacerRoster(room)) {
+            this.pushLobby(room.code);
             break;
           }
           if (room && (room.phase === 'lobby' || room.phase === 'finished')) {
@@ -319,6 +476,7 @@ export class GameServer {
         const room = this.displayRoomFor(conn, msg.roomCode, msg.expectedPhase);
         if (!room) break;
         if (this.stationResultsLocked(room)) break;
+        if (room.sharedVoiceReplayRequired) { this.pushLobby(room.code); break; }
         const first = room.lobbyPlayers()[0]?.playerId;
         if (msg.forPlayerId !== first) {
           // A display may advance a standalone results screen when only next-round callers remain.
@@ -378,6 +536,8 @@ export class GameServer {
         const room = conn.roomCode ? this.rooms.find(conn.roomCode) : undefined;
         if (room && !this.allowBrowserPlayer(room.code)) {
           this.send(conn, { type: 'error', code: 'station_requeue_required', message: 'station_requeue_required' });
+        } else if (room && this.hasSharedRacerRoster(room)) {
+          this.pushLobby(room.code);
         } else if (room) {
           if (room.start()) {
             if (room.phase === 'countdown') this.resetRendererPreparation(room);
@@ -393,6 +553,14 @@ export class GameServer {
           return this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'bad_display_auth' });
         }
         const room = this.room(msg.roomCode);
+        if (msg.count !== undefined) {
+          if (stationDisplay) {
+            return this.send(conn, { type: 'error', code: 'station_managed', message: 'station_managed' });
+          }
+          if (!room.configureStandaloneSeats(msg.count)) {
+            return this.send(conn, { type: 'error', code: 'setup_locked', message: 'setup_locked' });
+          }
+        }
         if (conn.roomCode !== msg.roomCode || conn.playerId || conn.stationDisplay !== stationDisplay) {
           this.releasePreviousBinding(conn, msg.roomCode);
         }
@@ -410,6 +578,7 @@ export class GameServer {
         // Drop this connection's PLAYER slot but keep it connected as a spectator (same roomCode).
         // Used by the shared screen toggling "I'm playing" → back to spectating, without reconnecting.
         if (conn.roomCode && conn.playerId) {
+          this.unbindKeyboardSeat(conn, true);
           const room=this.rooms.find(conn.roomCode);if(room){const before=room.phase;room.removePlayer(conn.playerId);this.reportAbandonedIfReset(room);this.publishSetupMutation(room,before);}
           conn.playerId = undefined;
           conn.hostAuthorized = false;
@@ -489,6 +658,7 @@ export class GameServer {
 
   voiceSetupChanged(roomCode:string,before:Phase):void {
     const room=this.rooms.find(roomCode);if(!room)return;
+    room.completeSharedReplayIfReady();
     this.publishSetupMutation(room,before);
   }
   /** A voice caller left (hung up). Drop their slot, refresh the lobby, and REAP the room if now empty
@@ -508,12 +678,21 @@ export class GameServer {
     }
     room.expectHumanPlayers(count);this.publishSetupMutation(room,before);
   }
+  /** A bound standalone display sets its seat count before callers begin the menu. */
+  voiceConfigureStandaloneSeats(roomCode: string, count: 1 | 2): boolean {
+    const room = this.room(roomCode);
+    if (!room.configureStandaloneSeats(count)) return false;
+    this.pushLobby(roomCode);
+    return true;
+  }
   /** Advance the flow (lobby→car_select→map_select→race). Returns true if the phase actually changed. */
   voiceAdvance(roomCode: string, spokenReplyPlayerId: string): boolean {
     const room = this.rooms.find(roomCode); if (!room) return false;
     if (this.stationResultsLocked(room)) return false;
     const before = room.phase;
-    room.advance(spokenReplyPlayerId);
+    // The caller's own fresh "next" command supersedes their interrupted cue/input hold;
+    // other callers' phone cues must still finish before a shared phase changes.
+    room.advance(spokenReplyPlayerId, true);
     const after = room.phase;
     if (after === 'countdown' && before !== 'countdown') this.resetRendererPreparation(room);
     if (after === 'countdown' || after === 'racing') this.reportStartedOnce(room);
@@ -543,6 +722,10 @@ export class GameServer {
     return !this.allowBrowserPlayer(room.code) && ['results', 'finished'].includes(room.phase);
   }
 
+  private hasSharedRacerRoster(room: Room): boolean {
+    return room.humanPlayerTarget >= 2 || room.lobbyPlayers().length >= 2;
+  }
+
   /** A display tap is bound to the exact room and screen it saw. The caller seat is checked
    * separately against the room's current selector target before changing any game state. */
   private displayRoomFor(conn: Conn, roomCode: string, expectedPhase: Phase): Room | null {
@@ -559,17 +742,33 @@ export class GameServer {
   }
 
   private menuTouchState(room: Room, viewer?: Conn): MenuTouchState {
-    const advancePlayerId = room.lobbyPlayers()[0]?.playerId ?? null;
+    const players = room.lobbyPlayers();
+    const advancePlayerId = players[0]?.playerId ?? null;
     // The display may advance for the active racers. A caller who joined while
     // their results are showing is waiting for the next round, so its own
     // Replay control must reflect its actual authority rather than the
     // display's (otherwise the tap looks enabled but the room rejects it).
     const replayActor = room.phase === 'results' && viewer?.playerId
       ? viewer.playerId : advancePlayerId ?? undefined;
+    const sharedReplayRequiresCalls = room.sharedVoiceReplayRequired;
+    const replayPlayers = new Map(players.map(player => [player.playerId, player]));
+    const sharedReplayStatuses: MenuTouchState['sharedReplayStatuses'] = sharedReplayRequiresCalls
+      && (room.phase === 'results' || room.phase === 'finished')
+      ? room.results().map(result => {
+          const player = replayPlayers.get(result.playerId);
+          return { playerId: result.playerId, state: !player ? 'left' as const
+            : player.setupStatus === 'reconnecting' ? 'reconnecting' as const
+              : player.setupStatus === 'phone' ? 'recap' as const
+                : room.hasReplayConsent(result.playerId) ? 'ready' as const : 'waiting' as const };
+        }) : undefined;
     return {
       activePlayerId: room.touchSelectionTarget(), advancePlayerId,
       canAdvance: !this.stationResultsLocked(room) && room.canAdvance(replayActor),
-      canBack: !room.usesStationSetup && (room.phase === 'car_select' || room.phase === 'map_select'),
+      canBack: !room.usesStationSetup && !this.hasSharedRacerRoster(room)
+        && (room.phase === 'car_select' || room.phase === 'map_select'),
+      expectedPlayers: room.humanPlayerTarget,
+      sharedReplayRequiresCalls,
+      ...(sharedReplayStatuses ? { sharedReplayStatuses } : {}),
     };
   }
 
@@ -628,6 +827,20 @@ export class GameServer {
       && conn.ws.readyState === WebSocket.OPEN);
   }
 
+  /** Retain the last generation after departure so an older in-flight join stays stale. */
+  private unbindKeyboardSeat(conn: Conn, released: boolean): void {
+    const id = conn.keyboardSessionId;
+    const room = conn.roomCode ? this.rooms.find(conn.roomCode) : undefined;
+    const seat = room && id ? this.keyboardSeats.get(room)?.get(id) : undefined;
+    if (seat?.conn === conn && seat.playerId === conn.playerId) {
+      seat.playerId = undefined;
+      seat.lane = undefined;
+      seat.conn = undefined;
+      seat.released = released;
+    }
+    conn.keyboardSessionId = undefined;
+  }
+
   /** Switching one socket's room or role must release its old roster/display binding first. */
   private releasePreviousBinding(conn: Conn, retainingRoomCode: string): void {
     const previousCode = conn.roomCode;
@@ -636,6 +849,7 @@ export class GameServer {
     if (conn.stationDisplay && room?.phase === 'countdown'
       && this.stationRendererReady.get(room) === conn.ws) this.stationRendererReady.delete(room);
     const previousPlayerId = conn.playerId;
+    if (previousPlayerId) this.unbindKeyboardSeat(conn, true);
     conn.roomCode = undefined;
     conn.playerId = undefined;
     conn.stationDisplay = false;

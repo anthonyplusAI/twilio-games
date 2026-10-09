@@ -1,7 +1,7 @@
 // Shared-screen Racer menus: lobby, car selection, track vote, and results. The server
 // supplies the current room and eligible caller seat for voice, keyboard, or touch selection.
 // Gameplay input remains on the phone; styling lives in racer.css.
-import type { LobbyPlayer, RaceResult, MenuTouchState } from '../shared/types';
+import type { LobbyPlayer, RaceResult, MenuTouchState, RacerSetupStatus } from '../shared/types';
 import { controlsLegendHtml } from './controls-legend';
 import { resultTechHtml } from './result-tech';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../shared/i18n/locales';
@@ -146,7 +146,7 @@ export class Screens {
 
   /** Stable, order-sensitive fingerprint of the roster for the dedup guard. */
   private rosterKey(players: LobbyPlayer[]): string {
-    return players.map(p => `${p.playerId}:${p.name}:${p.color}:${p.carIndex}:${p.ready ? 1 : 0}`).join('|');
+    return players.map(p => `${p.playerId}:${p.name}:${p.color}:${p.carIndex}:${p.ready ? 1 : 0}:${p.setupStatus ?? ''}`).join('|');
   }
   /** True if this exact view was already rendered (skip the rebuild). Stores the new key otherwise. */
   private unchanged(key: string): boolean {
@@ -268,7 +268,8 @@ export class Screens {
     for (const p of players) if (p.carIndex !== null) {
       const a = claims.get(p.carIndex) ?? []; a.push(p); claims.set(p.carIndex, a);
     }
-    const allReady = players.length > 0 && players.every(p => p.ready);
+    const allReady = players.length >= (this.menuTouch?.expectedPlayers ?? players.length)
+      && players.length > 0 && players.every(p => p.ready && (!p.setupStatus || p.setupStatus === 'ready'));
     const tiles = this.carNames.map((nm, i) => this.carTile(i, nm, claims.get(i) ?? [])).join('');
     // Pick a column count that keeps the grid roughly landscape (≈16:9) so all cars fit on one
     // screen without scrolling — e.g. 19 cars → 7 cols × 3 rows. CSS rows are 1fr (fill the height).
@@ -391,7 +392,17 @@ export class Screens {
     const heroDetail = winner
       ? this.text('screen.results.winningTime', { time: this.formatSeconds(winner.finishT) }) : '';
     const board = global ? this.boardHtml(global.map, global.entries, carNameFor) : '';
+    const replayStatuses = this.menuTouch?.sharedReplayRequiresCalls
+      ? this.menuTouch.sharedReplayStatuses ?? [] : [];
+    const replayProgress = replayStatuses.length ? `<div class="replay-progress" role="status" aria-live="polite" aria-label="${esc(this.text('screen.results.replay.title'))}">
+      ${replayStatuses.map(({ playerId, state }) => {
+        const name = results.find(result => result.playerId === playerId)?.name ?? playerId;
+        return `<div class="replay-progress-player is-${state}"><strong>${esc(name)}</strong><span>${esc(this.text(`screen.results.replay.${state}` as RacerMessageKey))}</span></div>`;
+      }).join('')}
+    </div>` : '';
     const resultFooter = this.stationManaged ? 'screen.results.stationFooter'
+      : replayStatuses.some(status => status.state === 'left') ? 'screen.results.sharedLeftFooter'
+      : this.menuTouch?.sharedReplayRequiresCalls ? 'screen.results.sharedFooter'
       : this.menuTouch?.canAdvance ? 'screen.results.againFooter'
         : this.menuTouch?.advancePlayerId ? 'screen.results.waitCurrentFooter'
           : 'screen.results.waitJoinFooter';
@@ -402,6 +413,7 @@ export class Screens {
           <h1>${esc(heroTitle)}</h1>${heroDetail ? `<p>${esc(heroDetail)}</p>` : ''}</div>
       </div>
       ${this.menuFooter(this.text(resultFooter), 'results')}
+      ${replayProgress}
       <div class="results-wrap">
         <div class="res-list"><div class="col-label">${this.text('screen.results.thisRace')}</div>${rows}</div>
         ${board}
@@ -459,6 +471,7 @@ export class Screens {
       : phase === 'car_select' ? 'screen.action.next'
         : phase === 'map_select' ? 'screen.action.race' : 'screen.action.replay';
     const advance = touch && !(this.stationManaged && phase === 'results')
+      && !(phase === 'results' && touch.sharedReplayRequiresCalls)
       ? `<button type="button" class="menu-button" data-menu-action="advance" ${touch.canAdvance ? '' : 'disabled'}>${this.text(actionKey)}</button>` : '';
     const exit = phase === 'results' && !this.stationManaged
       ? `<a class="menu-button secondary" href="/">${this.text('screen.results.exit')}</a>` : '';
@@ -466,15 +479,19 @@ export class Screens {
   }
 
   private chips(players: LobbyPlayer[]): string {
-    if (players.length === 0)
+    const expected = Math.max(players.length, this.menuTouch?.expectedPlayers ?? 0);
+    if (expected === 0)
       return `<div class="chips"><div class="chip-empty">${this.text('screen.waitingPlayers')}</div></div>`;
-    const chips = players.map((p, i) => {
+    const chips = Array.from({ length: expected }, (_, i) => {
+      const p = players.find(player => player.lane === i);
+      if (!p) return `<div class="chip chip-awaiting"><span class="setup-status is-waiting">${esc(this.text('screen.setup.waitingSeat', { number: i + 1 }))}</span></div>`;
       const col = cssColor(p.color);
       // Only show a car label once the player has actually picked one. In the lobby nobody has
       // chosen yet, so showing a placeholder "…" on every pill looked broken.
       const carLabel = p.carIndex !== null
         ? `<span class="car">${esc(this.carNames[p.carIndex]
             ?? this.text('screen.carFallback', { number: p.carIndex + 1 }))}</span>` : '';
+      const status = this.setupStatusLabel(p.setupStatus);
       // Two-line identity stack: a small "Player N" eyebrow over the player's NAME (the main text).
       return `
         <div class="chip${p.ready ? ' ready' : ''}${p.playerId === this.menuTouch?.activePlayerId ? ' touch-target' : ''}"${p.ready ? ` style="border-color:${col}"` : ''}>
@@ -484,9 +501,15 @@ export class Screens {
             <span class="nm">${esc(p.name)}</span>
           </span>
           ${carLabel}
+          ${status ? `<span class="setup-status is-${p.setupStatus}">${esc(status)}</span>` : ''}
         </div>`;
     }).join('');
     return `<div class="chips">${chips}</div>`;
+  }
+
+  private setupStatusLabel(status: RacerSetupStatus | undefined): string {
+    if (!status) return '';
+    return this.text(`screen.setup.${status}` as RacerMessageKey);
   }
 
   private placeLabel(place: number): string {

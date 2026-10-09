@@ -53,6 +53,280 @@ function latestState(client: Client): Message | undefined {
 }
 
 describe('FighterServer WebSocket authority and lifecycle', () => {
+  it('atomically reserves two seats when a standalone display first spectates', async () => {
+    const port = await start();
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: 'FIRST-CALL', initialSeatCount: 2 });
+    await waitFor(display, message => message.type === 'fighter_state');
+
+    const room = fighter!.findRoom('FIRST-CALL')!;
+    expect(room.state()).toMatchObject({ expectedPlayerCount: 2, automaticSetup: true });
+    const caller = fighter!.voiceJoin('FIRST-CALL', 'Ada')!;
+    expect(caller).not.toBeNull();
+    expect(fighter!.voiceAdvance('FIRST-CALL', caller)).toBe(false);
+    expect(room.phase).toBe('lobby');
+  });
+
+  it('keeps the display’s solo count when a browser tester requests two seats', async () => {
+    const port = await start();
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: 'SOLO-HOST', initialSeatCount: 1 });
+    await waitFor(display, message => message.type === 'fighter_state' && message.automaticSetup === true);
+
+    const keyboard = await connect(port);
+    send(keyboard, { type: 'join', roomCode: 'SOLO-HOST', name: 'Tester', initialSeatCount: 2 });
+    await waitFor(keyboard, message => message.type === 'joined');
+    expect(fighter!.findRoom('SOLO-HOST')!.state().expectedPlayerCount).toBe(1);
+    expect(fighter!.voiceJoin('SOLO-HOST', 'Caller')).toBeNull();
+  });
+
+  it('does not let a keyboard join reopen a solo seat when its display has disconnected', async () => {
+    const port = await start();
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: 'SOLO-OFFLINE', initialSeatCount: 1 });
+    await waitFor(display, message => message.type === 'fighter_state' && message.automaticSetup === true);
+    const caller = fighter!.voiceJoin('SOLO-OFFLINE', 'Ada');
+    expect(caller).not.toBeNull();
+    const closed = new Promise<void>(resolve => display.ws.once('close', resolve));
+    display.ws.close(); await closed;
+
+    const keyboard = await connect(port);
+    send(keyboard, { type: 'join', roomCode: 'SOLO-OFFLINE', name: 'Tester', initialSeatCount: 2 });
+    await waitFor(keyboard, message => message.type === 'error' && message.code === 'room_full');
+    expect(fighter!.findRoom('SOLO-OFFLINE')!.state().expectedPlayerCount).toBe(1);
+  });
+
+  it('rejects a standalone seat request on a station display', async () => {
+    const port = await start('station-secret');
+    fighter!.setBrowserPlayerAdmission(() => false);
+    const display = await connect(port);
+    send(display, { type: 'display_auth', roomCode: 'STATION-SEATS', token: 'station-secret' });
+    send(display, { type: 'spectate', roomCode: 'STATION-SEATS', initialSeatCount: 2 });
+    await waitFor(display, message => message.type === 'error' && message.code === 'forbidden');
+    expect(fighter!.findRoom('STATION-SEATS')).toBeUndefined();
+
+    send(display, { type: 'spectate', roomCode: 'STATION-SEATS' });
+    await waitFor(display, message => message.type === 'fighter_state');
+    expect(fighter!.findRoom('STATION-SEATS')!.state().expectedPlayerCount).toBe(1);
+  });
+
+  it('reserves the displayed seat count when the keyboard tester joins before the display socket', async () => {
+    const port = await start();
+    const keyboard = await connect(port);
+    send(keyboard, { type: 'join', roomCode: 'KEYBOARD-FIRST', name: 'Tester',
+      sessionId: 'keyboard-first-session', initialSeatCount: 2 });
+    const joined = await waitFor(keyboard, message => message.type === 'joined');
+    const room = fighter!.findRoom('KEYBOARD-FIRST')!;
+    expect(room.state()).toMatchObject({ expectedPlayerCount: 2, automaticSetup: true });
+    send(keyboard, { type: 'advance' });
+    await waitFor(keyboard, message => message.type === 'error' && message.code === 'not_ready');
+    expect(room.hasPlayer(joined.playerId as string)).toBe(true);
+    expect(room.phase).toBe('lobby');
+
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: 'KEYBOARD-FIRST', initialSeatCount: 2 });
+    await waitFor(display, message => message.type === 'fighter_state');
+    expect(room.state().expectedPlayerCount).toBe(2);
+  });
+
+  it('lets a separate keyboard player vote without taking the display host role', async () => {
+    const accepted: WebSocket[] = [];
+    const port = await start(undefined, undefined, ws => accepted.push(ws));
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: 'KEYBOARD-DUO' });
+    await waitFor(display, message => message.type === 'host_identity' && message.isHost === true);
+    send(display, { type: 'configure_seats', roomCode: 'KEYBOARD-DUO', count: 2 });
+    await waitFor(display, message => message.type === 'fighter_state' && message.expectedPlayerCount === 2);
+
+    const keyboard = await connect(port);
+    send(keyboard, { type: 'join', roomCode: 'KEYBOARD-DUO', name: 'Tester', sessionId: 'keyboard-session' });
+    const joined = await waitFor(keyboard, message => message.type === 'joined');
+    const phoneId = fighter!.voiceJoin('KEYBOARD-DUO', 'Ada')!;
+    const room = fighter!.findRoom('KEYBOARD-DUO')!;
+    expect(room.phase).toBe('lobby');
+    expect(fighter!.hasStandaloneDisplay(accepted[0]!, 'KEYBOARD-DUO')).toBe(true);
+    expect(fighter!.hasStandaloneDisplay(accepted[1]!, 'KEYBOARD-DUO')).toBe(false);
+
+    send(keyboard, { type: 'advance' });
+    await vi.waitFor(() => expect(room.state().advanceReadyPlayerIds).toContain(joined.playerId), { timeout: 600 });
+    expect(room.phase).toBe('lobby');
+    expect(fighter!.voiceAdvance('KEYBOARD-DUO', phoneId)).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+    expect(fighter!.hasStandaloneDisplay(accepted[0]!, 'KEYBOARD-DUO')).toBe(true);
+  });
+
+  it('applies a promoted standalone display’s new seat count before callers join', async () => {
+    const port = await start();
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'HANDOFF' });
+    await waitFor(host, message => message.type === 'host_identity' && message.isHost === true);
+    send(host, { type: 'configure_seats', roomCode: 'HANDOFF', count: 1 });
+    await waitFor(host, message => message.type === 'fighter_state' && message.automaticSetup === true);
+
+    const standby = await connect(port);
+    send(standby, { type: 'spectate', roomCode: 'HANDOFF' });
+    await waitFor(standby, message => message.type === 'host_identity' && message.isHost === false);
+    send(standby, { type: 'configure_seats', roomCode: 'HANDOFF', count: 2 });
+    await waitFor(standby, message => message.type === 'error' && message.code === 'forbidden');
+    expect(fighter!.findRoom('HANDOFF')?.state().expectedPlayerCount).toBe(1);
+
+    const closed = new Promise<void>(resolve => host.ws.once('close', resolve));
+    host.ws.close(); await closed;
+    await waitFor(standby, message => message.type === 'host_identity' && message.isHost === true);
+    send(standby, { type: 'configure_seats', roomCode: 'HANDOFF', count: 2 });
+    await waitFor(standby, message => message.type === 'fighter_state' && message.expectedPlayerCount === 2);
+    expect(fighter!.findRoom('HANDOFF')?.state().expectedPlayerCount).toBe(2);
+  });
+
+  it('applies a waiting display’s requested seats before announcing its promotion', async () => {
+    const port = await start();
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'HANDOFF-ATOMIC', initialSeatCount: 1 });
+    await waitFor(host, message => message.type === 'fighter_state' && message.automaticSetup === true);
+
+    const standby = await connect(port);
+    send(standby, { type: 'spectate', roomCode: 'HANDOFF-ATOMIC', initialSeatCount: 2 });
+    await waitFor(standby, message => message.type === 'host_identity' && message.isHost === false);
+    expect(fighter!.findRoom('HANDOFF-ATOMIC')?.state().expectedPlayerCount).toBe(1);
+
+    const closed = new Promise<void>(resolve => host.ws.once('close', resolve));
+    host.ws.close(); await closed;
+    await waitFor(standby, message => message.type === 'host_identity' && message.isHost === true);
+    const room = fighter!.findRoom('HANDOFF-ATOMIC')!;
+    expect(room.state().expectedPlayerCount).toBe(2);
+    const caller = fighter!.voiceJoin('HANDOFF-ATOMIC', 'Ada')!;
+    expect(fighter!.voiceAdvance('HANDOFF-ATOMIC', caller)).toBe(false);
+    expect(room.phase).toBe('lobby');
+  });
+
+  it('does not promote an incompatible standby display after setup has advanced', async () => {
+    const accepted: WebSocket[] = [];
+    const port = await start(undefined, undefined, ws => accepted.push(ws));
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'LOCKED-HANDOFF', initialSeatCount: 1 });
+    await waitFor(host, message => message.type === 'fighter_state' && message.automaticSetup === true);
+    const caller = fighter!.voiceJoin('LOCKED-HANDOFF', 'Ada')!;
+    expect(fighter!.voiceAdvance('LOCKED-HANDOFF', caller)).toBe(true);
+    expect(fighter!.findRoom('LOCKED-HANDOFF')?.phase).toBe('fighter_select');
+
+    const standby = await connect(port);
+    send(standby, { type: 'spectate', roomCode: 'LOCKED-HANDOFF', initialSeatCount: 2 });
+    await waitFor(standby, message => message.type === 'host_identity' && message.isHost === false);
+    const closed = new Promise<void>(resolve => host.ws.once('close', resolve));
+    host.ws.close(); await closed;
+    await waitFor(standby, message => message.type === 'error' && message.code === 'not_ready');
+
+    expect(fighter!.hasStandaloneDisplay(accepted[1]!, 'LOCKED-HANDOFF')).toBe(false);
+    expect(fighter!.findRoom('LOCKED-HANDOFF')?.state().expectedPlayerCount).toBe(1);
+  });
+
+  it('keeps a station match at two expected callers when the first caller confirms a name', () => {
+    http = createServer();
+    fighter = new FighterServer({ server: http });
+    const first = fighter.voiceJoin('NAME-GATE', 'Caller', 'p1', 2, false);
+    expect(first).not.toBeNull();
+    fighter.voiceSetName('NAME-GATE', first!, 'Ada');
+    const room = fighter.findRoom('NAME-GATE')!;
+    expect(room.state()).toMatchObject({ expectedPlayerCount: 2, hasExpectedPlayers: false });
+    expect(fighter.voiceAdvance('NAME-GATE', first!)).toBe(false);
+    expect(room.phase).toBe('lobby');
+  });
+
+  it('reserves two standalone seats through name confirmation and rejects another display changing the count', async () => {
+    const port = await start();
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'DUO' });
+    await waitFor(host, message => message.type === 'host_identity' && message.isHost === true);
+    send(host, { type: 'configure_seats', roomCode: 'DUO', count: 2 });
+    await waitFor(host, message => message.type === 'fighter_state' && message.expectedPlayerCount === 2);
+
+    const viewer = await connect(port);
+    send(viewer, { type: 'spectate', roomCode: 'DUO' });
+    await waitFor(viewer, message => message.type === 'fighter_state');
+    send(viewer, { type: 'configure_seats', roomCode: 'DUO', count: 1 });
+    await waitFor(viewer, message => message.type === 'error' && message.code === 'forbidden');
+
+    const caller = fighter!.voiceJoin('DUO', 'Caller', undefined, undefined, false)!;
+    fighter!.voiceSetName('DUO', caller, 'Ada');
+    expect(fighter!.findRoom('DUO')?.state()).toMatchObject({ expectedPlayerCount: 2, hasExpectedPlayers: false });
+    expect(fighter!.voiceAdvance('DUO', caller)).toBe(false);
+    fighter!.voiceLeave('DUO', caller);
+    expect(fighter!.findRoom('DUO')?.state().expectedPlayerCount).toBe(2);
+  });
+
+  it('keeps a configured solo seat full when another phone caller arrives', async () => {
+    const port = await start();
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'FIXED-SOLO' });
+    await waitFor(host, message => message.type === 'host_identity' && message.isHost === true);
+    send(host, { type: 'configure_seats', roomCode: 'FIXED-SOLO', count: 1 });
+    await waitFor(host, message => message.type === 'fighter_state' && message.automaticSetup === true);
+
+    expect(fighter!.voiceJoin('FIXED-SOLO', 'Ada')).not.toBeNull();
+    expect(fighter!.voiceJoin('FIXED-SOLO', 'Bo')).toBeNull();
+    expect(fighter!.findRoom('FIXED-SOLO')?.state()).toMatchObject({
+      expectedPlayerCount: 1, players: [expect.objectContaining({ name: 'Ada' })],
+    });
+  });
+
+  it('withdraws a browser caller’s advance vote during a reconnect hold', async () => {
+    const port = await start();
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'BROWSER-HOLD' });
+    await waitFor(host, message => message.type === 'host_identity' && message.isHost === true);
+    send(host, { type: 'configure_seats', roomCode: 'BROWSER-HOLD', count: 2 });
+    await waitFor(host, message => message.type === 'fighter_state' && message.expectedPlayerCount === 2);
+
+    const ada = await connect(port);
+    send(ada, { type: 'join', roomCode: 'BROWSER-HOLD', name: 'Ada', sessionId: 'browser-ada' });
+    const joined = await waitFor(ada, message => message.type === 'joined');
+    const bo = fighter!.voiceJoin('BROWSER-HOLD', 'Bo')!;
+    const room = fighter!.findRoom('BROWSER-HOLD')!;
+    room.advance(joined.playerId as string);
+    expect(room.state().advanceReadyPlayerIds).toEqual([joined.playerId]);
+
+    ada.ws.close();
+    await new Promise<void>(resolve => ada.ws.once('close', () => resolve()));
+    await vi.waitFor(() => expect(room.state().advanceReadyPlayerIds).toEqual([]));
+    room.advance(bo);
+    expect(room.phase).toBe('lobby');
+  });
+
+  it('keeps a two-caller result visible until the next pair starts on the same standalone display', async () => {
+    const port = await start();
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'REPLAY-DUO' });
+    await waitFor(host, message => message.type === 'host_identity' && message.isHost === true);
+    send(host, { type: 'configure_seats', roomCode: 'REPLAY-DUO', count: 2 });
+    await waitFor(host, message => message.type === 'fighter_state' && message.expectedPlayerCount === 2);
+
+    const ada = fighter!.voiceJoin('REPLAY-DUO', 'Ada')!;
+    const bo = fighter!.voiceJoin('REPLAY-DUO', 'Bo')!;
+    for (const id of [ada, bo]) expect(fighter!.voiceAdvance('REPLAY-DUO', id)).toBe(true);
+    expect(fighter!.voiceSelectFighter('REPLAY-DUO', ada, 'nyx')).toBe(true);
+    expect(fighter!.voiceSelectFighter('REPLAY-DUO', bo, 'wraith')).toBe(true);
+    for (const id of [ada, bo]) expect(fighter!.voiceAdvance('REPLAY-DUO', id)).toBe(true);
+    expect(fighter!.voiceSelectMap('REPLAY-DUO', ada, 'void')).toBe(true);
+    expect(fighter!.voiceSelectMap('REPLAY-DUO', bo, 'void')).toBe(true);
+    for (const id of [ada, bo]) expect(fighter!.voiceAdvance('REPLAY-DUO', id)).toBe(true);
+    const room = fighter!.findRoom('REPLAY-DUO')!;
+    expect(room.ready(room.state().loadingGeneration)).toBe(true);
+    room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);
+    const world = room.state().world!;
+    world.status = 'finished'; world.winner = 'p1';
+    room.tick(.1); room.tick(10.5);
+    fighter!.voiceLeave('REPLAY-DUO', ada);
+    fighter!.voiceLeave('REPLAY-DUO', bo);
+    expect(room.state()).toMatchObject({ phase: 'results', expectedPlayerCount: 2 });
+
+    const newAda = fighter!.voiceJoin('REPLAY-DUO', 'New Ada');
+    expect(newAda).not.toBeNull();
+    expect(room.state()).toMatchObject({ phase: 'lobby', expectedPlayerCount: 2, hasExpectedPlayers: false });
+    const newBo = fighter!.voiceJoin('REPLAY-DUO', 'New Bo');
+    expect(newBo).not.toBeNull();
+    expect(room.state().players.map(player => player.name)).toEqual(['New Ada', 'New Bo']);
+  });
+
   it('recognizes only a live, room-bound and authorized standalone display',async()=>{
     let serverSideDisplay:WebSocket|undefined;
     const port=await start('display-token',undefined,ws=>serverSideDisplay=ws);
@@ -300,12 +574,19 @@ describe('FighterServer WebSocket authority and lifecycle', () => {
     send(display, { type: 'spectate', roomCode: 'TOUCH' });
     await waitFor(display, message => message.type === 'host_identity' && message.isHost === true);
     send(display, { type: 'advance' });
+    await waitFor(display, message => message.type === 'error' && message.code === 'not_ready');
+    expect(fighter!.findRoom('TOUCH')?.phase).toBe('lobby');
+    expect(fighter!.voiceAdvance('TOUCH', first)).toBe(true);
+    expect(fighter!.findRoom('TOUCH')?.phase).toBe('lobby');
+    expect(fighter!.voiceAdvance('TOUCH', second)).toBe(true);
     await waitFor(display, message => message.type === 'fighter_state' && message.phase === 'fighter_select');
     send(display, { type: 'display_select_fighter', playerId: first, fighterId: 'nyx' });
     await waitFor(display, message => message.type === 'fighter_state' && (message.players as { fighterId: string | null }[])[0]?.fighterId === 'nyx');
     send(display, { type: 'display_select_fighter', playerId: second, fighterId: 'wraith' });
     await waitFor(display, message => message.type === 'fighter_state' && (message.players as { fighterId: string | null }[])[1]?.fighterId === 'wraith');
-    send(display, { type: 'advance' });
+    expect(fighter!.voiceAdvance('TOUCH', first)).toBe(true);
+    expect(fighter!.findRoom('TOUCH')?.phase).toBe('fighter_select');
+    expect(fighter!.voiceAdvance('TOUCH', second)).toBe(true);
     await waitFor(display, message => message.type === 'fighter_state' && message.phase === 'map_select');
     send(display, { type: 'display_select_map', playerId: first, mapId: 'void' });
     await waitFor(display, message => message.type === 'fighter_state' && (message.mapVotesByPlayerId as Record<string,string>)[first] === 'void');
@@ -548,23 +829,119 @@ describe('FighterServer WebSocket authority and lifecycle', () => {
     expect(fighter!.findRoom('HOME')?.hasPlayer(joined.playerId as string)).toBe(false);
   });
 
+  it('acknowledges release from an unbound reconnect socket, including an already released session', async () => {
+    const port = await start();
+    const player = await connect(port);
+    send(player, { type: 'join', roomCode: 'RELEASE-RETRY', name: 'Keyboard', sessionId: 'retry-session' });
+    const joined = await waitFor(player, message => message.type === 'joined');
+    const closed = new Promise<void>(resolve => player.ws.once('close', resolve));
+    player.ws.close(); await closed;
+    const room = fighter!.findRoom('RELEASE-RETRY')!;
+    expect(room.hasPlayer(joined.playerId as string)).toBe(true);
+
+    const release = await connect(port);
+    send(release, { type: 'release_session', roomCode: 'RELEASE-RETRY', sessionId: 'retry-session' });
+    await waitFor(release, message => message.type === 'session_released'
+      && message.roomCode === 'RELEASE-RETRY' && message.sessionId === 'retry-session');
+    expect(room.hasPlayer(joined.playerId as string)).toBe(false);
+
+    send(release, { type: 'release_session', roomCode: 'RELEASE-RETRY', sessionId: 'retry-session' });
+    await vi.waitFor(() => expect(release.messages.filter(message => message.type === 'session_released')).toHaveLength(2),
+      { timeout: 600 });
+
+    const replacement = await connect(port);
+    send(replacement, { type: 'join', roomCode: 'RELEASE-RETRY', name: 'Replacement', sessionId: 'new-session' });
+    const next = await waitFor(replacement, message => message.type === 'joined');
+    expect(fighter!.findRoom('RELEASE-RETRY')?.hasPlayer(next.playerId as string)).toBe(true);
+  });
+
+  it('rejects a delayed join when its session was released before the join reached the server', async () => {
+    const port = await start();
+    const release = await connect(port);
+    send(release, { type: 'release_session', roomCode: 'EARLY-RELEASE', sessionId: 'old-session' });
+    await waitFor(release, message => message.type === 'session_released'
+      && message.sessionId === 'old-session');
+
+    const stale = await connect(port);
+    send(stale, { type: 'join', roomCode: 'EARLY-RELEASE', name: 'Stale', sessionId: 'old-session' });
+    await waitFor(stale, message => message.type === 'error' && message.code === 'session_released');
+    expect(fighter!.findRoom('EARLY-RELEASE')?.playerCount ?? 0).toBe(0);
+
+    const replacement = await connect(port);
+    send(replacement, { type: 'join', roomCode: 'EARLY-RELEASE', name: 'Keyboard', sessionId: 'new-session' });
+    await waitFor(replacement, message => message.type === 'joined');
+    expect(fighter!.findRoom('EARLY-RELEASE')?.playerCount).toBe(1);
+  });
+
+  it('does not let a bound caller release another caller’s browser session', async () => {
+    const port = await start();
+    const first = await connect(port); const second = await connect(port);
+    send(first, { type: 'join', roomCode: 'RELEASE-GUARD', name: 'Ada', sessionId: 'ada-session' });
+    const ada = await waitFor(first, message => message.type === 'joined');
+    send(second, { type: 'join', roomCode: 'RELEASE-GUARD', name: 'Bo', sessionId: 'bo-session' });
+    await waitFor(second, message => message.type === 'joined');
+    send(second, { type: 'release_session', roomCode: 'RELEASE-GUARD', sessionId: 'ada-session' });
+    await waitFor(second, message => message.type === 'error' && message.code === 'forbidden');
+    expect(fighter!.findRoom('RELEASE-GUARD')?.hasPlayer(ada.playerId as string)).toBe(true);
+  });
+
+  it('does not erase a replacement group vote when HTTP release precedes WebSocket leave', async () => {
+    const port = await start();
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: 'RELEASE-RACE' });
+    await waitFor(display, message => message.type === 'host_identity' && message.isHost === true);
+    send(display, { type: 'configure_seats', roomCode: 'RELEASE-RACE', count: 2 });
+    await waitFor(display, message => message.type === 'fighter_state' && message.expectedPlayerCount === 2);
+
+    const departing = await connect(port);
+    send(departing, { type: 'join', roomCode: 'RELEASE-RACE', name: 'Keyboard', sessionId: 'departing-session' });
+    const departingId = (await waitFor(departing, message => message.type === 'joined')).playerId as string;
+    const callerId = fighter!.voiceJoin('RELEASE-RACE', 'Ada')!;
+    const room = fighter!.findRoom('RELEASE-RACE')!;
+
+    expect(fighter!.releaseBrowserSession('RELEASE-RACE', 'departing-session')).toBe(true);
+    expect(room.hasPlayer(departingId)).toBe(false);
+    const replacementId = fighter!.voiceJoin('RELEASE-RACE', 'Bo')!;
+    expect(replacementId).not.toBeNull();
+    send(departing, { type: 'join', roomCode: 'RELEASE-RACE', name: 'Stale', sessionId: 'departing-session' });
+    await waitFor(departing, message => message.type === 'error' && message.code === 'session_released');
+    expect(fighter!.voiceAdvance('RELEASE-RACE', callerId)).toBe(true);
+    expect(room.state().advanceReadyPlayerIds).toEqual([callerId]);
+
+    const previousStates = display.messages.filter(message => message.type === 'fighter_state').length;
+    send(departing, { type: 'leave', sessionId: 'departing-session' });
+    await vi.waitFor(() => expect(display.messages.filter(message => message.type === 'fighter_state').length)
+      .toBeGreaterThan(previousStates), { timeout: 600 });
+
+    expect(room.state().advanceReadyPlayerIds).toEqual([callerId]);
+    expect(room.hasPlayer(replacementId)).toBe(true);
+    expect(fighter!.voiceAdvance('RELEASE-RACE', replacementId)).toBe(true);
+    expect(room.phase).toBe('fighter_select');
+  });
+
   it('keeps voice selections independent and requires explicit phase advances', async () => {
     await start();
     const p1 = fighter!.voiceJoin(' voice ', 'Ada')!;
     const p2 = fighter!.voiceJoin('VOICE', 'Bob')!;
     expect(fighter!.findRoom('VOICE')?.phase).toBe('lobby');
     expect(fighter!.voiceAdvance('VOICE', p1)).toBe(true);
+    expect(fighter!.findRoom('VOICE')?.phase).toBe('lobby');
+    expect(fighter!.voiceAdvance('VOICE', p2)).toBe(true);
     expect(fighter!.findRoom('VOICE')?.phase).toBe('fighter_select');
     expect(fighter!.voiceSelectFighter('VOICE', p1, 'nyx')).toBe(true);
     expect(fighter!.voiceSelectFighter('VOICE', p2, 'wraith')).toBe(true);
     expect(fighter!.findRoom('VOICE')?.phase).toBe('fighter_select');
     expect(fighter!.voiceAdvance('VOICE', p1)).toBe(true);
+    expect(fighter!.findRoom('VOICE')?.phase).toBe('fighter_select');
+    expect(fighter!.voiceAdvance('VOICE', p2)).toBe(true);
     expect(fighter!.findRoom('VOICE')?.phase).toBe('map_select');
     expect(fighter!.voiceSelectMap('VOICE', p2, 'void')).toBe(true);
     expect(fighter!.voiceSelectMap('VOICE', p1, 'void')).toBe(true);
     const room = fighter!.findRoom('VOICE')!;
     expect(room.phase).toBe('map_select');
     expect(fighter!.voiceAdvance('VOICE', p2)).toBe(true);
+    expect(room.phase).toBe('map_select');
+    expect(fighter!.voiceAdvance('VOICE', p1)).toBe(true);
     expect(room.phase).toBe('loading');
     expect(room.ready(room.state().loadingGeneration)).toBe(true);
     room.tick(FIGHTER_INTRO_SECONDS); room.tick(6);

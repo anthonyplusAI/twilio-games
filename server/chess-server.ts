@@ -5,7 +5,8 @@ import { DEFAULT_LOCALE, resolveLocale, type SupportedLocale } from '../shared/i
 import { ChessRoom } from './chess-room';
 import type { ChessVoiceMoveChoice } from './chess-room';
 import { parseChessIntent } from '../shared/chess-intent';
-import type { ChessCommandResult as ChessCommandResponse, ChessState, WizardChessSceneSnapshot } from '../shared/chess-protocol';
+import type { ChessColor, ChessCommandResult as ChessCommandResponse, ChessMode, ChessState,
+  WizardChessSceneSnapshot } from '../shared/chess-protocol';
 import {
   isWizardChessTrigger, parseWizardChessVoiceAction,
   WIZARD_CHESS_DIALOGUE, WIZARD_CHESS_RESOLVED_DURATION_MS, WIZARD_CHESS_STORY_DURATION_MS,
@@ -25,7 +26,20 @@ interface DisplayConnection {
 interface VoiceBinding {
   callSid: string;
   playerId: string;
+  color: ChessColor;
+  name: string;
+  nameConfirmed: boolean;
   connected: boolean;
+  /** Invalidates a late playback callback from a replaced phone socket. */
+  welcomeGeneration: number;
+  /** Invalidates an earlier cue if this caller starts a replacement welcome. */
+  welcomeCueSequence: number;
+}
+
+interface PvpRematchVote {
+  gameId: number;
+  callSids: Set<string>;
+  finishing: boolean;
 }
 
 interface WizardSceneRuntime {
@@ -59,7 +73,8 @@ export class ChessServer {
   private readonly wss: WebSocketServer;
   private readonly rooms = new Map<string, ChessRoom>();
   private readonly displays = new Set<DisplayConnection>();
-  private readonly voiceBindings = new Map<string, VoiceBinding>();
+  private readonly voiceBindings = new Map<string, Map<ChessColor, VoiceBinding>>();
+  private readonly pvpRematchVotes = new Map<string, PvpRematchVote>();
   private readonly stationRooms = new Set<string>();
   private readonly previouslyBoundRooms = new Set<string>();
   private readonly computerTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -79,6 +94,7 @@ export class ChessServer {
   private onDisplayAuthenticated: ((ws: WebSocket) => void) | null = null;
   private onRoomState: ((roomCode: string) => void) | null = null;
   private onRoomEvents: ((roomCode: string, events: ChessEvents) => void) | null = null;
+  private pvpRematchSpeechBarrier: (roomCode: string) => Promise<void> = async () => {};
 
   constructor(options: ChessServerOptions = {}) {
     this.displayToken = options.displayToken?.trim() ?? '';
@@ -110,6 +126,9 @@ export class ChessServer {
   setOnRoomEvents(fn: (roomCode: string, events: ChessEvents) => void): void {
     this.onRoomEvents = fn;
   }
+  setPvpRematchSpeechBarrier(fn: (roomCode: string) => Promise<void>): void {
+    this.pvpRematchSpeechBarrier = fn;
+  }
 
   handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer, connected?: (ws: WebSocket) => void): void {
     if (this.displays.size >= this.maxConnections) {
@@ -139,6 +158,60 @@ export class ChessServer {
     return code ? this.rooms.get(code) : undefined;
   }
 
+  /** A trusted station may select one or two human seats before binding calls. */
+  configureMatch(rawCode: string, expectedHumans: 1 | 2): boolean {
+    const code = chessRoomCode(rawCode);
+    if (!code || ![1, 2].includes(expectedHumans) || this.hasBindings(code)) return false;
+    const room = this.getOrCreateRoom(code);
+    if (!room) return false;
+    room.configureMode(expectedHumans === 2 ? 'pvp' : 'solo');
+    this.flush(room);
+    this.pushState(code);
+    return true;
+  }
+
+  /** A station can lose an admitted caller before play and keep the remaining call connected. */
+  reconcileStationMatch(rawCode: string, expectedHumans: 1 | 2): boolean {
+    const code = chessRoomCode(rawCode);
+    if (!code || ![1, 2].includes(expectedHumans)) return false;
+    const room = this.rooms.get(code);
+    if (!room) return this.configureMatch(code, expectedHumans);
+    const targetMode: ChessMode = expectedHumans === 2 ? 'pvp' : 'solo';
+    if (room.mode === targetMode) return true;
+    const bindings = this.voiceBindings.get(code);
+    if (!bindings?.size) return this.configureMatch(code, expectedHumans);
+    const state = room.state();
+    if (targetMode !== 'solo' || room.mode !== 'pvp' || state.phase !== 'waiting'
+      || state.ply !== 0 || bindings.size !== 1) return false;
+
+    const binding = bindings.values().next().value!;
+    this.cancelComputer(code);
+    this.clearWizardScene(code);
+    room.configureMode('solo');
+    bindings.clear();
+    binding.color = room.humanColor;
+    bindings.set(binding.color, binding);
+    room.setPlayerSeat(binding.color, binding.playerId, binding.name,
+      binding.connected, binding.nameConfirmed);
+    this.flush(room);
+    this.pushState(code);
+    this.maybeScheduleComputer(code, room);
+    return true;
+  }
+
+  private bindingForCall(code: string, callSid: string): VoiceBinding | undefined {
+    return [...(this.voiceBindings.get(code)?.values() ?? [])]
+      .find(binding => binding.callSid === callSid.trim());
+  }
+
+  private firstBinding(code: string): VoiceBinding | undefined {
+    return this.voiceBindings.get(code)?.values().next().value;
+  }
+
+  private hasBindings(code: string): boolean {
+    return Boolean(this.voiceBindings.get(code)?.size);
+  }
+
   /** A complete screen/voice snapshot with the optional cinematic overlay. */
   snapshot(rawCode: string): ChessState | null {
     const code = chessRoomCode(rawCode);
@@ -147,9 +220,16 @@ export class ChessServer {
     if (!room) return null;
     const state = room.state();
     const scene = this.wizardScenes.get(code)?.snapshot ?? null;
-    const binding = this.voiceBindings.get(code);
+    const binding = this.firstBinding(code);
+    const vote = this.pvpRematchVotes.get(code);
+    const liveVote = state.mode === 'pvp' && vote?.gameId === state.gameId ? vote : null;
     return {
       ...state,
+      rematchReadyPlayerIds: state.mode === 'pvp'
+        ? [...(this.voiceBindings.get(code)?.values() ?? [])]
+          .filter(player => liveVote?.callSids.has(player.callSid)).map(player => player.playerId)
+        : undefined,
+      rematchWaitingForPhone: state.mode === 'pvp' ? Boolean(liveVote?.finishing) : undefined,
       wizardAvailable: Boolean(binding?.connected && this.canStartWizardScene(code, binding.callSid, state)),
       wizardScene: scene ? { ...scene } : null,
     };
@@ -175,58 +255,214 @@ export class ChessServer {
   }
 
   voiceJoin(rawCode: string, name: string, callSid: string, _locale: SupportedLocale,
-    trustedStationAssignment = false):
+    trustedStationAssignment = false, stationSeatIndex?: 0 | 1, nameConfirmed = true):
     { playerId: string; resumed: boolean } | null {
     const code = chessRoomCode(rawCode);
     const sid = callSid.trim();
-    if (!code || !sid || !name.trim()) return null;
-    const current = this.voiceBindings.get(code);
-    if (current && current.callSid !== sid) return null;
+    if (!code || !sid || !name.trim()
+      || (stationSeatIndex !== undefined && stationSeatIndex !== 0 && stationSeatIndex !== 1)) return null;
+    const current = this.bindingForCall(code, sid);
     if (!current && !trustedStationAssignment
       && this.requiresDisplayAuth(code) && !this.hasAuthenticatedDisplay(code)) return null;
     const room = this.getOrCreateRoom(code);
     if (!room) return null;
     if (trustedStationAssignment) this.stationRooms.add(code);
     if (current) {
+      this.retirePvpRematchVote(code, sid);
+      current.welcomeGeneration += 1;
+      room.clearWaitingPhoneTurns(current.color);
+      room.setPlayerWelcomePending(current.color);
       current.connected = true;
-      room.setPlayerConnected(true);
+      room.setPlayerSeatConnected(current.color, true);
       this.pushState(code);
       this.maybeScheduleComputer(code, room);
       return { playerId: current.playerId, resumed: true };
     }
+    const existing = this.voiceBindings.get(code);
+    if (room.mode === 'solo' && existing?.size) return null;
+    if (room.mode === 'pvp' && existing?.size === 2) return null;
+    if (room.mode === 'pvp' && room.state().phase === 'finished' && existing?.size) return null;
     // A fixed station result belongs to its current match until station handoff.
     if (this.stationRooms.has(code) && room.state().phase === 'finished') return null;
-    this.cancelResultReconnect(code);
-    this.clearWizardScene(code);
-    if (this.previouslyBoundRooms.has(code)) {
-      this.cancelComputer(code);
-      room.reset();
+    if (!existing?.size) {
+      this.pvpRematchVotes.delete(code);
+      this.cancelResultReconnect(code);
+      this.clearWizardScene(code);
+      if (this.previouslyBoundRooms.has(code)) {
+        this.cancelComputer(code);
+        room.reset();
+      }
     }
     this.previouslyBoundRooms.add(code);
-    const playerId = 'c1';
-    this.voiceBindings.set(code, { callSid: sid, playerId, connected: true });
-    room.setPlayerConnected(true);
+    const color: ChessColor = room.mode === 'solo' ? room.humanColor
+      : stationSeatIndex === 0 ? 'w' : stationSeatIndex === 1 ? 'b'
+        : existing?.has('w') ? 'b' : 'w';
+    if (room.mode === 'pvp' && existing?.has(color)) return null;
+    const playerId = room.mode === 'pvp' && color === 'b' ? 'c2' : 'c1';
+    // Standalone solo play has always begun without a spoken name. PvP and
+    // station matches hold their board until the caller confirms one.
+    const confirmedForMode = room.mode === 'pvp' || trustedStationAssignment
+      ? nameConfirmed : true;
+    const binding: VoiceBinding = { callSid: sid, playerId, color,
+      name: name.trim().slice(0, 40), nameConfirmed: confirmedForMode, connected: true,
+      welcomeGeneration: 1, welcomeCueSequence: 0 };
+    const bindings = existing ?? new Map<ChessColor, VoiceBinding>();
+    bindings.set(color, binding);
+    this.voiceBindings.set(code, bindings);
+    room.setPlayerSeat(color, playerId, binding.name, true, confirmedForMode, room.mode !== 'pvp');
     this.flush(room);
     this.pushState(code);
     this.maybeScheduleComputer(code, room);
     return { playerId, resumed: false };
   }
 
+  voiceConfirmName(rawCode: string, callSid: string, name: string): boolean {
+    const code = chessRoomCode(rawCode);
+    if (!code) return false;
+    const binding = this.bindingForCall(code, callSid);
+    const room = this.rooms.get(code);
+    const confirmed = room && binding && room.confirmPlayerName(binding.color, name);
+    if (!confirmed || !binding) return false;
+    binding.name = name.trim().slice(0, 40);
+    binding.nameConfirmed = true;
+    this.pushState(code);
+    return true;
+  }
+
+  /** Begin the caller's own welcome cue after their name is confirmed. */
+  voiceBeginWelcome(rawCode: string, callSid: string): (played: boolean) => void {
+    const code = chessRoomCode(rawCode);
+    const room = code ? this.rooms.get(code) : undefined;
+    const binding = code ? this.bindingForCall(code, callSid) : undefined;
+    if (!code || !room || room.mode !== 'pvp' || !binding?.connected || !binding.nameConfirmed)
+      return () => {};
+    const generation = binding.welcomeGeneration;
+    const gameId = room.state().gameId;
+    const cueSequence = ++binding.welcomeCueSequence;
+    if (room.setPlayerWelcomePending(binding.color)) this.pushState(code);
+    let released = false;
+    return played => {
+      if (released) return;
+      released = true;
+      if (this.rooms.get(code) !== room || room.state().gameId !== gameId
+        || this.bindingForCall(code, callSid) !== binding || !binding.connected
+        || binding.welcomeGeneration !== generation
+        || binding.welcomeCueSequence !== cueSequence) return;
+      const changed = played ? room.markPlayerWelcomeReady(binding.color)
+        : room.markPlayerWelcomeFailed(binding.color);
+      if (changed) this.pushState(code);
+    };
+  }
+
+  voiceBeginWaitingTurn(rawCode: string, callSid: string): () => void {
+    const code = chessRoomCode(rawCode);
+    const room = code ? this.rooms.get(code) : undefined;
+    const binding = code ? this.bindingForCall(code, callSid) : undefined;
+    if (!code || !room || !binding?.connected) return () => {};
+    const releaseTurn = room.beginWaitingPhoneTurn(binding.color);
+    if (!releaseTurn) return () => {};
+    const generation = binding.welcomeGeneration;
+    const gameId = room.state().gameId;
+    this.pushState(code);
+    return () => {
+      if (this.rooms.get(code) !== room || room.state().gameId !== gameId
+        || this.bindingForCall(code, callSid) !== binding || !binding.connected
+        || binding.welcomeGeneration !== generation) return;
+      if (releaseTurn()) this.pushState(code);
+    };
+  }
+
+  voiceMarkWaitingTurnFailed(rawCode: string, callSid: string): void {
+    const code = chessRoomCode(rawCode);
+    const room = code ? this.rooms.get(code) : undefined;
+    const binding = code ? this.bindingForCall(code, callSid) : undefined;
+    if (!code || !room || room.mode !== 'pvp' || room.phase !== 'waiting'
+      || !binding?.connected) return;
+    if (room.markWaitingPhoneTurnFailed(binding.color)) this.pushState(code);
+  }
+
+  voiceMarkWaitingTurnRecovered(rawCode: string, callSid: string): void {
+    const code = chessRoomCode(rawCode);
+    const room = code ? this.rooms.get(code) : undefined;
+    const binding = code ? this.bindingForCall(code, callSid) : undefined;
+    if (!code || !room || room.mode !== 'pvp' || room.phase !== 'waiting'
+      || !binding?.connected) return;
+    if (room.markWaitingPhoneTurnRecovered(binding.color)) this.pushState(code);
+  }
+
+  /** Both callers must request a replay; the host then waits for their phone recaps. */
+  voiceRequestPvpRematch(rawCode: string, callSid: string): 'unavailable' | 'waiting' | 'ready' {
+    const code = chessRoomCode(rawCode);
+    if (!code) return 'unavailable';
+    const room = this.rooms.get(code);
+    const binding = this.bindingForCall(code, callSid);
+    const bindings = this.voiceBindings.get(code);
+    const state = room?.state();
+    if (!room || state?.mode !== 'pvp' || state.phase !== 'finished'
+      || !binding?.connected || !binding.nameConfirmed || bindings?.size !== 2
+      || this.stationReplayForbidden(code) || this.wizardScenes.has(code)) return 'unavailable';
+    let vote = this.pvpRematchVotes.get(code);
+    if (vote?.gameId !== state.gameId) {
+      vote = { gameId: state.gameId, callSids: new Set(), finishing: false };
+      this.pvpRematchVotes.set(code, vote);
+    }
+    vote.callSids.add(binding.callSid);
+    const ready = [...bindings.values()].every(player => player.connected && player.nameConfirmed
+      && vote.callSids.has(player.callSid));
+    if (ready && !vote.finishing) {
+      vote.finishing = true;
+      queueMicrotask(() => { void this.finishPvpRematchWhenSpeechSettled(code, room, vote); });
+    }
+    this.pushState(code);
+    return ready ? 'ready' : 'waiting';
+  }
+
+  private async finishPvpRematchWhenSpeechSettled(
+    code: string, room: ChessRoom, vote: PvpRematchVote,
+  ): Promise<void> {
+    try { await this.pvpRematchSpeechBarrier(code); } catch { /* Failed speech is settled speech. */ }
+    const bindings = this.voiceBindings.get(code);
+    const state = room.state();
+    if (this.pvpRematchVotes.get(code) !== vote || this.rooms.get(code) !== room
+      || this.stationReplayForbidden(code) || state.mode !== 'pvp'
+      || state.phase !== 'finished' || state.gameId !== vote.gameId
+      || bindings?.size !== 2 || ![...bindings.values()].every(player => player.connected
+        && player.nameConfirmed && vote.callSids.has(player.callSid))) return;
+    this.pvpRematchVotes.delete(code);
+    if (!room.rematchPvp()) return;
+    this.flush(room);
+    this.pushState(code);
+  }
+
+  private retirePvpRematchVote(code: string, callSid: string): void {
+    const vote = this.pvpRematchVotes.get(code);
+    if (!vote) return;
+    const callSids = new Set(vote.callSids);
+    callSids.delete(callSid.trim());
+    if (!callSids.size) this.pvpRematchVotes.delete(code);
+    else this.pvpRematchVotes.set(code, { gameId: vote.gameId, callSids, finishing: false });
+  }
+
   hasVoiceBinding(rawCode: string, callSid: string): boolean {
     const code = chessRoomCode(rawCode);
-    return Boolean(code && this.voiceBindings.get(code)?.callSid === callSid.trim());
+    return Boolean(code && this.bindingForCall(code, callSid));
   }
 
   voiceSetConnected(rawCode: string, callSid: string, connected: boolean): boolean {
     const code = chessRoomCode(rawCode);
     if (!code) return false;
-    const binding = this.voiceBindings.get(code);
+    const binding = this.bindingForCall(code, callSid);
     const room = this.rooms.get(code);
-    if (!binding || binding.callSid !== callSid.trim() || !room) return false;
+    if (!binding || !room) return false;
     if (binding.connected === connected) return true;
+    this.retirePvpRematchVote(code, callSid);
     binding.connected = connected;
+    if (room.mode === 'pvp') {
+      binding.welcomeGeneration += 1;
+      room.setPlayerWelcomePending(binding.color);
+    }
     if (!connected) this.cancelComputer(code);
-    room.setPlayerConnected(connected);
+    room.setPlayerSeatConnected(binding.color, connected);
     this.pushState(code);
     if (connected) this.maybeScheduleComputer(code, room);
     return true;
@@ -236,8 +472,8 @@ export class ChessServer {
     const code = chessRoomCode(rawCode);
     if (!code) return null;
     const room = this.rooms.get(code);
-    const binding = this.voiceBindings.get(code);
-    if (!room || !binding?.connected || binding.callSid !== callSid.trim()) return null;
+    const binding = this.bindingForCall(code, callSid);
+    if (!room || !binding?.connected) return null;
     const scene = this.wizardScenes.get(code);
     if (scene) return this.handleWizardSceneCommand(code, scene, text, locale);
     if (isWizardChessTrigger(text, locale) && this.canStartWizardScene(code, binding.callSid, room.state())) {
@@ -250,7 +486,7 @@ export class ChessServer {
           ? 'A estação vai preparar a próxima partida. Aguarde a próxima rodada.'
           : 'The station will prepare the next match. Please wait for the next round.' };
     }
-    const result = room.handleVoiceCommand(text, locale);
+    const result = room.handleVoiceCommand(text, locale, binding.color);
     this.flush(room);
     this.pushState(code);
     if (result.code === 'confirmed') this.maybeScheduleComputer(code, room);
@@ -261,17 +497,17 @@ export class ChessServer {
     const code = chessRoomCode(rawCode);
     if (!code) return [];
     if (this.wizardScenes.has(code)) return [];
-    const binding = this.voiceBindings.get(code);
-    if (!binding?.connected || binding.callSid !== callSid.trim()) return [];
-    return this.rooms.get(code)?.legalVoiceMoves(locale) ?? [];
+    const binding = this.bindingForCall(code, callSid);
+    if (!binding?.connected) return [];
+    return this.rooms.get(code)?.legalVoiceMoves(locale, binding.color) ?? [];
   }
 
   voiceRestart(rawCode: string, callSid: string): boolean {
     const code = chessRoomCode(rawCode);
     if (!code) return false;
     const room = this.rooms.get(code);
-    const binding = this.voiceBindings.get(code);
-    if (!room || !binding?.connected || binding.callSid !== callSid.trim()
+    const binding = this.bindingForCall(code, callSid);
+    if (!room || room.mode === 'pvp' || !binding?.connected
       || this.wizardScenes.has(code) || room.state().phase !== 'finished'
       || this.stationReplayForbidden(code)) return false;
     this.cancelResultReconnect(code);
@@ -284,21 +520,27 @@ export class ChessServer {
     return true;
   }
 
-  voiceLeave(rawCode: string, callSid: string): void {
+  voiceLeave(rawCode: string, callSid: string, retireNoShow = false): void {
     const code = chessRoomCode(rawCode);
     if (!code) return;
-    const binding = this.voiceBindings.get(code);
-    if (!binding || binding.callSid !== callSid.trim()) return;
-    this.voiceBindings.delete(code);
+    const binding = this.bindingForCall(code, callSid);
+    if (!binding) return;
+    this.retirePvpRematchVote(code, callSid);
+    const bindings = this.voiceBindings.get(code)!;
+    bindings.delete(binding.color);
+    if (!bindings.size) this.voiceBindings.delete(code);
     const used = this.wizardUsedCallSids.get(code);
     used?.delete(binding.callSid);
     if (used?.size === 0) this.wizardUsedCallSids.delete(code);
     this.cancelComputer(code);
     const room = this.rooms.get(code);
-    room?.setPlayerConnected(false);
+    room?.removePlayerSeat(binding.color, retireNoShow);
     const scene = this.wizardScenes.get(code);
     if (scene?.snapshot.phase === 'ready') this.maybeScheduleWizardOrphan(code, scene);
-    if (room) this.pushState(code);
+    if (room) {
+      this.flush(room);
+      this.pushState(code);
+    }
     this.reap(code);
   }
 
@@ -315,6 +557,7 @@ export class ChessServer {
     }
     this.rooms.delete(code);
     this.voiceBindings.delete(code);
+    this.pvpRematchVotes.delete(code);
     this.previouslyBoundRooms.delete(code);
     this.stationRooms.delete(code);
     this.wizardUsedCallSids.delete(code);
@@ -333,6 +576,7 @@ export class ChessServer {
     for (const display of this.displays) display.ws.terminate();
     this.displays.clear();
     this.voiceBindings.clear();
+    this.pvpRematchVotes.clear();
     this.rooms.clear();
     this.previouslyBoundRooms.clear();
     this.stationRooms.clear();
@@ -405,6 +649,20 @@ export class ChessServer {
         this.send(display, { type: 'error', code: 'bad_display_auth', message: 'Display authentication required.' });
         return;
       }
+      if (message.mode !== undefined) {
+        const mode: ChessMode | null = message.mode === 'solo' || message.mode === 'pvp'
+          ? message.mode : null;
+        if (!mode || this.requiresDisplayAuth(code) || this.stationRooms.has(code)) {
+          this.send(display, { type: 'error', code: 'bad_display_auth',
+            message: 'This display cannot select the Chess match mode.' });
+          return;
+        }
+        if (this.rooms.get(code)?.mode !== mode && !this.configureMatch(code, mode === 'pvp' ? 2 : 1)) {
+          this.send(display, { type: 'error', code: 'mode_locked',
+            message: 'The Chess mode is locked after a caller joins.' });
+          return;
+        }
+      }
       const room = this.getOrCreateRoom(code);
       if (!room) {
         this.send(display, { type: 'error', code: 'room_capacity', message: 'Chess room capacity exhausted.' });
@@ -436,6 +694,26 @@ export class ChessServer {
         this.reap(code);
         const scene = this.wizardScenes.get(code);
         if (scene) this.maybeScheduleWizardDisplayFallback(code, scene);
+      }
+      return;
+    }
+    if (message.type === 'display_set_mode') {
+      const code = chessRoomCode(message.roomCode);
+      const mode: ChessMode | null = message.mode === 'solo' || message.mode === 'pvp'
+        ? message.mode : null;
+      if (!code || !mode || !this.displayAuthorizedForRoom(display, code)
+        || this.stationRooms.has(code)) {
+        this.send(display, { type: 'error', code: 'bad_display_auth',
+          message: 'This display cannot select the Chess match mode.' });
+        return;
+      }
+      if (this.rooms.get(code)?.mode === mode) {
+        this.send(display, this.displayState(display, this.rooms.get(code)!));
+        return;
+      }
+      if (!this.configureMatch(code, mode === 'pvp' ? 2 : 1)) {
+        this.send(display, { type: 'error', code: 'mode_locked',
+          message: 'The Chess mode is locked after a caller joins.' });
       }
       return;
     }
@@ -503,6 +781,17 @@ export class ChessServer {
   }
 
   private flush(room: ChessRoom): void {
+    // Solo replay can swap sides; keep the bound call's seat aligned with the
+    // room before publishing the new board or accepting another command.
+    if (room.mode === 'solo') {
+      const binding = this.firstBinding(room.code);
+      if (binding && binding.color !== room.humanColor) {
+        const bindings = this.voiceBindings.get(room.code)!;
+        bindings.delete(binding.color);
+        binding.color = room.humanColor;
+        bindings.set(binding.color, binding);
+      }
+    }
     const events = room.drainEvents();
     if (!events.length) return;
     for (const display of this.displays) {
@@ -522,8 +811,9 @@ export class ChessServer {
 
   private canDisplayReplay(display: DisplayConnection, room: ChessRoom): boolean {
     const code = room.code;
-    const binding = this.voiceBindings.get(code);
+    const binding = this.firstBinding(code);
     return this.displayAuthorizedForRoom(display, code)
+      && room.mode === 'solo'
       && room.state().phase === 'finished' && room.state().playerConnected
       && Boolean(binding?.connected) && !this.stationReplayForbidden(code);
   }
@@ -547,8 +837,8 @@ export class ChessServer {
   }
 
   private canStartWizardScene(code: string, callSid: string, state: ChessState): boolean {
-    const binding = this.voiceBindings.get(code);
-    return Boolean(binding?.connected && binding.callSid === callSid && state.playerConnected
+    const binding = this.firstBinding(code);
+    return Boolean(state.mode !== 'pvp' && binding?.connected && binding.callSid === callSid && state.playerConnected
       && !state.result && state.turn === state.humanColor && !this.wizardScenes.has(code)
       && !this.wizardUsedCallSids.get(code)?.has(callSid)
       && (state.ply === 0 || (state.ply === 1 && state.lastMove?.actor === 'computer')));
@@ -676,7 +966,7 @@ export class ChessServer {
   }
 
   private isCurrentWizardScene(code: string, scene: WizardSceneRuntime): boolean {
-    const binding = this.voiceBindings.get(code);
+    const binding = this.firstBinding(code);
     return this.wizardScenes.get(code) === scene && this.rooms.get(code) === scene.room
       && scene.room.state().gameId === scene.gameId
       && (!binding || binding.callSid === scene.callSid);
@@ -700,9 +990,9 @@ export class ChessServer {
   }
 
   private maybeScheduleWizardOrphan(code: string, scene: WizardSceneRuntime): void {
-    if (scene.snapshot.phase !== 'ready' || this.voiceBindings.has(code) || scene.orphanTimer) return;
+    if (scene.snapshot.phase !== 'ready' || this.hasBindings(code) || scene.orphanTimer) return;
     const timer = setTimeout(() => {
-      if (!this.isCurrentWizardScene(code, scene) || this.voiceBindings.has(code)
+      if (!this.isCurrentWizardScene(code, scene) || this.hasBindings(code)
         || scene.snapshot.phase !== 'ready') return;
       scene.orphanTimer = null;
       this.clearWizardScene(code);
@@ -734,13 +1024,13 @@ export class ChessServer {
 
   private maybeScheduleComputer(code: string, room: ChessRoom): void {
     const state = room.state();
-    if (!state.playerConnected || state.phase === 'finished' || state.turn !== state.computerColor
+    if (state.mode === 'pvp' || !state.playerConnected || state.phase === 'finished' || state.turn !== state.computerColor
       || this.computerTimers.has(code) || this.wizardScenes.has(code)) return;
     const revision = state.revision;
     const timer = setTimeout(() => {
       if (this.computerTimers.get(code) !== timer) return;
       this.computerTimers.delete(code);
-      if (this.rooms.get(code) !== room || !this.voiceBindings.get(code)?.connected) return;
+      if (this.rooms.get(code) !== room || !this.firstBinding(code)?.connected) return;
       room.playComputerMove(revision);
       this.flush(room);
       this.pushState(code);
@@ -769,7 +1059,7 @@ export class ChessServer {
   }
 
   private reap(code: string): void {
-    if (this.voiceBindings.has(code) || [...this.displays].some(display => display.roomCode === code)) return;
+    if (this.hasBindings(code) || [...this.displays].some(display => display.roomCode === code)) return;
     const room = this.rooms.get(code);
     if (room?.state().phase === 'finished') {
       // Station handoff explicitly aborts the old match. A standalone display
@@ -778,7 +1068,7 @@ export class ChessServer {
       if (!this.resultReconnectTimers.has(code)) {
         const timer = setTimeout(() => {
           this.resultReconnectTimers.delete(code);
-          if (this.rooms.get(code) !== room || this.voiceBindings.has(code)
+          if (this.rooms.get(code) !== room || this.hasBindings(code)
             || [...this.displays].some(display => display.roomCode === code)
             || room.state().phase !== 'finished') return;
           this.deleteRoom(code);
@@ -803,6 +1093,7 @@ export class ChessServer {
     this.cancelComputer(code);
     this.clearWizardScene(code);
     this.rooms.delete(code);
+    this.pvpRematchVotes.delete(code);
     this.previouslyBoundRooms.delete(code);
     this.stationRooms.delete(code);
     this.wizardUsedCallSids.delete(code);

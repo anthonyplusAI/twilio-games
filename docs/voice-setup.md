@@ -27,7 +27,7 @@ In station mode, the server resolves the caller to one persisted admitted player
 
 Room `4821` is the standalone room only. Active station matches use generated 12-character engine room codes.
 
-For standalone testing, pause the event, open the intended shared display before placing the call, and close unused game displays. An eligible display must belong to an operator-enabled game, connect as `display=1`, join the call's room, and remain open. A connected socket that has not joined the room cannot claim the call. Standalone room `4821` does not use operator pairing or validate the station display token, so expose standalone routing only in a controlled deployment. Generated station rooms are different: their display must inherit the authenticated `ARCADE_DISPLAY_TOKEN` capability installed by `/operator`. Exactly one eligible standalone game display must be open; zero or multiple different game displays receive unavailable TwiML rather than an inferred game route.
+For standalone testing, pause the event, open the intended shared display before placing the call, and close unused game displays. An eligible display must belong to an operator-enabled game, connect as `display=1`, join the call's room, and remain open. A connected socket that has not joined the room cannot claim the call. Standalone room `4821` does not use operator pairing or validate the station display token, so expose standalone routing only in a controlled deployment. Generated station rooms are different: their display must inherit the authenticated `ARCADE_DISPLAY_TOKEN` capability installed by `/operator`. Multiple independent eligible display tabs are ambiguous even when they show the same game and receive unavailable TwiML; navigating one tab to another game can hand off its display binding.
 
 The selected game is passed to `/voice` as a Conversation Relay custom parameter and remains fixed for that call. `POST /voice/join` is a legacy alias: it uses a posted `Digits` value when present and otherwise uses `4821`. Non-default Trivia and Chess rooms require a room-authenticated display; the stock standalone pages use `4821`. Do not configure new numbers to use `/voice/join`.
 
@@ -148,9 +148,9 @@ Speech barge-in stops Relay TTS. Voice Racer and Voice Monsters also invalidate 
 
 ## Station Launch And Personal Setup
 
-The persisted match roster supplies a stable slot for every caller: one for Karaoke or Chess, up to two for Racer, Monsters, or Fighter, and up to four for Trivia. The server reuses each registered first name instead of asking for it again; only a station identity without a stored completed name falls back to voice name capture in games that require a name.
+The persisted match roster supplies a stable slot for every caller: one for Karaoke, up to two for Racer, Monsters, Fighter, or Chess, and up to four for Trivia. The server reuses each registered first name instead of asking for it again; only a station identity without a stored completed name falls back to voice name capture in games that require a name.
 
-Each caller controls only their personal setup choices. Racer, Monsters, and Fighter keep explicit shared phase gates; Racer and Fighter add a voting gate before gameplay. Trivia automatically opens category voting after all expected names are confirmed and begins loading when every caller has voted. Chess starts the duel without a setup phase. A one-caller Monsters or Fighter match creates an AI opponent after setup, and Chess always has a computer opponent; Karaoke and Trivia have no AI players.
+Each caller controls only their personal setup choices. Racer, Monsters, and Fighter keep explicit shared phase gates; Racer and Fighter add a voting gate before gameplay. Trivia automatically opens category voting after all expected names and phone prompts are complete and begins loading when every caller has voted and heard their confirmation. Two-caller Chess waits for both names and welcome cues before starting the duel. A one-caller Monsters or Fighter match creates an AI opponent after setup; one-caller Chess faces the computer. Karaoke and Trivia have no AI players.
 
 A station match starts only when the display has acknowledged the current launch generation, the selected engine has started, and every expected caller is connected and bound. The launch timeout is also the setup inactivity window. After all expected callers connect, each final speech prompt or DTMF input from either caller moves that deadline forward by the configured launch timeout; partial transcripts do not. Activity extends setup but does not mark gameplay started or redeem a coin.
 
@@ -164,18 +164,18 @@ This 30-second binding grace is separate from Relay session recovery. When `Sess
 
 ## Voice Racer
 
-Voice Racer supports up to two callers. Standalone play uses room `4821`; station play uses its generated engine room.
+Voice Racer supports up to two callers. Choose the caller count on the standalone home screen or add `players=2` to its display URL before the calls arrive. Standalone play uses room `4821`; station play uses its generated engine room. The shared display keeps each caller's name, car, and track vote visible. During a two-caller race, each car has its own top or bottom chase view with its name, place, lap, and power shown beside it.
 
 The voice flow is:
 
 1. In standalone play, say your name. Station play greets you by your registered first name.
-2. After the expected callers connect, either player says `start` to open car selection.
+2. After the expected callers connect, confirm their names, and finish the current phone prompts, either player says `start` to open car selection.
 3. Each player says their own car name or number.
-4. After every player picks a car, either player says `next` to open track voting.
+4. After every player picks a car and finishes the current phone prompt, either player says `next` to open track voting.
 5. Each player says their own track name or number. To correct a car or change a vote before advancing, say `actually` followed by the new choice (`na verdade` in Portuguese).
-6. After every player votes, either player says `start` to begin the race.
+6. After every player votes and finishes the current phone prompt, either player says `start` to begin the race. On a two-caller result screen, both callers say `race again` after hearing their recaps to start another race.
 
-Car and track selection is deterministic and never uses OpenAI. Station Racer prompts callers one at a time in participant order, while either connected caller may speak the phase-advance command after all required choices are complete. Unrecognized setup speech receives concise guidance for the current screen. No caller controls another player's choice. Near-simultaneous identical choices from different calls are treated as likely acoustic cross-talk and the second caller is asked to repeat. Interim-origin tracking, duplicate-final suppression, and a post-transition guard reduce the chance that delayed speech from an earlier phase is interpreted in the next phase; physically shared audio remains an operational risk and callers should avoid speakerphone near each other.
+Clear car and track choices use deterministic matching; the optional interpreter handles conversational requests. Callers may make their own choices in either order; either connected caller may speak the phase-advance command after all required choices and phone cues are complete. A two-caller standalone room does not allow Back or display Restart to rewind the other person's menu or race. The result screen waits for both phone recaps and both rematch requests, with each caller's status visible. Unrecognized setup speech receives concise guidance for the current screen. No caller controls another player's choice. Interim-origin tracking, duplicate-final suppression, and a post-transition guard reduce the chance that delayed speech from an earlier phase is interpreted in the next phase; physically shared audio remains an operational risk and callers should avoid speakerphone near each other.
 
 During countdown and racing, finalized transcripts use the fast local intent path. Command bursts can fire in order, while revisable interim hypotheses never mutate the car.
 
@@ -195,16 +195,16 @@ The caller hears onboarding, menu prompts, the final countdown, `Go`, selected r
 
 ## Voice Monsters
 
-Voice Monsters is a one-on-one room with up to two human callers. A solo player receives an AI opponent when the battle starts. A late caller can wait for the next round when a battle is already active. If both slots are occupied, the caller hears that the battle is full or in progress.
+Voice Monsters is a one-on-one room with up to two human callers. Choose one or two callers on the standalone home screen or add `players=2` to its display URL. A solo player receives an AI opponent when the battle starts. A late caller can wait for the next round when a battle is already active. If both slots are occupied, the caller hears that the battle is full or in progress.
 
 The voice flow is:
 
 1. In standalone play, say your name. Station play greets you by your registered first name.
-2. After the expected callers are ready, either player says `next` to open monster selection.
+2. Each caller says `next` after their name and lobby phone guidance. The shared display opens monster selection when both are ready.
 3. Each player says their own monster name, number, or ordinal such as `the second one`.
-4. After every player picks, either player says `battle` to begin.
+4. Each caller picks their own monster and says `battle` when ready. The battle begins after both choices and both confirmations.
 5. On your turn, say `attack` to hear the four moves, then say a move name or number. `Fight` remains an accepted alias, and a move name can also be spoken directly from the root menu.
-6. In standalone play, say `rematch` after the final result is ready. Station play returns to the station results and requeue flow instead.
+6. In standalone play, each caller says `rematch` after hearing the result. The shared result waits for both callers; station play returns to the station results and requeue flow instead.
 
 Root battle commands are:
 
@@ -224,18 +224,18 @@ The common 30-second caller binding and up-to-two Relay recovery attempts apply 
 
 ## Voice Fighter
 
-Voice Fighter accepts up to two humans during the lobby or fighter-selection phase. A solo player receives an AI rival. New callers cannot join after setup has moved beyond fighter selection. Each caller owns their fighter choice and arena vote, and every setup screen requires an explicit voice command before advancing.
+Voice Fighter accepts up to two humans during the lobby or fighter-selection phase. Choose one or two callers on the standalone home screen or add `players=2` to its display URL. A solo player receives an AI rival. New callers cannot join after setup has moved beyond fighter selection. Each caller owns their fighter choice and arena vote, and every setup screen requires an explicit voice command before advancing.
 
 The voice flow is:
 
 1. In standalone play, say your name. Station play greets you by your registered first name.
 2. Listen to the controls and how-to-play instructions while the display remains in the lobby.
-3. After the expected callers are ready, either player says `next` to open fighter selection.
+3. Each caller says `next` after their own lobby guidance. The shared display opens fighter selection when both are ready.
 4. Each player says their own fighter name or number.
-5. After every player chooses, either player says `next` to open arena voting.
-6. Each player says their own arena name or number, then either player says `start` after every vote is in.
+5. Each caller chooses a fighter and says `next`. Arena voting opens after both have confirmed.
+6. Each player says their own arena name or number, then says `start` when ready. The fight starts after both votes and both confirmations; an arena-vote tie has a deterministic room choice shown on the display.
 7. The selected arena loads, then starts the intro and countdown.
-8. In standalone play, say `rematch` after the fight and result sequence. The caller hears whether they were victorious or lost. Station play returns to the station results and requeue flow instead.
+8. In standalone play, each caller says `rematch` after hearing the fight result. The shared result waits for both callers; station play returns to the station results and requeue flow instead.
 
 Combat commands are:
 
@@ -256,18 +256,18 @@ The common 30-second caller binding and up-to-two Relay recovery attempts apply 
 
 ## Voice Trivia
 
-Voice Trivia is the fifth default-enabled game and stable station or Messaging option `5`. Station matches accept 1-4 callers; the default standalone voice route expects one caller. Trivia has no AI opponent and keeps question content, scoring, and timing server-authoritative; the optional semantic interpreter maps conversational answers to one of the current visible choices. Standalone play opens `/trivia.html?display=1&room=4821`; station play launches `/trivia.html` with a generated room and the current `station`, `match`, and `launchGeneration`. Both use the same-origin `/trivia?display=1` display WebSocket, while callers remain on `/voice`.
+Voice Trivia is the fifth default-enabled game and stable station or Messaging option `5`. Station and standalone matches accept 1-4 callers; choose the standalone count on the home screen or add `players=2`, `3`, or `4` to `/trivia.html?display=1&room=4821` (the default is one). Trivia has no AI opponent and keeps question content, scoring, and timing server-authoritative; the optional semantic interpreter maps conversational answers to one of the current visible choices. Station play launches `/trivia.html` with a generated room and the current `station`, `match`, and `launchGeneration`. Both use the same-origin `/trivia?display=1` display WebSocket, while callers remain on `/voice`.
 
 The standalone lobby displays the configured locale's call QR and linked number. Station launches use the station `/join` QR rail, which registers visitors before their assigned call is routed into the game.
 
 The voice flow is:
 
-1. In standalone play, each caller says a first name. Station play greets each caller by the registered first name unless it is missing. After all expected callers connect and confirm names, the server leaves `lobby` for `category_select`.
-2. Each caller votes by category name or spoken number: General Knowledge, Science, Geography, History, Entertainment, Sports, Technology, Twilio, or Mixed. Votes can be revised. A unique plurality wins; a tied plurality or no votes selects Mixed.
+1. In standalone play, each caller says a first name. Station play greets each caller by the registered first name unless it is missing. The lobby shows who is confirming a name, finishing a phone prompt, or ready. It leaves `lobby` only after all expected callers connect, confirm names, and finish their current setup speech.
+2. Each caller votes by category name or spoken number: General Knowledge, Science, Geography, History, Entertainment, Sports, Technology, Twilio, or Mixed. The shared display can cast the currently named unvoted caller's choice. Votes can be revised, and each caller hears their category confirmation. The display shows who is choosing, finishing a phone prompt, or ready; `loading` waits for every vote and its phone confirmation. A unique plurality wins; a tied plurality selects Mixed.
 3. `loading` snapshots eight questions and shuffled choices from the current bank. The display must authenticate when station-managed and send readiness for the current generation within 30 seconds. Readiness starts the three-second `countdown`; a timeout returns the room to category voting.
 4. After the countdown and each reveal, the server publishes a redacted `question_prompt` and waits for the authenticated display to acknowledge the painted question. Each current caller then hears the question. Once all callers finish or skip that prompt, the shared 25-second answer clock starts with `answer_cue`, before Relay reads the four numbered choices. The display shows the same authoritative countdown while the choices are spoken. Current-attempt and display-revision checks prevent old speech or paint acknowledgments from opening a later question. Relay playback completion uses a conservative duration estimate if no completion event exists. If choice audio fails or outlasts the clock, the room pauses in `audio_problem`. A standalone caller can ask the agent to retry the question, with at most two voice-initiated retries for that question across reconnects; a station round instead needs an authenticated operator to replay it. Neither recovery charges an unheard choice set.
 5. Callers may interrupt and answer at any time, including by DTMF `1`-`4`. An answer heard during the pre-clock question prompt is queued only for that question and locks when the shared clock opens; an answer heard while choices are being read locks immediately. Cardinal and ordinal words, conversational phrases, safe letter names, and the visible choice text or private aliases are accepted when unambiguous. Negated, incidental, and multi-choice mentions are rejected. The first valid final answer locks even when wrong; an on-time interim onset may receive its final frame during the 1.5-second transport grace. An unanswered reconnect receives current-question guidance without changing the shared clock; a locked reconnect does not replay it.
-6. `reveal` lasts four seconds and discloses the correct answer, explanation, per-player raw-point result, and standings. The cycle repeats for eight questions, then `results` reports raw score, normalized leaderboard score, correct answers, best streak, and rank. Winner, tie, and personal phone lines use the normalized leaderboard score shown on the final display. Standalone callers can say `play again`; station callers return through the station requeue flow.
+6. `reveal` lasts four seconds and discloses the correct answer, explanation, per-player raw-point result, and standings. The cycle repeats for eight questions, then `results` reports raw score, normalized leaderboard score, correct answers, best streak, and rank. Winner, tie, and personal phone lines use the normalized leaderboard score shown on the final display. In a standalone group, each caller first hears their own result recap, then can say `play again`; the display may also show a named replay control once that caller's recap is ready. The result stays visible until every caller opts in. Station callers return through the station requeue flow.
 
 The eight content categories are General Knowledge, Science, Geography, History, Entertainment, Sports, Technology, and Twilio. A selected-category round contains two easy, four medium, and two hard questions. Mixed contains one question from every category with the same overall difficulty split. The complete bank has 200 questions, 25 per category, and requires matching `en-US` and `pt-BR` choice IDs plus localized prompts, choices, optional private voice aliases, and explanations.
 
@@ -285,13 +285,13 @@ The display reconnects with exponential delays from 500 ms to 8 seconds, then re
 
 ## Voice Chess
 
-Voice Chess starts a one-caller match against the computer when selected; there is no setup menu. It is enabled by default, is stable station or Messaging option `6`, and randomly assigns the caller White or Black. Standalone play opens `/chess.html?display=1&room=4821`; station play launches `/chess.html` with its generated room and paired display capability. Viewers can adjust the board camera, but moves are accepted only through the caller's `/voice` session; the board uses `/chess?display=1`.
+Voice Chess offers one caller against the computer or two callers against each other. Choose the caller count on the standalone home screen or add `players=2` to `/chess.html?display=1&room=4821`. It is enabled by default and is stable station or Messaging option `6`; station matches use their assigned room and paired display capability. In solo mode, the server randomly assigns the caller White or Black. In two-caller mode, White and Black are stable human seats, the board shows both names and whose turn it is, and play waits until both callers connect, confirm their names, and finish their own phone introductions. Viewers can adjust the board camera, but moves are accepted only through each caller's own `/voice` session; the board uses `/chess?display=1`.
 
-While the standalone board waits for a caller, it shows the configured locale's call QR and linked number. The card hides once the caller connects. Station launches use the station `/join` QR rail instead.
+While the standalone board waits for its callers, it shows the configured locale's call QR and linked number. The board shows when a seat is connected, waiting for a name, or recovering from a dropped call. Station launches use the station `/join` QR rail instead.
 
-Say a complete move such as `pawn from E two to E four`, or select a piece first and take as long as needed before naming its destination. Say `castle` for the available castling move; if both sides are legal, the host asks which side. The phone repeats a legal proposed move; say `confirm` to play it or `cancel` to discard it. Keypad `1`, `0`, and `9` mean confirm, cancel, and help. Ambiguous and illegal moves require a clearer choice. The phone describes the computer's reply, captured pieces, checks, and the result. A standalone caller can say `play again` after the result; station play returns to the next round.
+Say a complete move such as `pawn from E two to E four`, or select a piece first and take as long as needed before naming its destination. Say `castle` for the available castling move; if both sides are legal, the host asks which side. The phone repeats a legal proposed move; say `confirm` to play it or `cancel` to discard it. Keypad `1`, `0`, and `9` mean confirm, cancel, and help. Ambiguous and illegal moves require a clearer choice. In a two-caller game, only the named player whose turn is on the board can move; both phones receive move and result guidance. A temporary disconnect pauses the match during the reconnect window; a completed call forfeits an active two-caller game. After a standalone result, both callers say `play again` on their own phones. The result stays on screen until both votes and phone announcements finish, then a fresh board and welcome cues begin with the same calls and names. Solo standalone play also supports replay; station play returns to the next round.
 
-The server validates moves and chooses computer replies. Its default search settings aim for an approachable 800–1200 Elo feel, which has not been measured as a formal rating. The shared display animates moves and captures, plays the supplied *The Marble Gambit* track with a gesture retry for blocked autoplay, and never submits a move. Drag the board to rotate the camera, right-drag or use two fingers to pan, scroll or pinch to zoom, and double-click to reset the view. Voice Chess has private activation metrics and station results, but no leaderboard.
+The server validates moves and chooses computer replies only in solo mode. Its default search settings aim for an approachable 800–1200 Elo feel, which has not been measured as a formal rating. The shared display animates moves and captures, plays the supplied *The Marble Gambit* track with a gesture retry for blocked autoplay, and never submits a move. Drag the board to rotate the camera, right-drag or use two fingers to pan, scroll or pinch to zoom, and double-click to reset the view. Voice Chess has private activation metrics and station results, but no leaderboard.
 
 ## Voice Karaoke
 
@@ -359,15 +359,15 @@ The integration tests open fake Conversation Relay and Media Stream WebSockets a
 
 ## Live Call Acceptance Pass
 
-Use the actual booth phone numbers and shared display, with the production OpenAI key configured. Run the common checks in both English and Brazilian Portuguese: interrupt the welcome/menu speech with a choice, paraphrase a command, pronounce a visible choice imperfectly, correct yourself mid-turn, and speak while the host is still talking. The old cue should stop, the intended current-screen action should happen once, and an ambiguous request should get a short clarification. Tap every visible menu or selector on the shared screen and confirm the same state change; live movement, attacks, chess moves, and trivia answers remain phone-controlled. After a phase change or reconnect, the host should describe the screen that is actually visible and should never restart name collection mid-game.
+Use the actual booth phone numbers and shared display, with the production OpenAI key configured. Run the common checks in both English and Brazilian Portuguese: interrupt the welcome/menu speech with a choice, paraphrase a command, pronounce a visible choice imperfectly, correct yourself mid-turn, and speak while the host is still talking. The old cue should stop, the intended current-screen action should happen once, and an ambiguous request should get a short clarification. Tap every visible menu or selector on the shared screen and confirm the same state change; live movement, attacks, chess moves, and trivia answers remain phone-controlled. For each multiplayer game, use separate phones, stagger one caller's spoken prompt behind another's ready choice, and verify the screen stays on the current menu until required phone playback and choices finish. Repeat with a dropped and reconnected call. After a phase change or reconnect, the host should describe the screen that is actually visible and should never restart name collection mid-game.
 
 | Game | Minimum live flow to verify |
 |---|---|
-| Racer | Choose a car and track by voice and tap; interrupt setup; steer, brake, and boost by phone; finish and hear the result. |
-| Monsters | Choose a monster by voice and tap; use a named move, guard, item, and taunt by phone; finish and start a free-play rematch. |
-| Fighter | Choose fighter and arena by voice and tap; move, jump, defend, and attack by phone; confirm the solo opponent is beatable; hear the result before station retirement. |
-| Trivia | Choose a category by voice and tap; answer while the question is being read; confirm the answer clock starts after the phone cue, and recover a failed cue without a duplicate round. |
-| Chess | Speak a legal move in more than one natural form, clarify an ambiguous move, hear an illegal-move correction, finish, and use the finished-screen replay selector. |
+| Racer | Two callers choose their own cars and track votes; steer, brake, and boost by phone; hear both result recaps and confirm that both replay choices are required. |
+| Monsters | Two callers choose their own names and monsters, use distinct moves, and confirm that both result choices and phone recaps gate a free-play rematch. |
+| Fighter | Two callers choose their own names and fighters, vote for an arena, move and attack by phone, then hear both results before any replay. |
+| Trivia | Four callers choose or vote for a category, answer while the question is read, start the answer clock only after the required phone cues, and recover a failed cue without a duplicate round. |
+| Chess | Two named callers play White and Black, hear turn-specific guidance, make legal and illegal move attempts, then finish and see the shared result. Stagger their replay votes and phone announcements to verify a same-call rematch waits for both. Also verify solo finished-screen replay. |
 | Karaoke | Choose a song by voice and tap; hear and see the scoring disclosure; explicitly consent by phone before media starts; sing, score, and reconnect for the result. |
 
 Confirm Twilio accepts `SA7eD52NRr8WAehitVt1` for English calls on the deployed account and that Portuguese calls retain their own voice. Check Conversation Relay error events and handset audio as well as the on-screen state; fake Relay tests cannot establish voice entitlement or real acoustic recognition quality.
@@ -410,7 +410,7 @@ Confirm `KARAOKE_TIMINGS_PATH` resolves through `/app/data` to Azure Files and t
 
 ### The caller hears the right game but cannot join
 
-Voice Racer may already have two players. Voice Monsters may have two occupied slots. Voice Fighter may have two players or may already be past fighter selection. Voice Karaoke may already have its one microphone slot occupied. Voice Trivia may already have four callers or may be past `lobby`. Voice Chess admits one controlling caller. End stale calls or reset the shared display before retrying.
+Voice Racer may already have two players. Voice Monsters may have two occupied slots. Voice Fighter may have two players or may already be past fighter selection. Voice Karaoke may already have its one microphone slot occupied. Voice Trivia may already have four callers or may be past `lobby`. Voice Chess admits one or two controlling callers according to the selected mode. End stale calls or reset the shared display before retrying.
 
 ### Speech works only after the caller finishes talking
 

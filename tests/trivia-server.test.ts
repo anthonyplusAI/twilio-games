@@ -113,6 +113,262 @@ async function advanceQuestionAudio(client: Client, code: string, phonePlayers: 
 }
 
 describe('TriviaServer authority and lifecycle', () => {
+  it('reserves the selected seats before the display can route a first phone call', async () => {
+    const port = await start();
+    let firstCaller: string | null = null;
+    let seatsAtRegistration: number | null = null;
+    trivia!.setOnDisplayRegistered((_ws, code) => {
+      seatsAtRegistration = trivia!.findRoom(code)?.state().expectedPlayerCount ?? null;
+      firstCaller = trivia!.voiceJoin(code, 'Ada', 1, false, 'en-US', { voiceSetup: true });
+    });
+
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: 'ATOMIC-SEATS', count: 3 });
+    await waitFor(display, message => message.type === 'trivia_state' && message.roomCode === 'ATOMIC-SEATS');
+
+    expect(seatsAtRegistration).toBe(3);
+    expect(firstCaller).toBeTruthy();
+    expect(trivia!.findRoom('ATOMIC-SEATS')?.state()).toMatchObject({
+      phase: 'lobby', expectedPlayerCount: 3, hasExpectedPlayers: false,
+    });
+  });
+
+  it('holds an early phone caller until the display restores its selected lobby size', async () => {
+    const port = await start();
+    const first = trivia!.voiceJoin('PHONE-FIRST', 'Ada', 1, true, 'en-US',
+      { voiceSetup: true, requireDisplay: true })!;
+    expect(first).toBeTruthy();
+    trivia!.voiceBeginSetupSpeech('PHONE-FIRST', first, 'lobby')!(true);
+    expect(trivia!.voiceSnapshot('PHONE-FIRST', first)?.awaitingDisplay).toBe(true);
+    expect(trivia!.voiceAdvance('PHONE-FIRST', first)).toBe(false);
+    expect(trivia!.findRoom('PHONE-FIRST')?.phase).toBe('lobby');
+
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: 'PHONE-FIRST', count: 3 });
+    await waitFor(display, message => message.type === 'trivia_state' && message.expectedPlayerCount === 3);
+    expect(trivia!.voiceSnapshot('PHONE-FIRST', first)?.awaitingDisplay).toBe(false);
+    expect(trivia!.findRoom('PHONE-FIRST')?.state()).toMatchObject({
+      phase: 'lobby', expectedPlayerCount: 3, hasExpectedPlayers: false,
+      players: [{ playerId: first, setupStatus: 'phone' }],
+    });
+    expect(trivia!.voiceJoin('PHONE-FIRST', 'Grace', 1, true, 'en-US', { voiceSetup: true })).toBeTruthy();
+
+    const solo = trivia!.voiceJoin('PHONE-FIRST-SOLO', 'Katherine', 1, true, 'en-US',
+      { voiceSetup: true, requireDisplay: true })!;
+    trivia!.voiceBeginSetupSpeech('PHONE-FIRST-SOLO', solo, 'lobby')!(true);
+    expect(trivia!.voiceAdvance('PHONE-FIRST-SOLO', solo)).toBe(false);
+    const soloDisplay = await connect(port);
+    send(soloDisplay, { type: 'spectate', roomCode: 'PHONE-FIRST-SOLO', count: 1 });
+    await waitFor(soloDisplay, message => message.type === 'trivia_state' && message.expectedPlayerCount === 1);
+    expect(trivia!.voiceAdvance('PHONE-FIRST-SOLO', solo)).toBe(true);
+    expect(trivia!.findRoom('PHONE-FIRST-SOLO')?.phase).toBe('category_select');
+  });
+
+  it('rejects inline seat changes from standby and station displays', async () => {
+    const port = await start({ displayToken: 'secret' });
+    trivia!.setDisplayAuthenticationRequirement(code => code === 'STATION');
+
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'SHARED-SEATS', count: 2 });
+    await waitFor(host, message => message.type === 'trivia_state' && message.expectedPlayerCount === 2);
+    const standby = await connect(port);
+    send(standby, { type: 'spectate', roomCode: 'SHARED-SEATS', count: 4 });
+    await waitFor(standby, message => message.type === 'error' && message.code === 'forbidden');
+    expect(trivia!.findRoom('SHARED-SEATS')?.state().expectedPlayerCount).toBe(2);
+
+    const station = await connect(port);
+    send(station, { type: 'display_auth', roomCode: 'STATION', token: 'secret' });
+    send(station, { type: 'spectate', roomCode: 'STATION', count: 4 });
+    await waitFor(station, message => message.type === 'error' && message.code === 'forbidden');
+    expect(trivia!.findRoom('STATION')).toBeUndefined();
+
+    const invalid = await connect(port);
+    send(invalid, { type: 'spectate', roomCode: 'INVALID-SEATS', count: '3' });
+    await waitFor(invalid, message => message.type === 'error' && message.code === 'bad_spectate');
+    expect(trivia!.findRoom('INVALID-SEATS')).toBeUndefined();
+  });
+
+  it('does not register a replacement display whose requested count conflicts with an active lobby', async () => {
+    const port = await start();
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'LOCKED-SEATS', count: 2 });
+    await waitFor(host, message => message.type === 'trivia_state' && message.expectedPlayerCount === 2);
+    const first = trivia!.voiceJoin('LOCKED-SEATS', 'Ada', 1, true)!;
+    expect(first).toBeTruthy();
+    const closed = new Promise<void>(resolve => host.ws.once('close', () => resolve()));
+    host.ws.close();
+    await closed;
+
+    const replacement = await connect(port);
+    const serverSocket = [...(trivia as unknown as { conns: Set<{ ws: WebSocket }> }).conns].at(-1)!.ws;
+    send(replacement, { type: 'spectate', roomCode: 'LOCKED-SEATS', count: 3 });
+    await waitFor(replacement, message => message.type === 'error' && message.code === 'setup_locked');
+    expect(trivia!.hasStandaloneDisplay(serverSocket, 'LOCKED-SEATS')).toBe(false);
+    expect(trivia!.findRoom('LOCKED-SEATS')?.state().expectedPlayerCount).toBe(2);
+  });
+
+  it('applies a promoted standalone display’s new seat count before callers join', async () => {
+    const port = await start();
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'HANDOFF' });
+    await waitFor(host, message => message.type === 'host_identity' && message.isHost === true);
+    send(host, { type: 'configure_seats', roomCode: 'HANDOFF', count: 1 });
+    await waitFor(host, message => message.type === 'trivia_state' && message.automaticSetup === true);
+
+    const standby = await connect(port);
+    send(standby, { type: 'spectate', roomCode: 'HANDOFF' });
+    await waitFor(standby, message => message.type === 'host_identity' && message.isHost === false);
+    send(standby, { type: 'configure_seats', roomCode: 'HANDOFF', count: 3 });
+    await waitFor(standby, message => message.type === 'error' && message.code === 'forbidden');
+    expect(trivia!.findRoom('HANDOFF')?.state().expectedPlayerCount).toBe(1);
+
+    const closed = new Promise<void>(resolve => host.ws.once('close', resolve));
+    host.ws.close(); await closed;
+    await waitFor(standby, message => message.type === 'host_identity' && message.isHost === true);
+    send(standby, { type: 'configure_seats', roomCode: 'HANDOFF', count: 3 });
+    await waitFor(standby, message => message.type === 'trivia_state' && message.expectedPlayerCount === 3);
+    expect(trivia!.findRoom('HANDOFF')?.state().expectedPlayerCount).toBe(3);
+  });
+
+  it('applies an inline standby count before publishing host promotion', async () => {
+    const port = await start();
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'ATOMIC-HANDOFF', count: 1 });
+    await waitFor(host, message => message.type === 'trivia_state' && message.expectedPlayerCount === 1);
+    const standby = await connect(port);
+    send(standby, { type: 'spectate', roomCode: 'ATOMIC-HANDOFF', count: 3 });
+    await waitFor(standby, message => message.type === 'host_identity' && message.isHost === false);
+
+    const closed = new Promise<void>(resolve => host.ws.once('close', resolve));
+    host.ws.close(); await closed;
+    await waitFor(standby, message => message.type === 'host_identity' && message.isHost === true);
+    expect(trivia!.findRoom('ATOMIC-HANDOFF')?.state().expectedPlayerCount).toBe(3);
+  });
+
+  it('does not promote an inline standby count that conflicts with a joined caller', async () => {
+    const port = await start();
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'LOCKED-HANDOFF', count: 2 });
+    await waitFor(host, message => message.type === 'trivia_state' && message.expectedPlayerCount === 2);
+    expect(trivia!.voiceJoin('LOCKED-HANDOFF', 'Ada', 1, true)).toBeTruthy();
+    const standby = await connect(port);
+    const serverSocket = [...(trivia as unknown as { conns: Set<{ ws: WebSocket }> }).conns].at(-1)!.ws;
+    send(standby, { type: 'spectate', roomCode: 'LOCKED-HANDOFF', count: 3 });
+    await waitFor(standby, message => message.type === 'host_identity' && message.isHost === false);
+
+    const closed = new Promise<void>(resolve => host.ws.once('close', resolve));
+    host.ws.close(); await closed;
+    await waitFor(standby, message => message.type === 'error' && message.code === 'setup_locked');
+    expect(trivia!.hasStandaloneDisplay(serverSocket, 'LOCKED-HANDOFF')).toBe(false);
+    expect(trivia!.findRoom('LOCKED-HANDOFF')?.state().expectedPlayerCount).toBe(2);
+  });
+
+  it('lets only the current standalone display reserve seats before caller setup', async () => {
+    const port = await start();
+    const host = await connect(port);
+    send(host, { type: 'spectate', roomCode: 'SHARED' });
+    await waitFor(host, message => message.type === 'host_identity' && message.isHost === true);
+    const other = await connect(port);
+    send(other, { type: 'spectate', roomCode: 'SHARED' });
+    await waitFor(other, message => message.type === 'host_identity' && message.isHost === false);
+    send(other, { type: 'configure_seats', roomCode: 'SHARED', count: 2 });
+    await waitFor(other, message => message.type === 'error' && message.code === 'forbidden');
+
+    send(host, { type: 'configure_seats', roomCode: 'SHARED', count: 3 });
+    await waitFor(host, message => message.type === 'trivia_state' && message.expectedPlayerCount === 3);
+    const first = trivia!.voiceJoin('SHARED', 'Player 1', 1, false, 'en-US', { voiceSetup: true })!;
+    expect(first).toBeTruthy();
+    expect(trivia!.findRoom('SHARED')!.state()).toMatchObject({ expectedPlayerCount: 3, hasExpectedPlayers: false });
+    expect(trivia!.voiceSnapshot('SHARED', first)?.players[0]?.setupStatus).toBe('name');
+    expect(trivia!.voiceSetName('SHARED', first, 'Ada')).toBe(true);
+    const release = trivia!.voiceBeginSetupSpeech('SHARED', first, 'lobby')!;
+    expect(trivia!.findRoom('SHARED')!.state().players[0]?.setupStatus).toBe('phone');
+    release(true);
+    expect(trivia!.findRoom('SHARED')!.state().players[0]?.setupStatus).toBe('ready');
+    send(host, { type: 'configure_seats', roomCode: 'SHARED', count: 2 });
+    await waitFor(host, message => message.type === 'error' && message.code === 'setup_locked');
+  });
+
+  it('keeps the current category and result prompts on same-seat display reconnect', async () => {
+    const now = { value: 0 };
+    const port = await start({ now: () => now.value,
+      roomFactory: (code, options) => new TriviaRoom(code, { ...options, countdownMs: 20 }) });
+    const code = 'DISPLAY-REPLAY';
+    const display = await connect(port);
+    send(display, { type: 'spectate', roomCode: code });
+    await waitFor(display, message => message.type === 'host_identity' && message.isHost === true);
+    send(display, { type: 'configure_seats', roomCode: code, count: 2 });
+    await waitFor(display, message => message.type === 'trivia_state' && message.expectedPlayerCount === 2);
+    const first = trivia!.voiceJoin(code, 'Ada', 1, true, 'en-US', { voiceSetup: true })!;
+    const second = trivia!.voiceJoin(code, 'Grace', 1, true, 'en-US', { voiceSetup: true })!;
+    trivia!.voiceBeginSetupSpeech(code, first, 'lobby')!(true);
+    trivia!.voiceBeginSetupSpeech(code, second, 'lobby')!(true);
+    expect(trivia!.voiceAdvance(code, first)).toBe(true);
+    expect(trivia!.voiceVoteCategory(code, first, 'science')).toBe(true);
+    const firstConfirmation = trivia!.voiceBeginSetupSpeech(code, first, 'category_select')!;
+    const room = trivia!.findRoom(code)!;
+    expect(room.state().players.find(player => player.playerId === first)?.setupStatus).toBe('phone');
+    const firstClosed = new Promise<void>(resolve => display.ws.once('close', () => resolve()));
+    display.ws.close();
+    await firstClosed;
+
+    const categoryDisplay = await connect(port);
+    send(categoryDisplay, { type: 'spectate', roomCode: code });
+    await waitFor(categoryDisplay, message => message.type === 'host_identity' && message.isHost === true);
+    const categoryStart = categoryDisplay.messages.length;
+    send(categoryDisplay, { type: 'configure_seats', roomCode: code, count: 2 });
+    await waitUntil(() => categoryDisplay.messages.slice(categoryStart).some(message => message.type === 'trivia_state'));
+    expect(room.state()).toMatchObject({ phase: 'category_select', expectedPlayerCount: 2,
+      categoryVoteCounts: { science: 1 } });
+    expect(room.state().players.find(player => player.playerId === first)?.setupStatus).toBe('phone');
+    expect(categoryDisplay.messages.slice(categoryStart).some(message => message.code === 'setup_locked')).toBe(false);
+
+    expect(trivia!.voiceVoteCategory(code, second, 'science')).toBe(true);
+    trivia!.voiceBeginSetupSpeech(code, second, 'category_select')!(true);
+    firstConfirmation(true);
+    expect(trivia!.voiceAdvance(code, first)).toBe(true);
+    expect(room.ready(room.state().loadingGeneration)).toBe(true);
+    now.value = room.state().countdownEndsAtMs!;
+    room.tick();
+    for (let index = 0; index < 8; index++) {
+      const question = room.state().question!;
+      const attempt = room.state().questionAttemptId!;
+      for (const playerId of [first, second]) {
+        const generation = room.beginPromptDelivery(playerId, question.id, attempt)!;
+        expect(room.questionPromptReady(playerId, question.id, attempt, generation)).toBe(true);
+      }
+      for (const playerId of [first, second]) {
+        const generation = room.beginAnswerCueDelivery(playerId, question.id, attempt)!;
+        expect(room.questionAnswerCueReady(playerId, question.id, attempt, generation)).toBe(true);
+      }
+      now.value = room.state().answeringStartsAtMs!;
+      const correct = bank.questions.find(candidate => candidate.id === question.id)!.correctChoiceId;
+      room.answer(first, correct);
+      room.answer(second, correct);
+      now.value = room.state().revealEndsAtMs!;
+      room.tick();
+    }
+    expect(room.phase).toBe('results');
+    const result = room.state().result;
+    trivia!.voiceBeginSetupSpeech(code, first, 'results')!(true);
+    const pendingRecap = trivia!.voiceBeginSetupSpeech(code, second, 'results')!;
+    const categoryClosed = new Promise<void>(resolve => categoryDisplay.ws.once('close', () => resolve()));
+    categoryDisplay.ws.close();
+    await categoryClosed;
+
+    const resultDisplay = await connect(port);
+    send(resultDisplay, { type: 'spectate', roomCode: code });
+    await waitFor(resultDisplay, message => message.type === 'host_identity' && message.isHost === true);
+    const resultStart = resultDisplay.messages.length;
+    send(resultDisplay, { type: 'configure_seats', roomCode: code, count: 2 });
+    await waitUntil(() => resultDisplay.messages.slice(resultStart).some(message => message.type === 'trivia_state'));
+    expect(room.state()).toMatchObject({ phase: 'results', expectedPlayerCount: 2, result });
+    expect(room.state().players.find(player => player.playerId === second)?.setupStatus).toBe('phone');
+    pendingRecap(true);
+    expect(room.state().players.find(player => player.playerId === second)?.setupStatus).toBe('replay');
+    expect(resultDisplay.messages.slice(resultStart).some(message => message.code === 'setup_locked')).toBe(false);
+  });
+
   it('allows only the current standalone caller to retry failed audio, with a per-question cap', () => {
     const now = { value: 0 };
     trivia = new TriviaServer({ bank, now: () => now.value,

@@ -38,6 +38,7 @@ button:focus-visible,a:focus-visible{outline:2px solid var(--chess-ruby);outline
 .music-button[data-state="blocked"]{border-color:rgba(239,48,73,.52);color:#ffd9de}
 .duel-labels{position:absolute;z-index:3;top:100px;left:5vw;right:5vw;display:flex;align-items:center;justify-content:space-between;gap:20px;pointer-events:none}
 .duel-label{display:inline-flex;align-items:center;gap:9px;padding:6px 0;color:#d6dfec;font:12px "Twilio Sans Mono",monospace;text-shadow:0 2px 8px #000}
+.chess-app[data-mode="pvp"] .duel-label{max-width:min(43vw,440px);padding:9px 12px;border:1px solid rgba(209,170,113,.42);border-radius:4px;background:rgba(8,20,42,.88);font-size:clamp(13px,1.2vw,18px);line-height:1.25;white-space:normal}
 .computer-label{text-align:right}
 .label-marker{display:inline-block;width:6px;height:6px;transform:rotate(45deg);background:var(--chess-ruby);box-shadow:0 0 15px var(--chess-ruby)}
 .computer-label .label-marker{background:var(--chess-blue);box-shadow:0 0 15px var(--chess-blue)}
@@ -124,6 +125,7 @@ body[data-renderer="fallback"] .scene-vignette{display:none}
 
 @media(max-width:1000px){.duel-labels{top:88px;left:30px;right:30px}.status-deck{width:290px}.move-note{width:230px}.call-card{width:210px;padding:14px}.call-card-qr-frame{width:144px;height:144px}body[data-renderer="fallback"] .accessible-board{top:48.5%;width:min(50vh,34vw);height:min(50vh,34vw)}}
 @media(max-width:720px){
+  .chess-app[data-mode="pvp"] .duel-label{max-width:48%;padding:5px 7px;font-size:10px}
   .result-overlay{padding:10px 10px 14px}
   .result-card{padding:18px 12px}
   #result-title{font-size:clamp(45px,12vw,72px)}
@@ -184,6 +186,7 @@ html[data-theme="light"] .icon-button:hover{border-color:#b91c39;background:#fff
 html[data-theme="light"] .music-button[data-state="playing"]{border-color:#a77a42;background:#fff3e0;color:#6a451a}
 html[data-theme="light"] .music-button[data-state="blocked"]{border-color:#b91c39;color:#8e152d}
 html[data-theme="light"] .duel-label{color:#20364f;text-shadow:0 1px 8px rgba(255,255,255,.95)}
+html[data-theme="light"] .chess-app[data-mode="pvp"] .duel-label{border-color:#9fb2c4;background:rgba(255,255,255,.91);text-shadow:none}
 html[data-theme="light"] .status-deck{border-color:#aebbc7;border-left-color:var(--chess-ruby);background:linear-gradient(125deg,rgba(255,255,255,.96),rgba(244,248,251,.92));box-shadow:0 16px 40px rgba(30,52,74,.16),inset 0 1px #fff}
 html[data-theme="light"] .status-deck p{color:#344c62}
 html[data-theme="light"] .move-prompt{border-top-color:#c7d0d9;color:#435a70}

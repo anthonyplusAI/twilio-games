@@ -372,7 +372,7 @@ export class HttpServer {
   }>();
   private readonly standaloneDisplaySessions = new WeakMap<WebSocket, string>();
   private readonly standaloneNavigationIntents = new Map<string, {
-    game: MountedVoiceGame; roomCode: string; expiresAtMs: number;
+    game: MountedVoiceGame; roomCode: string; expiresAtMs: number; afterDisplayOrder: number;
   }>();
   private readonly standaloneVoiceRouteWaiters = new Set<() => void>();
   private readonly standaloneTriviaDisplayCandidates = new WeakSet<WebSocket>();
@@ -650,6 +650,7 @@ export class HttpServer {
           this.voiceReconnectAttempts.delete(callSid);
         }
       } else if (game === 'chess') {
+        // Drop removed seats before switching a still-waiting two-caller room to solo.
         const retained = new Set(activeEnginePlayerIds);
         for (const [callSid, binding] of this.chessVoiceCallBindings) {
           if (binding.code !== roomCode || retained.has(binding.playerId)) continue;
@@ -660,11 +661,12 @@ export class HttpServer {
           }
           this.chessVoiceCallBindings.delete(callSid);
           this.analyticsObserver.chessAborted(roomCode);
-          this.chess.voiceLeave(roomCode, callSid);
+          this.chess.voiceLeave(roomCode, callSid, true);
           this.abandonUnfinishedChessStationRoom(roomCode);
           this.stationVoiceReconnectRoutes.delete(callSid);
           this.voiceReconnectAttempts.delete(callSid);
         }
+        this.chess.reconcileStationMatch(roomCode, count >= 2 ? 2 : 1);
       } else assertNever(game);
     });
     this.arcadeApi?.setPlayerResetCleanupHandler?.(context => this.cleanupResetPlayerHistory(context));
@@ -886,24 +888,39 @@ export class HttpServer {
       if (room) this.analyticsObserver.chessState(room);
       const state = room?.state();
       if (!state) return;
+      for (const session of this.chessVoice.get(roomCode) ?? []) session.onStateChanged();
       if (!this.arcadeApi?.isStationEngineRoom?.(roomCode)) return;
       const result = state.result;
-      this.updateStationEngineLifecycle(
-        'chess', roomCode, state.phase,
-        ['playing', 'pending'], ['finished'],
-        result ? [{
+      const results = !result ? [] : state.mode === 'pvp'
+        ? (state.players ?? []).map(seat => ({
+          enginePlayerId: seat.playerId,
+          rank: result.winner === null ? 1 : result.winner === seat.color ? 1 : 2,
+          completed: true,
+          won: result.winner === null ? null : result.winner === seat.color,
+          score: null,
+          durationSeconds: null,
+        }))
+        : [{
           enginePlayerId: 'c1',
           rank: result.winner === state.humanColor ? 1 : result.winner === null ? 1 : 2,
           completed: true,
           won: result.winner === null ? null : result.winner === state.humanColor,
           score: null,
           durationSeconds: null,
-        }] : [],
+        }];
+      this.updateStationEngineLifecycle(
+        'chess', roomCode, state.phase,
+        ['playing', 'pending'], ['finished'],
+        results,
         ['waiting'],
       );
     });
     this.chess.setOnRoomEvents((roomCode, events) => {
       for (const session of this.chessVoice.get(roomCode) ?? []) session.onRoomEvents(events);
+    });
+    this.chess.setPvpRematchSpeechBarrier(async roomCode => {
+      await Promise.allSettled([...(this.chessVoice.get(roomCode) ?? [])]
+        .map(session => session.whenSpeechSettled()));
     });
     // SMS concierge: resolves a room code to a live Room wrapped as a ConciergeRoom (adds car names).
     this.concierge = new SmsConcierge({ findRoom: (code) => this.conciergeRoom(code) });
@@ -1776,13 +1793,13 @@ export class HttpServer {
         return;
       }
       if (route === 'battle') {
-        if (!battle) battle = this.makeBattleSession(say);
+        if (!battle) battle = this.makeBattleSession(sayOutcome);
         battle.setAuthoritativeName(stationFirstName);
         battle.setStationManaged(stationManaged);
         if(stationManaged)battle.setStationAssignment(stationParticipantIndex,stationParticipantCount);
         battle.handleMessage(raw);
       } else if (route === 'fighter') {
-        if (!fighter) fighter = this.makeFighterSession(say);
+        if (!fighter) fighter = this.makeFighterSession(sayOutcome);
         fighter.setAuthoritativeName(stationFirstName);
         fighter.setStationManaged(stationManaged);
         if(stationManaged)fighter.setStationAssignment(stationParticipantIndex,stationParticipantCount);
@@ -1803,13 +1820,23 @@ export class HttpServer {
         );
         trivia.setAuthoritativeName(stationFirstName);
         trivia.setStationManaged(stationManaged);
-        trivia.setExpectedPlayers(stationManaged ? stationParticipantCount : 1);
+        let triviaRoomCode = trivia.boundRoomCode;
+        if (!triviaRoomCode) {
+          try {
+            const setup = JSON.parse(raw) as { customParameters?: { roomCode?: unknown } };
+            if (typeof setup.customParameters?.roomCode === 'string') triviaRoomCode = setup.customParameters.roomCode;
+          } catch { /* The voice session validates malformed setup frames. */ }
+        }
+        const standaloneCount = triviaRoomCode
+          ? this.trivia.findRoom(triviaRoomCode)?.expectedPlayerCount ?? 1 : 1;
+        trivia.setExpectedPlayers(stationManaged ? stationParticipantCount : standaloneCount);
         if (stationManaged) trivia.setStationAssignment(stationParticipantIndex);
         trivia.handleMessage(raw);
       } else if (route === 'chess') {
-        if (!chess) chess = this.makeChessSession(say, () => stationManaged);
+        if (!chess) chess = this.makeChessSession(say, () => stationManaged, () => stationParticipantCount);
         chess.setAuthoritativeName(stationFirstName);
         chess.setStationManaged(stationManaged);
+        if (stationManaged) chess.setStationAssignment(stationParticipantIndex, stationParticipantCount);
         chess.handleMessage(raw);
       } else if (route === 'racer') {
         adapter.setAuthoritativeName(stationFirstName);
@@ -1996,11 +2023,9 @@ export class HttpServer {
   private recentVoiceGame(roomCode: string = DEFAULT_ROOM): MountedVoiceGame|null {
     const live = this.eligibleStandaloneVoiceConnections(roomCode);
     if (!live.length) return null;
-    if (live.every(candidate => candidate.game === live[0]!.game)) return live[0]!.game;
-    // A browser tab can briefly leave its previous game's socket open (or even half-open on
-    // spotty Wi-Fi). A shared session ID indicates one tab; select only
-    // the newest *accepted* display. Cross-game overlaps from distinct tabs or legacy clients
-    // still fail closed.
+    if (live.length === 1) return live[0]!.game;
+    // Multiple accepted displays are one handoff only when they identify the same tab.
+    // Separate tabs stay ambiguous even if both happen to show the same game.
     const sessionId = live[0]!.sessionId;
     if (!sessionId || live.some(candidate => candidate.sessionId !== sessionId)) return null;
     return live.reduce((latest, candidate) => candidate.order > latest.order ? candidate : latest).game;
@@ -2009,14 +2034,16 @@ export class HttpServer {
   private hasNewerUnboundStandaloneDisplay(roomCode: string): boolean {
     const accepted = this.eligibleStandaloneVoiceConnections(roomCode);
     if (!accepted.length) return false;
-    const routedGame = this.recentVoiceGame(roomCode);
-    const newestAccepted = Math.max(...accepted.map(candidate => candidate.order));
+    const newestAccepted = accepted.reduce((latest, candidate) =>
+      candidate.order > latest.order ? candidate : latest);
     const acceptedSessions = new Set(accepted.map(candidate => candidate.sessionId));
     return [...this.standaloneDisplayCandidates].some(([ws, candidate]) => {
       const configuredGame = candidate.game === 'battle' ? 'monsters' : candidate.game;
-      return ws.readyState === WebSocket.OPEN && candidate.order > newestAccepted
-        && candidate.game !== routedGame
+      return ws.readyState === WebSocket.OPEN && candidate.order > newestAccepted.order
         && acceptedSessions.has(this.standaloneDisplaySessions.get(ws) ?? null)
+        // A same-game socket can reconnect before its spectate frame. A page GET
+        // is tracked separately and still holds a true same-game relaunch.
+        && candidate.game !== newestAccepted.game
         && (candidate.acceptedRoomCode === null || candidate.acceptedRoomCode === roomCode)
         && this.arcadeApi?.standaloneGameEnabled?.(configuredGame) !== false;
     });
@@ -2025,37 +2052,31 @@ export class HttpServer {
   /** A successful game-page GET can precede its WebSocket by more than the short call settle
    * window. A lone intent can also keep the call waiting while no display is bound. An intent
    * extends the wait but never chooses the game: only accepted spectate can do that. */
-  private pendingStandaloneNavigationSession(roomCode: string): string | null {
-    const accepted = this.eligibleStandaloneVoiceConnections(roomCode);
+  private pendingStandaloneNavigationSession(roomCode: string): { sessionId: string | null } | null {
     const now = Date.now();
-    if (!accepted.length) {
-      let sessionId: string | null = null;
-      for (const [id, intent] of this.standaloneNavigationIntents) {
-        if (intent.expiresAtMs <= now) {
-          this.standaloneNavigationIntents.delete(id);
-          continue;
-        }
-        const configuredGame = intent.game === 'battle' ? 'monsters' : intent.game;
-        if (intent.roomCode !== roomCode
-          || this.arcadeApi?.standaloneGameEnabled?.(configuredGame) === false) continue;
-        if (sessionId !== null) return null;
-        sessionId = id;
+    const acceptedSessions = new Set(this.eligibleStandaloneVoiceConnections(roomCode)
+      .map(candidate => candidate.sessionId));
+    const relevant: Array<[string, { game: MountedVoiceGame; afterDisplayOrder: number }]> = [];
+    for (const [id, intent] of this.standaloneNavigationIntents) {
+      if (intent.expiresAtMs <= now) {
+        this.standaloneNavigationIntents.delete(id);
+        continue;
       }
-      return sessionId;
+      const configuredGame = intent.game === 'battle' ? 'monsters' : intent.game;
+      // A page load in a separate tab has not accepted spectate yet; it cannot
+      // displace a different tab's active display for a new caller.
+      if (intent.roomCode === roomCode && (!acceptedSessions.size || acceptedSessions.has(id))
+        && this.arcadeApi?.standaloneGameEnabled?.(configuredGame) !== false) relevant.push([id, intent]);
     }
-    const sessionId = accepted[0]?.sessionId;
-    if (!sessionId || accepted.some(candidate => candidate.sessionId !== sessionId)) return null;
-    const intent = this.standaloneNavigationIntents.get(sessionId);
-    if (!intent) return null;
-    if (intent.expiresAtMs <= now) {
-      this.standaloneNavigationIntents.delete(sessionId);
-      return null;
-    }
-    if (intent.roomCode !== roomCode) return null;
-    const configuredGame = intent.game === 'battle' ? 'monsters' : intent.game;
-    if (this.arcadeApi?.standaloneGameEnabled?.(configuredGame) === false) return null;
-    const newestAccepted = accepted.reduce((latest, candidate) => candidate.order > latest.order ? candidate : latest);
-    return newestAccepted.game !== intent.game ? sessionId : null;
+    if (!relevant.length) return null;
+    if (relevant.length > 1) return { sessionId: null };
+    const [sessionId, intent] = relevant[0]!;
+    const accepted = this.eligibleStandaloneVoiceConnections(roomCode)
+      .filter(candidate => candidate.sessionId === sessionId);
+    const newestAccepted = accepted.reduce<(typeof accepted)[number] | null>((latest, candidate) =>
+      !latest || candidate.order > latest.order ? candidate : latest, null);
+    return !newestAccepted || newestAccepted.order <= intent.afterDisplayOrder
+      || newestAccepted.game !== intent.game ? { sessionId } : null;
   }
 
   private hasAcceptedStandaloneDisplay(game: MountedVoiceGame, ws: WebSocket,
@@ -2128,9 +2149,13 @@ export class HttpServer {
       if (intent.expiresAtMs <= now) this.standaloneNavigationIntents.delete(id);
     }
     const sessionId = sessions[0]!;
+    const afterDisplayOrder = this.eligibleStandaloneVoiceConnections(roomCode)
+      .filter(candidate => candidate.sessionId === sessionId)
+      .reduce((latest, candidate) => Math.max(latest, candidate.order), 0);
     this.standaloneNavigationIntents.delete(sessionId);
     this.standaloneNavigationIntents.set(sessionId, {
       game: pageGame, roomCode, expiresAtMs: now + STANDALONE_NAVIGATION_INTENT_TTL_MS,
+      afterDisplayOrder,
     });
     while (this.standaloneNavigationIntents.size > STANDALONE_NAVIGATION_INTENT_LIMIT) {
       this.standaloneNavigationIntents.delete(this.standaloneNavigationIntents.keys().next().value!);
@@ -2167,7 +2192,7 @@ export class HttpServer {
       };
       const check = () => {
         const pendingNavigationSession = this.pendingStandaloneNavigationSession(roomCode);
-        if (pendingNavigationSession) expectedNavigationSession ??= pendingNavigationSession;
+        if (pendingNavigationSession?.sessionId) expectedNavigationSession ??= pendingNavigationSession.sessionId;
         const game = gameForExpectedSession();
         if (!settled && game === initial) return;
         if (game && !this.hasNewerUnboundStandaloneDisplay(roomCode)
@@ -2175,7 +2200,7 @@ export class HttpServer {
       };
       const onDeadline = () => {
         const pendingNavigationSession = this.pendingStandaloneNavigationSession(roomCode);
-        if (pendingNavigationSession) expectedNavigationSession ??= pendingNavigationSession;
+        if (pendingNavigationSession?.sessionId) expectedNavigationSession ??= pendingNavigationSession.sessionId;
         const game = gameForExpectedSession();
         if (game && !this.hasNewerUnboundStandaloneDisplay(roomCode)
           && !pendingNavigationSession) {
@@ -2309,20 +2334,23 @@ export class HttpServer {
   private makeChessSession(
     say: (text: string, isCurrent?: () => boolean) => void | Promise<boolean>,
     stationManaged: () => boolean,
+    stationParticipantCount: () => number = () => 1,
   ): ChessVoiceSession {
     let session: ChessVoiceSession;
     session = new ChessVoiceSession({
-      bind: (rawCode, name, callSid, locale) => {
+      bind: (rawCode, name, callSid, locale, stationSeatIndex, nameConfirmed) => {
         const code = rawCode.trim().toUpperCase();
+        if (stationManaged()) this.chess.configureMatch(code, stationParticipantCount() >= 2 ? 2 : 1);
         const previous = this.chessVoiceCallBindings.get(callSid.trim());
         if (previous && previous.code !== code) this.endChessVoiceCall(callSid);
-        const joined = this.chess.voiceJoin(code, name, callSid, locale, stationManaged());
+        const joined = this.chess.voiceJoin(code, name, callSid, locale, stationManaged(), stationSeatIndex, nameConfirmed);
         if (!joined) return null;
         this.analyticsObserver.chessBound(code, callSid);
         this.rememberChessVoiceCall(callSid, code, joined.playerId, locale, stationManaged(), session);
         this.registerChessVoiceSession(code, session);
         return joined;
       },
+      confirmName: (code, callSid, name) => this.chess.voiceConfirmName(code, callSid, name),
       leave: (code, playerId, callSid) => {
         this.unregisterChessVoiceSession(session);
         this.scheduleChessVoiceLeave(code, playerId, callSid, session);
@@ -2340,6 +2368,15 @@ export class HttpServer {
         if (restarted) this.analyticsObserver.voiceCommand('chess');
         return restarted;
       },
+      requestPvpRematch: (code, callSid) => {
+        const vote = this.chess.voiceRequestPvpRematch(code, callSid);
+        if (vote !== 'unavailable') this.analyticsObserver.voiceCommand('chess');
+        return vote;
+      },
+      beginWelcome: (code, callSid) => this.chess.voiceBeginWelcome(code, callSid),
+      beginWaitingTurn: (code, callSid) => this.chess.voiceBeginWaitingTurn(code, callSid),
+      markWaitingTurnFailed: (code, callSid) => this.chess.voiceMarkWaitingTurnFailed(code, callSid),
+      markWaitingTurnRecovered: (code, callSid) => this.chess.voiceMarkWaitingTurnRecovered(code, callSid),
       snapshot: code => this.chess.snapshot(code),
       legalMoves: (code, callSid, locale) => this.chess.voiceLegalMoves(code, callSid, locale),
       interpret: (spoken, locale, context, isCurrent) => {
@@ -2497,7 +2534,9 @@ export class HttpServer {
           expectedPlayers,
           nameConfirmed,
           locale,
-          { stationFixed: fixed, allowReplay: !fixed, ...(participantIndex !== undefined ? { participantIndex } : {}) },
+          { stationFixed: fixed, allowReplay: !fixed, voiceSetup: true,
+            requireDisplay: !fixed && this.voiceReconnectAttempts.has(callSid),
+            ...(participantIndex !== undefined ? { participantIndex } : {}) },
         );
         if (!playerId) return null;
         this.rememberTriviaVoiceCall(callSid, code, playerId, locale, participantIndex, session);
@@ -2524,6 +2563,10 @@ export class HttpServer {
         if (accepted && explicit) this.analyticsObserver.voiceCommand('trivia');
         return accepted;
       },
+      beginSetupSpeech: (code, playerId, phase) =>
+        this.trivia.voiceBeginSetupSpeech(code, playerId, phase),
+      beginMenuTurn: (code, playerId, phase) =>
+        this.trivia.voiceBeginMenuTurn(code, playerId, phase),
       beginPromptDelivery: (code, playerId, questionId, attemptId, estimatedSpeechMs) =>
         this.trivia.voiceBeginPromptDelivery(code, playerId, questionId, attemptId, estimatedSpeechMs),
       questionPromptReady: (code, playerId, questionId, attemptId, deliveryGeneration) =>
@@ -2677,22 +2720,31 @@ export class HttpServer {
     this.trivia.voiceLeave(binding.code, binding.playerId);
   }
 
-  private makeFighterSession(say: (text: string, isCurrent?: () => boolean) => void): FighterVoiceSession {
+  private makeFighterSession(
+    say: (text: string, isCurrent?: () => boolean) => Promise<RelaySpeechOutcome>,
+  ): FighterVoiceSession {
     let session: FighterVoiceSession;
     session = new FighterVoiceSession({
       say,
       join: (code, name, callSid, side, expectedPlayers, nameConfirmed) => {
         code = code.trim().toUpperCase();
         const resumed = this.resumeFighterVoiceCall(code, callSid, session);
-        if (resumed) return { playerId: resumed, resumed: true };
+        if (resumed) {
+          this.fighter.voiceRegisterMenuSession(code, resumed);
+          return { playerId: resumed, resumed: true };
+        }
         const playerId = this.fighter.voiceJoin(code, name, side, expectedPlayers, nameConfirmed); if (!playerId) return null;
         this.rememberFighterVoiceCall(callSid, code, playerId, session); this.registerFighterVoiceSession(code, session);
+        this.fighter.voiceRegisterMenuSession(code, playerId);
         return { playerId, resumed: false };
       },
       leave: (code, id, callSid) => { this.unregisterFighterVoiceSession(session); this.scheduleFighterVoiceLeave(code, id, callSid, session); },
       setName: (code, id, name) => this.fighter.voiceSetName(code, id, name),
       selectFighter: (code, id, fighterId) => this.fighter.voiceSelectFighter(code, id, fighterId),
       selectMap: (code, id, mapId) => this.fighter.voiceSelectMap(code, id, mapId),
+      beginMenuAudio: (code, id, phase, recovery) =>
+        this.fighter.voiceBeginMenuAudio(code, id, phase, recovery),
+      beginMenuTurn: (code, id, phase) => this.fighter.voiceBeginMenuTurn(code, id, phase),
       advance: (code, id) => this.fighter.voiceAdvance(code, id),
       back: (code, id) => this.fighter.voiceBack(code, id),
       skipIntro: (code, id) => this.fighter.voiceSkipIntro(code, id),
@@ -3040,9 +3092,15 @@ export class HttpServer {
     };
     return { phase: state.phase, myName: room.hasConfirmedName(playerId) ? me?.name ?? null : null,
       nameConfirmed: room.hasConfirmedName(playerId), myFighterId: me?.fighterId ?? null, myFighterName: fighterName(me?.fighterId),
-      foeName: foe?.name ?? null, foeFighterId: foe?.fighterId ?? null, foeFighterName: fighterName(foe?.fighterId), selectedMap: state.selectedMap,
+      foeName: foe && room.hasConfirmedName(foe.playerId) ? foe.name : null,
+      foeFighterId: foe?.fighterId ?? null, foeFighterName: fighterName(foe?.fighterId), selectedMap: state.selectedMap,
+      mapVoteTied: state.mapVoteTied,
       myMapVote:state.mapVotesByPlayerId[playerId]??null,
       allMapVotes:state.players.filter(player=>!player.isAi).every(player=>Boolean(state.mapVotesByPlayerId[player.playerId])),
+      myAdvanceReady: state.advanceReadyPlayerIds.includes(playerId),
+      myBackReady: state.backReadyPlayerIds.includes(playerId),
+      foeAdvanceReady: foe ? state.advanceReadyPlayerIds.includes(foe.playerId) : false,
+      foeBackReady: foe ? state.backReadyPlayerIds.includes(foe.playerId) : false,
       mySide, myHealth: state.world?.[mySide].health ?? null, foeHealth: state.world?.[foeSide].health ?? null,
       countdown: state.countdown, intro: state.intro, winnerName: state.result?.winnerName ?? null,
       winnerSide: state.result?.winner ?? null,
@@ -3050,6 +3108,8 @@ export class HttpServer {
       playerOneName: playerOne?.name ?? null, playerOneFighterName: fighterName(playerOne?.fighterId),
       playerTwoName: playerTwo?.name ?? null, playerTwoFighterName: fighterName(playerTwo?.fighterId),
       playerCount: state.players.filter(player => !player.isAi).length,
+      expectedPlayerCount: state.expectedPlayerCount,
+      phoneRetryPlayerIds: state.phoneRetryPlayerIds,
       hasExpectedPlayers: state.hasExpectedPlayers,
       automaticSetup:state.automaticSetup,
       hudPresented: room.hudPresented,
@@ -3169,6 +3229,7 @@ export class HttpServer {
     const sid = callSid.trim(); if (!sid) { this.fighter.voiceLeave(code, playerId); return; }
     const binding = this.fighterVoiceCallBindings.get(sid);
     if (binding?.activeSession && binding.activeSession !== session) return;
+    this.fighter.voiceSuspend(code, playerId);
     if (binding?.leaveTimer) clearTimeout(binding.leaveTimer);
     const leaveTimer = setTimeout(() => {
       const current = this.fighterVoiceCallBindings.get(sid); if (!current || current.playerId !== playerId || current.code !== code) return;
@@ -3190,7 +3251,9 @@ export class HttpServer {
   /** Build a Voice Monsters call session wired to the live BattleServer + the battle LLM host. The
    *  session registers itself in `battleVoice` on join (so it hears battle-event commentary) and
    *  unregisters on leave. */
-  private makeBattleSession(say: (t: string, isCurrent?: () => boolean) => void): BattleVoiceSession {
+  private makeBattleSession(
+    say: (t: string, isCurrent?: () => boolean) => Promise<RelaySpeechOutcome>,
+  ): BattleVoiceSession {
     let session: BattleVoiceSession;   // captured so join/leave can (un)register it for events
     const deps = {
       say,
@@ -3210,6 +3273,9 @@ export class HttpServer {
         this.scheduleBattleVoiceLeave(code, id, callSid, session);
       },
       setName: (code: string, id: string, n: string) => this.battle.voiceSetName(code, id, n),
+      clearSetupReady: (code: string, id: string) => this.battle.voiceClearSetupReady(code, id),
+      beginMenuSpeech: (code: string, id: string, phase: 'lobby' | 'monster_select' | 'results') =>
+        this.battle.voiceBeginMenuSpeech(code, id, phase),
       selectMonster: (code: string, id: string, m: string) => this.battle.voiceSelectMonster(code, id, m),
       openFight: (code: string, id: string) => this.battle.voiceOpenFight(code, id),
       backMenu: (code: string, id: string) => this.battle.voiceBackMenu(code, id),
@@ -3404,7 +3470,8 @@ export class HttpServer {
       const me = room.lobbyPlayers().find(p => p.playerId === playerId);
       // (car_select is handled by its own branch above; reaching here means lobby/map_select/results.)
       const ok = this.game.voiceAdvance(room.code, playerId);
-      if (!ok) return null;
+      if (!ok) return (room.phase === 'results' || room.phase === 'finished')
+        && room.hasReplayConsent(playerId) ? text('voice.waitingForPlayers') : null;
       // room.phase is now the NEW phase we advanced INTO — describe that screen.
       const landed = String(room.phase);
       void me;
@@ -3766,7 +3833,11 @@ export class HttpServer {
         canAdvanceLobby:room.canAdvanceLobby,
         canStartBattle,
         canRematch: room.canStartNextRound(playerId),
-        foeName: null, foeMonsterName: null, foeMonsterType: null, myHp: null, myMaxHp: null, foeHp: null, foeMaxHp: null,
+        mySetupReady: room.isSetupReady(playerId), setupPlayerCount: room.expectedPlayerCount,
+        currentCallerCount: room.playerCount,
+        currentOtherCallerName: players.find(p => p.playerId !== playerId && !p.isAi)?.name ?? null,
+        foeName: players.find(p => p.playerId !== playerId && p.nameConfirmed)?.name ?? null,
+        foeMonsterName: null, foeMonsterType: null, myHp: null, myMaxHp: null, foeHp: null, foeMaxHp: null,
         myPotions: 2, myGuarding: false, myTaunted: false, foeGuarding: false, foeTaunted: false,
         turn: null, activeSide: null, activeMenu: 'root', whoseTurn: null, participating: false, myMoves: [], winnerName: res?.winnerName ?? null,
       };
@@ -3784,6 +3855,9 @@ export class HttpServer {
       canAdvanceLobby:room.canAdvanceLobby,
       canStartBattle,
       canRematch: room.canStartNextRound(playerId),
+      mySetupReady: room.isSetupReady(playerId), setupPlayerCount: room.expectedPlayerCount,
+      currentCallerCount: room.playerCount,
+      currentOtherCallerName: players.find(p => p.playerId !== playerId && !p.isAi)?.name ?? null,
       foeName: foe.name,
       foeMonsterName: localizedMonsterName(locale, foe.monsterId),
       foeMonsterType: foe.type,

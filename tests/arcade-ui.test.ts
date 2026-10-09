@@ -333,7 +333,7 @@ describe('Arcade browser UI', () => {
 
   it('offers Voice Chess as choice 6 and an operator game without a leaderboard', () => {
     expect(html).toMatch(/data-game-choice="chess"><span>6<\/span><b>Voice Chess<\/b>/);
-    expect(stationGameSelect).toContain('<option value="chess">Voice Chess · 1 player</option>');
+    expect(stationGameSelect).toContain('<option value="chess">Voice Chess · up to 2 players</option>');
     expect(html).toContain('id="admin-game-chess"');
     const prioritySelects = [...html.matchAll(/<select id="admin-game-priority-[1-6]"[^>]*>[\s\S]*?<\/select>/g)]
       .map(match => match[0]);

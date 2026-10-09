@@ -215,7 +215,7 @@ describe('Arcade station reducer', () => {
     expect(state.rounds['round-1']?.gameChoicesByReadyEntryId).toEqual({});
   });
 
-  it.each([['racer', 2], ['monsters', 2], ['fighter', 2], ['karaoke', 1], ['trivia', 4]] as const)('enforces %s capacity %d', (game, capacity) => {
+  it.each([['racer', 2], ['monsters', 2], ['fighter', 2], ['karaoke', 1], ['trivia', 4], ['chess', 2]] as const)('enforces %s capacity %d', (game, capacity) => {
     let state = createArcadeStation('ARCADE-01', T0);
     for (let index = 1; index <= 4; index++) state = insert(state, `player-${index}`, index);
     state = closeStationRecruiting(state, { at: at(90), expectedRevision: state.station.revision });

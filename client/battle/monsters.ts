@@ -11,6 +11,7 @@ import { BattleRenderer, type UiPhase, type MenuMove } from './battle-renderer';
 import { ArenaBackground, ArenaPreload } from './arena-background';
 import { AmbientFx } from './ambient-fx';
 import { battleControlsLegendHtml } from './battle-controls-legend';
+import { isSharedRematch, rematchSeatStates, setupSeatStates, touchSelectionTarget, type SetupSeatState } from './setup-status';
 import { drawMonsterSprite, typeColor } from './monster-sprite';
 import { moveById } from '../../shared/monster-roster';
 import { spriteCandidateUrls } from './sprite-sources';
@@ -35,6 +36,7 @@ import QRCode from 'qrcode';
 const params = new URLSearchParams(location.search);
 const text = createTranslator(locale, MONSTERS_MESSAGES);
 const isDisplay = params.get('display') === '1';
+const requestedPlayerCount: 1 | 2 = params.get('players') === '2' ? 2 : 1;
 const roomCode = params.get('room') ?? '4821';
 const name = params.get('name') ?? text('player.default');
 
@@ -141,12 +143,14 @@ let menuLevel: 'root' | 'fight' = 'root';   // two-level command menu: root acti
 let phoneNumber = '';   // the number players call to join (from /api/config) — shown in the lobby join flow
 let phoneQr = '/brand/join-qr.png?v=2';
 let joinedHere = false;
+let keyboardPlayerConn: BattleConnection | null = null;
 let resultAuthorityFresh = false;
 let touchTargetPlayerId: string | null = null;
 let connectionEpoch = 0;
 let lastResultsAckGeneration: number | null = null;
 let pendingResultsAckGeneration: number | null = null;
 let pendingShowResultsGeneration: number | null = null;
+let displayModeRejected = false;
 
 function localizeBattleState(message: BattleStateMsg): BattleStateMsg {
   if (!message.snapshot) return message;
@@ -188,9 +192,17 @@ conn.onRoster((entries) => {
   }));
   renderOverlay();
 });
-conn.onJoined((id) => { myId = id; joinedHere = true; resultAuthorityFresh = false; lastOverlayKey = ''; renderOverlay(); });
+conn.onJoined((id) => {
+  if (isDisplay) return;
+  myId = id; joinedHere = true; resultAuthorityFresh = false; lastOverlayKey = ''; renderOverlay();
+});
 conn.onError((code, msg) => {
   console.error(`[battle] ${code}: ${msg}`);
+  if (code === 'setup_in_progress') {
+    displayModeRejected = true;
+    lastOverlayKey = '';
+    renderOverlay();
+  }
   if (code === 'room_full' || code === 'battle_in_progress' || code === 'round_complete') {
     myId = null; joinedHere = false; conn.spectate(roomCode, stationDisplay.displayToken ?? undefined);
   }
@@ -224,6 +236,7 @@ conn.onState((incoming) => {
   stationStateReady = true; maybeMarkStationReady();
   const m = localizeBattleState(incoming);
   const prevPhase = state?.phase;
+  const wasTwoCallerSetup = isTwoCallerSetup();
   const prevGeneration = state?.generation;
   const priorTouchTarget = state?.players.find(player => player.playerId === touchTargetPlayerId);
   const prevPlayerCount = state?.players?.length ?? 0;
@@ -236,7 +249,9 @@ conn.onState((incoming) => {
     if (pendingShowResultsGeneration !== m.generation) pendingShowResultsGeneration = null;
   }
   if (m.phase === 'monster_select' && isDisplay && !joinedHere) {
-    if (priorTouchTarget && !priorTouchTarget.monsterId
+    if (isTwoCallerSetup() && (prevPhase !== 'monster_select' || !wasTwoCallerSetup))
+      touchTargetPlayerId = null;
+    if (!isTwoCallerSetup() && priorTouchTarget && !priorTouchTarget.monsterId
       && m.players.find(player => player.playerId === priorTouchTarget.playerId)?.monsterId) {
       touchTargetPlayerId = m.players.find(player => !player.isAi && !player.monsterId)?.playerId
         ?? priorTouchTarget.playerId;
@@ -583,7 +598,7 @@ function scheduleResultsReceipt(): void {
     }
     pendingResultsAckGeneration = null;
     stationDisplay.markEngineResultsReady();
-    if (isDisplay && !joinedHere && !state.resultsPresented) {
+    if (isDisplay && !state.resultsPresented) {
       lastResultsAckGeneration = generation;
       conn.ackResults(generation);
     }
@@ -593,10 +608,10 @@ function scheduleResultsReceipt(): void {
 function overlayKey(phase: string): string {
   const players = state?.players ?? [];
   const roster3 = roster.length;
-  const roster3k = players.map(p => `${p.playerId}:${p.name}:${p.monsterId ?? ''}`).join('|');
+  const roster3k = players.map(p => `${p.playerId}:${p.side ?? ''}:${p.name}:${p.nameConfirmed ? 1 : 0}:${p.monsterId ?? ''}:${p.setupReady ? 1 : 0}:${p.phonePending ? 1 : 0}`).join('|');
   const win = state?.result?.winnerName ?? '';
   const replay = phase === 'results' && stationDisplay.active ? 'station' : canOfferRematch() ? 'ready' : 'locked';
-  return `${phase}|${isDisplay ? 'D' : 'P'}|${joinedHere ? 'J' : 'j'}|r${roster3}|${roster3k}|${win}|${replay}`;
+  return `${phase}|${isDisplay ? 'D' : 'P'}|${joinedHere ? 'J' : 'j'}|${myId ?? ''}|r${roster3}|${roster3k}|${win}|${replay}|${state?.expectedPlayerCount ?? ''}|${state?.resultsPresented ? 1 : 0}|${displayModeRejected ? 1 : 0}`;
 }
 
 function canOfferRematch(): boolean {
@@ -610,11 +625,55 @@ function canDrive(): boolean {
   return joinedHere || (isDisplay && havePlayers);
 }
 
+function isTwoCallerSetup(): boolean {
+  return (state?.expectedPlayerCount ?? 1) >= 2
+    || (state?.players.filter(player => !player.isAi).length ?? 0) >= 2
+    || (isDisplay && !stationDisplay.active && !displayModeRejected && requestedPlayerCount === 2);
+}
+
+function isTwoCallerRematch(): boolean {
+  return state?.phase === 'results' && isSharedRematch(state.snapshot, state.players);
+}
+
 function resolveTouchTarget(players: BattleStateMsg['players']): string | null {
-  const humans = players.filter(player => !player.isAi);
-  if (touchTargetPlayerId && humans.some(player => player.playerId === touchTargetPlayerId))
-    return touchTargetPlayerId;
-  return humans.find(player => !player.monsterId)?.playerId ?? humans[0]?.playerId ?? null;
+  return touchSelectionTarget(players, touchTargetPlayerId, isTwoCallerSetup());
+}
+
+function seatStatusText(status: SetupSeatState): string {
+  switch (status) {
+    case 'open': return text('setup.open');
+    case 'phone': return text('setup.phonePending');
+    case 'name_needed': return text('setup.nameNeeded');
+    case 'needs_ready': return text('setup.needsReady');
+    case 'needs_monster': return text('setup.needsMonster');
+    case 'needs_battle': return text('setup.needsBattle');
+    case 'needs_rematch': return text('results.rematchNeeded');
+    case 'ready': return text('setup.ready');
+  }
+}
+
+function setupStatusHtml(phase: 'lobby' | 'monster_select'): string {
+  if (!isTwoCallerSetup()) return '';
+  const seats = setupSeatStates(phase, state?.players ?? [], 2);
+  const pending = seats.find(seat => seat.state !== 'ready');
+  const rows = seats.map(seat => {
+    const name = seat.name ?? text('setup.playerSeat', { number: seat.seatNumber });
+    return `<div class="vm-seat vm-seat-${seat.state}">
+      <span class="vm-seat-index">${seat.seatNumber}</span>
+      <span class="vm-seat-copy"><strong>${esc(name)}</strong><span>${esc(seatStatusText(seat.state))}</span></span>
+    </div>`;
+  }).join('');
+  const summary = pending
+    ? `${text('setup.waitingFor', { player: pending.name ?? text('setup.playerSeat', { number: pending.seatNumber }) })} · ${seatStatusText(pending.state)}`
+    : text('setup.everyoneReady');
+  return `<div class="vm-setup-status" role="status" aria-live="polite">
+    <div class="vm-seat-row">${rows}</div><div class="vm-seat-summary">${esc(summary)}</div>
+  </div>`;
+}
+
+function displayModeAlertHtml(): string {
+  return displayModeRejected && requestedPlayerCount === 2
+    ? `<p class="vm-setup-alert" role="alert">${esc(text('setup.modeUnavailable'))}</p>` : '';
 }
 
 function lobbyHtml(): string {
@@ -625,8 +684,13 @@ function lobbyHtml(): string {
   const chips = players.map(p => `<span class="vm-chip">${esc(p.name)}${p.monsterId ? ' ✓' : ''}</span>`).join('')
     || `<span class="vm-dim">${text('lobby.waitingChallengers')}</span>`;
   const havePlayers = players.length > 0;
+  const shared = isTwoCallerSetup();
+  const myPlayer = players.find(player => player.playerId === myId);
   let action: string;
-  if (havePlayers && canDrive() && state?.canAdvanceLobby) {
+  if (shared) {
+    action = joinedHere && myPlayer?.nameConfirmed && !myPlayer.setupReady
+      ? `<button class="vm-btn" data-act="advance">${text('lobby.ready')}</button>` : '';
+  } else if (havePlayers && canDrive() && state?.canAdvanceLobby) {
     action = `<button class="vm-btn" data-act="advance">${text('lobby.chooseMonster')}</button>`;
   } else if (havePlayers) {
     action = `<div class="vm-dim">${text('lobby.waitingReady')}</div>`;
@@ -651,7 +715,8 @@ function lobbyHtml(): string {
   const left = `
     <div class="vm-lobby-main">
       ${join}
-      <div class="vm-chips">${chips}</div>
+      ${displayModeAlertHtml()}
+      ${shared ? setupStatusHtml('lobby') : `<div class="vm-chips">${chips}</div>`}
       ${action}
     </div>`;
   return `<div class="vm-card wide vm-lobby">
@@ -707,6 +772,7 @@ function upgradeSelectPortraits(): void {
 
 function monsterSelectHtml(): string {
   const players = state?.players ?? [];
+  const shared = isTwoCallerSetup();
   // Highlight ANY player's current pick (this is a shared screen — a caller who picked by VOICE must
   // see their square light up even though they have no browser + no local myId). Map monsterId → who
   // picked it, so a voice pick highlights just like a tap.
@@ -716,12 +782,14 @@ function monsterSelectHtml(): string {
   const canBattle = !!state?.canStartBattle;
   const target = isDisplay && !joinedHere ? resolveTouchTarget(players) : myId;
   const targetPlayer = players.find(player => player.playerId === target);
+  const canSelectTarget = !!target && canDrive() && (!shared || (!!targetPlayer?.nameConfirmed && !targetPlayer.setupReady));
   const picker = isDisplay && !joinedHere && players.some(player => !player.isAi)
     ? `<div class="vm-touch-picker" role="group" aria-label="${esc(text('select.touchTarget'))}">
-        ${players.filter(player => !player.isAi).map(player => `
+        ${players.filter(player => !player.isAi).map((player, index) => `
           <button type="button" class="vm-touch-player${target === player.playerId ? ' active' : ''}"
-            data-touch-player="${esc(player.playerId)}" aria-pressed="${target === player.playerId}">
-            ${esc(player.name)}${player.monsterId ? ` · ${esc(text('select.chosen'))}` : ''}
+            data-touch-player="${esc(player.playerId)}" aria-pressed="${target === player.playerId}"
+            ${shared && !player.nameConfirmed ? 'disabled' : ''}>
+            ${esc(player.nameConfirmed ? player.name : text('setup.playerSeat', { number: index + 1 }))}${player.monsterId ? ` · ${esc(text('select.chosen'))}` : ''}
           </button>`).join('')}
       </div>` : '';
   // MINIMAL cards: portrait + name + type + (who picked it). Portrait starts as the placeholder;
@@ -732,7 +800,7 @@ function monsterSelectHtml(): string {
     const typeLabel = monsterTypeLabel(m.type as MonsterType, locale);
     return `
     <button class="vm-mon t-${m.type}${selected ? ' sel' : ''}" data-mon="${m.id}"
-      ${!target || !canDrive() ? 'disabled' : ''}
+      ${!canSelectTarget ? 'disabled' : ''}
       aria-pressed="${targetPlayer?.monsterId === m.id}"
       aria-label="${esc(text('access.monsterOption', { name: m.name, type: typeLabel }))}">
       <div class="portrait"><img data-mon-portrait="${m.id}" src="${placeholderPortrait(m.id, m.type)}" alt=""></div>
@@ -743,14 +811,50 @@ function monsterSelectHtml(): string {
   }).join('');
   return `<div class="vm-card wide">
     ${brandHead(text('select.title'), text('select.subtitle'))}
+    ${displayModeAlertHtml()}
+    ${shared ? setupStatusHtml('monster_select') : ''}
     ${picker}
     <div class="vm-grid">${cards}</div>
-    ${canDrive() && canBattle
+    ${shared
+      ? (() => {
+          const mine = players.find(player => player.playerId === myId);
+          const ready = joinedHere && mine?.nameConfirmed && !!mine.monsterId && !mine.setupReady;
+          const change = joinedHere && !!mine?.monsterId;
+          return `<div class="vm-select-actions">
+            ${ready ? `<button class="vm-btn" data-act="advance">${text('select.ready')}</button>` : ''}
+            ${change ? `<button class="vm-btn vm-btn-secondary" data-act="back">${text('select.changeMine')}</button>` : ''}
+            ${isDisplay && !joinedHere && !target ? `<span class="vm-dim">${text('select.choosePlayerFirst')}</span>` : ''}
+          </div>`;
+        })()
+      : canDrive() && canBattle
       ? `<button class="vm-btn" data-act="advance">${text('select.battle')}</button>`
       : canDrive()
         ? `<div class="vm-dim">${anyPick ? text('select.waitingAll') : text('select.pickFirst')}</div>`
       : `<div class="vm-dim">${text('select.pick')}</div>`}
-    ${canDrive() ? `<button class="vm-btn vm-btn-secondary" data-act="back">${text('select.back')}</button>` : ''}
+    ${!shared && canDrive() ? `<button class="vm-btn vm-btn-secondary" data-act="back">${text('select.back')}</button>` : ''}
+  </div>`;
+}
+
+function rematchStatusHtml(): string {
+  if (!isTwoCallerRematch()) return '';
+  const seats = rematchSeatStates(state?.players ?? []);
+  const rows = seats.map(seat => {
+    const name = seat.name ?? text('setup.playerSeat', { number: seat.seatNumber });
+    const status = seat.state === 'phone' ? text('results.phonePending')
+      : seat.state === 'ready' ? text('results.rematchReady') : seatStatusText(seat.state);
+    return `<div class="vm-seat vm-seat-${seat.state}">
+      <span class="vm-seat-index">${seat.seatNumber}</span>
+      <span class="vm-seat-copy"><strong>${esc(name)}</strong><span>${esc(status)}</span></span>
+    </div>`;
+  }).join('');
+  const pending = seats.find(seat => seat.state !== 'ready');
+  const pendingName = pending ? pending.name ?? text('setup.playerSeat', { number: pending.seatNumber }) : '';
+  const summary = !pending ? text('setup.everyoneReady')
+    : pending.state === 'phone' ? text('results.waitingPhone', { player: pendingName })
+      : pending.state === 'open' ? text('results.waitingJoin', { player: pendingName })
+        : text('results.waitingFor', { player: pendingName });
+  return `<div class="vm-setup-status vm-rematch-status" role="status" aria-live="polite">
+    <div class="vm-seat-row">${rows}</div><div class="vm-seat-summary">${esc(summary)}</div>
   </div>`;
 }
 
@@ -760,8 +864,14 @@ function resultsHtml(): string {
   const winningMonster = winningSide === 'a' ? state?.snapshot?.a : winningSide === 'b' ? state?.snapshot?.b : null;
   const champion = winningMonster
     ? text('results.winningMonster', { monster: localizedMonsterName(locale, winningMonster.monsterId) }) : '';
+  const shared = isTwoCallerRematch();
+  const mine = state?.players.find(player => player.playerId === myId);
   const action = stationDisplay.active
     ? `<p class="vm-result-next">${text('results.stationNext')}</p>`
+    : shared
+      ? joinedHere && mine && !mine.setupReady && canOfferRematch()
+        ? `<button class="vm-btn" data-act="advance">${text('results.rematch')}</button>`
+        : `<span class="vm-dim">${state?.resultsPresented ? text('results.rematchInstructions') : text('results.announcing')}</span>`
     : !canOfferRematch()
       ? `<span class="vm-dim">${text('results.goodBattle')}</span>`
       : `<button class="vm-btn" data-act="advance">${text('results.rematch')}</button>`;
@@ -773,6 +883,7 @@ function resultsHtml(): string {
       <h1 id="vm-result-title" tabindex="-1">${esc(text('results.wins', { winner: w }))}</h1>
       ${champion ? `<p>${esc(champion)}</p>` : ''}
     </div>
+    ${shared && !stationDisplay.active ? rematchStatusHtml() : ''}
     <div class="vm-result-actions">${action}${exit}</div>
     ${resultTechHtml('monsters', locale, { stationManaged: stationDisplay.active })}
   </section>`;
@@ -787,15 +898,16 @@ function wireOverlay(): void {
     });
   overlay.querySelectorAll<HTMLElement>('[data-mon]').forEach(el =>
     el.onclick = () => {
-      if (isDisplay && !joinedHere) {
+      if (isDisplay && joinedHere) keyboardPlayerConn?.selectMonster(el.dataset.mon!);
+      else if (isDisplay) {
         const playerId = state && resolveTouchTarget(state.players);
         if (playerId) conn.displaySelectMonster(playerId, el.dataset.mon!);
       } else conn.selectMonster(el.dataset.mon!);
     });
   overlay.querySelectorAll<HTMLElement>('[data-act="advance"]').forEach(el =>
-    el.onclick = () => { if (state?.phase !== 'results' || canOfferRematch()) conn.advance(); });
+    el.onclick = () => { if (state?.phase !== 'results' || canOfferRematch()) actionConnection().advance(); });
   overlay.querySelectorAll<HTMLElement>('[data-act="back"]').forEach(el =>
-    el.onclick = () => conn.back());
+    el.onclick = () => actionConnection().back());
 }
 
 const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
@@ -803,19 +915,54 @@ const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;
 // ── connect: display spectates, device joins ─────────────────────────────────────────────────────
 // Matches Voice Racer's lobby model: the shared SCREEN defaults to a spectator (callers dial in as
 // players), and the operator presses P to add/drop a KEYBOARD TESTER player on this screen. A device
-// (phone browser) auto-joins as its own player. `joinedHere` = this client holds a player slot.
-if (isDisplay) conn.spectate(roomCode, stationDisplay.displayToken ?? undefined);
+// (phone browser) auto-joins as its own player. `joinedHere` = this page holds a player slot.
+if (isDisplay) conn.spectate(roomCode, stationDisplay.displayToken ?? undefined,
+  stationDisplay.active ? undefined : requestedPlayerCount);
 else conn.join(roomCode, name);
 
+function actionConnection(): BattleConnection {
+  return isDisplay && joinedHere && keyboardPlayerConn ? keyboardPlayerConn : conn;
+}
+function localPlayerConnection(): BattleConnection | null {
+  return isDisplay ? keyboardPlayerConn : conn;
+}
+
 /** Shared-screen P-toggle: opt IN as a keyboard tester player (adds a slot), or opt back OUT (drops it,
- *  stays the display). No-op on a device (already a player). */
+ *  stays the display). The display socket never changes identity. */
 function toggleSelfPlaying(): void {
   if (!isDisplay || stationDisplay.active) return;
   resultAuthorityFresh = false;
-  if (joinedHere) { conn.leave(roomCode); joinedHere = false; }
-  else conn.join(roomCode, name);
+  if (keyboardPlayerConn) {
+    keyboardPlayerConn.leave(roomCode, false);
+    keyboardPlayerConn = null;
+    myId = null; joinedHere = false;
+  } else {
+    const playerConn = conn.createKeyboardPlayerConnection();
+    keyboardPlayerConn = playerConn;
+    playerConn.onJoined(id => {
+      if (keyboardPlayerConn !== playerConn) return;
+      myId = id; joinedHere = true; resultAuthorityFresh = false;
+      lastOverlayKey = ''; renderOverlay();
+    });
+    playerConn.onDisconnected(() => {
+      if (keyboardPlayerConn !== playerConn) return;
+      myId = null; joinedHere = false; lastOverlayKey = ''; renderOverlay();
+    });
+    playerConn.onError((code, message) => {
+      console.error(`[battle keyboard] ${code}: ${message}`);
+      if (keyboardPlayerConn !== playerConn) return;
+      if (code === 'room_full' || code === 'battle_in_progress' || code === 'round_complete'
+        || code === 'station_voice_only') {
+        playerConn.leave(roomCode, false);
+        keyboardPlayerConn = null; myId = null; joinedHere = false;
+        lastOverlayKey = ''; renderOverlay();
+      }
+    });
+    playerConn.join(roomCode, name);
+  }
   lastOverlayKey = ''; renderOverlay();
 }
+addEventListener('pagehide', () => keyboardPlayerConn?.leave(roomCode, false), { once: true });
 
 // Keyboard: during MY choosing turn the command menu is two levels —
 //   root: 1 ATTACK (→ opens the moves) · 2 GUARD · 3 ITEM (Potion) · 4 TAUNT
@@ -829,8 +976,9 @@ addEventListener('keydown', (e) => {
   } else if ((e.key === 'p' || e.key === 'P') && isDisplay && state?.phase !== 'battle') {
     toggleSelfPlaying();
   } else if (e.key === 'Enter' && isDisplay && state?.phase !== 'battle'
+    && (state?.phase === 'results' ? !isTwoCallerRematch() || joinedHere : !isTwoCallerSetup() || joinedHere)
     && (state?.phase !== 'results' || canOfferRematch())) {
-    conn.advance();
+    actionConnection().advance();
   }
 });
 // Tap/click the stage to continue past the battle-end hold (phone-friendly, no keyboard needed).
@@ -891,9 +1039,11 @@ export function handleVoiceUtterance(text: string): boolean {
  *  the menu level; the four real actions commit the turn. ITEM is guarded on the potion count here too,
  *  so neither input path can spend a potion the player doesn't have. */
 function applyMenuAction(action: BattleAction | { kind: 'openFight' } | { kind: 'back' }): void {
+  const playerConn = localPlayerConnection();
+  if (!playerConn || (isDisplay && !joinedHere)) return;
   switch (action.kind) {
-    case 'openFight': menuLevel = 'fight'; conn.openFight(); paintBattle(); return;
-    case 'back':      menuLevel = 'root';  conn.backMenu(); paintBattle(); return;
+    case 'openFight': menuLevel = 'fight'; playerConn.openFight(); paintBattle(); return;
+    case 'back':      menuLevel = 'root';  playerConn.backMenu(); paintBattle(); return;
     case 'guard':     commitAction({ kind: 'guard' }, text('battle.lockGuard')); return;
     case 'taunt':     commitAction({ kind: 'taunt' }, text('battle.lockTaunt')); return;
     case 'item':      if (myPotions() > 0) commitAction({ kind: 'item', item: 'potion' }, text('battle.lockPotion')); return;
@@ -922,8 +1072,10 @@ function myPotions(): number {
 
 /** Commit a turn action + show the "locked, waiting…" beat. */
 function commitAction(action: BattleAction, lockedLabel: string): void {
+  const playerConn = localPlayerConnection();
+  if (!playerConn || (isDisplay && !joinedHere)) return;
   lockedMoveName = lockedLabel;
-  conn.chooseAction(action);
+  playerConn.chooseAction(action);
   paintBattle();
 }
 

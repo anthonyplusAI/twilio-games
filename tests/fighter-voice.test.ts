@@ -7,6 +7,199 @@ import type { FighterCommand, FighterEvent } from '../shared/fighter-world';
 import type { VoiceInterpretRequest, VoiceInterpretResult } from '../server/voice-interpreter';
 
 describe('fighter voice session', () => {
+  it('asks the first caller to confirm again when the other caller changes fighter after a ready vote', () => {
+    const game = voiceGame();
+    game.room.configureStandaloneSeats(2);
+    const ada = game.connect('CA-RECONFIRM-FIGHTER-ADA', 'VOICE', undefined, 'Ada', { index: 0, count: 2 });
+    const bo = game.connect('CA-RECONFIRM-FIGHTER-BO', 'VOICE', undefined, 'Bo', { index: 1, count: 2 });
+    ada.prompt('next'); bo.prompt('next');
+    ada.prompt('Nyx'); bo.prompt('Wraith');
+    ada.prompt('next');
+    expect(game.room.phase).toBe('fighter_select');
+    expect(game.room.state().advanceReadyPlayerIds).toContain(ada.playerId);
+
+    const before = ada.spoken.length;
+    bo.prompt('Remy Riot');
+    expect(game.room.state().advanceReadyPlayerIds).toEqual([]);
+    expect(ada.spoken.slice(before).join(' ')).toMatch(/say next when you are ready/i);
+  });
+
+  it('asks the first caller to confirm again when the display changes the other arena vote', () => {
+    const game = voiceGame();
+    game.room.configureStandaloneSeats(2);
+    const ada = game.connect('CA-RECONFIRM-MAP-ADA', 'VOICE', undefined, 'Ada', { index: 0, count: 2 });
+    const bo = game.connect('CA-RECONFIRM-MAP-BO', 'VOICE', undefined, 'Bo', { index: 1, count: 2 });
+    ada.prompt('next'); bo.prompt('next');
+    ada.prompt('Nyx'); bo.prompt('Wraith');
+    ada.prompt('next'); bo.prompt('next');
+    ada.prompt('first'); bo.prompt('second');
+    ada.prompt('start');
+    expect(game.room.phase).toBe('map_select');
+    expect(game.room.state().advanceReadyPlayerIds).toContain(ada.playerId);
+
+    const before = ada.spoken.length;
+    expect(game.room.selectMap(bo.playerId, 'foundry')).toBe(true);
+    game.stateChanged();
+    expect(game.room.state().advanceReadyPlayerIds).toEqual([]);
+    expect(ada.spoken.slice(before).join(' ')).toMatch(/say start when ready/i);
+  });
+
+  it('offers the back choice instead of the old next choice when another caller votes back', () => {
+    const game = voiceGame();
+    game.room.configureStandaloneSeats(2);
+    const ada = game.connect('CA-BACK-AFTER-NEXT-ADA', 'VOICE', undefined, 'Ada', { index: 0, count: 2 });
+    const bo = game.connect('CA-BACK-AFTER-NEXT-BO', 'VOICE', undefined, 'Bo', { index: 1, count: 2 });
+    ada.prompt('next'); bo.prompt('next');
+    ada.prompt('Nyx'); bo.prompt('Wraith');
+    ada.prompt('next');
+
+    const before = ada.spoken.length;
+    bo.prompt('go back');
+    expect(game.room.phase).toBe('fighter_select');
+    expect(ada.spoken.slice(before).join(' ')).toMatch(/wants to go back\. Say back to agree/i);
+    expect(ada.spoken.slice(before).join(' ')).not.toMatch(/say next when you are ready/i);
+  });
+
+  it('waits for a caller’s AI answer and its phone playback before honoring both menu votes', async () => {
+    let answerInterpretation: ((result: VoiceInterpretResult) => void) | undefined;
+    let finishAnswerAudio: ((played: boolean) => void) | undefined;
+    const game = voiceGame(
+      () => new Promise(resolve => { answerInterpretation = resolve; }),
+      text => text.startsWith('The fighters on screen')
+        ? new Promise(resolve => { finishAnswerAudio = resolve; }) : Promise.resolve(true),
+      true,
+    );
+    game.room.configureStandaloneSeats(2);
+    const ada = game.connect('CA-MENU-AI-ADA', 'VOICE', undefined, 'Ada', { index: 0, count: 2 });
+    const bo = game.connect('CA-MENU-AI-BO', 'VOICE', undefined, 'Bo', { index: 1, count: 2 });
+    ada.prompt('next'); bo.prompt('next');
+    await vi.waitFor(() => expect(game.room.phase).toBe('fighter_select'));
+    ada.prompt('Nyx'); bo.prompt('Wraith');
+    ada.prompt('next');
+    ada.prompt('What fighters can I choose?');
+    expect(answerInterpretation).toBeTypeOf('function');
+    bo.prompt('next');
+    await Promise.resolve();
+    expect(game.room.phase).toBe('fighter_select');
+
+    answerInterpretation!({ kind: 'answer', factId: 'fighters' });
+    await vi.waitFor(() => expect(finishAnswerAudio).toBeTypeOf('function'));
+    expect(game.room.phase).toBe('fighter_select');
+    finishAnswerAudio!(true);
+    await vi.waitFor(() => expect(game.room.phase).toBe('map_select'));
+  });
+
+  it('holds both shared votes while a caller speaks an interim transcript and hears the reply', async () => {
+    let holdNextCue = false;
+    let finishPriorCue: ((played: boolean) => void) | undefined;
+    let holdReply = false;
+    let finishReply: ((played: boolean) => void) | undefined;
+    const game = voiceGame(undefined, () => {
+      if (holdNextCue) {
+        holdNextCue = false;
+        return new Promise<boolean>(resolve => { finishPriorCue = resolve; });
+      }
+      if (holdReply) return new Promise<boolean>(resolve => { finishReply = resolve; });
+      return Promise.resolve(true);
+    }, true);
+    game.room.configureStandaloneSeats(2);
+    const ada = game.connect('CA-INTERIM-ADA', 'VOICE', undefined, 'Ada', { index: 0, count: 2 });
+    const bo = game.connect('CA-INTERIM-BO', 'VOICE', undefined, 'Bo', { index: 1, count: 2 });
+    await vi.waitFor(() => expect(game.room.state().phonePendingPlayerIds).toEqual([]));
+
+    holdNextCue = true;
+    ada.prompt('next');
+    bo.prompt('next');
+    expect(finishPriorCue).toBeTypeOf('function');
+    ada.prompt('I need', false);
+    expect(game.room.state().phoneTurnPendingPlayerIds).toContain(ada.playerId);
+    finishPriorCue!(true);
+    await Promise.resolve();
+    expect(game.room.phase).toBe('lobby');
+
+    holdReply = true;
+    ada.prompt('help');
+    expect(finishReply).toBeTypeOf('function');
+    expect(game.room.phase).toBe('lobby');
+    holdReply = false;
+    finishReply!(true);
+    await vi.waitFor(() => expect(game.room.phase).toBe('fighter_select'));
+  });
+
+  it.each([false, 'failed', 'interrupted', 'rejected'] as const)(
+    'keeps shared votes after a %s phone cue until the caller requests its replay', async outcome => {
+      let failNextCue = false;
+      let holdRetry = false;
+      let finishRetry: ((played: boolean) => void) | undefined;
+      const game = voiceGame(undefined, () => {
+        if (failNextCue) {
+          failNextCue = false;
+          return outcome === 'rejected' ? Promise.reject(new Error('Relay audio rejected'))
+            : Promise.resolve(outcome);
+        }
+        if (holdRetry) return new Promise<boolean>(resolve => { finishRetry = resolve; });
+        return Promise.resolve(true);
+      }, true);
+      game.room.configureStandaloneSeats(2);
+      const ada = game.connect('CA-FAILED-ADA', 'VOICE', undefined, 'Ada', { index: 0, count: 2 });
+      const bo = game.connect('CA-FAILED-BO', 'VOICE', undefined, 'Bo', { index: 1, count: 2 });
+      await vi.waitFor(() => expect(game.room.state().phonePendingPlayerIds).toEqual([]));
+
+      failNextCue = true;
+      ada.prompt('next');
+      bo.prompt('next');
+      await vi.waitFor(() => expect(game.room.state().phoneRetryPlayerIds).toHaveLength(1));
+      expect(game.room.phase).toBe('lobby');
+
+      holdRetry = true;
+      const callerToRetry = game.room.state().phoneRetryPlayerIds[0] === ada.playerId ? ada : bo;
+      callerToRetry.prompt('repeat');
+      expect(finishRetry).toBeTypeOf('function');
+      expect(game.room.phase).toBe('lobby');
+      holdRetry = false;
+      finishRetry!(true);
+      await vi.waitFor(() => expect(game.room.phase).toBe('fighter_select'));
+    },
+  );
+
+  it('does not request a phone retry when a shared-screen choice replaces a queued menu cue', async () => {
+    let holdNext = false;
+    let finishOld: ((outcome: 'interrupted') => void) | undefined;
+    const game = voiceGame(undefined, () => {
+      if (holdNext) {
+        holdNext = false;
+        return new Promise<'interrupted'>(resolve => { finishOld = resolve; });
+      }
+      return Promise.resolve(true);
+    }, true);
+    game.room.configureStandaloneSeats(2);
+    const ada = game.connect('CA-REPLACED-ADA', 'VOICE', undefined, 'Ada', { index: 0, count: 2 });
+    const bo = game.connect('CA-REPLACED-BO', 'VOICE', undefined, 'Bo', { index: 1, count: 2 });
+    await vi.waitFor(() => expect(game.room.state().phonePendingPlayerIds).toEqual([]));
+    game.room.advance(ada.playerId);
+    game.room.advance(bo.playerId);
+    game.stateChanged();
+    expect(game.room.phase).toBe('fighter_select');
+    await vi.waitFor(() => expect(game.room.state().phonePendingPlayerIds).toEqual([]));
+
+    holdNext = true;
+    ada.prompt('help');
+    expect(finishOld).toBeTypeOf('function');
+    expect(game.room.selectFighter(ada.playerId, 'nyx')).toBe(true);
+    game.stateChanged();
+    await Promise.resolve();
+    finishOld!('interrupted');
+    await vi.waitFor(() => expect(game.room.state().phonePendingPlayerIds).toEqual([]));
+    expect(game.room.state().phoneRetryPlayerIds).toEqual([]);
+
+    expect(game.room.selectFighter(bo.playerId, 'wraith')).toBe(true);
+    game.stateChanged();
+    await vi.waitFor(() => expect(game.room.state().phonePendingPlayerIds).toEqual([]));
+    game.room.advance(ada.playerId);
+    game.room.advance(bo.playerId);
+    expect(game.room.phase).toBe('map_select');
+  });
+
   it('keeps the Twilio introduction on its screen but expires it when touch advances the menu', () => {
     const game = voiceGame();
     const caller = game.connect('CA-GREETING-BARGE', 'VOICE', undefined, 'Ada');
@@ -251,10 +444,14 @@ describe('fighter voice session', () => {
     const game=voiceGame();const ada=game.connect('CA-boundary-a'),bob=game.connect('CA-boundary-b');
     ada.prompt('Ada');bob.prompt('Bob');
     ada.prompt('next');
+    expect(game.room.phase).toBe('lobby');
+    bob.prompt('next');
     ada.prompt('second');
     bob.prompt('first');
     expect(game.room.phase).toBe('fighter_select');
     ada.prompt('next');
+    expect(game.room.phase).toBe('fighter_select');
+    bob.prompt('next');
     expect(game.room.phase).toBe('map_select');
     ada.prompt('second');
     expect(game.room.state().mapVotesByPlayerId[ada.playerId]).toBe('void');
@@ -499,6 +696,8 @@ describe('fighter voice session', () => {
 
     expect(game.room.phase).toBe('fighter_select');
     ada.prompt('next');
+    expect(game.room.phase).toBe('fighter_select');
+    bob.prompt('next');
     expect(game.room.phase).toBe('map_select');
     bob.prompt('first');
     expect(game.room.state().mapVotesByPlayerId[bob.playerId]).toBe('foundry');
@@ -506,6 +705,8 @@ describe('fighter voice session', () => {
     ada.prompt('second');
     expect(game.room.phase).toBe('map_select');
     bob.prompt('start');
+    expect(game.room.phase).toBe('map_select');
+    ada.prompt('start');
     expect(game.room.phase).toBe('loading');
     game.room.ready(game.room.state().loadingGeneration); game.stateChanged();
     advanceIntro(game); game.tick(6);
@@ -523,8 +724,9 @@ describe('fighter voice session', () => {
 
   it('executes queued combat commands independently for both callers', () => {
     const game=voiceGame(),ada=game.connect('CA-A'),bob=game.connect('CA-B');
-    ada.prompt('Ada');bob.prompt('Bob');ada.prompt('next');ada.prompt('Nyx');bob.prompt('Wraith');ada.prompt('next');
-    ada.prompt('second');bob.prompt('second');ada.prompt('start');
+    ada.prompt('Ada');bob.prompt('Bob');ada.prompt('next');bob.prompt('next');
+    ada.prompt('Nyx');bob.prompt('Wraith');ada.prompt('next');bob.prompt('next');
+    ada.prompt('second');bob.prompt('second');ada.prompt('start');bob.prompt('start');
     game.room.ready(game.room.state().loadingGeneration);game.stateChanged();advanceIntro(game);game.tick(6);
     ada.prompt('forward punch kick jump');
     bob.prompt('forward kick punch jump');
@@ -541,13 +743,17 @@ describe('fighter voice session', () => {
     expect(game.room.canControlSetup(ada.playerId)).toBe(true);
     expect(game.room.canControlSetup(bob.playerId)).toBe(true);
     ada.prompt('next');
+    expect(game.room.phase).toBe('lobby');
+    bob.prompt('next');
     ada.prompt('Nyx');
     expect(game.room.advance()).toBe(false);
     bob.prompt('Wraith');
     expect(game.room.phase).toBe('fighter_select');
     bob.prompt('next');
+    expect(game.room.phase).toBe('fighter_select');
+    ada.prompt('next');
     expect(game.room.phase).toBe('map_select');
-    ada.prompt('second');bob.prompt('second');ada.prompt('start');
+    ada.prompt('second');bob.prompt('second');ada.prompt('start');bob.prompt('start');
     game.room.ready(game.room.state().loadingGeneration);game.stateChanged();advanceIntro(game);game.tick(6);
     ada.prompt('forward punch');bob.prompt('forward kick');
     for(let index=0;index<40;index++)game.tick(0.1);
@@ -949,7 +1155,8 @@ describe('fighter voice session', () => {
 });
 
 function voiceGame(interpret?: (request: VoiceInterpretRequest) => Promise<VoiceInterpretResult>,
-  speechDelivery?: (text: string) => void | Promise<boolean>) {
+  speechDelivery?: (text: string) => void | Promise<boolean | 'played' | 'estimated' | 'interrupted' | 'failed'>,
+  menuSpeechBarrier = false) {
   const room = new FighterRoom('VOICE', 1234);
   const sessions: FighterVoiceSession[] = [];
   const commands: { playerId: string; command: FighterCommand }[] = [];
@@ -978,6 +1185,7 @@ function voiceGame(interpret?: (request: VoiceInterpretRequest) => Promise<Voice
       foeFighterId: foe?.fighterId ?? null,
       foeFighterName: fighterName(foe?.fighterId),
       selectedMap: state.selectedMap,
+      mapVoteTied: state.mapVoteTied,
       loadingGeneration: state.loadingGeneration,
       myMapVote:state.mapVotesByPlayerId[playerId]??null,
       allMapVotes:humans.every(player=>Boolean(state.mapVotesByPlayerId[player.playerId])),
@@ -996,6 +1204,12 @@ function voiceGame(interpret?: (request: VoiceInterpretRequest) => Promise<Voice
       playerTwoName: playerTwo?.name ?? null,
       playerTwoFighterName: fighterName(playerTwo?.fighterId),
       playerCount: humans.length,
+      expectedPlayerCount: state.expectedPlayerCount,
+      phoneRetryPlayerIds: state.phoneRetryPlayerIds,
+      myAdvanceReady: state.advanceReadyPlayerIds.includes(playerId),
+      myBackReady: state.backReadyPlayerIds.includes(playerId),
+      foeAdvanceReady: foe ? state.advanceReadyPlayerIds.includes(foe.playerId) : false,
+      foeBackReady: foe ? state.backReadyPlayerIds.includes(foe.playerId) : false,
       hasExpectedPlayers: state.hasExpectedPlayers,
       automaticSetup:state.automaticSetup,
       allFightersSelected: humans.length > 0 && humans.every(player => player.fighterId),
@@ -1020,6 +1234,7 @@ function voiceGame(interpret?: (request: VoiceInterpretRequest) => Promise<Voice
         else if(room.playerCount>=1)room.expectHumanPlayers(2,false);
         const joined = room.addPlayer(name,side,nameConfirmed);
         if ('error' in joined) return null;
+        if (menuSpeechBarrier) room.registerVoicePlayer(joined.playerId);
         playerId = joined.playerId; stateChanged(); return { playerId, resumed: false };
       },
       leave: (_code, id) => { room.removePlayer(id); stateChanged(); },
@@ -1042,6 +1257,19 @@ function voiceGame(interpret?: (request: VoiceInterpretRequest) => Promise<Voice
         const emitted=room.drainEvents();events.push(...emitted);publishEvents(emitted);stateChanged();return outcomes;
       },
       snapshot: (_code, id) => snapshot(id),
+      ...(menuSpeechBarrier ? { beginMenuAudio: (_code: string, id: string,
+        phase: FighterVoiceSnapshot['phase'], recovery?: boolean) => {
+        const release = room.beginMenuAudio(id, phase, recovery);
+        return (played?: boolean) => { release(played); queueMicrotask(() => {
+          if (room.completeSharedDecisionIfReady()) stateChanged();
+        }); };
+      }, beginMenuTurn: (_code: string, id: string,
+        phase: FighterVoiceSnapshot['phase']) => {
+        const release = room.beginMenuTurn(id, phase);
+        return () => { release(); queueMicrotask(() => {
+          if (room.completeSharedDecisionIfReady()) stateChanged();
+        }); };
+      } } : {}),
       ...(interpret?{interpret}:{}),
     });
     session.setAuthoritativeName(authoritativeName??null);
@@ -1065,10 +1293,11 @@ function voiceGame(interpret?: (request: VoiceInterpretRequest) => Promise<Voice
 }
 
 function startTwoCallerFight(game: ReturnType<typeof voiceGame>) {
-  const ada=game.connect('CA-COMMENTARY-A','VOICE',undefined,'Ada');
-  const bob=game.connect('CA-COMMENTARY-B','VOICE',undefined,'Bob');
-  ada.prompt('next');
-  ada.prompt('Nyx');bob.prompt('Wraith');ada.prompt('next');ada.prompt('second');bob.prompt('second');ada.prompt('start');
+  const ada=game.connect('CA-COMMENTARY-A','VOICE',undefined,'Ada',{index:0,count:2});
+  const bob=game.connect('CA-COMMENTARY-B','VOICE',undefined,'Bob',{index:1,count:2});
+  ada.prompt('next');bob.prompt('next');
+  ada.prompt('Nyx');bob.prompt('Wraith');ada.prompt('next');bob.prompt('next');
+  ada.prompt('second');bob.prompt('second');ada.prompt('start');bob.prompt('start');
   game.room.ready(game.room.state().loadingGeneration);game.stateChanged();advanceIntro(game);game.tick(6);
   return {ada,bob};
 }

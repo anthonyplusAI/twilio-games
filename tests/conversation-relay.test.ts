@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { parseCrMessage } from '../server/conversation-relay';
 import { ConversationRelayAdapter } from '../server/conversation-relay';
+import { Room } from '../server/room';
 import type { Intent } from '../shared/types';
 
 function fakeRoom() {
@@ -59,6 +60,288 @@ describe('parseCrMessage', () => {
 });
 
 describe('ConversationRelayAdapter', () => {
+  it('marks a real caller ready only after all current-menu Relay speech settles', async () => {
+    const room = new Room('SYNC', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const finishSpeech: Array<() => void> = [];
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => room.phase,
+      say: () => new Promise<boolean>(resolve => finishSpeech.push(() => resolve(true))),
+    });
+    adapter.setAuthoritativeName('Ada');
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-sync',
+      customParameters: { roomCode: 'SYNC' } }));
+
+    expect(room.lobbyPlayers()[0]?.setupStatus).toBe('phone');
+    expect(finishSpeech.length).toBeGreaterThan(1);
+    for (const finish of finishSpeech) finish();
+    await vi.waitFor(() => expect(room.lobbyPlayers()[0]?.setupStatus).toBe('ready'));
+    adapter.handleClose(true);
+    expect(room.lobbyPlayers()[0]?.setupStatus).toBe('reconnecting');
+  });
+
+  it('keeps a failed phone cue pending until the caller gets a fresh response', async () => {
+    const room = new Room('FAILED-CUE', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const bo = room.addPlayer('Bo') as { playerId: string };
+    const finishSpeech: Array<(played: boolean) => void> = [];
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => room.phase,
+      say: () => new Promise<boolean>(resolve => finishSpeech.push(resolve)),
+      onSetupChanged: () => { if (room.canAdvance(bo.playerId)) room.advance(bo.playerId); },
+    });
+    adapter.setAuthoritativeName('Ada');
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-failed-cue',
+      customParameters: { roomCode: 'FAILED-CUE' } }));
+    expect(finishSpeech.length).toBeGreaterThan(1);
+    const initialCueCount = finishSpeech.length;
+    finishSpeech.forEach((finish, index) => finish(index !== 0));
+    await Promise.resolve();
+    expect(room.lobbyPlayers().find(player => player.name === 'Ada')?.setupStatus).toBe('phone');
+    expect(room.phase).toBe('lobby');
+
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'help', last: true }));
+    expect(room.phase).toBe('lobby');
+    for (const finish of finishSpeech.slice(initialCueCount)) finish(true);
+    await vi.waitFor(() => expect(room.phase).toBe('car_select'));
+  });
+
+  it('keeps a shared menu on screen while one caller is waiting for an AI answer', async () => {
+    const room = new Room('HOST-WAIT', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const bo = room.addPlayer('Bo') as { playerId: string };
+    let finishHost!: (answer: string) => void;
+    const said: string[] = [];
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => room.phase,
+      say: line => { said.push(line); return Promise.resolve(true); },
+      converse: () => new Promise<string>(resolve => { finishHost = resolve; }),
+    });
+    adapter.setAuthoritativeName('Ada');
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-host-wait',
+      customParameters: { roomCode: 'HOST-WAIT' } }));
+    await vi.waitFor(() => expect(room.canAdvance(bo.playerId)).toBe(true));
+    room.advance(bo.playerId);
+    adapter.onGameEvent({ kind: 'enter_car_select' });
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.name === 'Ada')?.setupStatus).toBe('car'));
+    room.selectCar(bo.playerId, 0);
+    room.selectCar(adapter.boundPlayerId!, 1);
+
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'Which car', last: false }));
+    expect(room.canAdvance(bo.playerId)).toBe(false);
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'Which car is fastest?', last: true }));
+    expect(room.lobbyPlayers().find(player => player.name === 'Ada')?.setupStatus).toBe('phone');
+    expect(room.canAdvance(bo.playerId)).toBe(false);
+    adapter.onGameEvent({ kind: 'car_picked', playerId: bo.playerId, name: 'Bo', car: 'Roadster' });
+    finishHost('Both cars can win.');
+    await vi.waitFor(() => expect(room.canAdvance(bo.playerId)).toBe(true));
+    expect(said).toContain('Both cars can win.');
+  });
+  it('keeps one caller’s car guidance current when the other caller chooses', async () => {
+    const room = new Room('OTHER-PICK', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const ada = room.addPlayer('Ada') as { playerId: string };
+    let finishCarCue!: (played: boolean) => void;
+    let carCueCurrent!: () => boolean;
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => room.phase,
+      say: (_line, isCurrent) => room.phase === 'car_select'
+        ? new Promise<boolean>(resolve => { finishCarCue = resolve; carCueCurrent = isCurrent!; })
+        : Promise.resolve(true),
+    });
+    adapter.setAuthoritativeName('Bo');
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-other-pick',
+      customParameters: { roomCode: 'OTHER-PICK' } }));
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.name === 'Bo')?.setupStatus)
+      .toBe('ready'));
+    room.advance(ada.playerId);
+    adapter.onGameEvent({ kind: 'enter_car_select' });
+    expect(carCueCurrent()).toBe(true);
+
+    room.selectCar(ada.playerId, 0);
+    adapter.onGameEvent({ kind: 'car_picked', playerId: ada.playerId, name: 'Ada', car: 'Roadster' });
+    expect(carCueCurrent()).toBe(true);
+    finishCarCue(true);
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.name === 'Bo')?.setupStatus)
+      .toBe('car'));
+  });
+  it('holds a voted rematch through a barge-in until the new result answer finishes', async () => {
+    const room = new Room('RESULT-INTERRUPT', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const bo = room.addPlayer('Bo') as { playerId: string };
+    const finishHosts: Array<(answer: string) => void> = [];
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => room.phase,
+      say: () => Promise.resolve(true),
+      converse: () => new Promise<string>(resolve => { finishHosts.push(resolve); }),
+      onSetupChanged: () => { room.completeSharedReplayIfReady(); },
+    });
+    adapter.setAuthoritativeName('Ada');
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-result-interrupt',
+      customParameters: { roomCode: 'RESULT-INTERRUPT' } }));
+    const ada = adapter.boundPlayerId!;
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.playerId === ada)?.setupStatus)
+      .toBe('ready'));
+    room.advance(ada);
+    room.selectCar(ada, 0);
+    room.selectCar(bo.playerId, 1);
+    room.beginMenuAudio(ada, 'car_select')();
+    room.advance(ada);
+    room.selectMap('Silver Lake', ada);
+    room.selectMap('Silver Lake', bo.playerId);
+    room.beginMenuAudio(ada, 'map_select')();
+    room.advance(ada);
+    for (let i = 0; i < 60 * 120 && room.phase !== 'results'; i++) room.tick(1 / 60);
+    expect(room.phase).toBe('results');
+    room.beginMenuAudio(ada, 'results')();
+
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'How did I finish?', last: true }));
+    expect(room.lobbyPlayers().find(player => player.playerId === ada)?.setupStatus).toBe('phone');
+    expect(room.advance(ada)).toBe(false);
+    expect(room.advance(bo.playerId)).toBe(false);
+    adapter.handleMessage(JSON.stringify({ type: 'interrupt', durationUntilInterruptMs: 500 }));
+    expect(room.phase).toBe('results');
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'Tell me how I did', last: true }));
+    expect(room.phase).toBe('results');
+    finishHosts[1]!('Your result is on the screen.');
+    await vi.waitFor(() => expect(room.phase).toBe('car_select'));
+    finishHosts[0]!('Old result answer');
+  });
+  it('does not start a voted rematch while its last result answer caller disconnects', async () => {
+    const room = new Room('RESULT-DISCONNECT', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const bo = room.addPlayer('Bo') as { playerId: string };
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => room.phase,
+      say: () => Promise.resolve(true),
+      converse: () => new Promise<string>(() => {}),
+      onSetupChanged: () => { room.completeSharedReplayIfReady(); },
+    });
+    adapter.setAuthoritativeName('Ada');
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-result-disconnect',
+      customParameters: { roomCode: 'RESULT-DISCONNECT' } }));
+    const ada = adapter.boundPlayerId!;
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.playerId === ada)?.setupStatus)
+      .toBe('ready'));
+    room.advance(ada);
+    room.selectCar(ada, 0);
+    room.selectCar(bo.playerId, 1);
+    room.beginMenuAudio(ada, 'car_select')();
+    room.advance(ada);
+    room.selectMap('Silver Lake', ada);
+    room.selectMap('Silver Lake', bo.playerId);
+    room.beginMenuAudio(ada, 'map_select')();
+    room.advance(ada);
+    for (let i = 0; i < 60 * 120 && room.phase !== 'results'; i++) room.tick(1 / 60);
+    expect(room.phase).toBe('results');
+    room.beginMenuAudio(ada, 'results')();
+
+    adapter.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'How did I finish?', last: true }));
+    expect(room.advance(ada)).toBe(false);
+    expect(room.advance(bo.playerId)).toBe(false);
+    adapter.handleClose(true);
+
+    expect(room.phase).toBe('results');
+    expect(room.lobbyPlayers().find(player => player.playerId === ada)?.setupStatus).toBe('reconnecting');
+  });
+
+  it('replays interrupted menu guidance after an unsupported keypad key', async () => {
+    const room = new Room('INVALID-KEY', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const bo = room.addPlayer('Bo') as { playerId: string };
+    const carCues: Array<(played: boolean) => void> = [];
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => room.phase,
+      say: () => room.phase === 'car_select'
+        ? new Promise<boolean>(resolve => carCues.push(resolve)) : Promise.resolve(true),
+    });
+    adapter.setAuthoritativeName('Ada');
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-invalid-key',
+      customParameters: { roomCode: 'INVALID-KEY' } }));
+    const ada = adapter.boundPlayerId!;
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.playerId === ada)?.setupStatus)
+      .toBe('ready'));
+    room.advance(bo.playerId);
+    adapter.onGameEvent({ kind: 'enter_car_select' });
+    room.selectCar(bo.playerId, 0);
+    room.selectCar(ada, 1);
+    expect(room.canAdvance(bo.playerId)).toBe(false);
+    expect(carCues).toHaveLength(1);
+
+    adapter.handleMessage(JSON.stringify({ type: 'dtmf', digit: '#' }));
+    await Promise.resolve();
+    expect(carCues).toHaveLength(2);
+    expect(room.canAdvance(bo.playerId)).toBe(false);
+    carCues[1]!(true);
+    await vi.waitFor(() => expect(room.canAdvance(bo.playerId)).toBe(true));
+  });
+  it('replays an interrupted result recap before a voted rematch', async () => {
+    const room = new Room('RESULT-INVALID-KEY', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const bo = room.addPlayer('Bo') as { playerId: string };
+    const resultCues: Array<{ line: string; finish: (played: boolean) => void }> = [];
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => room.phase,
+      say: line => room.phase === 'results'
+        ? new Promise<boolean>(resolve => resultCues.push({ line, finish: resolve })) : Promise.resolve(true),
+      resultRecap: () => 'Your result is on the screen.',
+      onSetupChanged: () => { room.completeSharedReplayIfReady(); },
+    });
+    adapter.setAuthoritativeName('Ada');
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-result-invalid-key',
+      customParameters: { roomCode: 'RESULT-INVALID-KEY' } }));
+    const ada = adapter.boundPlayerId!;
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.playerId === ada)?.setupStatus)
+      .toBe('ready'));
+    room.advance(ada);
+    room.selectCar(ada, 0);
+    room.selectCar(bo.playerId, 1);
+    room.beginMenuAudio(ada, 'car_select')();
+    room.advance(ada);
+    room.selectMap('Silver Lake', ada);
+    room.selectMap('Silver Lake', bo.playerId);
+    room.beginMenuAudio(ada, 'map_select')();
+    room.advance(ada);
+    for (let i = 0; i < 60 * 120 && room.phase !== 'results'; i++) room.tick(1 / 60);
+    expect(room.phase).toBe('results');
+    adapter.onGameEvent({ kind: 'race_over' });
+    expect(resultCues.map(cue => cue.line)).toEqual(['Your result is on the screen.']);
+    expect(room.advance(ada)).toBe(false);
+    expect(room.advance(bo.playerId)).toBe(false);
+
+    adapter.handleMessage(JSON.stringify({ type: 'dtmf', digit: '#' }));
+    await Promise.resolve();
+    expect(room.phase).toBe('results');
+    expect(resultCues.map(cue => cue.line)).toEqual([
+      'Your result is on the screen.', 'Your result is on the screen.',
+    ]);
+    resultCues[1]!.finish(true);
+    await vi.waitFor(() => expect(room.phase).toBe('car_select'));
+  });
+  it('repeats the personal result recap when a standalone caller reconnects', () => {
+    const room = fakeRoom();
+    const said: string[] = [];
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      resumePlayer: () => ({ playerId: 'p1', lane: 0, resumed: true, name: 'Ada' }),
+      phaseOf: () => 'results',
+      resultRecap: () => 'Ada finished second in this race.',
+      say: line => { said.push(line); return true; },
+    });
+    adapter.setAuthoritativeName('Ada');
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-result-return',
+      customParameters: { roomCode: 'RESULT-RETURN' } }));
+
+    expect(said).toContain('Ada finished second in this race.');
+  });
   it('keeps the call introduction on its screen, but expires it when a touch advances the menu', () => {
     const room = fakeRoom();
     let phase = 'lobby';
@@ -369,6 +652,37 @@ describe('ConversationRelayAdapter', () => {
     await adapter.whenSpeechSettled();
     expect(said).toEqual([recap]);
     expect(modelTurns).toBe(0);
+  });
+
+  it('keeps a shared result menu pending through the caller recap playback', async () => {
+    let phase = 'lobby';
+    let resultAudioPending = 0;
+    let finishRecap!: (played: boolean) => void;
+    const recap = new Promise<boolean>(resolve => { finishRecap = resolve; });
+    const room = {
+      ...fakeRoom(),
+      beginMenuAudio: (_playerId: string, speechPhase: string) => {
+        if (speechPhase !== 'results') return () => {};
+        resultAudioPending++;
+        return () => { resultAudioPending--; };
+      },
+    };
+    const adapter = new ConversationRelayAdapter({
+      findOrCreateRoom: () => room,
+      phaseOf: () => phase,
+      say: line => line === 'Your race recap.' ? recap : undefined,
+      resultRecap: () => 'Your race recap.',
+    });
+    adapter.setAuthoritativeName('Ada');
+    adapter.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-shared-recap',
+      customParameters: { roomCode: '4821' } }));
+
+    phase = 'results';
+    adapter.onGameEvent({ kind: 'race_over' });
+    expect(resultAudioPending).toBe(1);
+    finishRecap(true);
+    await adapter.whenSpeechSettled();
+    expect(resultAudioPending).toBe(0);
   });
 
   it('answers interrupted station result questions from authoritative standings', () => {

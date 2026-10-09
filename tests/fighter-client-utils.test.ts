@@ -1,8 +1,38 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { fighterResultActionState, isInteractiveShortcutTarget, resolveNumericSelection } from '../client/fighter/fighter-client-utils';
+import { fighterResultActionState, fighterSharedSeatStatus, isInteractiveShortcutTarget, resolveNumericSelection } from '../client/fighter/fighter-client-utils';
+import { FighterRoom } from '../server/fighter-room';
 
 describe('fighter client shortcuts', () => {
+  it('labels a saved shared vote as waiting for phone audio and a dropped phone as reconnecting', () => {
+    const room = new FighterRoom('PHONE-STATUS', 1);
+    room.configureStandaloneSeats(2);
+    const ada = room.addPlayer('Ada'), bo = room.addPlayer('Bo');
+    if ('error' in ada || 'error' in bo) throw new Error('join failed');
+    room.registerVoicePlayer(ada.playerId);
+    const finishPhonePrompt = room.beginMenuAudio(ada.playerId, 'lobby');
+    const player = room.lobbyPlayers().find(candidate => candidate.playerId === ada.playerId)!;
+    expect(room.state().phonePendingPlayerIds).toContain(ada.playerId);
+    expect(fighterSharedSeatStatus(room.state(), player)).toBe('shared.phonePending');
+
+    room.advance(ada.playerId);
+    expect(fighterSharedSeatStatus(room.state(), player)).toBe('shared.phonePendingVote');
+    finishPhonePrompt();
+    expect(room.state().phonePendingPlayerIds).not.toContain(ada.playerId);
+    expect(fighterSharedSeatStatus(room.state(), player)).toBe('shared.ready');
+
+    const finishInput = room.beginMenuTurn(ada.playerId, 'lobby');
+    expect(fighterSharedSeatStatus(room.state(), player)).toBe('shared.phoneConversation');
+    finishInput();
+    const failedCue = room.beginMenuAudio(ada.playerId, 'lobby');
+    failedCue(false);
+    expect(fighterSharedSeatStatus(room.state(), player)).toBe('shared.phoneRetry');
+
+    room.suspendPlayer(ada.playerId);
+    expect(room.state().phoneDisconnectedPlayerIds).toContain(ada.playerId);
+    expect(fighterSharedSeatStatus(room.state(), player)).toBe('shared.phoneReconnect');
+  });
+
   it('offers result Rematch only to a connected standalone host display', () => {
     expect(fighterResultActionState(false, true, 'connected', 'results')).toBe('rematch');
     expect(fighterResultActionState(false, false, 'connected', 'results')).toBe('viewer');

@@ -10,10 +10,12 @@ import { dwellForEvent, HANDOFF_PAUSE_MS } from '../shared/battle-timing';
 
 export type BattlePhase = 'lobby' | 'monster_select' | 'battle' | 'results';
 
-interface Slot { id: string; name: string; nameConfirmed: boolean; monsterId: string | null; isAi: boolean; side: Side; }
+interface Slot { id: string; name: string; nameConfirmed: boolean; monsterId: string | null; setupReady: boolean; isAi: boolean; side: Side; }
+type BattleMenuPhase = 'lobby' | 'monster_select' | 'results';
+interface VoiceMenuSpeech { phase: BattleMenuPhase; generation: number; latestCue: number; pending: number; delivered: boolean; }
 
 /** Roster row for the lobby / monster-select screens. */
-export interface BattlePlayer { playerId: string; name: string; monsterId: string | null; isAi: boolean; }
+export interface BattlePlayer { playerId: string; side: Side; name: string; nameConfirmed: boolean; monsterId: string | null; setupReady: boolean; phonePending: boolean; isAi: boolean; }
 
 export interface BattleResult { winner: Side; winnerName: string; }
 
@@ -41,6 +43,8 @@ export class BattleRoom {
   private expectedHumanPlayers = 1;
   private automaticSetup=false;
   private fixedExpectedHumanPlayers=false;
+  private displayConfiguredPlayers: 1 | 2 | null = null;
+  private voiceMenus = new Map<string, VoiceMenuSpeech>();
 
   constructor(code: string, seed: number) {
     this.code = code;
@@ -50,6 +54,14 @@ export class BattleRoom {
 
   get phase(): BattlePhase { return this._phase; }
   get playerCount(): number { return this.slots.length; }
+  get expectedPlayerCount(): number { return this.expectedHumanPlayers; }
+  get requiresIndividualSetupReady(): boolean { return this.requiresIndividualReadiness(); }
+  get requiresIndividualRematchReady(): boolean { return this.requiresBothRematchVotes(); }
+  /** The display cannot accept a replay for either caller of a finished human duel, even if one leaves. */
+  get requiresCallerRematchControl(): boolean {
+    return this._phase === 'results' && (this.requiresBothRematchVotes()
+      || Boolean(this.world && this.world.snapshot().b.id !== AI_ID));
+  }
   get isEmpty(): boolean { return this.slots.length === 0; }
   get generation(): number { return this.battleGeneration; }
   get resultsPresented():boolean{return this._phase==='results'&&this._resultsPresented;}
@@ -61,11 +73,11 @@ export class BattleRoom {
     return this._phase==='results'&&this.slots.some(slot=>slot.id===playerId)
       &&this.isBattleParticipant(playerId);
   }
-  /** A late caller may take over a finished standalone room only after its original players leave.
-   * Until then the original players own the replay decision and the displayed result stays put. */
+  /** Both current callers can consent to replay. A lone late caller can also take over
+   * after the finished battle's original participants have left. */
   canStartNextRound(playerId:string):boolean{
     if(this._phase!=='results'||!this.canRematch||!this.slots.some(slot=>slot.id===playerId))return false;
-    return this.isBattleParticipant(playerId)
+    return this.requiresBothRematchVotes() || this.isBattleParticipant(playerId)
       || !this.slots.some(slot=>this.isBattleParticipant(slot.id));
   }
   acknowledgeResultsPresented(generation:number):boolean{
@@ -83,7 +95,61 @@ export class BattleRoom {
 
   /** Roster for the shared-display lobby + monster-select screens. */
   lobbyPlayers(): BattlePlayer[] {
-    return this.slots.map(s => ({ playerId: s.id, name: s.name, monsterId: s.monsterId, isAi: s.isAi }));
+    return this.slots.map(s => ({ playerId: s.id, side: s.side, name: s.name, nameConfirmed: s.nameConfirmed,
+      monsterId: s.monsterId, setupReady: s.setupReady, phonePending: this.isPhonePending(s.id), isAi: s.isAi }));
+  }
+
+  /** Each voice cue is bound to the caller and current menu; a superseded cue cannot release it. */
+  beginVoiceMenuSpeech(playerId: string, phase: BattleMenuPhase): ((delivered: boolean) => void) | null {
+    if (this._phase !== phase || !this.slots.some(slot => slot.id === playerId)) return null;
+    let menu = this.voiceMenus.get(playerId);
+    if (!menu || menu.phase !== phase) {
+      menu = { phase, generation: (menu?.generation ?? 0) + 1, latestCue: 0, pending: 0, delivered: false };
+      this.voiceMenus.set(playerId, menu);
+    }
+    menu.pending++;
+    menu.latestCue++;
+    menu.delivered = false;
+    const cue = menu.latestCue;
+    const generation = menu.generation;
+    let settled = false;
+    return delivered => {
+      if (settled) return;
+      settled = true;
+      if (this.voiceMenus.get(playerId) !== menu || menu.generation !== generation
+        || this._phase !== phase || !this.slots.some(slot => slot.id === playerId)) return;
+      menu.pending = Math.max(0, menu.pending - 1);
+      if (cue === menu.latestCue) menu.delivered = delivered;
+      this.progressReadyMenu();
+    };
+  }
+
+  private isPhonePending(playerId: string): boolean {
+    const menu = this.voiceMenus.get(playerId);
+    return Boolean(menu && menu.phase === this._phase && (menu.pending > 0 || !menu.delivered));
+  }
+
+  private voiceMenuReady(playerId: string): boolean { return !this.isPhonePending(playerId); }
+
+  isSetupReady(playerId: string): boolean {
+    return (this._phase === 'lobby' || this._phase === 'monster_select' || this._phase === 'results')
+      && this.slots.find(slot => slot.id === playerId)?.setupReady === true;
+  }
+
+  /** A caller who lost their phone session must confirm the current shared menu again on return. */
+  clearSetupReady(playerId: string): boolean {
+    const slot = this.slots.find(candidate => candidate.id === playerId);
+    if (!slot || (this._phase !== 'lobby' && this._phase !== 'monster_select'
+      && this._phase !== 'results')) return false;
+    const wasReady = slot.setupReady;
+    slot.setupReady = false;
+    const menu = this.voiceMenus.get(playerId);
+    if (menu) {
+      menu.generation++;
+      menu.pending = 0;
+      menu.delivered = false;
+    }
+    return wasReady || Boolean(menu);
   }
 
   participantResults(): Array<{
@@ -112,21 +178,23 @@ export class BattleRoom {
     // Keep the final screen after the last caller leaves. A new standalone caller explicitly begins
     // the next session; a late station caller must not erase the previous match's result.
     if (this._phase === 'results' && this.slots.length === 0) {
-      if (this.fixedExpectedHumanPlayers) return { error: 'round_complete' };
+      if (this.fixedExpectedHumanPlayers && this.displayConfiguredPlayers === null) return { error: 'round_complete' };
       this.reset();
       // The prior duel may have required two callers and player-bound station-style setup.
       // A new standalone caller starts with the same solo policy as a fresh room.
-      this.expectedHumanPlayers = 1;
-      this.automaticSetup = false;
-      this.fixedExpectedHumanPlayers = false;
+      this.expectedHumanPlayers = this.displayConfiguredPlayers ?? 1;
+      this.automaticSetup = this.displayConfiguredPlayers !== null;
+      this.fixedExpectedHumanPlayers = this.displayConfiguredPlayers !== null;
     }
+    if (this.displayConfiguredPlayers === 1 && this.slots.length >= 1) return { error: 'room_full' };
     if (this._phase === 'results' && this.slots.length >= 2) return { error: 'room_full' };
     if (this._phase === 'battle' && this.slots.length >= 2) return { error: 'battle_in_progress' };
     if (this.slots.length >= 2) return { error: 'room_full' };
     const side = preferredSide ?? (this.slots.some(slot => slot.side === 'a') ? 'b' : 'a');
     if (this.slots.some(slot => slot.side === side)) return { error: 'room_full' };
     const id = `p${this.nextId++}`;
-    this.slots.push({ id, name: name || `Player ${this.slots.length + 1}`, nameConfirmed, monsterId: null, isAi: false, side });
+    this.slots.push({ id, name: name || `Player ${this.slots.length + 1}`, nameConfirmed,
+      monsterId: null, setupReady: false, isAi: false, side });
     this.slots.sort((left, right) => left.side.localeCompare(right.side));
     return { playerId: id };
   }
@@ -139,17 +207,38 @@ export class BattleRoom {
       this.slots[0]!.side = 'a';
     }
   }
+
+  /** A standalone shared display can make its first choice while callers are still in the lobby.
+   *  This closes the ordering gap where a phone or keyboard socket joins before the display socket. */
+  configureDisplayPlayers(count: 1 | 2): boolean {
+    if (this.displayConfiguredPlayers === count) return true;
+    if (this._phase === 'battle') return false;
+    if (this.slots.length > 0 && (this.displayConfiguredPlayers !== null || this._phase !== 'lobby'
+      || this.slots.length > count || this.expectedHumanPlayers > count)) return false;
+    this.displayConfiguredPlayers = count;
+    this.expectedHumanPlayers = count;
+    this.automaticSetup = true;
+    this.fixedExpectedHumanPlayers = true;
+    return true;
+  }
   playerSide(playerId: string): Side | null { return this.slots.find(slot => slot.id === playerId)?.side ?? null; }
   canControlSetup(playerId: string): boolean {
     return this.playerSide(playerId)!==null;
   }
 
   removePlayer(playerId: string): void {
+    const previousCount = this.slots.length;
     const wasInBattle = this.isBattleParticipant(playerId);
     this.slots = this.slots.filter(s => s.id !== playerId);
+    if (this.slots.length === previousCount) return;
+    this.voiceMenus.delete(playerId);
+    this.clearAllSetupReady();
     if (this.slots.length === 0) {
       if (this._phase !== 'results') {
-        this.reset(); this.automaticSetup = false; this.expectedHumanPlayers = 1; this.fixedExpectedHumanPlayers = false;
+        this.reset();
+        this.automaticSetup = this.displayConfiguredPlayers !== null;
+        this.expectedHumanPlayers = this.displayConfiguredPlayers ?? 1;
+        this.fixedExpectedHumanPlayers = this.displayConfiguredPlayers !== null;
       }
     }
     else {
@@ -163,7 +252,11 @@ export class BattleRoom {
 
   setPlayerInfo(playerId: string, info: { name?: string }): void {
     const s = this.slots.find(x => x.id === playerId);
-    if (s && info.name) { s.name = info.name.slice(0, 20); s.nameConfirmed = true; }
+    if (s && info.name) {
+      const name = info.name.slice(0, 20);
+      if (name !== s.name || !s.nameConfirmed) s.setupReady = false;
+      s.name = name; s.nameConfirmed = true;
+    }
   }
   hasConfirmedName(playerId: string): boolean { return this.slots.find(slot => slot.id === playerId)?.nameConfirmed === true; }
 
@@ -182,6 +275,8 @@ export class BattleRoom {
     if (!monsterById(monsterId)) return false;
     const s = this.slots.find(x => x.id === playerId);
     if (!s) return false;
+    if (this.requiresIndividualReadiness() && !s.nameConfirmed) return false;
+    if (s.monsterId !== monsterId) s.setupReady = false;
     s.monsterId=monsterId;
     return true;
   }
@@ -191,28 +286,100 @@ export class BattleRoom {
   advance(playerId?: string): boolean {
     if (this._phase === 'results') {
       if (!this.slots.length || !this.canRematch || (playerId && !this.canStartNextRound(playerId))) return false;
-      this.world = null; this.ai = null; this._result = null;
-      this.resultsReadyAt = 0;
-      this._resultsPresented = false;
-      this.presentationReadyAt = 0;
-      this.lastPresentedActionSide = null;
-      for (const s of this.slots) s.monsterId = null;
-      this._phase = this.slots.every(slot => slot.nameConfirmed) ? 'monster_select' : 'lobby';
+      if (this.requiresCallerRematchControl) {
+        const slot = this.slots.find(candidate => candidate.id === playerId);
+        if (!slot) return false;
+        slot.setupReady = true;
+        this.progressReadyMenu();
+        return true;
+      }
+      this.startRematch();
       return true;
     }
     if(this.automaticSetup&&(!playerId||!this.canControlSetup(playerId)))return false;
     if (this._phase === 'lobby') {
-      if (!this.canAdvanceLobby) return false;
+      if (this.requiresIndividualReadiness()) {
+        const slot = this.slots.find(candidate => candidate.id === playerId);
+        if (!slot?.nameConfirmed) return false;
+        slot.setupReady = true;
+        this.progressReadyMenu();
+        return true;
+      } else if (!this.canAdvanceLobby) {
+        return false;
+      }
+      this.clearAllSetupReady();
       this._phase = 'monster_select';return true;
     }
-    if (this._phase === 'monster_select' && this.canStart()) { this.start();return true; }
+    if (this._phase === 'monster_select') {
+      if (this.requiresIndividualReadiness()) {
+        const slot = this.slots.find(candidate => candidate.id === playerId);
+        if (!slot?.nameConfirmed || !slot.monsterId) return false;
+        slot.setupReady = true;
+        this.progressReadyMenu();
+        return true;
+      } else if (!this.canStart()) {
+        return false;
+      }
+      this.start();return true;
+    }
     return false;
   }
 
   back(playerId?:string): boolean {
     if(this.automaticSetup&&(!playerId||!this.canControlSetup(playerId)))return false;
-    if (this._phase === 'monster_select') { this._phase = 'lobby'; return true; }
+    if (this._phase === 'monster_select') {
+      if (this.requiresIndividualReadiness()) {
+        const slot = this.slots.find(candidate => candidate.id === playerId);
+        if (!slot || (!slot.monsterId && !slot.setupReady)) return false;
+        slot.monsterId = null; slot.setupReady = false;
+        return true;
+      }
+      this.clearAllSetupReady(); this._phase = 'lobby'; return true;
+    }
     return false;
+  }
+
+  private requiresIndividualReadiness(): boolean {
+    return this.automaticSetup && this.expectedHumanPlayers >= 2;
+  }
+
+  private requiresBothRematchVotes(): boolean {
+    return this._phase === 'results' && this.slots.length === 2;
+  }
+
+  private progressReadyMenu(): boolean {
+    if (this._phase === 'lobby' && this.requiresIndividualReadiness() && this.canAdvanceLobby
+      && this.slots.every(slot => slot.setupReady && this.voiceMenuReady(slot.id))) {
+      this.clearAllSetupReady();
+      this._phase = 'monster_select';
+      return true;
+    }
+    if (this._phase === 'monster_select' && this.requiresIndividualReadiness() && this.canStart()
+      && this.slots.every(slot => slot.setupReady && this.voiceMenuReady(slot.id))) {
+      this.start();
+      return true;
+    }
+    if (this._phase === 'results' && this.requiresCallerRematchControl && this.canRematch
+      && this.slots.length > 0
+      && this.slots.every(slot => slot.setupReady && this.voiceMenuReady(slot.id))) {
+      this.startRematch();
+      return true;
+    }
+    return false;
+  }
+
+  private startRematch(): void {
+    this.world = null; this.ai = null; this._result = null;
+    this.resultsReadyAt = 0;
+    this._resultsPresented = false;
+    this.presentationReadyAt = 0;
+    this.lastPresentedActionSide = null;
+    for (const slot of this.slots) { slot.monsterId = null; slot.setupReady = false; }
+    this._phase = this.slots.every(slot => slot.nameConfirmed) ? 'monster_select' : 'lobby';
+  }
+
+  private clearAllSetupReady(): void {
+    for (const slot of this.slots) slot.setupReady = false;
   }
 
   /** Ready to battle when at least one human has picked a monster (the 2nd side is the other human
@@ -221,11 +388,12 @@ export class BattleRoom {
     if (this._phase !== 'monster_select') return false;
     if (this.slots.length < this.expectedHumanPlayers) return false;
     const picked = this.slots.filter(s => s.monsterId);
-    if (this.slots.length >= 2) return this.slots.every(s => s.monsterId);   // 2P: both must pick
+    if (this.slots.length >= 2) return this.slots.every(s => s.nameConfirmed && s.monsterId); // 2P: both named + picked
     return picked.length === 1;                                              // 1P: the human picked
   }
 
   private start(): void {
+    this.clearAllSetupReady();
     const humans = this.slots.filter(s => s.monsterId);
     const a = humans.find(slot => slot.side === 'a') ?? humans[0]!;
     let bId: string, bName: string, bMonster: string;
@@ -243,7 +411,8 @@ export class BattleRoom {
       this.seed,
     );
     this.menu = { a: 'root', b: 'root' };
-    this.active = this.ai?.side === 'a' ? 'b' : 'a';
+    // A solo caller always opens. Two humans alternate the seeded opener on rematches.
+    this.active = this.ai ? 'a' : ((this.seed ^ this.battleGeneration) & 1) === 0 ? 'a' : 'b';
     this.battleGeneration++;
     this.resultsReadyAt = 0;
     this._resultsPresented = false;
@@ -374,7 +543,7 @@ export class BattleRoom {
     this._resultsPresented = false;
     this.presentationReadyAt = 0;
     this.lastPresentedActionSide = null;
-    for (const s of this.slots) s.monsterId = null;
+    for (const s of this.slots) { s.monsterId = null; s.setupReady = false; }
     this._phase = 'lobby';
   }
 
@@ -409,7 +578,11 @@ export class BattleRoom {
     this._resultsPresented = false;
     this.presentationReadyAt = 0;
     this.lastPresentedActionSide = null;
+    this.clearAllSetupReady();
     this._phase = this.slots.length > 0 && this.slots.every(slot => slot.nameConfirmed) ? 'monster_select' : 'lobby';
+    // The survivor is back on a fresh setup menu even if it has the same phase name as
+    // the pre-battle menu. Old audio receipts must not count as fresh guidance.
+    this.voiceMenus.clear();
   }
 
   private canChoose(playerId: string): boolean {

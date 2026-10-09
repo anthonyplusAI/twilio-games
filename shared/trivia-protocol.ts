@@ -40,6 +40,10 @@ export interface TriviaPublicPlayer {
   readonly rawScore: number;
   readonly correctCount: number;
   readonly bestStreak: number;
+  /** Shared setup status for this caller's current menu. */
+  readonly setupStatus?: 'name' | 'phone' | 'category' | 'ready' | 'reconnecting' | 'replay' | 'replay_ready';
+  readonly categoryVoted?: boolean;
+  readonly replayReady?: boolean;
 }
 
 export interface TriviaPublicStanding extends TriviaPublicPlayer {
@@ -92,6 +96,7 @@ interface TriviaStateBase {
   readonly category: TriviaRoundCategoryId | null;
   readonly categoryVoteCounts: TriviaCategoryVoteCounts;
   readonly categoryVotingSeat: TriviaCategoryVotingSeat | null;
+  readonly replayVotingSeat?: TriviaCategoryVotingSeat | null;
   readonly players: readonly TriviaPublicPlayer[];
   readonly serverNowMs: number;
   readonly loadingGeneration: number;
@@ -171,11 +176,13 @@ export type TriviaEvent =
 /** Browser commands. Generic answers and all scoring remain outside this union. */
 export type TriviaClientMessage =
   | { type: 'join'; roomCode: string; name: string; sessionId?: string; locale?: SupportedLocale }
-  | { type: 'spectate'; roomCode: string; locale?: SupportedLocale }
+  | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; count?: 1 | 2 | 3 | 4 }
   | { type: 'display_auth'; roomCode: string; token: string }
+  | { type: 'configure_seats'; roomCode: string; count: 1 | 2 | 3 | 4 }
   | { type: 'clock_sync'; clientSentAtMs: number }
   | { type: 'select_category'; category: TriviaRoundCategoryId }
   | { type: 'display_select_category'; playerId: string; category: TriviaRoundCategoryId }
+  | { type: 'display_replay'; playerId: string }
   | { type: 'view_rendered'; questionId: string; questionAttemptId: number; phase: 'question_prompt' | 'answer_cue'; renderRevision: number }
   | { type: 'keyboard_answer'; choiceId: string }
   | { type: 'advance' }
@@ -213,6 +220,7 @@ export interface TriviaAuthoritativeState {
   readonly category: TriviaRoundCategoryId | null;
   readonly categoryVoteCounts?: TriviaCategoryVoteCounts;
   readonly categoryVotingSeat?: TriviaCategoryVotingSeat | null;
+  readonly replayVotingSeat?: TriviaCategoryVotingSeat | null;
   readonly players: readonly TriviaAuthoritativePlayer[];
   readonly serverNowMs: number;
   readonly loadingGeneration: number;
@@ -258,6 +266,9 @@ export function projectTriviaState(state: TriviaAuthoritativeState, locale: Supp
     rawScore: player.rawScore,
     correctCount: player.correctCount,
     bestStreak: player.bestStreak,
+    ...(player.setupStatus ? { setupStatus: player.setupStatus } : {}),
+    ...(player.categoryVoted !== undefined ? { categoryVoted: player.categoryVoted } : {}),
+    ...(player.replayReady !== undefined ? { replayReady: player.replayReady } : {}),
   })));
   const standings = state.phase === 'reveal' || state.phase === 'results'
     ? Object.freeze(state.players.slice().sort((a, b) => b.rawScore - a.rawScore
@@ -297,6 +308,7 @@ export function projectTriviaState(state: TriviaAuthoritativeState, locale: Supp
     category: state.category,
     categoryVoteCounts: state.categoryVoteCounts ?? emptyCategoryVoteCounts(),
     categoryVotingSeat: state.categoryVotingSeat ?? null,
+    replayVotingSeat: state.replayVotingSeat ?? null,
     players,
     serverNowMs: state.serverNowMs,
     loadingGeneration: state.loadingGeneration,
@@ -360,11 +372,19 @@ export function parseTriviaClientMessage(raw: string): TriviaClientMessage | Tri
       };
     }
     case 'spectate': {
-      if (!hasOnlyKeys(value, ['type', 'roomCode', 'locale'])) return badFields('bad_spectate');
+      if (!hasOnlyKeys(value, ['type', 'roomCode', 'locale', 'count'])) return badFields('bad_spectate');
       const roomCode = room(value.roomCode);
       if (!roomCode) return error('bad_spectate', 'valid roomCode required');
       if (value.locale !== undefined && !isSupportedLocale(value.locale)) return error('bad_spectate', 'invalid locale');
-      return { type: 'spectate', roomCode, ...(isSupportedLocale(value.locale) ? { locale: value.locale } : {}) };
+      if (value.count !== undefined && (!Number.isSafeInteger(value.count)
+        || (value.count as number) < TRIVIA_MIN_PLAYERS || (value.count as number) > TRIVIA_MAX_PLAYERS)) {
+        return error('bad_spectate', 'one to four seats required');
+      }
+      return {
+        type: 'spectate', roomCode,
+        ...(isSupportedLocale(value.locale) ? { locale: value.locale } : {}),
+        ...(value.count !== undefined ? { count: value.count as 1 | 2 | 3 | 4 } : {}),
+      };
     }
     case 'display_auth': {
       if (!hasOnlyKeys(value, ['type', 'roomCode', 'token'])) return badFields('bad_display_auth');
@@ -372,6 +392,15 @@ export function parseTriviaClientMessage(raw: string): TriviaClientMessage | Tri
       const token = opaque(value.token, 256);
       if (!roomCode || !token) return error('bad_display_auth', 'valid roomCode + token required');
       return { type: 'display_auth', roomCode, token };
+    }
+    case 'configure_seats': {
+      if (!hasOnlyKeys(value, ['type', 'roomCode', 'count'])) return badFields('bad_configure_seats');
+      const roomCode = room(value.roomCode);
+      if (!roomCode || !Number.isSafeInteger(value.count) || (value.count as number) < TRIVIA_MIN_PLAYERS
+        || (value.count as number) > TRIVIA_MAX_PLAYERS) {
+        return error('bad_configure_seats', 'valid roomCode and one to four seats required');
+      }
+      return { type: 'configure_seats', roomCode, count: value.count as 1 | 2 | 3 | 4 };
     }
     case 'clock_sync':
       if (!hasOnlyKeys(value, ['type', 'clientSentAtMs']) || !nonNegativeSafeInteger(value.clientSentAtMs)) {
@@ -391,6 +420,13 @@ export function parseTriviaClientMessage(raw: string): TriviaClientMessage | Tri
         return error('bad_select_category', 'valid voting seat and category required');
       }
       return { type: 'display_select_category', playerId, category: value.category as TriviaRoundCategoryId };
+    }
+    case 'display_replay': {
+      const playerId = opaque(value.playerId, 32);
+      if (!hasOnlyKeys(value, ['type', 'playerId']) || !playerId) {
+        return error('bad_display_replay', 'valid replay seat required');
+      }
+      return { type: 'display_replay', playerId };
     }
     case 'view_rendered': {
       const questionId = opaque(value.questionId, 128);

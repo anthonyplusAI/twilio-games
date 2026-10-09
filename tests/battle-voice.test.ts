@@ -3,7 +3,9 @@
 // battle events. Tested against a fake battle backend + fake LLM (no WS/Twilio).
 import { describe, it, expect, vi } from 'vitest';
 import { BattleVoiceSession, parseSpokenName, isAdvanceWord, type BattleVoiceDeps, type BattleVoiceSnapshot } from '../server/battle-voice';
+import { BattleRoom } from '../server/battle-room';
 import type { BattleEvent } from '../shared/battle-world';
+import type { VoiceInterpretResult } from '../server/voice-interpreter';
 
 describe('parseSpokenName', () => {
   it('extracts a name from common phrasings', () => {
@@ -152,7 +154,61 @@ describe('BattleVoiceSession', () => {
     snap = { ...snap, myMonsterId: 'sparkmouse', myMonsterName: 'Sparkmouse' };
     session.onBattleStateChanged();
     expect(said.join(' ')).toMatch(/Sparkmouse.*locked|locked.*Sparkmouse/i);
-    expect(said.join(' ')).toMatch(/waiting for the other player/i);
+    expect(said.join(' ')).toMatch(/say battle to confirm.*wait for the other player/i);
+  });
+
+  it('keeps a caller’s queued monster guidance when only the other choice changes', () => {
+    let snap = battleSnap({ myName: 'Ada', nameConfirmed: true, setupPlayerCount: 2, foeName: 'Bo' });
+    const lines: { text: string; isCurrent?: () => boolean }[] = [];
+    const { deps } = fakeDeps({ snapshot: () => snap, say: (text, isCurrent) => lines.push({ text, isCurrent }) });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    const choicePrompt = lines.find(line => /choose your own monster/i.test(line.text));
+    expect(choicePrompt?.isCurrent?.()).toBe(true);
+
+    snap = { ...snap, foeMonsterName: 'Embertail' };
+    session.onBattleStateChanged();
+    expect(choicePrompt?.isCurrent?.()).toBe(true);
+  });
+
+  it('replaces a canceled pick cue with the caller’s monster and the next action', () => {
+    let snap = battleSnap({ myName: 'Ada', nameConfirmed: true, setupPlayerCount: 2, foeName: 'Bo' });
+    let session: BattleVoiceSession;
+    const lines: { text: string; isCurrent?: () => boolean }[] = [];
+    const { deps } = fakeDeps({
+      snapshot: () => snap,
+      selectMonster: () => {
+        snap = { ...snap, myMonsterId: 'sparkmouse', myMonsterName: 'Sparkmouse' };
+        session.onBattleStateChanged();
+      },
+      say: (text, isCurrent) => lines.push({ text, isCurrent }),
+    });
+    session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    session.handleMessage(prompt('Sparkmouse'));
+    const firstPickCue = lines.find(line => /Locked in.*Sparkmouse/i.test(line.text));
+    expect(firstPickCue?.isCurrent?.()).toBe(true);
+
+    snap = { ...snap, canStartBattle: true, foeMonsterName: 'Embertail' };
+    session.onBattleStateChanged();
+    expect(firstPickCue?.isCurrent?.()).toBe(false);
+    const current = lines.filter(line => line.isCurrent?.()).map(line => line.text).join(' ');
+    expect(current).toMatch(/Sparkmouse.*say battle/i);
+  });
+
+  it('renews selection guidance when another caller joins an open seat', () => {
+    let snap = battleSnap({ myName: 'Ada', nameConfirmed: true, setupPlayerCount: 1 });
+    const lines: { text: string; isCurrent?: () => boolean }[] = [];
+    const { deps } = fakeDeps({ snapshot: () => snap, say: (text, isCurrent) => lines.push({ text, isCurrent }) });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    const firstChoicePrompt = lines.find(line => /choose your own monster/i.test(line.text));
+    expect(firstChoicePrompt?.isCurrent?.()).toBe(true);
+
+    snap = { ...snap, setupPlayerCount: 2, foeName: 'Bo' };
+    session.onBattleStateChanged();
+    expect(firstChoicePrompt?.isCurrent?.()).toBe(false);
+    expect(lines.some(line => line.isCurrent?.() && /choose your own monster/i.test(line.text))).toBe(true);
   });
 
   it('revokes queued name guidance after the caller or display advances', () => {
@@ -402,7 +458,7 @@ describe('BattleVoiceSession', () => {
     });
     const session=new BattleVoiceSession(deps);session.handleMessage(setup());said.length=0;
     session.handleMessage(prompt('rematch'));
-    expect(said.join(' ')).toMatch(/every player.*say next/i);
+    expect(said.join(' ')).toMatch(/say next or ready.*choose monsters/i);
     expect(said.join(' ')).not.toMatch(/pick your monster/i);
   });
 
@@ -577,7 +633,7 @@ describe('BattleVoiceSession', () => {
 
   it('treats a spoken monster name as a selection after the screen leaves the lobby', () => {
     const { deps, log } = fakeDeps({
-      snapshot: () => battleSnap({ myName: null }),
+      snapshot: () => battleSnap({ myName: 'Ada', nameConfirmed: true }),
     });
     const s = new BattleVoiceSession(deps);
     s.handleMessage(setup());
@@ -589,7 +645,7 @@ describe('BattleVoiceSession', () => {
   });
 
   it('does not treat a descriptive monster phrase as option one or as the caller name', async () => {
-    const { deps, log, said } = fakeDeps({ snapshot: () => battleSnap({ myName: null }) });
+    const { deps, log, said } = fakeDeps({ snapshot: () => battleSnap({ myName: 'Ada', nameConfirmed: true }) });
     const s = new BattleVoiceSession(deps);
     s.handleMessage(setup());
     said.length = 0;
@@ -811,6 +867,273 @@ describe('BattleVoiceSession', () => {
     expect(log.filter(l => l === 'advance')).toHaveLength(1);
   });
 
+  it('tells a ready caller which player the shared lobby is waiting for', () => {
+    let snap = battleSnap({ phase: 'lobby', myName: 'Ada', foeName: 'Bo', setupPlayerCount: 2, mySetupReady: false });
+    const { deps, log, said } = fakeDeps({ snapshot: () => snap });
+    deps.advance = () => { log.push('advance'); snap = { ...snap, mySetupReady: true }; return true; };
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup()); said.length = 0;
+    session.handleMessage(prompt('ready'));
+
+    expect(log).toContain('advance');
+    expect(snap.phase).toBe('lobby');
+    expect(said.join(' ')).toMatch(/waiting for Bo.*ready/i);
+    expect(said.join(' ')).not.toMatch(/off to monster select/i);
+  });
+
+  it('accepts a named caller’s ready while the second shared seat is still open', () => {
+    let snap = battleSnap({ phase: 'lobby', myName: 'Ada', nameConfirmed: true,
+      foeName: null, canAdvanceLobby: false, setupPlayerCount: 2, mySetupReady: false });
+    const { deps, log, said } = fakeDeps({ snapshot: () => snap });
+    deps.advance = () => { log.push('advance'); snap = { ...snap, mySetupReady: true }; return true; };
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup()); said.length = 0;
+    session.handleMessage(prompt('ready'));
+    expect(log).toContain('advance');
+    expect(snap.phase).toBe('lobby');
+    expect(said.join(' ')).toMatch(/waiting for the other player.*ready/i);
+  });
+
+  it('holds a caller on monster selection after their battle confirmation until the other caller is ready', () => {
+    let snap = battleSnap({ phase: 'monster_select', myName: 'Ada', foeName: 'Bo',
+      myMonsterId: 'sparkmouse', myMonsterName: 'Sparkmouse', canStartBattle: true,
+      setupPlayerCount: 2, mySetupReady: false });
+    const { deps, log, said } = fakeDeps({ snapshot: () => snap });
+    deps.advance = () => { log.push('advance'); snap = { ...snap, mySetupReady: true }; return true; };
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup()); said.length = 0;
+    session.handleMessage(prompt('battle'));
+
+    expect(log).toContain('advance');
+    expect(snap.phase).toBe('monster_select');
+    expect(said.join(' ')).toMatch(/waiting for Bo.*battle/i);
+  });
+
+  it('accepts battle confirmation before the second caller picks their monster', () => {
+    let snap = battleSnap({ phase: 'monster_select', myName: 'Ada', nameConfirmed: true,
+      foeName: 'Bo', myMonsterId: 'sparkmouse', myMonsterName: 'Sparkmouse',
+      canStartBattle: false, setupPlayerCount: 2, mySetupReady: false });
+    const { deps, log, said } = fakeDeps({ snapshot: () => snap });
+    deps.advance = () => { log.push('advance'); snap = { ...snap, mySetupReady: true }; return true; };
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup()); said.length = 0;
+    session.handleMessage(prompt('battle'));
+    expect(log).toContain('advance');
+    expect(snap.phase).toBe('monster_select');
+    expect(said.join(' ')).toMatch(/waiting for Bo.*battle/i);
+  });
+
+  it('keeps the result visible until the other caller requests a rematch', () => {
+    let snap = battleSnap({ phase: 'results', myName: 'Ada', nameConfirmed: true,
+      foeName: 'Bo', resultsPresented: true, canRematch: true, setupPlayerCount: 2,
+      mySetupReady: false, winnerName: 'Ada' });
+    const { deps, log, said } = fakeDeps({ snapshot: () => snap });
+    deps.advance = () => { log.push('advance'); snap = { ...snap, mySetupReady: true }; return true; };
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup()); said.length = 0;
+    session.handleMessage(prompt('rematch'));
+    expect(log).toContain('advance');
+    expect(snap.phase).toBe('results');
+    expect(said.join(' ')).toMatch(/waiting for Bo.*rematch/i);
+    said.length = 0;
+    session.handleMessage(prompt('what now'));
+    expect(said.join(' ')).toMatch(/waiting for Bo.*rematch/i);
+  });
+
+  it('names the current replacement caller in replay guidance', () => {
+    let snap = battleSnap({ phase: 'results', myName: 'Ada', nameConfirmed: true,
+      foeName: 'Bo', currentOtherCallerName: 'Cy', currentCallerCount: 2,
+      resultsPresented: true, canRematch: true, setupPlayerCount: 2, winnerName: 'Ada' });
+    const { deps, said } = fakeDeps({ snapshot: () => snap });
+    deps.advance = () => { snap = { ...snap, mySetupReady: true }; return true; };
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup()); said.length = 0;
+    session.handleMessage(prompt('rematch'));
+    expect(said.join(' ')).toMatch(/waiting for Cy.*rematch/i);
+  });
+
+  it('tells a lone duel survivor the rematch menu opens after the phone cue', () => {
+    let snap = battleSnap({ phase: 'results', myName: 'Ada', nameConfirmed: true,
+      foeName: 'Bo', currentCallerCount: 1, currentOtherCallerName: null,
+      resultsPresented: true, canRematch: true, setupPlayerCount: 2, winnerName: 'Ada' });
+    const { deps, said } = fakeDeps({ snapshot: () => snap });
+    deps.advance = () => { snap = { ...snap, mySetupReady: true }; return true; };
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup()); said.length = 0;
+    session.handleMessage(prompt('rematch'));
+    expect(said.join(' ')).toMatch(/monster menu will open after this message/i);
+    expect(said.join(' ')).not.toMatch(/waiting for Bo/i);
+  });
+
+  it('waits for the last caller’s Relay response before opening the shared monster menu', async () => {
+    const room = new BattleRoom('4821', 42);
+    room.expectHumanPlayers(2);
+    const ada = room.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = room.addPlayer('Bo', 'b') as { playerId: string };
+    let settleBoReady!: (outcome: 'played' | 'interrupted') => void;
+    let holdBoReady = true;
+    const boReady = new Promise<'played' | 'interrupted'>(resolve => { settleBoReady = resolve; });
+    const caller = (playerId: string, name: string) => {
+      const { deps } = fakeDeps({
+        join: () => ({ playerId, resumed: false }),
+        advance: (_code, id) => room.advance(id),
+        beginMenuSpeech: (_code, id, phase) => room.beginVoiceMenuSpeech(id, phase),
+        snapshot: () => battleSnap({
+          phase: room.phase, myName: name, nameConfirmed: true,
+          foeName: name === 'Ada' ? 'Bo' : 'Ada', setupPlayerCount: room.expectedPlayerCount,
+          mySetupReady: room.isSetupReady(playerId), canAdvanceLobby: room.canAdvanceLobby,
+          canStartBattle: room.canStart(), canRematch: room.canStartNextRound(playerId),
+        }),
+        say: text => {
+          if (name === 'Bo' && holdBoReady && /^You are ready\./.test(text)) {
+            holdBoReady = false;
+            return boReady;
+          }
+          return Promise.resolve('played' as const);
+        },
+      });
+      const session = new BattleVoiceSession(deps);
+      session.handleMessage(setup());
+      return session;
+    };
+    const adaCall = caller(ada.playerId, 'Ada');
+    const boCall = caller(bo.playerId, 'Bo');
+    await vi.waitFor(() => expect(room.lobbyPlayers().every(player => !player.phonePending)).toBe(true));
+    adaCall.handleMessage(prompt('ready'));
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.playerId === ada.playerId)?.phonePending).toBe(false));
+    boCall.handleMessage(prompt('ready'));
+    expect(room.phase).toBe('lobby');
+    expect(room.isSetupReady(ada.playerId)).toBe(true);
+    expect(room.isSetupReady(bo.playerId)).toBe(true);
+    expect(room.lobbyPlayers().find(player => player.playerId === bo.playerId)?.phonePending).toBe(true);
+
+    settleBoReady('interrupted');
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.playerId === bo.playerId)?.phonePending).toBe(true));
+    expect(room.phase).toBe('lobby');
+    boCall.handleMessage(prompt('what now'));
+    await vi.waitFor(() => expect(room.phase).toBe('monster_select'));
+  });
+
+  it('keeps the lobby visible while an already-ready caller awaits AI interpretation', async () => {
+    const room = new BattleRoom('4821', 43);
+    room.expectHumanPlayers(2);
+    const ada = room.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = room.addPlayer('Bo', 'b') as { playerId: string };
+    let settleInterpret!: (value: VoiceInterpretResult) => void;
+    const interpreting = new Promise<VoiceInterpretResult>(resolve => { settleInterpret = resolve; });
+    const caller = (playerId: string, name: string, interpret?: BattleVoiceDeps['interpret']) => {
+      const { deps } = fakeDeps({
+        join: () => ({ playerId, resumed: false }),
+        advance: (_code, id) => room.advance(id),
+        beginMenuSpeech: (_code, id, phase) => room.beginVoiceMenuSpeech(id, phase),
+        snapshot: () => battleSnap({
+          phase: room.phase, myName: name, nameConfirmed: true,
+          foeName: name === 'Ada' ? 'Bo' : 'Ada', setupPlayerCount: room.expectedPlayerCount,
+          mySetupReady: room.isSetupReady(playerId), canAdvanceLobby: room.canAdvanceLobby,
+          canStartBattle: room.canStart(), canRematch: room.canStartNextRound(playerId),
+        }),
+        say: () => Promise.resolve('played' as const),
+        ...(interpret ? { interpret } : {}),
+      });
+      const session = new BattleVoiceSession(deps);
+      session.handleMessage(setup());
+      return session;
+    };
+    const adaCall = caller(ada.playerId, 'Ada');
+    const boCall = caller(bo.playerId, 'Bo', () => interpreting);
+    await vi.waitFor(() => expect(room.lobbyPlayers().every(player => !player.phonePending)).toBe(true));
+    boCall.handleMessage(prompt('ready'));
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.playerId === bo.playerId)?.phonePending).toBe(false));
+    boCall.handleMessage(prompt('tell me a story'));
+    expect(room.lobbyPlayers().find(player => player.playerId === bo.playerId)?.phonePending).toBe(true);
+    adaCall.handleMessage(prompt('ready'));
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.playerId === ada.playerId)?.phonePending).toBe(false));
+    expect(room.phase).toBe('lobby');
+    settleInterpret({ kind: 'clarify', reason: 'unsupported' });
+    await vi.waitFor(() => expect(room.phase).toBe('monster_select'));
+  });
+
+  it('keeps the shared menu visible while a ready caller is still speaking', async () => {
+    const room = new BattleRoom('4821', 44);
+    room.expectHumanPlayers(2);
+    const ada = room.addPlayer('Ada', 'a') as { playerId: string };
+    const bo = room.addPlayer('Bo', 'b') as { playerId: string };
+    const { deps } = fakeDeps({
+      join: () => ({ playerId: ada.playerId, resumed: false }),
+      advance: (_code, id) => room.advance(id),
+      beginMenuSpeech: (_code, id, phase) => room.beginVoiceMenuSpeech(id, phase),
+      snapshot: () => battleSnap({ phase: room.phase, myName: 'Ada', nameConfirmed: true,
+        foeName: 'Bo', currentCallerCount: 2, currentOtherCallerName: 'Bo', setupPlayerCount: 2,
+        mySetupReady: room.isSetupReady(ada.playerId), canAdvanceLobby: room.canAdvanceLobby,
+        canStartBattle: room.canStart() }),
+      say: () => Promise.resolve('played' as const),
+    });
+    const adaCall = new BattleVoiceSession(deps);
+    adaCall.handleMessage(setup());
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.playerId === ada.playerId)?.phonePending).toBe(false));
+    const finishBo = room.beginVoiceMenuSpeech(bo.playerId, 'lobby')!;
+    expect(room.advance(bo.playerId)).toBe(true);
+    adaCall.handleMessage(prompt('ready'));
+    await vi.waitFor(() => expect(room.lobbyPlayers().find(player => player.playerId === ada.playerId)?.phonePending).toBe(false));
+    adaCall.handleMessage(prompt('I have a question', false));
+    expect(room.lobbyPlayers().find(player => player.playerId === ada.playerId)?.phonePending).toBe(true);
+    finishBo(true);
+    expect(room.phase).toBe('lobby');
+    adaCall.handleMessage(prompt('what now'));
+    await vi.waitFor(() => expect(room.phase).toBe('monster_select'));
+  });
+
+  it('clears a disconnected caller’s setup confirmation before the other phone can advance', () => {
+    let snap = battleSnap({ phase: 'lobby', myName: 'Ada', mySetupReady: true, setupPlayerCount: 2 });
+    const { deps, log } = fakeDeps({ snapshot: () => snap,
+      clearSetupReady: () => { log.push('clearReady'); snap = { ...snap, mySetupReady: false }; return true; } });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    session.handleClose();
+    expect(log).toContain('clearReady');
+    expect(snap.mySetupReady).toBe(false);
+  });
+
+  it('tells the remaining caller to reconfirm when the shared selection changes', () => {
+    let snap = battleSnap({ phase: 'monster_select', myName: 'Ada', nameConfirmed: true,
+      myMonsterId: 'sparkmouse', myMonsterName: 'Sparkmouse', foeName: 'Bo',
+      canStartBattle: true, setupPlayerCount: 2, mySetupReady: true });
+    const { deps, said } = fakeDeps({ snapshot: () => snap });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup()); said.length = 0;
+    snap = { ...snap, foeName: null, canStartBattle: false, mySetupReady: false };
+    session.onBattleStateChanged();
+    expect(said.join(' ')).toMatch(/Sparkmouse.*say battle again/i);
+  });
+
+  it('requires a resumed caller to confirm the current shared menu again', () => {
+    let snap = battleSnap({ phase: 'monster_select', myName: 'Ada', myMonsterId: 'sparkmouse',
+      myMonsterName: 'Sparkmouse', mySetupReady: true, setupPlayerCount: 2 });
+    const { deps, log } = fakeDeps({ snapshot: () => snap,
+      join: () => ({ playerId: 'p1', resumed: true }),
+      clearSetupReady: () => { log.push('clearReady'); snap = { ...snap, mySetupReady: false }; return true; } });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    expect(log).toContain('clearReady');
+    expect(snap.mySetupReady).toBe(false);
+  });
+
+  it('asks a late caller for their name before accepting a monster choice', () => {
+    let snap = battleSnap({ phase: 'monster_select', myName: null, nameConfirmed: false,
+      monsterNames: ['Sparkmouse', 'Embertail'], canStartBattle: false, setupPlayerCount: 2 });
+    const { deps, log, said } = fakeDeps({ snapshot: () => snap,
+      setName: (_code, _id, name) => { log.push(`name ${name}`); snap = { ...snap, myName: name, nameConfirmed: true }; } });
+    const session = new BattleVoiceSession(deps);
+    session.handleMessage(setup());
+    expect(said.join(' ')).toMatch(/what.s your name/i);
+    said.length = 0;
+    session.handleMessage(prompt('Sparkmouse'));
+    expect(log.some(entry => entry.startsWith('monster '))).toBe(false);
+    expect(log.some(entry => entry.startsWith('name '))).toBe(false);
+    session.handleMessage(prompt('Bo'));
+    expect(log).toContain('name Bo');
+  });
+
   it('keeps a lobby gated while expected players are missing', () => {
     const { deps, log, said } = fakeDeps({
       snapshot: () => battleSnap({ phase: 'lobby', monsterNames: ['Sparkmouse'], myName: 'Ada', canAdvanceLobby: false }),
@@ -818,7 +1141,7 @@ describe('BattleVoiceSession', () => {
     const s = new BattleVoiceSession(deps);s.handleMessage(setup());said.length=0;
     s.handleMessage(prompt('next'));
     expect(log).not.toContain('advance');
-    expect(said.join(' ')).toMatch(/every player.*say next/i);
+    expect(said.join(' ')).toMatch(/say next or ready.*choose monsters/i);
   });
 
   it('"battle" in monster-select is REFUSED until a monster is picked (no LLM)', () => {
@@ -845,7 +1168,7 @@ describe('BattleVoiceSession', () => {
     s.handleMessage(prompt('battle'));
 
     expect(log.some(l => l === 'advance')).toBe(false);
-    expect(said.some(t => /waiting for the other player/i.test(t))).toBe(true);
+    expect(said.some(t => /say battle to confirm.*wait for the other player/i.test(t))).toBe(true);
   });
 
   it('"battle" in monster-select advances when picks are complete', () => {

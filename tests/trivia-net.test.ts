@@ -78,6 +78,42 @@ describe('TriviaConnection', () => {
     connection.close();
   });
 
+  it('registers the standalone display with its seat target on each connection', () => {
+    const connection = new TriviaConnection('ws://trivia');
+    connection.configureSeats('ROOM', 3);
+    connection.spectate('ROOM');
+    sockets[0]!.open();
+    expect(commands(sockets[0]!)).toEqual([
+      { type: 'spectate', roomCode: 'ROOM', count: 3 },
+    ]);
+    sockets[0]!.readyState = 3;
+    sockets[0]!.onclose?.({ code: 1006 });
+    vi.advanceTimersByTime(500);
+    sockets[1]!.open();
+    expect(commands(sockets[1]!)).toEqual([
+      { type: 'spectate', roomCode: 'ROOM', count: 3 },
+    ]);
+    connection.displayReplay('t2');
+    expect(commands(sockets[1]!).at(-1)).toEqual({ type: 'display_replay', playerId: 't2' });
+    connection.close();
+  });
+
+  it('reapplies the selected seats when an overlapping display becomes host', () => {
+    const connection = new TriviaConnection('ws://trivia');
+    connection.configureSeats('ROOM', 3); connection.spectate('ROOM'); sockets[0]!.open();
+    sockets[0]!.message({ type: 'host_identity', roomCode: 'ROOM', isHost: false, loadingGeneration: 0 });
+    expect(commands(sockets[0]!)).toEqual([
+      { type: 'spectate', roomCode: 'ROOM', count: 3 },
+    ]);
+    sockets[0]!.message({ type: 'host_identity', roomCode: 'ROOM', isHost: true, loadingGeneration: 0 });
+    sockets[0]!.message({ type: 'host_identity', roomCode: 'ROOM', isHost: true, loadingGeneration: 0 });
+    expect(commands(sockets[0]!)).toEqual([
+      { type: 'spectate', roomCode: 'ROOM', count: 3 },
+      { type: 'configure_seats', roomCode: 'ROOM', count: 3 },
+    ]);
+    connection.close();
+  });
+
   it('reports clock responses with the browser receipt timestamp', () => {
     vi.setSystemTime(20_200);
     const connection = new TriviaConnection('ws://trivia');

@@ -6,6 +6,16 @@ describe('fighter protocol', () => {
     expect(parseFighterClientMessage(JSON.stringify({ type: 'spectate', roomCode: '4821', locale: 'pt-BR' })))
       .toEqual({ type: 'spectate', roomCode: '4821', locale: 'pt-BR' });
   });
+  it('accepts only one or two initial standalone seats', () => {
+    expect(parseFighterClientMessage('{"type":"spectate","roomCode":"4821","initialSeatCount":2}'))
+      .toEqual({ type: 'spectate', roomCode: '4821', initialSeatCount: 2 });
+    expect(parseFighterClientMessage('{"type":"join","roomCode":"4821","name":"Tester","initialSeatCount":2}'))
+      .toEqual({ type: 'join', roomCode: '4821', name: 'Tester', initialSeatCount: 2 });
+    expect(parseFighterClientMessage('{"type":"spectate","roomCode":"4821","initialSeatCount":3}'))
+      .toMatchObject({ type: 'error', code: 'bad_spectate' });
+    expect(parseFighterClientMessage('{"type":"join","roomCode":"4821","name":"Tester","initialSeatCount":0}'))
+      .toMatchObject({ type: 'error', code: 'bad_join' });
+  });
   it('parses every combat command', () => {
     for (const command of ['forward', 'back', 'jump', 'punch', 'kick', 'block']) {
       expect(parseFighterClientMessage(JSON.stringify({ type: 'command', command }))).toEqual({ type: 'command', command });
@@ -13,6 +23,12 @@ describe('fighter protocol', () => {
   });
   it('rejects arbitrary commands and sides', () => {
     expect(parseFighterClientMessage(JSON.stringify({ type: 'command', command: 'win', fighter: 'p2' }))).toMatchObject({ type: 'error' });
+  });
+  it('requires a room and session token for a reconnect-safe release', () => {
+    expect(parseFighterClientMessage('{"type":"release_session","roomCode":"4821","sessionId":"session-1"}'))
+      .toEqual({ type: 'release_session', roomCode: '4821', sessionId: 'session-1' });
+    expect(parseFighterClientMessage('{"type":"release_session","roomCode":"4821"}'))
+      .toMatchObject({ type: 'error', code: 'bad_release' });
   });
   it('parses selection and navigation messages', () => {
     expect(parseFighterClientMessage('{"type":"select_fighter","fighterId":"nyx"}')).toEqual({ type: 'select_fighter', fighterId: 'nyx' });

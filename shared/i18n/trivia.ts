@@ -16,6 +16,7 @@ const EN_MESSAGES = {
   'voice.unknownCategory': 'I did not recognize that category. Choose one shown on the display.',
   'voice.categorySelected': '{category} selected.',
   'voice.notReady': 'The room is not ready to start yet.',
+  'voice.waitingDisplay': 'Please wait for the game screen to connect before we start.',
   'voice.preparing': 'Preparing the trivia round. Keep watching the display.',
   'voice.loadingTimeout': 'The display did not become ready. Check the display, then choose a category again.',
   'voice.question': 'Question {number}. {prompt}',
@@ -38,9 +39,10 @@ const EN_MESSAGES = {
   'voice.result': '{name}, your leaderboard score is {score}. You answered {correct} of eight correctly.',
   'voice.howItWorks': 'Twilio Conversation Relay transcribed phone answers; Voice Trivia scored them on screen and spoke results.',
   'voice.stationRequeue': 'Check messages for coins to replay.',
-  'voice.stationResultWinner': '{winner} wins. {score} points; {correct} correct.',
-  'voice.stationResultTie': "It's a tie. {score} points; {correct} correct.",
+  'voice.stationResultWinner': '{winner} wins. Your leaderboard score: {score}; {correct} correct.',
+  'voice.stationResultTie': "It's a tie. Your leaderboard score: {score}; {correct} correct.",
   'voice.playAgain': 'Your results are on the display. To play again, say Play again.',
+  'voice.replayWaiting': 'Ready for another round. Waiting for the other players.',
 } as const;
 
 export type TriviaMessageKey = keyof typeof EN_MESSAGES;
@@ -60,6 +62,7 @@ const PT_MESSAGES: Record<TriviaMessageKey, string> = {
   'voice.unknownCategory': 'Não reconheci essa categoria. Escolha uma das opções exibidas na tela.',
   'voice.categorySelected': 'Categoria {category} selecionada.',
   'voice.notReady': 'A sala ainda não está pronta para começar.',
+  'voice.waitingDisplay': 'Aguarde a tela do jogo se conectar antes de começarmos.',
   'voice.preparing': 'Preparando a rodada de quiz. Continue olhando para a tela.',
   'voice.loadingTimeout': 'A tela não ficou pronta. Verifique a tela e escolha uma categoria novamente.',
   'voice.question': 'Pergunta {number}. {prompt}',
@@ -80,11 +83,12 @@ const PT_MESSAGES: Record<TriviaMessageKey, string> = {
   'voice.correct': 'Correto! Você ganhou {points} pontos.',
   'voice.incorrect': 'Essa resposta não está correta.',
   'voice.result': '{name}, sua pontuação no ranking é {score}. Você acertou {correct} de oito perguntas.',
-  'voice.howItWorks': 'Twilio Conversation Relay transcreve; o jogo pontua na tela e narra.',
-  'voice.stationRequeue': 'Veja o SMS sobre moedas para jogar de novo.',
-  'voice.stationResultWinner': '{winner} venceu. {score} pontos; {correct} acertos.',
-  'voice.stationResultTie': 'Empate. {score} pontos; {correct} acertos.',
+  'voice.howItWorks': 'Twilio Conversation Relay transcreve, pontua na tela e narra.',
+  'voice.stationRequeue': 'Moedas no SMS. Jogue de novo.',
+  'voice.stationResultWinner': '{winner} venceu. Sua pontuação no ranking: {score}; {correct} acertos.',
+  'voice.stationResultTie': 'Empate. Sua pontuação no ranking: {score}; {correct} acertos.',
   'voice.playAgain': 'Seus resultados estão na tela. Para jogar novamente, diga Jogar novamente.',
+  'voice.replayWaiting': 'Pronto para outra rodada. Aguardando os outros jogadores.',
 };
 
 export const TRIVIA_MESSAGES: LocalizedCatalog<TriviaMessageKey> = {

@@ -91,6 +91,18 @@ html[data-theme="light"] .brand-lockup img, html[data-theme="light"] .countdown-
 .standalone-game p { position:absolute;left:clamp(14px,2vw,26px);right:clamp(14px,2vw,26px);bottom:clamp(13px,2vh,22px);margin:0;color:#DDE0E6;font-size:clamp(11px,1vw,14px);line-height:1.3;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden; }
 .standalone-game:hover video,.standalone-game:focus-visible video { transform:scale(1.04);filter:saturate(1.1); }
 .standalone-game:focus-visible { outline:3px solid #2188EF;outline-offset:-3px; }
+.standalone-mode-hint { position:absolute;top:14px;right:14px;padding:7px 10px;border:1px solid rgba(255,255,255,.55);border-radius:999px;color:#fff;background:rgba(0,13,37,.72);font-size:11px;font-weight:700; }
+.standalone-mode-dialog { width:min(480px,calc(100vw - 28px));max-height:calc(100vh - 28px);padding:28px;border:1px solid var(--th-border);border-radius:20px;color:var(--th-text);background:var(--th-card);box-shadow:0 28px 80px rgba(0,0,0,.4);text-align:center; }
+.standalone-mode-dialog::backdrop { background:rgba(0,13,37,.7);backdrop-filter:blur(8px); }
+.standalone-mode-dialog h2 { margin:0 0 12px;font:800 clamp(28px,4vw,42px)/1 'Twilio Sans Display',sans-serif; }
+.standalone-mode-dialog p { margin:0;color:var(--th-text);font-size:17px;font-weight:700; }
+.standalone-mode-dialog small { display:block;margin:8px auto 18px;color:var(--th-dim);font-size:13px;line-height:1.4; }
+.standalone-mode-options { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px; }
+.standalone-mode-options button,.standalone-mode-cancel { min-height:48px;padding:10px 14px;border-radius:10px;font:700 15px 'Twilio Sans Text',sans-serif;cursor:pointer; }
+.standalone-mode-options button { border:1px solid #EF223A;color:#fff;background:#EF223A; }
+.standalone-mode-options button:hover,.standalone-mode-options button:focus-visible { background:#C71329; }
+.standalone-mode-cancel { margin-top:14px;border:1px solid var(--th-border);color:var(--th-text);background:var(--th-raised); }
+.standalone-mode-dialog button:focus-visible { outline:3px solid #2188EF;outline-offset:2px; }
 .standalone-future { min-height:74px;display:grid;grid-template-columns:minmax(100px,auto) minmax(0,1fr);align-items:stretch;gap:clamp(10px,1.5vw,18px);padding-top:clamp(9px,1.2vh,14px);border-top:1px solid var(--th-border); }
 .standalone-future>.eyebrow { align-self:center;padding-right:clamp(8px,1vw,16px);color:var(--th-dim); }
 .standalone-future-cards { display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:clamp(8px,1vw,14px); }

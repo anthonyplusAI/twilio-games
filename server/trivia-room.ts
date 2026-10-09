@@ -66,6 +66,16 @@ export interface TriviaRosterPolicy {
   readonly allowReplay?: boolean;
 }
 
+export type TriviaSetupPhase = 'lobby' | 'category_select' | 'results';
+
+interface VoiceSetupState {
+  phase: TriviaSetupPhase;
+  generation: number;
+  pending: number;
+  delivered: boolean;
+  activeTurns: number;
+}
+
 interface RoomPlayer extends TriviaAuthoritativePlayer {
   name: string;
   nameConfirmed: boolean;
@@ -93,8 +103,11 @@ export class TriviaRoom {
   private expectedPlayerCountValue: 1 | 2 | 3 | 4 = 1;
   private automaticSetupValue = false;
   private stationFixedValue = false;
+  private standaloneSeatsFixedValue = false;
   private allowReplayValue = true;
   private rosterFrozen = false;
+  private readonly voiceSetup = new Map<string, VoiceSetupState>();
+  private readonly replayReadyPlayerIds = new Set<string>();
   private locale: SupportedLocale;
   private readonly questions: TriviaQuestionBank | readonly TriviaQuestionDefinition[];
   private readonly now: () => number;
@@ -222,6 +235,8 @@ export class TriviaRoom {
       this.pauseAudio(this.currentQuestion()?.question.id ?? '', this.questionAttemptIdValue);
     }
     this.players.splice(index, 1);
+    this.voiceSetup.delete(playerId);
+    this.replayReadyPlayerIds.delete(playerId);
     this.semanticAnswerResolutions.delete(playerId);
     this.promptReadyPlayerIds.delete(playerId);
     this.answerCueReadyPlayerIds.delete(playerId);
@@ -230,13 +245,20 @@ export class TriviaRoom {
     this.revealDeliveries.delete(playerId);
     this.revealReadyPlayerIds.delete(playerId);
     this.events.push({ type: 'player_left', playerId, atMs: this.now() });
+    if (this.standaloneSeatsFixedValue
+      && (this.phase === 'lobby' || this.phase === 'category_select' || this.phase === 'loading')) {
+      this.nextPlayerOrder = 0;
+      if (this.phase !== 'lobby') this.resetStandalonePregameAfterDeparture();
+    }
     if (!this.players.length) {
       const stationPregame = this.stationFixedValue
         && (this.phase === 'lobby' || this.phase === 'category_select' || this.phase === 'loading');
       if (!stationPregame) this.resetEmptyRoom();
       return true;
     }
-    if (!this.stationFixedValue) this.expectedPlayerCountValue = this.players.length as 1 | 2 | 3 | 4;
+    if (!this.stationFixedValue && !this.standaloneSeatsFixedValue) {
+      this.expectedPlayerCountValue = this.players.length as 1 | 2 | 3 | 4;
+    }
     if (this.phase === 'question_prompt') this.maybeStartAnswerCue(this.now());
     else if (this.phase === 'answer_cue') this.maybeStartAnswering(this.now());
     else if (this.phase === 'question'
@@ -267,6 +289,8 @@ export class TriviaRoom {
 
     const removed = this.players.filter(player => !retained.has(player.playerId));
     for (const player of removed) {
+      this.voiceSetup.delete(player.playerId);
+      this.replayReadyPlayerIds.delete(player.playerId);
       this.events.push({ type: 'player_left', playerId: player.playerId, atMs: this.now() });
     }
     const orderedPlayers = participantSlots.flatMap((playerId, playerOrder): RoomPlayer[] => (
@@ -274,7 +298,9 @@ export class TriviaRoom {
     ));
     this.players.splice(0, this.players.length, ...orderedPlayers);
     if (this.phase === 'loading') this.loadingGenerationValue += 1;
+    const wasLobby = this.phase === 'lobby';
     this.phase = 'lobby';
+    if (!wasLobby) for (const player of this.players) this.resetVoiceSetup(player.playerId, 'lobby');
     this.expectedPlayerCountValue = expectedPlayerCount as 1 | 2 | 3 | 4;
     this.automaticSetupValue = true;
     this.stationFixedValue = true;
@@ -310,6 +336,8 @@ export class TriviaRoom {
     const player = this.players.find(candidate => candidate.playerId === playerId);
     if (!player || player.connected === connected) return false;
     player.connected = connected;
+    this.replayReadyPlayerIds.delete(playerId);
+    this.resetVoiceSetup(playerId);
     return true;
   }
 
@@ -329,6 +357,7 @@ export class TriviaRoom {
     if (!player) return false;
     player.name = cleanName(name);
     player.nameConfirmed = true;
+    this.resetVoiceSetup(playerId, 'lobby');
     if (this.resultValue) {
       const resultPlayers = this.resultValue.players.map(resultPlayer => resultPlayer.playerId === playerId
         ? Object.freeze({ ...resultPlayer, name: player.name })
@@ -342,8 +371,82 @@ export class TriviaRoom {
     return this.players.some(player => player.playerId === playerId && player.nameConfirmed);
   }
 
+  /** A display may reserve standalone seats while the lobby is still open. */
+  configureStandaloneSeats(count: number): boolean {
+    if (!Number.isSafeInteger(count) || count < TRIVIA_MIN_PLAYERS || count > TRIVIA_MAX_PLAYERS
+      || this.stationFixedValue) return false;
+    if (this.standaloneSeatsFixedValue) {
+      if (count === this.expectedPlayerCountValue) return true;
+      if (this.isUnattendedResult) this.prepareForNewCaller();
+    }
+    if (this.phase !== 'lobby' || this.rosterFrozen
+      || (this.players.length > 0 && (this.standaloneSeatsFixedValue || count < this.players.length))) return false;
+    const countChanged = this.expectedPlayerCountValue !== count;
+    this.expectedPlayerCountValue = count as 1 | 2 | 3 | 4;
+    this.automaticSetupValue = true;
+    this.standaloneSeatsFixedValue = true;
+    this.allowReplayValue = true;
+    if (countChanged) {
+      for (const player of this.players) if (player.nameConfirmed) this.resetVoiceSetup(player.playerId, 'lobby');
+    }
+    return true;
+  }
+
+  /** Marks a real phone caller before publishing their join to other callers. */
+  registerVoicePlayer(playerId: string): boolean {
+    if (!this.hasPlayer(playerId) || this.voiceSetup.has(playerId)) return false;
+    this.voiceSetup.set(playerId, {
+      phase: this.setupPhase() ?? 'lobby', generation: 0, pending: 0, delivered: false,
+      activeTurns: 0,
+    });
+    return true;
+  }
+
+  /** The release callback is scoped to the current menu and choice revision. */
+  beginSetupSpeech(playerId: string, phase: TriviaSetupPhase): ((completed?: boolean) => void) | null {
+    const setup = this.voiceSetup.get(playerId);
+    if (!setup || !this.hasPlayer(playerId) || this.phase !== phase) return null;
+    if (setup.phase !== phase) this.resetVoiceSetup(playerId, phase);
+    const generation = setup.generation;
+    setup.pending += 1;
+    let settled = false;
+    return (completed = false) => {
+      if (settled) return;
+      settled = true;
+      if (setup.generation !== generation || this.phase !== phase || !this.hasPlayer(playerId)) return;
+      if (!completed) {
+        this.resetVoiceSetup(playerId, phase);
+        return;
+      }
+      setup.pending = Math.max(0, setup.pending - 1);
+      setup.delivered = true;
+    };
+  }
+
+  /** Holds a caller's current menu while they speak, wait for intent, or hear a reply. */
+  beginMenuTurn(playerId: string, phase: TriviaSetupPhase): (() => void) | null {
+    const setup = this.voiceSetup.get(playerId);
+    if (!setup || !this.hasPlayer(playerId) || this.phase !== phase) return null;
+    if (setup.phase !== phase) this.resetVoiceSetup(playerId, phase);
+    const generation = setup.generation;
+    setup.activeTurns += 1;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      if (setup.generation !== generation || this.phase !== phase || !this.hasPlayer(playerId)) return;
+      setup.activeTurns = Math.max(0, setup.activeTurns - 1);
+      if (phase === 'results') this.maybeStartReplay();
+    };
+  }
+
   expectHumanPlayers(count: number, automaticSetup = true, policy: TriviaRosterPolicy = {}): boolean {
     if (!Number.isSafeInteger(count) || count < TRIVIA_MIN_PLAYERS || count > TRIVIA_MAX_PLAYERS) return false;
+    if (this.standaloneSeatsFixedValue) {
+      if (policy.stationFixed) return false;
+      count = this.expectedPlayerCountValue;
+      automaticSetup = true;
+    }
     if (this.rosterFrozen && this.phase !== 'results') return count === this.expectedPlayerCountValue;
     this.expectedPlayerCountValue = count as 1 | 2 | 3 | 4;
     this.automaticSetupValue = automaticSetup;
@@ -370,6 +473,7 @@ export class TriviaRoom {
     const player = this.players.find(candidate => candidate.playerId === playerId);
     if (!player) return false;
     player.categoryVote = category;
+    this.resetVoiceSetup(playerId, 'category_select');
     return true;
   }
 
@@ -387,19 +491,26 @@ export class TriviaRoom {
     if (this.phase === 'lobby' && this.canFreezeRoster()) {
       this.rosterFrozen = true;
       this.phase = 'category_select';
+      for (const player of this.players) this.resetVoiceSetup(player.playerId, 'category_select');
       this.categoryValue = null;
       this.resultValue = null;
       return true;
     }
-    if (this.phase === 'category_select' && this.canFreezeRoster()) {
+    if (this.phase === 'category_select' && this.canFreezeRoster()
+      && (!this.hasSynchronizedMenus() || this.players.every(player => player.categoryVote !== null))) {
       this.beginLoading();
       return true;
     }
     if (this.phase === 'results' && this.allowReplayValue && playerId && this.hasPlayer(playerId)) {
-      this.resetPlayersForRound();
-      this.phase = 'category_select';
-      this.categoryValue = null;
-      this.resultValue = null;
+      if (this.hasSynchronizedMenus()) {
+        const player = this.players.find(candidate => candidate.playerId === playerId);
+        if (!player?.connected || !player.nameConfirmed || !this.isVoiceReady(playerId, 'results')) return false;
+        if (this.replayReadyPlayerIds.has(playerId)) return false;
+        this.replayReadyPlayerIds.add(playerId);
+        this.maybeStartReplay();
+        return true;
+      }
+      this.restartRound();
       return true;
     }
     return false;
@@ -829,7 +940,13 @@ export class TriviaRoom {
       category: this.categoryValue,
       categoryVoteCounts: this.categoryVoteCounts(),
       categoryVotingSeat: this.categoryVotingSeat(),
-      players: this.players,
+      replayVotingSeat: this.replayVotingSeat(),
+      players: this.players.map(player => ({
+        ...player,
+        setupStatus: this.setupStatus(player),
+        categoryVoted: player.categoryVote !== null,
+        replayReady: this.replayReadyPlayerIds.has(player.playerId),
+      })),
       serverNowMs: this.now(),
       loadingGeneration: this.loadingGenerationValue,
       displayReady: this.displayReadyValue,
@@ -861,6 +978,7 @@ export class TriviaRoom {
   get expectedPlayerCount(): 1 | 2 | 3 | 4 { return this.expectedPlayerCountValue; }
   get hasExpectedPlayers(): boolean { return this.players.length === this.expectedPlayerCountValue; }
   get stationFixed(): boolean { return this.stationFixedValue; }
+  get standaloneSeatsFixed(): boolean { return this.standaloneSeatsFixedValue; }
   get allowReplay(): boolean { return this.allowReplayValue; }
   get isEmpty(): boolean { return this.players.length === 0; }
   get isUnattendedResult(): boolean {
@@ -877,7 +995,74 @@ export class TriviaRoom {
     return this.players.length >= TRIVIA_MIN_PLAYERS
       && this.players.length === this.expectedPlayerCountValue
       && (!this.stationFixedValue || this.hasValidStationPlayerOrder())
-      && this.players.every(player => player.nameConfirmed);
+      && this.players.every(player => player.nameConfirmed)
+      && (!this.hasSynchronizedMenus() || this.players.every(player => (
+        player.connected && this.isVoiceReady(player.playerId, this.setupPhase())
+      )));
+  }
+
+  private hasSynchronizedMenus(): boolean {
+    return this.expectedPlayerCountValue > 1
+      && (this.standaloneSeatsFixedValue || this.voiceSetup.size > 0);
+  }
+
+  private setupPhase(): TriviaSetupPhase | null {
+    return this.phase === 'lobby' || this.phase === 'category_select' || this.phase === 'results'
+      ? this.phase : null;
+  }
+
+  private resetVoiceSetup(playerId: string, phase = this.setupPhase()): void {
+    const setup = this.voiceSetup.get(playerId);
+    if (!setup || !phase) return;
+    setup.phase = phase;
+    setup.generation += 1;
+    setup.pending = 0;
+    setup.delivered = false;
+    setup.activeTurns = 0;
+  }
+
+  private isVoiceReady(playerId: string, phase: TriviaSetupPhase | null): boolean {
+    if (!phase) return true;
+    const setup = this.voiceSetup.get(playerId);
+    return !setup || setup.phase === phase && setup.pending === 0
+      && setup.activeTurns === 0 && setup.delivered;
+  }
+
+  private setupStatus(player: RoomPlayer): 'name' | 'phone' | 'category' | 'ready' | 'reconnecting' | 'replay' | 'replay_ready' {
+    if (!player.connected) return 'reconnecting';
+    if (this.phase === 'lobby' && !player.nameConfirmed) return 'name';
+    if (this.voiceSetup.get(player.playerId)?.activeTurns) return 'phone';
+    if (this.phase === 'category_select' && player.categoryVote === null) return 'category';
+    if (this.setupPhase() && !this.isVoiceReady(player.playerId, this.setupPhase())) return 'phone';
+    if (this.phase === 'results') return this.replayReadyPlayerIds.has(player.playerId) ? 'replay_ready' : 'replay';
+    return 'ready';
+  }
+
+  private replayVotingSeat(): { playerId: string; name: string } | null {
+    if (this.phase !== 'results' || !this.allowReplayValue) return null;
+    if (!this.hasSynchronizedMenus()) {
+      const first = this.players.find(player => player.connected);
+      return first ? { playerId: first.playerId, name: first.name } : null;
+    }
+    const player = this.players.find(candidate => !this.replayReadyPlayerIds.has(candidate.playerId)
+      && this.setupStatus(candidate) === 'replay');
+    return player ? { playerId: player.playerId, name: player.name } : null;
+  }
+
+  private maybeStartReplay(): boolean {
+    if (this.phase !== 'results' || !this.allowReplayValue || !this.hasSynchronizedMenus()
+      || this.replayReadyPlayerIds.size < this.expectedPlayerCountValue || !this.canFreezeRoster()) return false;
+    this.restartRound();
+    return true;
+  }
+
+  private restartRound(): void {
+    this.replayReadyPlayerIds.clear();
+    this.resetPlayersForRound();
+    this.phase = 'category_select';
+    for (const player of this.players) this.resetVoiceSetup(player.playerId, 'category_select');
+    this.categoryValue = null;
+    this.resultValue = null;
   }
 
   private hasValidStationPlayerOrder(): boolean {
@@ -1106,6 +1291,8 @@ export class TriviaRoom {
       completedAtMs,
     });
     this.phase = 'results';
+    this.replayReadyPlayerIds.clear();
+    for (const player of this.players) this.resetVoiceSetup(player.playerId, 'results');
     this.questionPromptEndsAt = null;
     this.answerCueEndsAt = null;
     this.answeringStartsAt = null;
@@ -1173,6 +1360,38 @@ export class TriviaRoom {
     }
   }
 
+  /** A departed fixed standalone seat can be refilled only after its old menu and loading work is retired. */
+  private resetStandalonePregameAfterDeparture(): void {
+    this.phase = 'lobby';
+    this.loadingGenerationValue += 1;
+    this.rosterFrozen = false;
+    this.categoryValue = null;
+    this.round = [];
+    this.displayReadyValue = false;
+    this.loadingDeadlineAt = null;
+    this.countdownEndsAt = null;
+    this.countdownValue = null;
+    this.questionIndexValue = null;
+    this.audioProblemValue = null;
+    this.questionPromptEndsAt = null;
+    this.answerCueEndsAt = null;
+    this.answeringStartsAt = null;
+    this.questionEndsAt = null;
+    this.finalAnswerDeadlineAt = null;
+    this.semanticAnswerResolutions.clear();
+    this.revealEndsAt = null;
+    this.revealHardEndsAt = null;
+    this.promptReadyPlayerIds.clear();
+    this.answerCueReadyPlayerIds.clear();
+    this.promptDeliveries.clear();
+    this.cueDeliveries.clear();
+    this.revealDeliveries.clear();
+    this.revealReadyPlayerIds.clear();
+    this.resultValue = null;
+    this.resetPlayersForRound();
+    for (const player of this.players) this.resetVoiceSetup(player.playerId, 'lobby');
+  }
+
   private clearSubmittedAnswer(player: RoomPlayer): void {
     player.submittedChoiceId = null;
     player.submittedElapsedMs = null;
@@ -1183,11 +1402,13 @@ export class TriviaRoom {
 
   private resetEmptyRoom(): void {
     this.phase = 'lobby';
-    this.expectedPlayerCountValue = 1;
-    this.automaticSetupValue = false;
+    if (!this.standaloneSeatsFixedValue) this.expectedPlayerCountValue = 1;
+    this.automaticSetupValue = this.standaloneSeatsFixedValue;
     this.stationFixedValue = false;
     this.allowReplayValue = true;
     this.rosterFrozen = false;
+    this.voiceSetup.clear();
+    this.replayReadyPlayerIds.clear();
     this.categoryValue = null;
     this.round = [];
     this.displayReadyValue = false;
