@@ -1,5 +1,6 @@
 /** Serializable contracts shared by the Voice Chess room, transport, and 3D display. */
 export type ChessColor = 'w' | 'b';
+export type ChessMode = 'solo' | 'pvp';
 export type ChessPieceType = 'p' | 'n' | 'b' | 'r' | 'q' | 'k';
 export type ChessFile = 'a' | 'b' | 'c' | 'd' | 'e' | 'f' | 'g' | 'h';
 export type ChessRank = '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8';
@@ -64,6 +65,7 @@ export interface ChessMoveRecord extends ChessMovePreview {
 
 export type ChessResultReason =
   | 'checkmate'
+  | 'forfeit'
   | 'stalemate'
   | 'threefold_repetition'
   | 'fifty_move'
@@ -113,10 +115,32 @@ export interface ChessSelection {
   from?: ChessSquare;
 }
 
+export interface ChessPlayerSeat {
+  playerId: string;
+  color: ChessColor;
+  name: string;
+  connected: boolean;
+  nameConfirmed: boolean;
+}
+
 export interface ChessState {
   roomCode: string;
   gameId: number;
   phase: ChessPhase;
+  /** Solo keeps the original caller-versus-computer rules. PvP requires both named callers. */
+  mode?: ChessMode;
+  /** Human seats, ordered White then Black. An empty seat is omitted. */
+  players?: ChessPlayerSeat[];
+  /** Named callers whose phone welcome, question, or answer is still pending. */
+  phonePendingPlayerIds?: string[];
+  /** Callers still completing a waiting-room question and its AI phone answer. */
+  phoneTurnPendingPlayerIds?: string[];
+  /** Callers whose welcome cue failed and must be replayed before the board starts. */
+  phoneRetryPlayerIds?: string[];
+  /** Callers who consented to another standalone two-player game on the current calls. */
+  rematchReadyPlayerIds?: string[];
+  /** Both replay votes are in; the result and vote acknowledgements are still playing by phone. */
+  rematchWaitingForPhone?: boolean;
   playerConnected: boolean;
   humanColor: ChessColor;
   computerColor: ChessColor;
@@ -130,6 +154,8 @@ export interface ChessState {
   selection: ChessSelection | null;
   pendingMove: ChessPendingMove | null;
   hintsRemaining: number;
+  /** Separate hint budgets for White and Black in a two-caller match. */
+  hintsRemainingByColor?: Record<ChessColor, number>;
   hint: ChessHint | null;
   lastMove: ChessMoveRecord | null;
   result: ChessResult | null;
@@ -158,9 +184,10 @@ export interface ChessCommandResult {
 }
 
 export type ChessClientMessage =
-  | { type: 'spectate'; roomCode: string; locale?: 'en-US' | 'pt-BR' }
+  | { type: 'spectate'; roomCode: string; locale?: 'en-US' | 'pt-BR'; mode?: ChessMode }
   | { type: 'leave' }
   | { type: 'display_auth'; roomCode: string; token: string }
+  | { type: 'display_set_mode'; roomCode: string; mode: ChessMode }
   | { type: 'clock_sync'; clientSentAtMs: number }
   | { type: 'display_wizard_skip'; roomCode: string; sceneId: number }
   | { type: 'display_wizard_progress'; roomCode: string; sceneId: number; cursor: number }

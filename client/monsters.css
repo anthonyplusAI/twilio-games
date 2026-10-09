@@ -145,11 +145,36 @@ html[data-theme="light"] .vm-results:not(.station-result) .vm-result-actions { b
 .vm-card.wide { max-width: 1040px; width: 94vw; max-height: calc(100vh - 48px);
   display: flex; flex-direction: column; overflow: hidden; padding: 20px 28px; }
 /* Header + Battle button are fixed-height bookends; only the grid between them flexes/shrinks. */
-.vm-card.wide > .vm-head, .vm-card.wide > .vm-btn, .vm-card.wide > .vm-dim { flex: 0 0 auto; }
+.vm-card.wide > .vm-head, .vm-card.wide > .vm-btn, .vm-card.wide > .vm-dim,
+.vm-card.wide > .vm-setup-status, .vm-card.wide > .vm-select-actions { flex: 0 0 auto; }
 .vm-card.wide > .vm-head { margin-bottom: 6px; }
 .vm-chips { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin: 18px 0; }
 .vm-chip { background: rgba(239,34,58,.14); border: 1px solid rgba(239,34,58,.4);
   border-radius: 999px; padding: 5px 14px; font-family: var(--mono); font-size: 14px; }
+.vm-setup-status { width: 100%; max-width: 680px; display: grid; gap: 8px; margin: 8px auto 2px; }
+.vm-seat-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.vm-seat { display: flex; align-items: center; gap: 11px; min-width: 0; padding: 10px 12px;
+  text-align: left; border: 1px solid var(--glass-brd-2); border-radius: 12px; background: var(--glass); }
+.vm-seat-index { width: 32px; height: 32px; flex: 0 0 32px; display: grid; place-items: center;
+  border-radius: 999px; background: rgba(239,34,58,.2); color: var(--ink); font: 800 14px var(--disp); }
+.vm-seat-copy { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.vm-seat-copy strong { color: var(--ink); font: 800 16px/1.2 var(--disp); overflow-wrap: anywhere; }
+.vm-seat-copy span { color: var(--ink-dim); font: 700 14px/1.25 var(--text); }
+.vm-seat-phone { border-color: rgba(82, 174, 244, .55); background: rgba(82, 174, 244, .1); }
+.vm-seat-phone .vm-seat-index { background: rgba(82, 174, 244, .24); }
+.vm-seat-ready { border-color: rgba(79,196,74,.6); background: rgba(79,196,74,.09); }
+.vm-seat-ready .vm-seat-index { background: rgba(79,196,74,.22); }
+.vm-seat-ready .vm-seat-copy span { color: #69d963; }
+html[data-theme="light"] .vm-seat-ready .vm-seat-copy span { color: #12670d; }
+.vm-seat-summary { color: var(--ink-dim); font: 700 14px/1.25 var(--text); text-align: center; }
+.vm-setup-alert { width: 100%; max-width: 680px; margin: 8px auto; padding: 10px 12px;
+  color: var(--ink); background: rgba(239,34,58,.13); border: 1px solid var(--red);
+  border-radius: 10px; font: 700 14px/1.35 var(--text); }
+.vm-select-actions { min-height: 44px; display: flex; justify-content: center; align-items: center;
+  flex-wrap: wrap; gap: 8px; }
+.vm-select-actions .vm-btn { margin: 0; }
+.vm-select-actions .vm-dim { margin: 0; }
+.vm-rematch-status { max-width: none; margin-top: 14px; }
 .vm-btn { margin-top: 18px; background: linear-gradient(135deg, var(--red), var(--red-2));
   color: #fff; font-weight: 800; border: none; border-radius: 12px; padding: 13px 26px;
   font-family: var(--disp); font-size: 16px; letter-spacing: .02em; cursor: pointer;
@@ -261,6 +286,11 @@ html[data-theme="light"] .cl-row.cl-power :is(.cl-say,.cl-action) { color:#880B1
   .vm-lobby-grid { grid-template-columns: 1fr; }
   .controls-legend { width: min(100%, 384px); justify-self: center; }
 }
+@media (max-height: 700px) and (min-width: 521px) {
+  .vm-card.wide:not(.vm-lobby) { padding: 12px 18px; max-height: calc(100vh - 24px); }
+  .vm-card.wide:not(.vm-lobby) .vm-grid { margin: 8px auto; gap: 8px; }
+  .vm-card.wide:not(.vm-lobby) .vm-seat { padding: 6px 10px; }
+}
 @media (max-width: 520px) {
   #overlay { justify-content: flex-start; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 68px 10px 20px; }
   .vm-card, .vm-card.wide { width: 100%; max-width: none; max-height: none; overflow: visible; padding: 16px 12px; }
@@ -279,6 +309,8 @@ html[data-theme="light"] .cl-row.cl-power :is(.cl-say,.cl-action) { color:#880B1
   .vm-join-steps { width: 100%; gap: 8px; font-size: 14px; }
   .vm-join-steps li { gap: 8px; }
   .vm-chips { margin: 10px 0; }
+  .vm-seat-row { grid-template-columns: 1fr; gap: 6px; }
+  .vm-seat { padding: 8px 10px; }
   .controls-legend { width: 100%; height: auto; padding: 16px; }
   .cl-row { min-height: 0; grid-template-columns: minmax(108px,.8fr) 1fr; gap: 8px; padding: 8px 0; }
   .cl-say, .cl-action { font-size: 13px; }

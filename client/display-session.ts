@@ -3,6 +3,7 @@
 const DISPLAY_SESSION_KEY = 'twilio-games:display-session:v1';
 const DISPLAY_ACTIVE_PREFIX = 'twilio-games:display-active:';
 const DISPLAY_STORAGE_PROBE_KEY = 'twilio-games:display-storage-probe';
+const TOP_CLAIM_KEY = '__twilioGamesDisplayClaim';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ACTIVE_CLAIM_TTL_MS = 60 * 60 * 1_000;
 const ACTIVE_CLAIM_REFRESH_MS = 60 * 1_000;
@@ -11,6 +12,30 @@ let claimedSessionId: string | null = null;
 let pagehideRegistered = false;
 let claimRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let activeClaimAvailable: boolean | null = null;
+
+type TopClaimHost = Window & { [TOP_CLAIM_KEY]?: { sessionId: string; owner: string } };
+
+function topClaimHost(): TopClaimHost | null {
+  if (typeof window === 'undefined') return null;
+  let host = window as TopClaimHost;
+  // A same-origin Home page may itself be framed by another site. Its game iframe and Home
+  // still need the same claim host, so climb only as far as parent access permits.
+  while (true) {
+    try {
+      const parent = host.parent as TopClaimHost | undefined;
+      if (!parent || parent === host) return host;
+      void parent[TOP_CLAIM_KEY];
+      host = parent;
+    } catch { return host; }
+  }
+}
+
+function sameTopClaim(sessionId: string, owner: string): boolean {
+  try {
+    const claim = topClaimHost()?.[TOP_CLAIM_KEY];
+    return claim?.sessionId === sessionId && claim.owner === owner;
+  } catch { return false; }
+}
 
 function readClaim(key: string): { owner?: unknown; at?: unknown } | null {
   const value = localStorage.getItem(key);
@@ -48,9 +73,8 @@ function createSessionId(): string | null {
   }
 }
 
-/** Used by the home launcher when building a destination URL. The home document can stay
- * open behind a game iframe, so it only checks storage support and never claims the display.
- * Without both stores, a copied tab could share this ID; omit the hint and fail closed instead. */
+/** Return the stored tab identity without claiming it. A page that actually launches a
+ * game must use navigationDisplaySessionId so copied Home tabs reserve different IDs. */
 export function ensureDisplaySessionId(): string | null {
   if (!canUseActiveClaims()) return null;
   try {
@@ -65,6 +89,13 @@ export function ensureDisplaySessionId(): string | null {
   }
 }
 
+/** Reserve the page-navigation hint at launch time. A duplicated Home tab inherits
+ * sessionStorage, but not the other tab's top-level window. Claiming here rotates its
+ * copied ID before the HTTP request, and the game iframe can take over the same claim. */
+export function navigationDisplaySessionId(): string | null {
+  return displaySessionId();
+}
+
 function displaySessionId(): string | null {
   const id = ensureDisplaySessionId();
   return id ? claimDisplaySession(id) : null;
@@ -74,6 +105,11 @@ function releaseDisplayClaim(): void {
   if (claimRefreshTimer) clearInterval(claimRefreshTimer);
   claimRefreshTimer = null;
   if (!claimedSessionId || !documentId) return;
+  try {
+    const top = topClaimHost();
+    if (top?.[TOP_CLAIM_KEY]?.sessionId === claimedSessionId
+      && top[TOP_CLAIM_KEY]?.owner === documentId) delete top[TOP_CLAIM_KEY];
+  } catch { /* The claim still expires in storage. */ }
   try {
     const key = `${DISPLAY_ACTIVE_PREFIX}${claimedSessionId}`;
     const claim = readClaim(key);
@@ -106,7 +142,8 @@ function claimDisplaySession(initialId: string): string | null {
     const prior = readClaim(key);
     if (prior && (typeof prior.owner !== 'string' || typeof prior.at !== 'number')) return null;
     const otherActive = prior && prior.owner !== documentId
-      && typeof prior.at === 'number' && Date.now() - prior.at < ACTIVE_CLAIM_TTL_MS;
+      && typeof prior.at === 'number' && Date.now() - prior.at < ACTIVE_CLAIM_TTL_MS
+      && !sameTopClaim(id, prior.owner as string);
     if (otherActive) {
       const replacement = createSessionId();
       if (replacement) {
@@ -121,6 +158,10 @@ function claimDisplaySession(initialId: string): string | null {
       JSON.stringify({ owner: documentId, at: Date.now() }));
     if (readClaim(`${DISPLAY_ACTIVE_PREFIX}${id}`)?.owner !== documentId) return null;
     claimedSessionId = id;
+    try {
+      const top = topClaimHost();
+      if (top) top[TOP_CLAIM_KEY] = { sessionId: id, owner: documentId };
+    } catch { /* A blocked top window must not prevent the game from opening. */ }
   } catch {
     activeClaimAvailable = false;
     return null;

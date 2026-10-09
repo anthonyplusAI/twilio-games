@@ -39,4 +39,38 @@ describe('Voice Chess result presentation', () => {
     expect(draw.exitLabel).toBe('Voltar aos jogos');
     expect(resultSummary(null, 'w', 'en-US')).toBe('The final position is on the board.');
   });
+
+  it('names the winning caller on a shared two-player board without a one-player verdict', () => {
+    const players = [
+      { playerId: 'c1', color: 'w' as const, name: 'Ada', connected: true, nameConfirmed: true },
+      { playerId: 'c2', color: 'b' as const, name: 'Ben', connected: true, nameConfirmed: true },
+    ];
+    const checkmate = chessResultPresentation(
+      { reason: 'checkmate', winner: 'b' }, 'w', 'en-US',
+      { mode: 'pvp', players, canReplayOnDisplay: false, stationManaged: true },
+    );
+    expect(checkmate.title).toBe('Ben wins');
+    expect(checkmate.detail).toBe('Ben checkmated Ada.');
+    expect(checkmate.showReplay).toBe(false);
+    const forfeit = chessResultPresentation(
+      { reason: 'forfeit', winner: 'w' }, 'w', 'en-US',
+      { mode: 'pvp', players, canReplayOnDisplay: false, stationManaged: false },
+    );
+    expect(forfeit.title).toBe('Ada wins');
+    expect(forfeit.detail).toMatch(/Ada.*Ben.*left the call/i);
+    expect(forfeit.stationNextRound).toMatch(/both callers say play again/i);
+
+    const oneVote = chessResultPresentation(
+      { reason: 'checkmate', winner: 'w' }, 'w', 'en-US',
+      { mode: 'pvp', players, canReplayOnDisplay: false, stationManaged: false,
+        rematchReadyPlayerIds: ['c1'] },
+    );
+    expect(oneVote.stationNextRound).toMatch(/Ada requested.*waiting for the other caller/i);
+    const bothWaitingForPhone = chessResultPresentation(
+      { reason: 'checkmate', winner: 'w' }, 'w', 'en-US',
+      { mode: 'pvp', players, canReplayOnDisplay: false, stationManaged: false,
+        rematchReadyPlayerIds: ['c1', 'c2'], rematchWaitingForPhone: true },
+    );
+    expect(bothWaitingForPhone.stationNextRound).toMatch(/waiting for both phone announcements/i);
+  });
 });

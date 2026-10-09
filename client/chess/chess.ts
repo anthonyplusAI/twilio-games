@@ -11,9 +11,11 @@ import { getMusicManager } from '../music-manager';
 import { updateThemeToggleIcon } from '../icon-controls';
 import { currentTheme, wireThemeToggle } from '../theme';
 import type { ChessBoardScene, BoardPiece } from './chess-board';
-import { ChessConnection, chessWebSocketUrl, type ChessConnectionState } from './chess-net';
+import { ChessConnection, chessModeForLaunch, chessWebSocketUrl, type ChessConnectionState } from './chess-net';
 import { createChessResultDialog } from './chess-result-dialog';
 import { chessResultPresentation, resultSummary } from './chess-result-view';
+import { chessModeConflictScreenCopy, chessPvpCaptureBanner, chessPvpMoveCaption,
+  chessPvpScreenCopy } from './chess-pvp-view';
 import { wizardCharacterAt } from '../../shared/wizard-chess-scene';
 import { WizardSceneController } from './wizard-scene-controller';
 import { wizardPieceArt } from './wizard-2d-art';
@@ -30,7 +32,9 @@ const musicButton = element<HTMLButtonElement>('music-button');
 const musicLabel = element<HTMLSpanElement>('music-label');
 const statusTitle = element<HTMLHeadingElement>('status-title');
 const statusDetail = element<HTMLParagraphElement>('status-detail');
+const duelLabels = element<HTMLDivElement>('duel-labels');
 const callCard = element<HTMLElement>('call-card');
+const callCardTitle = element<HTMLHeadingElement>('call-card-title');
 const callCardInstructions = element<HTMLParagraphElement>('call-card-instructions');
 const callCardQrFrame = element<HTMLDivElement>('call-card-qr-frame');
 const callCardQr = element<HTMLImageElement>('call-card-qr');
@@ -39,6 +43,7 @@ const callCardAvailability = element<HTMLParagraphElement>('call-card-availabili
 const turnLabel = element<HTMLSpanElement>('turn-label');
 const prompt = element<HTMLDivElement>('move-prompt');
 const hintTracker = element<HTMLDivElement>('hint-tracker');
+const hintTrackerLabel = element<HTMLSpanElement>('hint-tracker-label');
 const hintCount = element<HTMLElement>('hint-count');
 const hintMove = element<HTMLDivElement>('hint-move');
 const hintPips = [...element<HTMLDivElement>('hint-pips').querySelectorAll<HTMLElement>('i')];
@@ -64,6 +69,7 @@ const roomCode = params.get('room') || DEFAULT_ROOM;
 const stationLaunchRequested = params.has('station') || params.has('match') || params.has('launchGeneration');
 const stationDisplay = createStationDisplay();
 const stationManaged = stationLaunchRequested || stationDisplay.active;
+const preferredMode = chessModeForLaunch(params, stationManaged);
 const isPortuguese = locale === 'pt-BR';
 const music = getMusicManager();
 const themeLabels = {
@@ -98,6 +104,7 @@ let latestState: ChessState | null = null;
 let visualState: ChessState | null = null;
 let processingBoard = false;
 let transportError = '';
+let modeConflict = false;
 let lastFeedbackSequence = -1;
 let lastAnnouncedMove = '';
 let lastResultKey = '';
@@ -187,7 +194,7 @@ async function loadChessScene(): Promise<void> {
     board = scene;
     wizardScene.attachBoard(scene);
     if (current && !wizardScene.active) synchronizeScene(scene, current);
-    if (current && (current.phase === 'waiting' || current.wizardAvailable)
+    if (current && current.mode !== 'pvp' && (current.phase === 'waiting' || current.wizardAvailable)
       && !current.wizardScene) scheduleWizardPrefetch();
     scene.setAvailabilityHandler(available => {
       document.body.dataset.renderer = available ? 'three' : 'fallback';
@@ -223,11 +230,12 @@ if (stationLaunchRequested && !stationDisplay.displayToken) {
 } else {
   try {
     connection = new ChessConnection(chessWebSocketUrl(location), roomCode,
-      stationLaunchRequested ? stationDisplay.displayToken : null, locale);
+      stationLaunchRequested ? stationDisplay.displayToken : null, locale, preferredMode);
     connection.onState(receiveState);
     connection.onEvents(receiveEvents);
     connection.onClockOffset(offset => wizardScene.setClockOffset(offset));
     connection.onError((code, message) => {
+      modeConflict = code === 'mode_locked' && preferredMode !== null;
       if (code === 'bad_display_auth') {
         if (stationLaunchRequested) rejectDisplayToken(stationDisplay.displayToken);
         connection?.close();
@@ -239,11 +247,19 @@ if (stationLaunchRequested && !stationDisplay.displayToken) {
             ? 'Esta sala pertence a uma estação. Abra o Xadrez por Voz na página de jogos.'
             : 'This room belongs to a station. Open Voice Chess from the games page.';
       } else transportError = message;
+      if (modeConflict && preferredMode) {
+        const copy = chessModeConflictScreenCopy(preferredMode, locale);
+        liveAnnouncer.textContent = `${copy.title}. ${copy.prompt}`;
+      }
+      renderConnection();
       renderStatus();
     });
     connection.onConnection(next => {
       connectionState = next;
-      if (next === 'connected') transportError = '';
+      if (next === 'connected') {
+        transportError = '';
+        modeConflict = false;
+      }
       renderConnection();
       renderStatus();
     });
@@ -281,6 +297,7 @@ addEventListener('pagehide', () => {
 function receiveEvents(events: readonly ChessEvent[]): void {
   // State snapshots are the single board authority. Events only add timely spoken feedback.
   for (const event of events) {
+    if (latestState?.mode === 'pvp') continue;
     if (event.type === 'feedback' && event.feedback.sequence > lastFeedbackSequence) {
       lastFeedbackSequence = event.feedback.sequence;
       liveAnnouncer.textContent = event.feedback.text;
@@ -290,6 +307,8 @@ function receiveEvents(events: readonly ChessEvent[]): void {
 
 function receiveState(next: ChessState): void {
   if (!validRoomState(next)) return;
+  transportError = '';
+  modeConflict = false;
   const previous = latestState;
   if (previous && (next.gameId !== previous.gameId || next.revision < previous.revision
     || next.ply < previous.ply)) {
@@ -299,9 +318,12 @@ function receiveState(next: ChessState): void {
     eventBanner.classList.remove('show');
   }
   latestState = next;
+  app.dataset.mode = next.mode === 'pvp' ? 'pvp' : 'solo';
+  duelLabels.setAttribute('aria-hidden', next.mode === 'pvp' ? 'false' : 'true');
   wizardScene.update(next.wizardScene);
   if (previous?.wizardScene && !next.wizardScene && board) synchronizeScene(board, next);
-  if ((next.phase === 'waiting' || next.wizardAvailable) && !next.wizardScene) scheduleWizardPrefetch();
+  if (next.mode !== 'pvp' && (next.phase === 'waiting' || next.wizardAvailable)
+    && !next.wizardScene) scheduleWizardPrefetch();
   renderConnection();
   renderStatus();
   renderMoveNote();
@@ -334,8 +356,9 @@ async function processBoardQueue(): Promise<void> {
         && next.lastMove?.ply === next.ply && next.lastMove.revision === next.revision;
       if (oneMove && next.lastMove) {
         if (next.lastMove.captured) {
+          if (bannerTimer) clearTimeout(bannerTimer);
           bannerTimer = setTimeout(() => {
-            if (latestState?.gameId === next.gameId && latestState.ply >= next.ply) showCaptureBanner(next.lastMove!);
+            if (latestState?.gameId === next.gameId && latestState.ply === next.ply) showCaptureBanner(next);
           }, 670);
         }
         await board?.animateTo(next.pieces, next.lastMove);
@@ -379,6 +402,7 @@ function scheduleWizardPrefetch(): void {
   setTimeout(() => {
     wizardPrefetchScheduled = false;
     if (!pageClosing && latestState
+      && latestState.mode !== 'pvp'
       && (latestState.phase === 'waiting' || latestState.wizardAvailable)
       && !latestState.wizardScene) {
       wizardScene.prefetchOpeningVoice();
@@ -396,7 +420,18 @@ function validRoomState(state: ChessState): boolean {
     || !['waiting', 'playing', 'pending', 'finished'].includes(state.phase)
     || !Number.isInteger(state.hintsRemaining) || state.hintsRemaining < 0 || state.hintsRemaining > 3
     || !['w', 'b'].includes(state.humanColor) || !['w', 'b'].includes(state.turn)
+    || (state.mode !== undefined && !['solo', 'pvp'].includes(state.mode))
     || typeof state.fen !== 'string' || !Array.isArray(state.pieces) || state.pieces.length > 32) return false;
+  if (state.players !== undefined) {
+    if (!Array.isArray(state.players) || state.players.length > 2) return false;
+    const colors = new Set<string>();
+    for (const player of state.players) {
+      if (!player || typeof player.playerId !== 'string' || typeof player.name !== 'string'
+        || !['w', 'b'].includes(player.color) || colors.has(player.color)
+        || typeof player.connected !== 'boolean' || typeof player.nameConfirmed !== 'boolean') return false;
+      colors.add(player.color);
+    }
+  }
   const squares = new Set<string>();
   for (const piece of state.pieces) {
     if (!piece || !/^[a-h][1-8]$/.test(piece.square) || squares.has(piece.square)
@@ -417,9 +452,15 @@ function validRoomState(state: ChessState): boolean {
 }
 
 function renderConnection(): void {
-  connectionStatus.dataset.state = connectionState;
-  const label = connectionState === 'connected'
-    ? latestState?.playerConnected
+  connectionStatus.dataset.state = modeConflict ? 'conflict' : connectionState;
+  const pvp = latestState?.mode === 'pvp';
+  const readyCount = pvp ? chessPvpScreenCopy(latestState!, locale).readyCount : 0;
+  const label = modeConflict
+    ? isPortuguese ? 'Sala em uso' : 'Room in use'
+    : connectionState === 'connected'
+    ? pvp
+      ? isPortuguese ? `${readyCount} de 2 jogadores prontos` : `${readyCount} of 2 players ready`
+      : latestState?.playerConnected
       ? isPortuguese ? 'Telefone conectado' : 'Phone connected'
       : isPortuguese ? 'Tabuleiro conectado' : 'Board connected'
     : connectionState === 'reconnecting'
@@ -437,7 +478,13 @@ function renderStatus(): void {
   let detail: string;
   let label: string;
   let hint: string;
-  if (transportError) {
+  if (modeConflict && preferredMode) {
+    const copy = chessModeConflictScreenCopy(preferredMode, locale);
+    title = copy.title;
+    detail = copy.detail;
+    label = copy.turnLabel;
+    hint = copy.prompt;
+  } else if (transportError) {
     title = isPortuguese ? 'A câmara está em silêncio' : 'The chamber is quiet';
     detail = transportError;
     label = isPortuguese ? 'Conexão' : 'Connection';
@@ -468,6 +515,12 @@ function renderStatus(): void {
     detail = isPortuguese ? 'A posição atual continua no tabuleiro.' : 'Your last known position remains on the board.';
     label = isPortuguese ? 'Canal de voz' : 'Voice channel';
     hint = isPortuguese ? 'Aguarde a conexão voltar.' : 'Waiting for the voice link to return.';
+  } else if (state.mode === 'pvp') {
+    const copy = chessPvpScreenCopy(state, locale);
+    title = copy.title;
+    detail = copy.detail;
+    label = copy.turnLabel;
+    hint = copy.prompt;
   } else if (state.phase === 'finished') {
     title = isPortuguese ? 'Duelo encerrado' : 'Duel complete';
     detail = resultSummary(state.result, state.humanColor, locale);
@@ -503,7 +556,8 @@ function renderStatus(): void {
     label = isPortuguese ? 'Vez do rival' : 'Rival’s turn';
     hint = isPortuguese ? 'O telefone anunciará o próximo lance.' : 'Your phone will announce the next move.';
   }
-  if (state?.feedback && ['illegal', 'ambiguous', 'unknown', 'help', 'not_your_turn', 'stale'].includes(state.feedback.code)) {
+  if (!modeConflict && !transportError && state?.mode !== 'pvp' && state?.feedback
+    && ['illegal', 'ambiguous', 'unknown', 'help', 'not_your_turn', 'stale'].includes(state.feedback.code)) {
     detail = state.feedback.text;
   }
   statusTitle.textContent = title;
@@ -516,11 +570,20 @@ function renderStatus(): void {
 }
 
 function renderHintTracker(state: ChessState | null): void {
-  hintTracker.hidden = state?.phase === 'finished' || !!state?.wizardScene;
+  hintTracker.hidden = modeConflict || state?.phase === 'finished' || !!state?.wizardScene
+    || (state?.mode === 'pvp' && state.phase === 'waiting');
   const remaining = state?.hintsRemaining ?? 3;
+  const owner = state?.mode === 'pvp'
+    ? state.players?.find(player => player.color === state.turn)?.name
+      ?? (state.turn === 'w' ? isPortuguese ? 'Brancas' : 'White'
+        : isPortuguese ? 'Pretas' : 'Black')
+    : null;
+  hintTrackerLabel.textContent = owner
+    ? `${owner} · ${isPortuguese ? 'DICAS' : 'HINTS'}`
+    : isPortuguese ? 'DICAS DE JOGADA' : 'MOVE HINTS';
   hintCount.textContent = `${remaining} / 3`;
-  hintTracker.setAttribute('aria-label', isPortuguese
-    ? `${remaining} de 3 dicas de jogada restantes` : `${remaining} of 3 move hints remaining`);
+  hintTracker.setAttribute('aria-label', `${owner ? `${owner}: ` : ''}${isPortuguese
+    ? `${remaining} de 3 dicas de jogada restantes` : `${remaining} of 3 move hints remaining`}`);
   hintPips.forEach((pip, index) => pip.classList.toggle('spent', index >= remaining));
   const recommendation = state?.pendingMove ? null : state?.hint;
   hintTracker.dataset.active = recommendation ? 'true' : 'false';
@@ -534,18 +597,26 @@ function renderHintTracker(state: ChessState | null): void {
 }
 
 function renderCallCard(): void {
+  const pvp = latestState?.mode === 'pvp';
+  const connectedSeats = pvp ? latestState!.players?.filter(player => player.connected).length ?? 0 : 0;
   const waitingForCaller = !stationLaunchRequested && !stationDisplay.active
     && connectionState === 'connected' && !transportError
     && latestState !== null && latestState.phase !== 'finished'
-    && !latestState.wizardScene && !latestState.playerConnected;
+    && !latestState.wizardScene && (pvp ? connectedSeats < 2 : !latestState.playerConnected);
   callCard.hidden = !waitingForCaller;
   app.dataset.callCard = waitingForCaller ? 'visible' : 'hidden';
   if (!waitingForCaller) return;
 
+  const pvpCopy = pvp ? chessPvpScreenCopy(latestState!, locale) : null;
+  callCardTitle.textContent = pvpCopy?.callCardTitle
+    ?? (isPortuguese ? 'Ligue para jogar' : 'Call to play');
+
   callCardInstructions.hidden = !phoneNumber;
-  callCardInstructions.textContent = phoneQr
+  const callInstructions = phoneQr
     ? isPortuguese ? 'Escaneie com o celular ou toque no número.' : 'Scan with your phone or tap the number.'
     : isPortuguese ? 'Toque no número para ligar e começar.' : 'Tap the number to call and start.';
+  callCardInstructions.textContent = pvpCopy
+    ? `${pvpCopy.callCardInstructions} ${callInstructions}` : callInstructions;
   callCard.dataset.qr = phoneQr ? 'ready' : 'missing';
   callCardQrFrame.hidden = !phoneQr;
   if (phoneQr) callCardQr.src = phoneQr;
@@ -571,6 +642,12 @@ function renderCallCard(): void {
 
 function renderSides(): void {
   if (!latestState) return;
+  if (latestState.mode === 'pvp') {
+    const copy = chessPvpScreenCopy(latestState, locale);
+    humanLabel.textContent = copy.whiteLabel;
+    computerLabel.textContent = copy.blackLabel;
+    return;
+  }
   const human = latestState.humanColor;
   humanLabel.textContent = isPortuguese
     ? `Você · ${human === 'w' ? 'Brancas' : 'Pretas'}`
@@ -581,13 +658,20 @@ function renderSides(): void {
 }
 
 function renderMoveNote(): void {
+  if (latestState?.mode === 'pvp') {
+    const copy = chessPvpScreenCopy(latestState, locale);
+    lastMoveLabel.textContent = copy.lastMoveLabel;
+    mobileLastMove.textContent = copy.lastMoveLabel;
+    lastCaption.textContent = copy.lastCaption;
+    return;
+  }
   const move = latestState?.lastMove;
   const notation = move
     ? `${move.actor === 'human' ? isPortuguese ? 'Você' : 'You' : isPortuguese ? 'Arquimago' : 'Archmage'} · ${move.san}`
     : isPortuguese ? 'Nenhum lance ainda' : 'No moves yet';
   lastMoveLabel.textContent = notation;
   mobileLastMove.textContent = notation;
-  lastCaption.textContent = move ? moveCaption(move)
+  lastCaption.textContent = move ? moveCaption(move, latestState!)
     : isPortuguese ? 'As peças aguardam o primeiro comando.' : 'The pieces await their first command.';
 }
 
@@ -599,10 +683,15 @@ function renderResult(state: ChessState): void {
     return;
   }
   const key = `${state.gameId}:${state.ply}:${state.result.reason}`;
-  const humanWon = state.result.winner === null ? null : state.result.winner === state.humanColor;
+  const humanWon = state.result.winner === null ? null
+    : state.mode === 'pvp' ? true : state.result.winner === state.humanColor;
   const presentation = chessResultPresentation(state.result, state.humanColor, locale, {
     canReplayOnDisplay: state.canReplayOnDisplay === true,
     stationManaged,
+    mode: state.mode,
+    players: state.players,
+    rematchReadyPlayerIds: state.rematchReadyPlayerIds,
+    rematchWaitingForPhone: state.rematchWaitingForPhone,
   });
   resultOverlay.dataset.result = presentation.outcome;
   resultKicker.textContent = presentation.kicker;
@@ -614,7 +703,7 @@ function renderResult(state: ChessState): void {
   resultExit.textContent = presentation.exitLabel;
   resultExit.hidden = !presentation.showExit;
   resultStationNote.textContent = presentation.stationNextRound;
-  resultStationNote.hidden = !stationManaged;
+  resultStationNote.hidden = !stationManaged && state.mode !== 'pvp';
   const newlyVisible = resultOverlay.hidden;
   resultOverlay.hidden = false;
   if (newlyVisible) resultDialog.show();
@@ -628,19 +717,27 @@ function renderResult(state: ChessState): void {
 }
 
 function announceState(next: ChessState, previous: ChessState | null): void {
-  if (next.feedback && next.feedback.sequence > lastFeedbackSequence) {
+  if (next.mode !== 'pvp' && next.feedback && next.feedback.sequence > lastFeedbackSequence) {
     lastFeedbackSequence = next.feedback.sequence;
     liveAnnouncer.textContent = next.feedback.text;
   }
   const key = next.lastMove ? `${next.gameId}:${next.lastMove.ply}` : '';
   if (key && key !== lastAnnouncedMove && previous?.gameId === next.gameId && next.ply === previous.ply + 1) {
     lastAnnouncedMove = key;
-    liveAnnouncer.textContent = moveCaption(next.lastMove!);
+    liveAnnouncer.textContent = moveCaption(next.lastMove!, next);
   }
 }
 
-function showCaptureBanner(move: ChessMoveRecord): void {
-  if (!move.captured || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+function showCaptureBanner(state: ChessState): void {
+  const move = state.lastMove;
+  if (!move?.captured || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  if (state.mode === 'pvp') {
+    eventBanner.textContent = chessPvpCaptureBanner(state, locale);
+    eventBanner.classList.remove('show');
+    void eventBanner.offsetWidth;
+    eventBanner.classList.add('show');
+    return;
+  }
   const victim = capitalize(pieceName(move.captured));
   eventBanner.textContent = move.actor === 'human'
     ? isPortuguese ? `${victim} destruído!` : `${victim} shattered!`
@@ -743,7 +840,8 @@ function localizeStaticCopy(): void {
   accessibleBoard.setAttribute('aria-label', 'Tabuleiro de xadrez ao vivo');
 }
 
-function moveCaption(move: ChessMoveRecord): string {
+function moveCaption(move: ChessMoveRecord, state: ChessState): string {
+  if (state.mode === 'pvp') return chessPvpMoveCaption(state, locale);
   const to = move.to.toUpperCase();
   const actor = move.actor === 'human';
   if (move.captured) {

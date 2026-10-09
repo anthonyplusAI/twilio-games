@@ -20,6 +20,399 @@ function connectCollect(port: number): Promise<{ ws: WebSocket; msgs: Record<str
 const send = (ws: WebSocket, m: unknown) => ws.send(JSON.stringify(m));
 
 describe('BattleServer', () => {
+  it('announces standby display promotion without granting its early count request', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const host = await connectCollect(port);
+    send(host.ws, { type: 'spectate', roomCode: 'HANDOFF' });
+    await wait(20);
+    expect(host.msgs).toContainEqual({ type: 'host_identity', roomCode: 'HANDOFF', isHost: true });
+    send(host.ws, { type: 'configure_players', count: 1 });
+    await wait(20);
+
+    const standby = await connectCollect(port);
+    send(standby.ws, { type: 'spectate', roomCode: 'HANDOFF', playerCount: 2 });
+    send(standby.ws, { type: 'configure_players', count: 2 });
+    await wait(20);
+    expect(standby.msgs).toContainEqual({ type: 'host_identity', roomCode: 'HANDOFF', isHost: false });
+    expect(standby.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'forbidden' }));
+    expect(server.findRoom('HANDOFF')?.expectedPlayerCount).toBe(1);
+
+    const closed = new Promise<void>(resolve => host.ws.once('close', resolve));
+    host.ws.close(); await closed;
+    await wait(20);
+    expect(standby.msgs).toContainEqual({ type: 'host_identity', roomCode: 'HANDOFF', isHost: true });
+    send(standby.ws, { type: 'configure_players', count: 2 });
+    await wait(20);
+    expect(server.findRoom('HANDOFF')?.expectedPlayerCount).toBe(2);
+    standby.ws.close();
+  });
+
+  it('applies a standby display’s selected count before announcing its promotion', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const host = await connectCollect(port);
+    send(host.ws, { type: 'spectate', roomCode: 'ATOMIC-HANDOFF', playerCount: 1 });
+    await wait(20);
+    const standby = await connectCollect(port);
+    send(standby.ws, { type: 'spectate', roomCode: 'ATOMIC-HANDOFF', playerCount: 2 });
+    await wait(20);
+    expect(server.findRoom('ATOMIC-HANDOFF')?.expectedPlayerCount).toBe(1);
+
+    const closed = new Promise<void>(resolve => host.ws.once('close', resolve));
+    host.ws.close(); await closed;
+    await wait(20);
+    expect(standby.msgs).toContainEqual({ type: 'host_identity', roomCode: 'ATOMIC-HANDOFF', isHost: true });
+    expect(server.findRoom('ATOMIC-HANDOFF')?.expectedPlayerCount).toBe(2);
+    standby.ws.close();
+  });
+
+  it('does not promote a standby count that conflicts with an advanced solo setup', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const host = await connectCollect(port);
+    send(host.ws, { type: 'spectate', roomCode: 'LOCKED-HANDOFF', playerCount: 1 });
+    await wait(20);
+    const ada = server.voiceJoin('LOCKED-HANDOFF', 'Ada')!;
+    expect(server.voiceAdvance('LOCKED-HANDOFF', ada)).toBe(true);
+    expect(server.findRoom('LOCKED-HANDOFF')?.phase).toBe('monster_select');
+
+    const standby = await connectCollect(port);
+    send(standby.ws, { type: 'spectate', roomCode: 'LOCKED-HANDOFF', playerCount: 2 });
+    await wait(20);
+    const closed = new Promise<void>(resolve => host.ws.once('close', resolve));
+    host.ws.close(); await closed;
+    await wait(20);
+    expect(standby.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'setup_in_progress' }));
+    expect([...(server as unknown as { conns: Set<{ roomCode?: string; display?: boolean }> }).conns]
+      .some(conn => conn.roomCode === 'LOCKED-HANDOFF' && conn.display)).toBe(false);
+    expect(server.findRoom('LOCKED-HANDOFF')?.expectedPlayerCount).toBe(1);
+    standby.ws.close();
+  });
+
+  it('lets only the standalone display reserve two phone seats before setup', async () => {
+    server = new BattleServer({ port: 0, displayToken: 'station-token' });
+    server.setBrowserPlayerAdmission(code => code !== 'STATION');
+    const port = await server.start();
+    const spectator = await connectCollect(port);
+    send(spectator.ws, { type: 'configure_players', count: 2 });
+    await wait(20);
+    expect(spectator.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'forbidden' }));
+
+    send(spectator.ws, { type: 'spectate', roomCode: 'STATION', displayToken: 'station-token', playerCount: 2 });
+    await wait(20);
+    expect(server.findRoom('STATION')?.expectedPlayerCount).toBe(1);
+    send(spectator.ws, { type: 'configure_players', count: 2 });
+    await wait(20);
+    expect(server.findRoom('STATION')?.expectedPlayerCount).toBe(1);
+
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'LOCAL-DUO' });
+    send(display.ws, { type: 'configure_players', count: 2 });
+    await wait(20);
+    const room = server.findRoom('LOCAL-DUO')!;
+    expect(room.expectedPlayerCount).toBe(2);
+    expect(display.msgs.filter(message => message.type === 'battle_state').at(-1))
+      .toMatchObject({ expectedPlayerCount: 2, players: [] });
+
+    const ada = server.voiceJoin('LOCAL-DUO', 'Ada')!;
+    server.voiceSetName('LOCAL-DUO', ada, 'Ada');
+    expect(room.expectedPlayerCount).toBe(2);
+    expect(server.voiceAdvance('LOCAL-DUO', ada)).toBe(true);
+    expect(room.isSetupReady(ada)).toBe(true);
+    const bo = server.voiceJoin('LOCAL-DUO', 'Bo')!;
+    expect(room.phase).toBe('lobby');
+    send(display.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('lobby');
+    expect(display.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'caller_ready_required' }));
+    expect(server.voiceAdvance('LOCAL-DUO', bo)).toBe(true);
+    expect(room.phase).toBe('monster_select');
+    spectator.ws.close(); display.ws.close();
+  });
+
+  it('applies a two-caller display mode before publishing its first state', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'ATOMIC', playerCount: 2 });
+    await wait(20);
+    expect(display.msgs.find(message => message.type === 'battle_state'))
+      .toMatchObject({ phase: 'lobby', expectedPlayerCount: 2, players: [] });
+    const keyboard = await connectCollect(port);
+    send(keyboard.ws, { type: 'join', roomCode: 'ATOMIC', name: 'Tester' });
+    await wait(20);
+    expect(server.findRoom('ATOMIC')?.expectedPlayerCount).toBe(2);
+    keyboard.ws.close(); display.ws.close();
+  });
+
+  it('does not route calls to a display whose requested count is locked out', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const original = await connectCollect(port);
+    send(original.ws, { type: 'spectate', roomCode: 'LOCKED-COUNT', playerCount: 1 });
+    await wait(20);
+    const ada = server.voiceJoin('LOCKED-COUNT', 'Ada')!;
+    expect(server.voiceAdvance('LOCKED-COUNT', ada)).toBe(true);
+    expect(server.findRoom('LOCKED-COUNT')?.phase).toBe('monster_select');
+    const closed = new Promise<void>(resolve => original.ws.once('close', resolve));
+    original.ws.close(); await closed;
+
+    const conflicting = await connectCollect(port);
+    send(conflicting.ws, { type: 'spectate', roomCode: 'LOCKED-COUNT', playerCount: 2 });
+    await wait(20);
+    expect(conflicting.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'setup_in_progress' }));
+    expect([...(server as unknown as { conns: Set<{ roomCode?: string; display?: boolean }> }).conns]
+      .some(conn => conn.roomCode === 'LOCKED-COUNT' && conn.display)).toBe(false);
+    expect(server.findRoom('LOCKED-COUNT')?.expectedPlayerCount).toBe(1);
+    conflicting.ws.close();
+  });
+
+  it('accepts an older display’s count follow-up after a caller joins the lobby', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'LATE-COUNT' });
+    await wait(20);
+    const ada = server.voiceJoin('LATE-COUNT', 'Ada')!;
+    const room = server.findRoom('LATE-COUNT')!;
+    send(display.ws, { type: 'configure_players', count: 2 });
+    await wait(20);
+    expect(room.expectedPlayerCount).toBe(2);
+    expect(display.msgs).not.toContainEqual(expect.objectContaining({ type: 'error', code: 'setup_in_progress' }));
+    expect(server.voiceAdvance('LATE-COUNT', ada)).toBe(true);
+    expect(room.phase).toBe('lobby');
+    display.ws.close();
+  });
+
+  it('accepts keyboard-first display setup and waits for each caller and phone cue', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const keyboard = await connectCollect(port);
+    send(keyboard.ws, { type: 'join', roomCode: 'KEYBOARD-FIRST', name: 'Tester' });
+    await wait(20);
+    const room = server.findRoom('KEYBOARD-FIRST')!;
+    expect(room.expectedPlayerCount).toBe(1);
+
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'KEYBOARD-FIRST', playerCount: 2 });
+    await wait(20);
+    expect(room.expectedPlayerCount).toBe(2);
+    expect(room.requiresIndividualSetupReady).toBe(true);
+    send(display.ws, { type: 'configure_players', count: 2 });
+    send(keyboard.ws, { type: 'advance' });
+    await wait(20);
+    expect(display.msgs).not.toContainEqual(expect.objectContaining({ type: 'error', code: 'setup_in_progress' }));
+    expect(room.phase).toBe('lobby');
+    expect(room.lobbyPlayers()[0]?.setupReady).toBe(true);
+
+    const bo = server.voiceJoin('KEYBOARD-FIRST', 'Bo')!;
+    const finishBo = server.voiceBeginMenuSpeech('KEYBOARD-FIRST', bo, 'lobby')!;
+    send(display.ws, { type: 'advance' });
+    await wait(20);
+    expect(display.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'caller_ready_required' }));
+    expect(server.voiceAdvance('KEYBOARD-FIRST', bo)).toBe(true);
+    expect(room.phase).toBe('lobby');
+    finishBo(true);
+    expect(room.phase).toBe('monster_select');
+    keyboard.ws.close(); display.ws.close();
+  });
+
+  it('accepts phone-first display setup and holds a caller’s pending menu cue', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const ada = server.voiceJoin('PHONE-FIRST', 'Ada')!;
+    const finishAda = server.voiceBeginMenuSpeech('PHONE-FIRST', ada, 'lobby')!;
+    const room = server.findRoom('PHONE-FIRST')!;
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'PHONE-FIRST', playerCount: 2 });
+    await wait(20);
+    expect(room.expectedPlayerCount).toBe(2);
+    expect(server.voiceAdvance('PHONE-FIRST', ada)).toBe(true);
+    expect(room.phase).toBe('lobby');
+    const keyboard = await connectCollect(port);
+    send(keyboard.ws, { type: 'join', roomCode: 'PHONE-FIRST', name: 'Tester' });
+    await wait(20);
+    send(keyboard.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('lobby');
+    expect(room.lobbyPlayers()).toEqual(expect.arrayContaining([
+      expect.objectContaining({ playerId: ada, setupReady: true, phonePending: true }),
+      expect.objectContaining({ name: 'Tester', setupReady: true }),
+    ]));
+    finishAda(true);
+    expect(room.phase).toBe('monster_select');
+    keyboard.ws.close(); display.ws.close();
+  });
+
+  it('accepts the same two-caller display mode after reconnect in selection and results', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const roomCode = 'RECONNECT-MODE';
+    const openDisplay = async () => {
+      const display = await connectCollect(port);
+      send(display.ws, { type: 'spectate', roomCode });
+      await wait(15);
+      send(display.ws, { type: 'configure_players', count: 2 });
+      await wait(15);
+      expect(display.msgs).not.toContainEqual(expect.objectContaining({ type: 'error', code: 'setup_in_progress' }));
+      return display;
+    };
+    const firstDisplay = await openDisplay();
+    const ada = server.voiceJoin(roomCode, 'Ada')!;
+    const bo = server.voiceJoin(roomCode, 'Bo')!;
+    const room = server.findRoom(roomCode)!;
+    server.voiceAdvance(roomCode, ada);
+    server.voiceAdvance(roomCode, bo);
+    expect(room.phase).toBe('monster_select');
+
+    firstDisplay.ws.close();
+    await wait(20);
+    const selectDisplay = await openDisplay();
+    expect(room.phase).toBe('monster_select');
+    expect(room.expectedPlayerCount).toBe(2);
+    server.voiceSelectMonster(roomCode, ada, 'sparkmouse');
+    server.voiceSelectMonster(roomCode, bo, 'embertail');
+    server.voiceAdvance(roomCode, ada);
+    server.voiceAdvance(roomCode, bo);
+    expect(room.phase).toBe('battle');
+    for (let turn = 0; turn < 200 && room.phase === 'battle'; turn++) {
+      const snapshot = room.snapshot()!;
+      const side = room.activeSide();
+      const actor = side === 'a' ? ada : bo;
+      const move = side === 'a' ? snapshot.a.moves[0]! : snapshot.b.moves[0]!;
+      expect(room.chooseAction(actor, { kind: 'fight', moveId: move.id })).toBe(true);
+    }
+    expect(room.phase).toBe('results');
+
+    selectDisplay.ws.close();
+    await wait(20);
+    const resultDisplay = await openDisplay();
+    expect(room.phase).toBe('results');
+    expect(room.expectedPlayerCount).toBe(2);
+    resultDisplay.ws.close();
+  });
+
+  it('clears a disconnected caller’s ready state so the other phone cannot advance alone', async () => {
+    server = new BattleServer({ port: 0 });
+    await server.start();
+    const ada = server.voiceJoin('RECONNECT', 'Ada', 'a', 2)!;
+    const bo = server.voiceJoin('RECONNECT', 'Bo', 'b', 2)!;
+    const room = server.findRoom('RECONNECT')!;
+    expect(server.voiceAdvance('RECONNECT', ada)).toBe(true);
+    expect(room.isSetupReady(ada)).toBe(true);
+    expect(server.voiceClearSetupReady('RECONNECT', ada)).toBe(true);
+    expect(server.voiceAdvance('RECONNECT', bo)).toBe(true);
+    expect(room.phase).toBe('lobby');
+    expect(room.isSetupReady(ada)).toBe(false);
+  });
+
+  it('publishes phone wait states and advances only after both Relay cues complete', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'PHONE-CUES' });
+    send(display.ws, { type: 'configure_players', count: 2 });
+    await wait(20);
+    const ada = server.voiceJoin('PHONE-CUES', 'Ada')!;
+    const bo = server.voiceJoin('PHONE-CUES', 'Bo')!;
+    const room = server.findRoom('PHONE-CUES')!;
+    const finishAda = server.voiceBeginMenuSpeech('PHONE-CUES', ada, 'lobby')!;
+    const finishBo = server.voiceBeginMenuSpeech('PHONE-CUES', bo, 'lobby')!;
+    expect(server.voiceAdvance('PHONE-CUES', ada)).toBe(true);
+    expect(server.voiceAdvance('PHONE-CUES', bo)).toBe(true);
+    await wait(20);
+    expect(room.phase).toBe('lobby');
+    const lastState = () => display.msgs.filter(message => message.type === 'battle_state').at(-1);
+    expect(lastState()?.players).toEqual(expect.arrayContaining([
+      expect.objectContaining({ playerId: ada, setupReady: true, phonePending: true }),
+      expect.objectContaining({ playerId: bo, setupReady: true, phonePending: true }),
+    ]));
+    finishAda(true);
+    finishBo(false);
+    expect(room.phase).toBe('lobby');
+    const retryBo = server.voiceBeginMenuSpeech('PHONE-CUES', bo, 'lobby')!;
+    retryBo(true);
+    await wait(20);
+    expect(room.phase).toBe('monster_select');
+    expect(lastState()?.phase).toBe('monster_select');
+    display.ws.close();
+  });
+
+  it('preserves a fixed two-seat station match when the first caller gives their name', async () => {
+    server = new BattleServer({ port: 0 });
+    await server.start();
+    const first = server.voiceJoin('STATION-NAME', 'Challenger', 'a', 2, false)!;
+    server.voiceSetName('STATION-NAME', first, 'Ada');
+    const room = server.findRoom('STATION-NAME')!;
+    expect(room.expectedPlayerCount).toBe(2);
+    expect(server.voiceAdvance('STATION-NAME', first)).toBe(true);
+    expect(room.phase).toBe('lobby');
+    expect(room.isSetupReady(first)).toBe(true);
+  });
+
+  it('retains a finished two-caller result on its display until a fresh pair starts', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'NEXT-PAIR' });
+    send(display.ws, { type: 'configure_players', count: 2 });
+    await wait(20);
+    const ada = server.voiceJoin('NEXT-PAIR', 'Ada')!;
+    const bo = server.voiceJoin('NEXT-PAIR', 'Bo')!;
+    const room = server.findRoom('NEXT-PAIR')!;
+    server.voiceAdvance('NEXT-PAIR', ada); server.voiceAdvance('NEXT-PAIR', bo);
+    server.voiceSelectMonster('NEXT-PAIR', ada, 'sparkmouse');
+    server.voiceSelectMonster('NEXT-PAIR', bo, 'embertail');
+    server.voiceAdvance('NEXT-PAIR', ada); server.voiceAdvance('NEXT-PAIR', bo);
+    for (let index = 0; index < 200 && room.phase === 'battle'; index++) {
+      const snapshot = room.snapshot()!;
+      const action = room.activeSide() === 'a'
+        ? { playerId: ada, moveId: snapshot.a.moves[0]!.id }
+        : { playerId: bo, moveId: snapshot.b.moves[0]!.id };
+      server.voiceChooseAction('NEXT-PAIR', action.playerId, { kind: 'fight', moveId: action.moveId });
+    }
+    expect(room.phase).toBe('results');
+    const result = room.result();
+    server.voiceLeave('NEXT-PAIR', ada);
+    server.voiceLeave('NEXT-PAIR', bo);
+    await wait(20);
+    expect(server.findRoom('NEXT-PAIR')).toBe(room);
+    expect(room.phase).toBe('results');
+    expect(room.result()).toEqual(result);
+    expect(room.expectedPlayerCount).toBe(2);
+    const displayed = display.msgs.filter(message => message.type === 'battle_state').at(-1);
+    expect(displayed).toMatchObject({ phase: 'results', expectedPlayerCount: 2, players: [], result });
+
+    const nextAda = server.voiceJoin('NEXT-PAIR', 'Next Ada')!;
+    expect(room.phase).toBe('lobby');
+    expect(room.expectedPlayerCount).toBe(2);
+    expect(server.voiceAdvance('NEXT-PAIR', nextAda)).toBe(true);
+    expect(room.phase).toBe('lobby');
+    const nextBo = server.voiceJoin('NEXT-PAIR', 'Next Bo')!;
+    expect(server.voiceAdvance('NEXT-PAIR', nextBo)).toBe(true);
+    expect(room.phase).toBe('monster_select');
+    display.ws.close();
+  });
+
+  it('waits for both browser players to confirm the shared menus', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const first = await connectCollect(port);
+    const second = await connectCollect(port);
+    send(first.ws, { type: 'join', roomCode: 'BROWSER-DUO', name: 'Ada' });
+    send(second.ws, { type: 'join', roomCode: 'BROWSER-DUO', name: 'Bo' });
+    await wait(20);
+    const room = server.findRoom('BROWSER-DUO')!;
+    expect(room.expectedPlayerCount).toBe(2);
+    send(first.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('lobby');
+    send(second.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('monster_select');
+    first.ws.close(); second.ws.close();
+  });
   it('recognizes only a live, room-bound and authorized standalone display',async()=>{
     server=new BattleServer({port:0,displayToken:'display-token'});
     server.setBrowserPlayerAdmission(code=>code!=='PAID');
@@ -49,7 +442,7 @@ describe('BattleServer', () => {
     expect(server.hasStandaloneDisplay(serverSideDisplay!,'OTHER')).toBe(false);
   });
 
-  it('lets the authenticated station display select each caller’s monster and use setup menus', async () => {
+  it('lets the authenticated station display show picks while only callers advance their menus', async () => {
     server=new BattleServer({port:0,displayToken:'touch-token'});
     server.setBrowserPlayerAdmission(code=>code!=='TOUCH');
     const port=await server.start();
@@ -58,6 +451,9 @@ describe('BattleServer', () => {
     const display=await connectCollect(port);
     send(display.ws,{type:'spectate',roomCode:'TOUCH',displayToken:'touch-token'});await wait(20);
     send(display.ws,{type:'advance'});await wait(20);
+    expect(server.findRoom('TOUCH')?.phase).toBe('lobby');
+    expect(display.msgs).toContainEqual(expect.objectContaining({type:'error',code:'caller_ready_required'}));
+    server.voiceAdvance('TOUCH',first);server.voiceAdvance('TOUCH',second);
     expect(server.findRoom('TOUCH')?.phase).toBe('monster_select');
     send(display.ws,{type:'display_select_monster',playerId:first,monsterId:'embertail'});
     send(display.ws,{type:'display_select_monster',playerId:second,monsterId:'thornling'});
@@ -66,8 +462,14 @@ describe('BattleServer', () => {
       expect.objectContaining({playerId:first,monsterId:'embertail'}),
       expect.objectContaining({playerId:second,monsterId:'thornling'}),
     ]));
+    server.voiceAdvance('TOUCH',first);
+    send(display.ws,{type:'display_select_monster',playerId:first,monsterId:'sparkmouse'});
+    await wait(20);
+    expect(display.msgs).toContainEqual(expect.objectContaining({type:'error',code:'caller_ready_locked'}));
+    expect(server.findRoom('TOUCH')?.lobbyPlayers().find(player=>player.playerId===first)?.monsterId).toBe('embertail');
     send(display.ws,{type:'back'});await wait(20);
-    expect(server.findRoom('TOUCH')?.phase).toBe('lobby');
+    expect(server.findRoom('TOUCH')?.phase).toBe('monster_select');
+    expect(display.msgs).toContainEqual(expect.objectContaining({type:'error',code:'caller_ready_required'}));
     display.ws.close();
   });
 
@@ -261,7 +663,7 @@ describe('BattleServer', () => {
     display.ws.close();
   });
 
-  it('offers result rematch only to a finished participant or the elected standalone display', async () => {
+  it('requires both current callers to request a result rematch while the display watches', async () => {
     server = new BattleServer({ port: 0 });
     const port = await server.start();
     const participant = await connectCollect(port);
@@ -294,9 +696,9 @@ describe('BattleServer', () => {
     const lastResult = (messages: Record<string, unknown>[]) => messages
       .filter(message => message.type === 'battle_state' && message.phase === 'results').at(-1);
     expect(lastResult(participant.msgs)?.canRematch).toBe(true);
-    expect(lastResult(leader.msgs)?.canRematch).toBe(true);
+    expect(lastResult(leader.msgs)?.canRematch).toBe(false);
     expect(lastResult(secondary.msgs)?.canRematch).toBe(false);
-    expect(lastResult(late.msgs)?.canRematch).toBe(false);
+    expect(lastResult(late.msgs)?.canRematch).toBe(true);
     expect(server.voiceAdvance('RESULT-AUTH')).toBe(false);
     expect(room.phase).toBe('results');
 
@@ -304,7 +706,6 @@ describe('BattleServer', () => {
     send(late.ws, { type: 'advance' });
     await wait(30);
     expect(secondary.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'forbidden' }));
-    expect(late.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'not_ready' }));
     expect(room.phase).toBe('results');
     const observedPhases: string[] = [];
     server.setOnRoomState(code => {
@@ -313,13 +714,17 @@ describe('BattleServer', () => {
     });
     send(leader.ws, { type: 'advance' });
     await wait(30);
+    expect(leader.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'caller_ready_required' }));
+    expect(room.phase).toBe('results');
+    send(participant.ws, { type: 'advance' });
+    await wait(30);
     expect(room.phase).toBe('monster_select');
     expect(observedPhases.at(-1)).toBe('monster_select');
     expect(leader.msgs).toContainEqual(expect.objectContaining({ type: 'battle_state', phase: 'monster_select' }));
     participant.ws.close(); leader.ws.close(); secondary.ws.close(); late.ws.close();
   });
 
-  it('unlocks a waiting standalone caller after the finished player disconnects', async () => {
+  it('unlocks a waiting standalone caller after the finished player leaves', async () => {
     server = new BattleServer({ port: 0 });
     const port = await server.start();
     const original = await connectCollect(port);
@@ -343,11 +748,17 @@ describe('BattleServer', () => {
     const waiting = await connectCollect(port);
     send(waiting.ws, { type: 'join', roomCode: 'RESULT-HANDOFF', name: 'Bo' });
     await wait(20);
-    expect(waiting.msgs.filter(message => message.type === 'battle_state').at(-1)?.canRematch).toBe(false);
-
-    original.ws.close();
+    expect(waiting.msgs.filter(message => message.type === 'battle_state').at(-1)?.canRematch).toBe(true);
+    expect(display.msgs.filter(message => message.type === 'battle_state').at(-1)?.canRematch).toBe(false);
+    send(waiting.ws, { type: 'advance' });
     await wait(30);
     expect(room.phase).toBe('results');
+
+    send(original.ws, { type: 'leave' });
+    await wait(30);
+    expect(room.phase).toBe('results');
+    const waitingId = waiting.msgs.find(message => message.type === 'joined')?.playerId as string;
+    expect(room.isSetupReady(waitingId)).toBe(false);
     expect(waiting.msgs.filter(message => message.type === 'battle_state').at(-1)?.canRematch).toBe(true);
     expect(display.msgs.filter(message => message.type === 'battle_state').at(-1)?.canRematch).toBe(true);
     send(waiting.ws, { type: 'advance' });
@@ -486,6 +897,167 @@ describe('BattleServer', () => {
     resumed.ws.close();
   });
 
+  it('requires a held caller to confirm each shared setup screen again after reconnect', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'HELD-SETUP' });
+    send(display.ws, { type: 'configure_players', count: 2 });
+    await wait(20);
+    const first = await connectCollect(port);
+    const second = await connectCollect(port);
+    send(first.ws, { type: 'join', roomCode: 'HELD-SETUP', name: 'Ada', sessionId: 'ada-setup' });
+    send(second.ws, { type: 'join', roomCode: 'HELD-SETUP', name: 'Bo', sessionId: 'bo-setup' });
+    await wait(30);
+    const adaId = String(first.msgs.find(message => message.type === 'joined')?.playerId);
+    const room = server.findRoom('HELD-SETUP')!;
+    send(first.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.isSetupReady(adaId)).toBe(true);
+
+    first.ws.close();
+    await new Promise<void>(resolve => first.ws.once('close', () => resolve()));
+    await wait(20);
+    expect(room.isSetupReady(adaId)).toBe(false);
+    send(second.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('lobby');
+
+    const lobbyReturn = await connectCollect(port);
+    send(lobbyReturn.ws, { type: 'join', roomCode: 'HELD-SETUP', name: 'Ada', sessionId: 'ada-setup' });
+    await wait(20);
+    expect(lobbyReturn.msgs.find(message => message.type === 'joined')?.playerId).toBe(adaId);
+    expect(room.isSetupReady(adaId)).toBe(false);
+    send(lobbyReturn.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('monster_select');
+
+    send(lobbyReturn.ws, { type: 'select_monster', monsterId: 'sparkmouse' });
+    send(second.ws, { type: 'select_monster', monsterId: 'embertail' });
+    await wait(20);
+    send(lobbyReturn.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.isSetupReady(adaId)).toBe(true);
+    lobbyReturn.ws.close();
+    await new Promise<void>(resolve => lobbyReturn.ws.once('close', () => resolve()));
+    await wait(20);
+    expect(room.isSetupReady(adaId)).toBe(false);
+    send(second.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('monster_select');
+
+    const selectionReturn = await connectCollect(port);
+    send(selectionReturn.ws, { type: 'join', roomCode: 'HELD-SETUP', name: 'Ada', sessionId: 'ada-setup' });
+    await wait(20);
+    expect(selectionReturn.msgs.find(message => message.type === 'joined')?.playerId).toBe(adaId);
+    send(selectionReturn.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('battle');
+    selectionReturn.ws.close(); second.ws.close(); display.ws.close();
+  });
+
+  it('holds a human duel result through reconnect and requires the survivor to request replay', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'HELD-RESULT' });
+    send(display.ws, { type: 'configure_players', count: 2 });
+    await wait(20);
+    const first = await connectCollect(port);
+    const second = await connectCollect(port);
+    send(first.ws, { type: 'join', roomCode: 'HELD-RESULT', name: 'Ada', sessionId: 'ada-result' });
+    send(second.ws, { type: 'join', roomCode: 'HELD-RESULT', name: 'Bo', sessionId: 'bo-result' });
+    await wait(30);
+    const adaId = String(first.msgs.find(message => message.type === 'joined')?.playerId);
+    const boId = String(second.msgs.find(message => message.type === 'joined')?.playerId);
+    const room = server.findRoom('HELD-RESULT')!;
+    room.advance(adaId); room.advance(boId);
+    room.selectMonster(adaId, 'sparkmouse'); room.selectMonster(boId, 'embertail');
+    room.advance(adaId); room.advance(boId);
+    for (let index = 0; index < 200 && room.phase === 'battle'; index++) {
+      const snap = room.snapshot()!;
+      if (room.activeSide() === 'a') room.chooseMove(adaId, snap.a.moves[0]!.id);
+      else room.chooseMove(boId, snap.b.moves[0]!.id);
+    }
+    expect(room.phase).toBe('results');
+    room.acknowledgeResultsPresented(room.generation);
+    const result = room.result();
+    send(second.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.isSetupReady(boId)).toBe(true);
+
+    second.ws.close();
+    await new Promise<void>(resolve => second.ws.once('close', () => resolve()));
+    await wait(20);
+    expect(room.isSetupReady(boId)).toBe(false);
+    send(first.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('results');
+    expect(room.result()).toEqual(result);
+
+    const returned = await connectCollect(port);
+    send(returned.ws, { type: 'join', roomCode: 'HELD-RESULT', name: 'Bo', sessionId: 'bo-result' });
+    await wait(20);
+    expect(returned.msgs.find(message => message.type === 'joined')?.playerId).toBe(boId);
+    expect(room.phase).toBe('results');
+    expect(room.isSetupReady(boId)).toBe(false);
+    returned.ws.close();
+    await new Promise<void>(resolve => returned.ws.once('close', () => resolve()));
+
+    const release = await connectCollect(port);
+    send(release.ws, { type: 'spectate', roomCode: 'HELD-RESULT' });
+    send(release.ws, { type: 'leave', sessionId: 'bo-result' });
+    await wait(20);
+    expect(room.phase).toBe('results');
+    expect(room.result()).toEqual(result);
+    expect(room.isSetupReady(adaId)).toBe(false);
+    const lastDisplay = display.msgs.filter(message => message.type === 'battle_state').at(-1);
+    expect(lastDisplay).toMatchObject({ phase: 'results', canRematch: false });
+    send(display.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('results');
+    expect(display.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'caller_ready_required' }));
+    send(first.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('monster_select');
+    first.ws.close(); release.ws.close(); display.ws.close();
+  });
+
+  it('keeps replay on the surviving caller’s phone after an unreserved duel loses a player', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode: 'OPEN-DUEL-RESULT' });
+    await wait(20);
+    const ada = server.voiceJoin('OPEN-DUEL-RESULT', 'Ada')!;
+    const bo = server.voiceJoin('OPEN-DUEL-RESULT', 'Bo')!;
+    const room = server.findRoom('OPEN-DUEL-RESULT')!;
+    server.voiceAdvance(room.code, ada); server.voiceAdvance(room.code, bo);
+    server.voiceSelectMonster(room.code, ada, 'sparkmouse');
+    server.voiceSelectMonster(room.code, bo, 'embertail');
+    server.voiceAdvance(room.code, ada); server.voiceAdvance(room.code, bo);
+    for (let index = 0; index < 200 && room.phase === 'battle'; index++) {
+      const snap = room.snapshot()!;
+      if (room.activeSide() === 'a') room.chooseMove(ada, snap.a.moves[0]!.id);
+      else room.chooseMove(bo, snap.b.moves[0]!.id);
+    }
+    expect(room.phase).toBe('results');
+    room.acknowledgeResultsPresented(room.generation);
+    server.voiceLeave(room.code, bo);
+    await wait(20);
+    expect(room.expectedPlayerCount).toBe(1);
+    expect(display.msgs.filter(message => message.type === 'battle_state').at(-1))
+      .toMatchObject({ phase: 'results', canRematch: false });
+
+    send(display.ws, { type: 'advance' });
+    await wait(20);
+    expect(room.phase).toBe('results');
+    expect(display.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'caller_ready_required' }));
+    expect(server.voiceAdvance(room.code, ada)).toBe(true);
+    expect(room.phase).toBe('monster_select');
+    display.ws.close();
+  });
+
   it('closes a replaced browser tab with a non-reconnect takeover code', async () => {
     server = new BattleServer({ port: 0 });
     const port = await server.start();
@@ -523,6 +1095,121 @@ describe('BattleServer', () => {
     spec.ws.close();
   });
 
+  it('keeps a replacement keyboard owner when an older reconnect repeats its late leave', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const roomCode = 'RAPID-P-TOGGLE';
+    const sessionId = 'keyboard-session';
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode });
+    send(display.ws, { type: 'configure_players', count: 1 });
+    await wait(20);
+
+    const first = await connectCollect(port);
+    send(first.ws, { type: 'join', roomCode, name: 'Tester', sessionId });
+    await wait(20);
+    expect(first.msgs.find(message => message.type === 'joined')?.playerId).toEqual(expect.any(String));
+    const closed = new Promise<void>(resolve => first.ws.once('close', resolve));
+    first.ws.close(); await closed;
+
+    const release = await connectCollect(port);
+    send(release.ws, { type: 'leave', sessionId });
+    await wait(20);
+    expect(release.msgs).toContainEqual({ type: 'session_released', sessionId });
+
+    const replacement = await connectCollect(port);
+    const replacementSessionId = 'replacement-session';
+    send(replacement.ws, { type: 'join', roomCode, name: 'Tester', sessionId: replacementSessionId });
+    await wait(20);
+    const replacementPlayerId = replacement.msgs.find(message => message.type === 'joined')?.playerId;
+    expect(replacementPlayerId).toEqual(expect.any(String));
+
+    const delayedRelease = await connectCollect(port);
+    send(delayedRelease.ws, { type: 'leave', sessionId });
+    await wait(20);
+    expect(server.findRoom(roomCode)?.lobbyPlayers().filter(player => !player.isAi).map(player => player.playerId))
+      .toEqual([replacementPlayerId]);
+    expect(server.voiceJoin(roomCode, 'Phone')).toBeNull();
+    expect(display.ws.readyState).toBe(WebSocket.OPEN);
+
+    send(replacement.ws, { type: 'leave', sessionId: replacementSessionId });
+    await wait(20);
+    expect(server.voiceJoin(roomCode, 'Phone')).toEqual(expect.any(String));
+    delayedRelease.ws.close(); replacement.ws.close(); release.ws.close(); display.ws.close();
+  });
+
+  it('records a release before its old join arrives so the stale join cannot claim a seat', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const roomCode = 'DELAYED-OLD-JOIN';
+    const oldSessionId = 'old-keyboard-session';
+    const release = await connectCollect(port);
+    send(release.ws, { type: 'leave', sessionId: oldSessionId });
+    await wait(20);
+    expect(release.msgs).toContainEqual({ type: 'session_released', sessionId: oldSessionId });
+
+    const lateJoin = await connectCollect(port);
+    send(lateJoin.ws, { type: 'join', roomCode, name: 'Old keyboard', sessionId: oldSessionId });
+    await wait(20);
+    expect(lateJoin.msgs).toContainEqual(expect.objectContaining({ type: 'error', code: 'session_released' }));
+    expect(server.findRoom(roomCode)?.playerCount ?? 0).toBe(0);
+
+    const replacement = await connectCollect(port);
+    send(replacement.ws, { type: 'join', roomCode, name: 'New keyboard', sessionId: 'new-keyboard-session' });
+    await wait(20);
+    expect(replacement.msgs).toContainEqual(expect.objectContaining({ type: 'joined' }));
+    expect(server.findRoom(roomCode)?.playerCount).toBe(1);
+    replacement.ws.close(); lateJoin.ws.close(); release.ws.close();
+  });
+
+  it('releases an old keyboard seat when its reconnect leave arrives before the server sees its close', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const roomCode = 'RELEASE-BEFORE-CLOSE';
+    const sessionId = 'old-keyboard-session';
+    const old = await connectCollect(port);
+    send(old.ws, { type: 'join', roomCode, name: 'Tester', sessionId });
+    await wait(20);
+    expect(server.findRoom(roomCode)?.playerCount).toBe(1);
+
+    const release = await connectCollect(port);
+    send(release.ws, { type: 'leave', sessionId });
+    await wait(20);
+    expect(release.msgs).toContainEqual({ type: 'session_released', sessionId });
+    expect(server.findRoom(roomCode)?.playerCount ?? 0).toBe(0);
+
+    const replacement = await connectCollect(port);
+    send(replacement.ws, { type: 'join', roomCode, name: 'Tester', sessionId: 'new-keyboard-session' });
+    await wait(20);
+    old.ws.close();
+    await wait(20);
+    expect(server.findRoom(roomCode)?.playerCount).toBe(1);
+    replacement.ws.close(); release.ws.close();
+  });
+
+  it('keeps a combined display socket watching when another socket releases its player session', async () => {
+    server = new BattleServer({ port: 0 });
+    const port = await server.start();
+    const roomCode = 'COMBINED-DISPLAY-RELEASE';
+    const sessionId = 'combined-session';
+    const display = await connectCollect(port);
+    send(display.ws, { type: 'spectate', roomCode });
+    send(display.ws, { type: 'configure_players', count: 1 });
+    send(display.ws, { type: 'join', roomCode, name: 'Tester', sessionId });
+    await wait(20);
+    expect(server.findRoom(roomCode)?.expectedPlayerCount).toBe(1);
+
+    const release = await connectCollect(port);
+    send(release.ws, { type: 'leave', sessionId });
+    await wait(20);
+    expect(server.findRoom(roomCode)?.playerCount).toBe(0);
+    send(display.ws, { type: 'configure_players', count: 2 });
+    await wait(20);
+    expect(server.findRoom(roomCode)?.expectedPlayerCount).toBe(2);
+    expect(display.ws.readyState).toBe(WebSocket.OPEN);
+    release.ws.close(); display.ws.close();
+  });
+
   it('two-player battle broadcasts activeSide and activeMenu, and gates commands to that side', async () => {
     server = new BattleServer({ port: 0 });
     const port = await server.start();
@@ -533,37 +1220,45 @@ describe('BattleServer', () => {
     await wait(60);
     send(a, { type: 'advance' });
     await wait(40);
+    send(b, { type: 'advance' });
+    await wait(40);
     send(a, { type: 'select_monster', monsterId: 'sparkmouse' });
     send(b, { type: 'select_monster', monsterId: 'embertail' });
     await wait(60);
     send(a, { type: 'advance' });
+    send(b, { type: 'advance' });
     await wait(60);
     let state = am.filter(m => m.type === 'battle_state').at(-1)! as { activeSide: string; activeMenu: string; snapshot: { chosen: { a: boolean; b: boolean }; turn: number; a: { moves: { id: string }[] }; b: { moves: { id: string }[] } } };
     const before = state.snapshot.turn;
-    expect(state.activeSide).toBe('a');
+    expect(['a','b']).toContain(state.activeSide);
     expect(state.activeMenu).toBe('root');
 
-    send(b, { type: 'open_fight' });
+    const active = state.activeSide === 'a' ? a : b;
+    const inactive = state.activeSide === 'a' ? b : a;
+    const activeSide = state.activeSide as 'a' | 'b';
+    const inactiveSide = activeSide === 'a' ? 'b' : 'a';
+
+    send(inactive, { type: 'open_fight' });
     await wait(40);
     state = am.filter(m => m.type === 'battle_state').at(-1)! as typeof state;
     expect(state.activeMenu).toBe('root');
 
-    send(a, { type: 'open_fight' });
+    send(active, { type: 'open_fight' });
     await wait(40);
     state = am.filter(m => m.type === 'battle_state').at(-1)! as typeof state;
     expect(state.activeMenu).toBe('fight');
 
-    send(b, { type: 'choose_move', moveId: state.snapshot.b.moves[0]!.id });
+    send(inactive, { type: 'choose_move', moveId: state.snapshot[inactiveSide].moves[0]!.id });
     await wait(40);
     state = am.filter(m => m.type === 'battle_state').at(-1)! as typeof state;
-    expect(state.snapshot.chosen.b).toBe(false);
+    expect(state.snapshot.chosen[inactiveSide]).toBe(false);
 
-    send(a, { type: 'choose_move', moveId: state.snapshot.a.moves[0]!.id });
+    send(active, { type: 'choose_move', moveId: state.snapshot[activeSide].moves[0]!.id });
     await wait(40);
     state = am.filter(m => m.type === 'battle_state').at(-1)! as typeof state;
-    expect(state.snapshot.chosen.a).toBe(false);
+    expect(state.snapshot.chosen[activeSide]).toBe(false);
     expect(state.snapshot.turn).toBe(before + 1);
-    expect(state.activeSide).toBe('b');
+    expect(state.activeSide).toBe(inactiveSide);
 
     a.close(); b.close();
   });
@@ -589,9 +1284,11 @@ describe('BattleServer', () => {
     const ada=server.voiceJoin('VOICE','Ada')!,bo=server.voiceJoin('VOICE','Bo')!;
     const room=server.findRoom('VOICE')!;
     expect(room.phase).toBe('lobby');expect(server.voiceAdvance('VOICE')).toBe(false);
-    expect(server.voiceAdvance('VOICE',ada)).toBe(true);expect(room.phase).toBe('monster_select');
+    expect(server.voiceAdvance('VOICE',ada)).toBe(true);expect(room.phase).toBe('lobby');
+    expect(server.voiceAdvance('VOICE',bo)).toBe(true);expect(room.phase).toBe('monster_select');
     server.voiceSelectMonster('VOICE',ada,ROSTER[0]!.id);server.voiceSelectMonster('VOICE',bo,ROSTER[1]!.id);
     expect(room.phase).toBe('monster_select');expect(server.voiceAdvance('VOICE')).toBe(false);
-    expect(server.voiceAdvance('VOICE',bo)).toBe(true);expect(room.phase).toBe('battle');
+    expect(server.voiceAdvance('VOICE',bo)).toBe(true);expect(room.phase).toBe('monster_select');
+    expect(server.voiceAdvance('VOICE',ada)).toBe(true);expect(room.phase).toBe('battle');
   });
 });

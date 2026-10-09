@@ -47,6 +47,10 @@ const roomCode = params.get('room') || DEFAULT_ROOM;
 const stationDisplay = createStationDisplay();
 const stationLaunchRequested = params.has('station') || params.has('match') || params.has('launchGeneration');
 const stationMode = stationDisplay.active || stationLaunchRequested;
+const requestedSeats = Number(params.get('players'));
+const standaloneSeatTarget = !stationMode && params.has('players')
+  && Number.isSafeInteger(requestedSeats) && requestedSeats >= 1 && requestedSeats <= 4
+  ? requestedSeats as 1 | 2 | 3 | 4 : null;
 let pairingRequired = triviaDisplayPairingRequired(location.hostname, stationLaunchRequested, stationDisplay.displayToken);
 const localKeyboardTestingAllowed = triviaLocalKeyboardTestingAllowed(
   location.hostname, stationMode, roomCode,
@@ -183,7 +187,11 @@ stage.addEventListener('click', event => {
   const replay = (event.target as Element | null)?.closest?.('#trivia-replay');
   if (!replay || !isHost || connectionState !== 'connected' || state?.phase !== 'results'
     || stationMode || !state.players.length) return;
-  connection?.advance();
+  if (state.expectedPlayerCount > 1) {
+    const seat = state.replayVotingSeat;
+    if (seat) connection?.displayReplay(seat.playerId);
+    else if (seat === undefined) connection?.advance();
+  } else connection?.advance();
 });
 
 function connect(): void {
@@ -248,6 +256,7 @@ function connect(): void {
     render();
   });
   connection.onState(applyState);
+  if (standaloneSeatTarget) connection.configureSeats(roomCode, standaloneSeatTarget);
   connection.spectate(roomCode);
 }
 
@@ -268,9 +277,11 @@ async function prepareEssentialStage(): Promise<void> {
 function applyState(next: TriviaState): void {
   serverClock.observeSync({ serverNowMs: next.serverNowMs, clientReceivedAtMs: Date.now() });
   const previousQuestionKey = `${state?.question?.id}:${state?.questionAttemptId}`;
+  const phaseChanged = state?.phase !== next.phase;
   const readinessChanged = next.phase === 'loading'
     && displayReadinessContext(next) !== rejectedReadyContext;
   state = next;
+  if (phaseChanged) stage.scrollTop = 0;
   if (next.phase !== 'category_select' || next.categoryVotingSeat?.playerId !== pendingCategoryVoteSeat) {
     clearPendingCategoryVote();
   }

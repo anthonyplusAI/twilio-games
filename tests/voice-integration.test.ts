@@ -3,6 +3,7 @@ import { WebSocket } from 'ws';
 import twilio from 'twilio';
 import { HttpServer } from '../server/http-server';
 import type { GameServer } from '../server/game-server';
+import type { FighterServer } from '../server/fighter-server';
 
 let srv: HttpServer;
 afterEach(async () => { vi.restoreAllMocks(); await srv?.stop(); });
@@ -76,11 +77,11 @@ describe('voice integration (fake Conversation Relay client)', () => {
     await new Promise<void>(resolve=>voice.on('open',resolve));
     voice.send(JSON.stringify({type:'setup',callSid:`CA-tts-error-${errorCode}`,customParameters:{roomCode:'TTSERR'}}));
     try {
-      await wait(50);expect(messages).toHaveLength(1);
+      await vi.waitFor(() => expect(messages).toHaveLength(1), { timeout: 3_000 });
       voice.send(JSON.stringify({type:'error',description:`${errorCode} Relay speech failure`}));
-      await wait(750);expect(messages).toHaveLength(2);
+      await vi.waitFor(() => expect(messages).toHaveLength(2), { timeout: 4_000 });
     } finally { closeWs(voice); }
-  });
+  }, 12_000);
 
   it('retires a station voice session after queued speech plays without a WebSocket failure', async () => {
     srv = new HttpServer({ port: 0, publicBaseUrl: 'http://localhost', validateSignatures: false });
@@ -265,6 +266,76 @@ describe('voice integration (fake Conversation Relay client)', () => {
     closeWs(attendee);closeWs(display);
   });
 
+  it('rejects new calls while two different tabs show the same standalone room', async () => {
+    srv = new HttpServer({
+      port: 0, publicBaseUrl: 'http://localhost', validateSignatures: false,
+      standaloneVoiceEnabled: true,
+    });
+    const port = await srv.start();
+    const sessions = [
+      '11111111-1111-4111-8111-111111111111',
+      '22222222-2222-4222-8222-222222222222',
+    ];
+    const displays: WebSocket[] = [];
+    try {
+      for (const displaySessionId of sessions) {
+        const display = new WebSocket(`ws://127.0.0.1:${port}/fighter?display=1&displaySessionId=${displaySessionId}`);
+        displays.push(display);
+        await new Promise<void>((resolve, reject) => {
+          display.once('open', resolve); display.once('error', reject);
+        });
+        display.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+      }
+      await wait(50);
+      const response = await fetch(`http://127.0.0.1:${port}/voice/incoming`, {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'CallSid=CA-same-game-ambiguous&From=%2B14155550199',
+      });
+      expect(await response.text()).not.toContain('<ConversationRelay');
+    } finally {
+      for (const display of displays) closeWs(display);
+    }
+  });
+
+  it('waits for a fresh same-game page binding before routing a new call', async () => {
+    srv = new HttpServer({
+      port: 0, publicBaseUrl: 'http://localhost', validateSignatures: false,
+      standaloneVoiceEnabled: true, clientDir: 'client',
+    });
+    const port = await srv.start();
+    const displaySessionId = '33333333-3333-4333-8333-333333333333';
+    const displays: WebSocket[] = [];
+    const openDisplay = async () => {
+      const display = new WebSocket(`ws://127.0.0.1:${port}/fighter?display=1&displaySessionId=${displaySessionId}`);
+      displays.push(display);
+      await new Promise<void>((resolve, reject) => {
+        display.once('open', resolve); display.once('error', reject);
+      });
+      display.send(JSON.stringify({ type: 'spectate', roomCode: '4821' }));
+      await wait(40);
+      return display;
+    };
+    try {
+      await openDisplay();
+      const page = await fetch(`http://127.0.0.1:${port}/fighter.html?display=1&room=4821&displaySessionId=${displaySessionId}`);
+      expect(page.status).toBe(200);
+      await page.arrayBuffer();
+      let routed = false;
+      const incoming = fetch(`http://127.0.0.1:${port}/voice/incoming`, {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'CallSid=CA-same-game-handoff&From=%2B14155550199',
+      }).then(response => response.text()).then(xml => { routed = true; return xml; });
+      await wait(450);
+      const routedBeforeNewPage = routed;
+      await openDisplay();
+      const xml = await incoming;
+      expect(routedBeforeNewPage).toBe(false);
+      expect(xml).toContain('<Parameter name="game" value="fighter"');
+    } finally {
+      for (const display of displays) closeWs(display);
+    }
+  });
+
   it('does not treat Fighter display authentication as presence until the screen spectates', async () => {
     srv = new HttpServer({
       port:0,publicBaseUrl:'http://localhost',validateSignatures:false,standaloneVoiceEnabled:true,
@@ -439,8 +510,8 @@ describe('voice integration (fake Conversation Relay client)', () => {
       expect(room.phase).toBe('car_select');
       b.send(JSON.stringify({type:'prompt',voicePrompt:'next',last:true}));await wait(1_600);expect(room.phase).toBe('map_select');
       a.send(JSON.stringify({type:'prompt',voicePrompt:'one',last:true}));await wait(60);expect(room.mapVotes().counts).toEqual({'Silver Lake':1});
-      b.send(JSON.stringify({type:'prompt',voicePrompt:'one',last:true}));await wait(60);expect(room.mapVotes().counts).toEqual({'Silver Lake':1});
-      b.send(JSON.stringify({type:'prompt',voicePrompt:'two',last:true}));await wait(60);expect(room.mapVotes().counts).toEqual({'Silver Lake':1,Drift:1});
+      b.send(JSON.stringify({type:'prompt',voicePrompt:'one',last:true}));await wait(60);expect(room.mapVotes().counts).toEqual({'Silver Lake':2});
+      b.send(JSON.stringify({type:'prompt',voicePrompt:'actually two',last:true}));await wait(60);expect(room.mapVotes().counts).toEqual({'Silver Lake':1,Drift:1});
       a.send(JSON.stringify({type:'prompt',voicePrompt:'start',last:true}));await wait(60);expect(room.phase).toBe('countdown');
       const countdownBefore=room.snapshot()!;
       a.send(JSON.stringify({type:'prompt',voicePrompt:'right',last:true}));await wait(40);
@@ -457,7 +528,7 @@ describe('voice integration (fake Conversation Relay client)', () => {
       expect(afterB.cars.find(car=>car.id===playerA!.playerId)?.targetLane).toBe(afterA.cars.find(car=>car.id===playerA!.playerId)?.targetLane);
       expect(afterB.cars.find(car=>car.id===playerB!.playerId)?.targetLane).toBe((afterA.cars.find(car=>car.id===playerB!.playerId)?.targetLane??0)-1);
     }finally{closeWs(a);closeWs(b);}
-  });
+  }, 12_000);
 
   it('voice setup flows name → explicit car/map advances → race without asking for the name again', async () => {
     srv = new HttpServer({
@@ -766,4 +837,76 @@ describe('voice integration (fake Conversation Relay client)', () => {
       } finally { closeWs(resumed); }
     } finally { closeWs(first); closeWs(display); }
   });
+
+  it('keeps shared Fighter menus through delayed phone audio, retries interrupted cues, and clears a dropped vote', async () => {
+    srv = new HttpServer({ port: 0, publicBaseUrl: 'http://localhost', validateSignatures: false });
+    const port = await srv.start();
+    const fighter = (srv as unknown as { fighter: FighterServer }).fighter;
+    const roomCode = 'FIGHTER-PHONE-BARRIER';
+    const room = fighter.getOrCreateRoom(roomCode);
+    room.configureStandaloneSeats(2);
+    const menus = (room as unknown as { voiceMenus: Map<string, { pending: number }> }).voiceMenus;
+
+    const connect = async (callSid: string, initiallyAcknowledge: boolean) => {
+      const socket = new WebSocket(`ws://127.0.0.1:${port}/voice`);
+      let acknowledge = initiallyAcknowledge;
+      let heldToken: string | null = null;
+      socket.on('message', data => {
+        const message = JSON.parse(data.toString()) as { type?: string; token?: string };
+        if (message.type !== 'text' || !message.token) return;
+        if (acknowledge) socket.send(JSON.stringify({ type: 'info', name: 'tokensPlayed', value: message.token }));
+        else heldToken = message.token;
+      });
+      await new Promise<void>((resolve, reject) => {
+        socket.once('open', resolve);
+        socket.once('error', reject);
+      });
+      socket.send(JSON.stringify({ type: 'setup', callSid,
+        customParameters: { roomCode, game: 'fighter' } }));
+      return {
+        socket,
+        releaseAudio() {
+          acknowledge = true;
+          if (heldToken) socket.send(JSON.stringify({ type: 'info', name: 'tokensPlayed', value: heldToken }));
+        },
+        get hasHeldAudio() { return heldToken !== null; },
+      };
+    };
+    const first = await connect('CA-fighter-barrier-ada', false);
+    const second = await connect('CA-fighter-barrier-bo', true);
+    try {
+      await vi.waitFor(() => expect(room.playerCount).toBe(2));
+      await vi.waitFor(() => expect(first.hasHeldAudio).toBe(true));
+      const [ada, bo] = room.lobbyPlayers().map(player => player.playerId);
+      fighter.voiceSetName(roomCode, ada!, 'Ada');
+      fighter.voiceSetName(roomCode, bo!, 'Bo');
+      expect(fighter.voiceAdvance(roomCode, ada!)).toBe(true);
+      expect(fighter.voiceAdvance(roomCode, bo!)).toBe(true);
+      await vi.waitFor(() => expect(menus.get(bo!)?.pending).toBe(0));
+      expect(menus.get(ada!)?.pending).toBeGreaterThan(0);
+      expect(room.state().phonePendingPlayerIds).toContain(ada);
+      expect(room.phase).toBe('lobby');
+
+      first.releaseAudio();
+      await vi.waitFor(() => expect(room.state().phoneRetryPlayerIds).toEqual([ada, bo]));
+      expect(room.phase).toBe('lobby');
+      first.socket.send(JSON.stringify({ type: 'prompt', voicePrompt: 'repeat', last: true }));
+      second.socket.send(JSON.stringify({ type: 'prompt', voicePrompt: 'repeat', last: true }));
+      await vi.waitFor(() => expect(room.phase).toBe('fighter_select'), { timeout: 4_000 });
+      expect(room.state().advanceReadyPlayerIds).toEqual([]);
+
+      await vi.waitFor(() => expect(menus.get(ada!)?.pending).toBe(0));
+      fighter.voiceBack(roomCode, ada!);
+      expect(room.state().backReadyPlayerIds).toEqual([ada]);
+      first.socket.close();
+      await new Promise<void>(resolve => first.socket.once('close', () => resolve()));
+      await vi.waitFor(() => expect(room.state().backReadyPlayerIds).toEqual([]));
+      expect(room.state().phoneDisconnectedPlayerIds).toContain(ada);
+      fighter.voiceBack(roomCode, bo!);
+      expect(room.phase).toBe('fighter_select');
+    } finally {
+      closeWs(first.socket);
+      closeWs(second.socket);
+    }
+  }, 10_000);
 });

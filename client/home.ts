@@ -11,7 +11,7 @@ import { wireFullscreenToggle } from './fullscreen-toggle';
 import { wireThemeToggle } from './theme';
 import { createCoinInsertionPresenter } from './coin-insertion';
 import { getSoundEffectsManager } from './sound-effects';
-import { ensureDisplaySessionId } from './display-session';
+import { navigationDisplaySessionId } from './display-session';
 import { calculatePageCount, clampPageIndex, orderByConfiguredIds, STANDALONE_GAMES_PER_PAGE } from './home-nav';
 import {
   captureDisplayToken,
@@ -46,6 +46,10 @@ const copy = locale === 'pt-BR' ? {
   standaloneTitle: 'Jogue com sua <span>voz.</span>',
   standaloneDescription: 'Com tecnologia Twilio ConversationRelay. Sua voz é o controle.',
   quickStartOne: 'Toque no jogo', quickStartTwo: 'Escaneie o código QR', quickStartThree: 'Ligue e jogue por voz',
+  choosePlayers: 'Quantas pessoas vão jogar nesta tela?',
+  choosePlayersHint: 'Cada jogador usa seu próprio telefone. Todos veem a mesma partida.',
+  oneCaller: '1 jogador', manyCallers: '{count} jogadores', cancelMode: 'Cancelar',
+  choosePlayerCount: 'Escolher jogadores',
   standaloneUnavailable: 'Os jogos por voz não estão disponíveis agora. Peça ajuda à equipe.',
   previousPage: 'Página anterior', nextPage: 'Próxima página', pageStatus: 'Página {page} de {pages}',
   nextGame: 'Próximo jogo', gameComplete: 'Partida concluída',
@@ -62,7 +66,7 @@ const copy = locale === 'pt-BR' ? {
   fighterBlurb: 'Transforme cada golpe gritado em um confronto na arena.',
   karaokeBlurb: 'Escolha a música e cante cada palavra no tempo certo.',
   triviaBlurb: 'Responda em voz alta a perguntas rápidas e marque pontos antes dos rivais.',
-  chessBlurb: 'Comande peças encantadas por voz e desafie um mago virtual.',
+  chessBlurb: 'Jogue xadrez por voz contra o computador ou outra pessoa.',
   freeDescription: 'Escaneie, entre pelo WhatsApp e responda PRONTO quando estiver pronto na tela.',
   freeStep: 'Responda PRONTO na tela',
   vote: 'voto', votes: 'votos', leader: 'Na liderança', tiedLeader: 'Líder empatado', textCommand: 'Envie',
@@ -83,6 +87,10 @@ const copy = locale === 'pt-BR' ? {
   standaloneTitle: 'Play with your <span>voice.</span>',
   standaloneDescription: 'Powered by Twilio Conversation Relay. Your voice is the controller.',
   quickStartOne: 'Tap the game', quickStartTwo: 'Scan the QR code', quickStartThree: 'Call and play by voice',
+  choosePlayers: 'How many people will play on this screen?',
+  choosePlayersHint: 'Each player uses their own phone. Everyone sees the same match.',
+  oneCaller: '1 caller', manyCallers: '{count} callers', cancelMode: 'Cancel',
+  choosePlayerCount: 'Choose players',
   standaloneUnavailable: 'Voice games are unavailable right now. Please ask booth staff for help.',
   previousPage: 'Previous page', nextPage: 'Next page', pageStatus: 'Page {page} of {pages}',
   nextGame: 'Next game', gameComplete: 'Game complete',
@@ -99,7 +107,7 @@ const copy = locale === 'pt-BR' ? {
   fighterBlurb: 'Turn every shouted move into an arena showdown.',
   karaokeBlurb: 'Pick a song and sing every word on the beat.',
   triviaBlurb: 'Answer quick-fire questions out loud and score before your rivals.',
-  chessBlurb: 'Command enchanted pieces by voice and duel a computer wizard.',
+  chessBlurb: 'Play voice chess against the computer or another caller.',
   freeDescription: 'Scan, join, and reply READY when you are at the screen.',
   freeStep: 'Reply READY at the screen',
   vote: 'vote', votes: 'votes', leader: 'Leading', tiedLeader: 'Tied lead', textCommand: 'Text',
@@ -246,14 +254,58 @@ function renderStandaloneLauncher(): void {
     const link = document.createElement('a');
     const url = new URL(game.route, location.origin);
     url.searchParams.set('display', '1');url.searchParams.set('room', '4821');url.searchParams.set('locale', locale);
-    const displaySessionId = ensureDisplaySessionId();
-    if (displaySessionId) url.searchParams.set('displaySessionId', displaySessionId);
     link.href=url.toString();link.className='standalone-game';link.dataset.game=game.id;
     const preview=selectionVideos[game.id];
-    link.innerHTML=`${preview?`<video data-src="${preview}" preload="none" loop muted playsinline aria-hidden="true"></video>`:''}<span>${gameTitle(locale,game.id)}</span><p>${gameBlurbs[game.id]}</p>`;
+    link.innerHTML=`${preview?`<video data-src="${preview}" preload="none" loop muted playsinline aria-hidden="true"></video>`:''}<span>${gameTitle(locale,game.id)}</span><p>${gameBlurbs[game.id]}</p>${game.humanCapacity > 1 ? `<small class="standalone-mode-hint">${copy.choosePlayerCount}</small>` : ''}`;
+    if (game.humanCapacity > 1) {
+      link.setAttribute('aria-label', `${gameTitle(locale, game.id)}. ${copy.choosePlayerCount}`);
+      link.addEventListener('click', event => {
+        if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        event.preventDefault();
+        openStandaloneModeDialog(game.id, game.humanCapacity, url);
+      });
+    }
     return link;
   }));
   renderStandalonePage();
+}
+
+function openStandaloneModeDialog(game: PlayableArcadeGame, capacity: number, baseUrl: URL): void {
+  const dialog = document.createElement('dialog');
+  dialog.className = 'standalone-mode-dialog';
+  dialog.setAttribute('aria-labelledby', 'standalone-mode-title');
+  const title = document.createElement('h2');
+  title.id = 'standalone-mode-title';
+  title.textContent = gameTitle(locale, game);
+  const question = document.createElement('p');
+  question.textContent = copy.choosePlayers;
+  const hint = document.createElement('small');
+  hint.textContent = copy.choosePlayersHint;
+  const options = document.createElement('div');
+  options.className = 'standalone-mode-options';
+  for (let count = 1; count <= capacity; count++) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = count === 1 ? copy.oneCaller : format(copy.manyCallers, { count });
+    button.addEventListener('click', () => {
+      const destination = new URL(baseUrl);
+      destination.searchParams.set('players', String(count));
+      const displaySessionId = navigationDisplaySessionId();
+      if (displaySessionId) destination.searchParams.set('displaySessionId', displaySessionId);
+      dialog.close();
+      if (!fullscreenGameShell.launch(destination.toString())) location.assign(destination.toString());
+    });
+    options.append(button);
+  }
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.className = 'standalone-mode-cancel';
+  cancel.textContent = copy.cancelMode;
+  cancel.addEventListener('click', () => dialog.close());
+  dialog.append(title, question, hint, options, cancel);
+  dialog.addEventListener('close', () => dialog.remove(), { once: true });
+  document.body.append(dialog);
+  dialog.showModal();
 }
 
 function renderStandalonePage(nextPage=standalonePageIndex): void {
@@ -454,12 +506,12 @@ function wireStandalonePagination(): void {
 
 function wireFullscreenGameLaunches(): void {
   standaloneGames.addEventListener('click', event => {
-    if (!(event instanceof MouseEvent) || event.button !== 0
+    if (event.defaultPrevented || !(event instanceof MouseEvent) || event.button !== 0
       || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
     const target = event.target instanceof Element ? event.target.closest<HTMLAnchorElement>('a.standalone-game') : null;
     if (target) {
       const destination = new URL(target.href);
-      const displaySessionId = ensureDisplaySessionId();
+      const displaySessionId = navigationDisplaySessionId();
       if (displaySessionId) destination.searchParams.set('displaySessionId', displaySessionId);
       else destination.searchParams.delete('displaySessionId');
       target.href = destination.toString();

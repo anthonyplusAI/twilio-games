@@ -8,7 +8,7 @@ export type TriviaConnectionState = 'connecting' | 'connected' | 'reconnecting' 
 
 type Identity =
   | { type: 'join'; roomCode: string; name: string; sessionId: string; locale?: SupportedLocale }
-  | { type: 'spectate'; roomCode: string; locale?: SupportedLocale };
+  | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; count?: 1 | 2 | 3 | 4 };
 
 export class TriviaConnection {
   private ws!: WebSocket;
@@ -19,6 +19,8 @@ export class TriviaConnection {
   private clockSyncTimer: ReturnType<typeof setInterval> | null = null;
   private identity: Identity | null = null;
   private displayAuth: { roomCode: string; token: string } | null = null;
+  private displaySeats: { roomCode: string; count: 1 | 2 | 3 | 4 } | null = null;
+  private hostIdentity: boolean | null = null;
   private displayAuthSupported = false;
   private displayAuthSentGeneration = 0;
   private identitySentGeneration = 0;
@@ -37,6 +39,7 @@ export class TriviaConnection {
   }
 
   private connect(): void {
+    this.hostIdentity = null;
     const generation = ++this.generation;
     const ws = this.ws = new WebSocket(withDisplaySession(this.url));
     this.connectionCallback?.(generation === 1 ? 'connecting' : 'reconnecting');
@@ -76,7 +79,17 @@ export class TriviaConnection {
       if (message.type === 'trivia_state') this.stateCallback?.(message);
       else if (message.type === 'trivia_events') this.eventsCallback?.(message.events);
       else if (message.type === 'joined') this.joinedCallback?.(message.playerId);
-      else if (message.type === 'host_identity') this.hostCallback?.(message.isHost);
+      else if (message.type === 'host_identity') {
+        if (this.identity?.roomCode === message.roomCode) {
+          const wasHost = this.hostIdentity;
+          this.hostIdentity = message.isHost;
+          if (wasHost === false && message.isHost && this.identity.type === 'spectate'
+            && this.displaySeats?.roomCode === message.roomCode) {
+            this.sendNow(ws, { type: 'configure_seats', ...this.displaySeats });
+          }
+        }
+        this.hostCallback?.(message.isHost);
+      }
       else if (message.type === 'error') this.errorCallback?.(message.code, message.message);
     };
     ws.onclose = event => {
@@ -120,6 +133,14 @@ export class TriviaConnection {
     this.identitySentGeneration = generation;
   }
 
+  private spectatorIdentity(roomCode: string): Extract<Identity, { type: 'spectate' }> {
+    return {
+      type: 'spectate', roomCode,
+      ...(this.locale ? { locale: this.locale } : {}),
+      ...(this.displaySeats?.roomCode === roomCode ? { count: this.displaySeats.count } : {}),
+    };
+  }
+
   private startClockSync(ws: WebSocket): void {
     this.stopClockSync();
     const sync = () => this.sendNow(ws, { type: 'clock_sync', clientSentAtMs: Date.now() });
@@ -137,8 +158,20 @@ export class TriviaConnection {
     if (this.displayAuth) this.sendDisplayAuth(this.ws, this.generation);
   }
 
+  configureSeats(roomCode: string, count: 1 | 2 | 3 | 4): void {
+    this.displaySeats = { roomCode, count };
+    if (this.identity?.type === 'spectate' && this.identity.roomCode === roomCode) {
+      this.identity = this.spectatorIdentity(roomCode);
+    }
+    if (this.ws.readyState === WebSocket.OPEN && this.identity?.type === 'spectate'
+      && this.identity.roomCode === roomCode) {
+      this.sendNow(this.ws, { type: 'configure_seats', ...this.displaySeats });
+    }
+  }
+
   spectate(roomCode: string): void {
-    this.identity = { type: 'spectate', roomCode, ...(this.locale ? { locale: this.locale } : {}) };
+    if (this.identity?.roomCode !== roomCode) this.hostIdentity = null;
+    this.identity = this.spectatorIdentity(roomCode);
     if (this.ws.readyState === WebSocket.OPEN) this.sendNow(this.ws, this.identity);
   }
 
@@ -152,7 +185,7 @@ export class TriviaConnection {
 
   leave(roomCode: string): void {
     const sessionId = this.identity?.type === 'join' ? this.identity.sessionId : undefined;
-    this.identity = { type: 'spectate', roomCode, ...(this.locale ? { locale: this.locale } : {}) };
+    this.identity = this.spectatorIdentity(roomCode);
     this.outbound = [];
     clearSessionId(roomCode);
     if (this.ws.readyState === WebSocket.OPEN) {
@@ -164,6 +197,7 @@ export class TriviaConnection {
   displaySelectCategory(playerId: string, category: TriviaRoundCategoryId): void {
     this.send({ type: 'display_select_category', playerId, category });
   }
+  displayReplay(playerId: string): void { this.send({ type: 'display_replay', playerId }); }
   viewRendered(questionId: string, questionAttemptId: number,
     phase: 'question_prompt' | 'answer_cue', renderRevision: number): void {
     this.send({ type: 'view_rendered', questionId, questionAttemptId, phase, renderRevision });

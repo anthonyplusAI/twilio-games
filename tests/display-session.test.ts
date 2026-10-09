@@ -151,4 +151,131 @@ describe('standalone display session identity', () => {
     expect(clonedTabId).toBeTruthy();
     expect(clonedTabId).not.toBe(firstId);
   });
+
+  it('gives a cloned Home tab a new navigation ID before the game page request', async () => {
+    let sequence = 0;
+    vi.stubGlobal('crypto', {
+      randomUUID: () => `${(++sequence).toString(16).padStart(8, '0')}-1111-4111-8111-111111111111`,
+    });
+    const active = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => active.get(key) ?? null,
+      setItem: (key: string, value: string) => { active.set(key, value); },
+      removeItem: (key: string) => { active.delete(key); },
+    });
+    const originalStorage = new Map<string, string>();
+    const useStorage = (entries: Map<string, string>) => vi.stubGlobal('sessionStorage', {
+      getItem: (key: string) => entries.get(key) ?? null,
+      setItem: (key: string, value: string) => { entries.set(key, value); },
+    });
+    const originalTop = {};
+    vi.stubGlobal('window', { parent: originalTop, top: originalTop, addEventListener: vi.fn() });
+    useStorage(originalStorage);
+    vi.resetModules();
+    const game = await import('../client/display-session');
+    const originalId = new URL(game.withDisplaySession('ws://example.test/game?display=1'))
+      .searchParams.get('displaySessionId');
+    expect(originalId).toBeTruthy();
+
+    // Home can stay open behind this game iframe, so its next launch keeps the same ID.
+    vi.stubGlobal('window', { parent: originalTop, top: originalTop, addEventListener: vi.fn() });
+    vi.resetModules();
+    const sameTopHome = await import('../client/display-session');
+    expect(sameTopHome.navigationDisplaySessionId()).toBe(originalId);
+
+    // Duplicate Tab copies sessionStorage but has a different top-level window. Its page GET
+    // must already use the new ID that its WebSocket will claim.
+    const clonedStorage = new Map(originalStorage);
+    const clonedTop = {};
+    vi.stubGlobal('window', { parent: clonedTop, top: clonedTop, addEventListener: vi.fn() });
+    useStorage(clonedStorage);
+    vi.resetModules();
+    const clonedHome = await import('../client/display-session');
+    const clonedId = clonedHome.navigationDisplaySessionId();
+    expect(clonedId).toBeTruthy();
+    expect(clonedId).not.toBe(originalId);
+    expect(new URL(clonedHome.withDisplaySession('ws://example.test/battle?display=1'))
+      .searchParams.get('displaySessionId')).toBe(clonedId);
+  });
+
+  it('reserves separate navigation IDs when two copied Home tabs launch before either game connects', async () => {
+    let sequence = 0;
+    vi.stubGlobal('crypto', {
+      randomUUID: () => `${(++sequence).toString(16).padStart(8, '0')}-1111-4111-8111-111111111111`,
+    });
+    const active = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => active.get(key) ?? null,
+      setItem: (key: string, value: string) => { active.set(key, value); },
+      removeItem: (key: string) => { active.delete(key); },
+    });
+    const firstStorage = new Map<string, string>();
+    const useStorage = (entries: Map<string, string>) => vi.stubGlobal('sessionStorage', {
+      getItem: (key: string) => entries.get(key) ?? null,
+      setItem: (key: string, value: string) => { entries.set(key, value); },
+    });
+    const firstTop = {};
+    vi.stubGlobal('window', { parent: firstTop, top: firstTop, addEventListener: vi.fn() });
+    useStorage(firstStorage);
+    vi.resetModules();
+    const firstHome = await import('../client/display-session');
+    const copiedId = firstHome.ensureDisplaySessionId();
+    expect(copiedId).toBeTruthy();
+    const secondStorage = new Map(firstStorage);
+    expect(firstHome.navigationDisplaySessionId()).toBe(copiedId);
+
+    const secondTop = {};
+    vi.stubGlobal('window', { parent: secondTop, top: secondTop, addEventListener: vi.fn() });
+    useStorage(secondStorage);
+    vi.resetModules();
+    const secondHome = await import('../client/display-session');
+    const secondId = secondHome.navigationDisplaySessionId();
+    expect(secondId).toBeTruthy();
+    expect(secondId).not.toBe(copiedId);
+
+    vi.stubGlobal('window', { parent: secondTop, top: secondTop, addEventListener: vi.fn() });
+    vi.resetModules();
+    const secondGame = await import('../client/display-session');
+    expect(new URL(secondGame.withDisplaySession('ws://example.test/chess?display=1'))
+      .searchParams.get('displaySessionId')).toBe(secondId);
+
+    vi.stubGlobal('window', { parent: firstTop, top: firstTop, addEventListener: vi.fn() });
+    useStorage(firstStorage);
+    vi.resetModules();
+    const firstGame = await import('../client/display-session');
+    expect(new URL(firstGame.withDisplaySession('ws://example.test/racer?display=1'))
+      .searchParams.get('displaySessionId')).toBe(copiedId);
+  });
+
+  it('keeps an iframe handoff inside an embedded Home page under a cross-origin outer window', async () => {
+    let sequence = 0;
+    vi.stubGlobal('crypto', {
+      randomUUID: () => `${(++sequence).toString(16).padStart(8, '0')}-1111-4111-8111-111111111111`,
+    });
+    const active = new Map<string, string>();
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => active.get(key) ?? null,
+      setItem: (key: string, value: string) => { active.set(key, value); },
+      removeItem: (key: string) => { active.delete(key); },
+    });
+    const session = new Map<string, string>();
+    vi.stubGlobal('sessionStorage', {
+      getItem: (key: string) => session.get(key) ?? null,
+      setItem: (key: string, value: string) => { session.set(key, value); },
+    });
+    const outer = new Proxy({}, { get: () => { throw new Error('cross-origin parent'); } });
+    const homeWindow = { parent: outer, top: outer, addEventListener: vi.fn() };
+    vi.stubGlobal('window', homeWindow);
+    vi.resetModules();
+    const home = await import('../client/display-session');
+    const pageId = home.navigationDisplaySessionId();
+    expect(pageId).toBeTruthy();
+
+    vi.stubGlobal('window', { parent: homeWindow, top: outer, addEventListener: vi.fn() });
+    vi.resetModules();
+    const game = await import('../client/display-session');
+    const socketId = new URL(game.withDisplaySession('ws://example.test/fighter?display=1'))
+      .searchParams.get('displaySessionId');
+    expect(socketId).toBe(pageId);
+  });
 });

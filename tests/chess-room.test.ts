@@ -8,6 +8,122 @@ function whiteRoom(fen?: string): ChessRoom {
 }
 
 describe('Voice Chess room', () => {
+  it('waits for both named callers and never lets the computer take a PvP turn', () => {
+    const room = new ChessRoom('DUEL', { mode: 'pvp', random: () => 0.99 });
+    expect(room.state()).toMatchObject({ mode: 'pvp', phase: 'waiting', ply: 0, turn: 'w' });
+    room.setPlayerSeat('w', 'c1', 'Ada', true, true);
+    room.setPlayerSeat('b', 'c2', 'Player 2', true, false);
+    expect(room.state()).toMatchObject({ phase: 'waiting', players: [
+      { playerId: 'c1', color: 'w', name: 'Ada', nameConfirmed: true },
+      { playerId: 'c2', color: 'b', name: 'Player 2', nameConfirmed: false },
+    ] });
+    expect(room.legalVoiceMoves('en-US', 'w')).toEqual([]);
+    room.confirmPlayerName('b', 'Ben');
+    expect(room.state().phase).toBe('playing');
+    expect(room.handleVoiceCommand('E2 to E4', 'en-US', 'b').code).toBe('not_your_turn');
+    expect(room.handleVoiceCommand('E2 to E4', 'en-US', 'w').code).toBe('proposed');
+    expect(room.handleVoiceCommand('cancel', 'en-US', 'b').code).toBe('not_your_turn');
+    expect(room.handleVoiceCommand('confirm', 'en-US', 'b').code).toBe('not_your_turn');
+    expect(room.state().pendingMove?.to).toBe('e4');
+    expect(room.handleVoiceCommand('confirm', 'en-US', 'w').code).toBe('confirmed');
+    expect(room.state()).toMatchObject({ ply: 1, turn: 'b', lastMove: { actor: 'human', color: 'w' } });
+    expect(room.playComputerMove(room.state().revision)).toBeNull();
+    expect(room.legalVoiceMoves('en-US', 'w')).toEqual([]);
+    expect(room.legalVoiceMoves('en-US', 'b')).toContainEqual(expect.objectContaining({ id: 'e7e5' }));
+    expect(room.handleVoiceCommand('E7 to E5', 'en-US', 'b').code).toBe('proposed');
+    expect(room.handleVoiceCommand('confirm', 'en-US', 'b').code).toBe('confirmed');
+    expect(room.state()).toMatchObject({ ply: 2, turn: 'w', lastMove: { actor: 'human', color: 'b' } });
+  });
+
+  it('freezes a PvP board during a temporary disconnect and awards a permanent departure', () => {
+    const room = new ChessRoom('DUEL', { mode: 'pvp' });
+    room.setPlayerSeat('w', 'c1', 'Ada', true, true);
+    room.setPlayerSeat('b', 'c2', 'Ben', true, true);
+    room.handleVoiceCommand('E2 to E4', 'en-US', 'w');
+    room.setPlayerSeatConnected('b', false);
+    expect(room.state()).toMatchObject({ phase: 'waiting', pendingMove: null, result: null });
+    expect(room.handleVoiceCommand('E2 to E4', 'en-US', 'w').code).toBe('waiting');
+    room.setPlayerSeatConnected('b', true);
+    room.markPlayerWelcomeReady('b');
+    expect(room.state().phase).toBe('playing');
+    expect(room.handleVoiceCommand('E2 to E4', 'en-US', 'w').code).toBe('proposed');
+    expect(room.handleVoiceCommand('confirm', 'en-US', 'w').code).toBe('confirmed');
+    room.removePlayerSeat('b');
+    expect(room.state()).toMatchObject({ phase: 'finished', result: { reason: 'forfeit', winner: 'w' } });
+    expect(room.handleVoiceCommand('help', 'en-US', 'w')).toMatchObject({
+      code: 'finished', message: expect.stringMatching(/match is over/i),
+    });
+    expect(room.handleVoiceCommand('play again', 'en-US', 'w')).toMatchObject({
+      code: 'finished', message: expect.stringMatching(/both connected callers.*play again/i),
+    });
+    room.reset();
+    expect(room.state()).toMatchObject({ phase: 'waiting', result: null, players: [] });
+  });
+
+  it('holds a named two-caller board until both phone welcome cues finish', () => {
+    const room = new ChessRoom('DUEL', { mode: 'pvp' });
+    room.setPlayerSeat('w', 'c1', 'Ada', true, true, false);
+    room.setPlayerSeat('b', 'c2', 'Ben', true, true, false);
+    expect(room.state()).toMatchObject({ phase: 'waiting', ply: 0,
+      phonePendingPlayerIds: ['c1', 'c2'] });
+    expect(room.handleVoiceCommand('E2 to E4', 'en-US', 'w').code).toBe('waiting');
+
+    room.markPlayerWelcomeReady('w');
+    expect(room.state()).toMatchObject({ phase: 'waiting', phonePendingPlayerIds: ['c2'] });
+    room.markPlayerWelcomeReady('b');
+    expect(room.state()).toMatchObject({ phase: 'playing', phonePendingPlayerIds: [] });
+
+    room.setPlayerSeatConnected('b', false);
+    expect(room.state()).toMatchObject({ phase: 'waiting', phonePendingPlayerIds: [] });
+    room.setPlayerSeatConnected('b', true);
+    expect(room.state()).toMatchObject({ phase: 'waiting', phonePendingPlayerIds: ['c2'] });
+  });
+
+  it('holds an older waiting-room phone answer after the other caller finishes their welcome', () => {
+    const room = new ChessRoom('DUEL', { mode: 'pvp' });
+    room.setPlayerSeat('w', 'c1', 'Ada', true, true);
+    room.setPlayerSeat('b', 'c2', 'Ben', true, true, false);
+    const finishAnswer = room.beginWaitingPhoneTurn('w');
+    expect(finishAnswer).not.toBeNull();
+    room.markPlayerWelcomeReady('b');
+    expect(room.state()).toMatchObject({ phase: 'waiting', phonePendingPlayerIds: ['c1'],
+      phoneTurnPendingPlayerIds: ['c1'] });
+    expect(finishAnswer?.()).toBe(true);
+    expect(room.state()).toMatchObject({ phase: 'playing', phonePendingPlayerIds: [] });
+  });
+
+  it('restarts a finished two-caller game with the same named seats behind fresh phone welcomes', () => {
+    const room = new ChessRoom('DUEL', { mode: 'pvp',
+      initialFen: '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1' });
+    room.setPlayerSeat('w', 'c1', 'Ada', true, true);
+    room.setPlayerSeat('b', 'c2', 'Ben', true, true);
+    expect(room.rematchPvp()).toBeNull();
+    room.handleVoiceCommand('queen to G7', 'en-US', 'w');
+    room.handleVoiceCommand('confirm', 'en-US', 'w');
+    const finished = room.state();
+    expect(finished).toMatchObject({ phase: 'finished', result: { winner: 'w' } });
+
+    expect(room.rematchPvp()).toMatchObject({ gameId: finished.gameId + 1,
+      phase: 'waiting', ply: 0, result: null, phonePendingPlayerIds: ['c1', 'c2'],
+      players: [
+        { playerId: 'c1', color: 'w', name: 'Ada', nameConfirmed: true },
+        { playerId: 'c2', color: 'b', name: 'Ben', nameConfirmed: true },
+      ] });
+    room.markPlayerWelcomeReady('w');
+    expect(room.state().phase).toBe('waiting');
+    room.markPlayerWelcomeReady('b');
+    expect(room.state()).toMatchObject({ phase: 'playing', turn: 'w' });
+  });
+
+  it('finishes a two-caller match if one caller leaves before confirming a name', () => {
+    const room = new ChessRoom('DUEL', { mode: 'pvp' });
+    room.setPlayerSeat('w', 'c1', 'Ada', true, true);
+    room.setPlayerSeat('b', 'c2', 'Player 2', true, false);
+    expect(room.state().phase).toBe('waiting');
+    room.removePlayerSeat('b');
+    expect(room.state()).toMatchObject({ phase: 'finished', result: { reason: 'forfeit', winner: 'w' } });
+  });
+
   it('recommends an actual legal move, keeps the board unchanged, and reuses a hint on the same position', () => {
     const room = whiteRoom();
     const before = room.state();

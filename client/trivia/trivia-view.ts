@@ -59,6 +59,9 @@ const COPY = {
     callQrPreparing: 'Preparing the call QR code. You can call the number below.',
     callQrUnavailable: 'QR code unavailable. Call the number below.',
     ready: 'Ready', confirming: 'Confirming name', reconnecting: 'Reconnecting', openSeat: 'Open seat', waiting: 'Waiting',
+    phoneMenu: 'Finishing phone prompt', chooseCategory: 'Choosing category', replayReady: 'Ready to replay',
+    replayWaiting: 'Waiting for replay choice', replayFor: 'Play again for {name}', replayWait: 'Waiting for callers',
+    categoryConfirming: 'Waiting for callers to hear their category choice',
     category: 'Choose the category', categoryBody: 'Choose a category for the named player. The live totals decide the round.',
     categoryTouch: '{name} is voting on this screen', categorySubmitting: "Recording {name}'s vote...", categoryWaiting: 'Waiting for phone votes', vote: 'vote', votes: 'votes',
     loading: 'Building the question deck', loadingBody: 'The display is checking fonts and stage readiness.',
@@ -93,6 +96,9 @@ const COPY = {
     callQrPreparing: 'Preparando o código QR. Você pode ligar para o número abaixo.',
     callQrUnavailable: 'Código QR indisponível. Ligue para o número abaixo.',
     ready: 'Pronto', confirming: 'Confirmando nome', reconnecting: 'Reconectando', openSeat: 'Lugar livre', waiting: 'Aguardando',
+    phoneMenu: 'Terminando áudio no telefone', chooseCategory: 'Escolhendo categoria', replayReady: 'Pronto para repetir',
+    replayWaiting: 'Aguardando escolha de repetição', replayFor: 'Jogar novamente: {name}', replayWait: 'Aguardando jogadores',
+    categoryConfirming: 'Aguardando a confirmação da categoria nos telefones',
     category: 'Escolham a categoria', categoryBody: 'Escolham uma categoria para o jogador indicado. Os totais ao vivo decidem a rodada.',
     categoryTouch: '{name} está votando nesta tela', categorySubmitting: 'Registrando o voto de {name}...', categoryWaiting: 'Aguardando votos por telefone', vote: 'voto', votes: 'votos',
     loading: 'Montando as perguntas', loadingBody: 'A tela está verificando fontes e o palco.',
@@ -158,7 +164,8 @@ export function renderTriviaView(state: TriviaState | null, context: TriviaViewC
 
 function renderLobby(state: TriviaState, context: TriviaViewContext): TriviaRenderedView {
   const copy = COPY[context.locale];
-  const confirmed = state.players.filter(player => player.connected && player.nameConfirmed).length;
+  const confirmed = state.players.filter(player => player.connected
+    && (player.setupStatus === 'ready' || player.setupStatus === undefined && player.nameConfirmed)).length;
   const callEntry = !context.stationMode && context.callEntry
     ? renderCallEntry(context.callEntry, context.locale) : '';
   const html = `<section class="scene lobby-scene" data-view="lobby">
@@ -168,7 +175,7 @@ function renderLobby(state: TriviaState, context: TriviaViewContext): TriviaRend
     </div>
     <section class="stage-card roster-card" aria-labelledby="roster-title"><header><div><span>${escapeHtml(copy.room)} ${escapeHtml(state.roomCode)}</span><h2 id="roster-title">${escapeHtml(copy.players)}</h2></div><strong>${state.players.length}/${state.expectedPlayerCount}</strong></header>${renderRoster(state, context.locale)}</section>
   </section>`;
-  return rendered(`lobby:${state.players.map(player => `${player.playerId}:${player.connected}:${player.nameConfirmed}`).join('|')}`,
+  return rendered(`lobby:${state.players.map(player => `${player.playerId}:${player.connected}:${player.nameConfirmed}:${player.setupStatus}`).join('|')}`,
     `${confirmed} ${copy.ready}.`, html);
 }
 
@@ -204,12 +211,14 @@ function renderCategories(state: TriviaState, context: TriviaViewContext): Trivi
   }).join('');
   const seatLabel = seat
     ? (submitting ? copy.categorySubmitting : copy.categoryTouch).replace('{name}', seat.name)
-    : copy.categoryWaiting;
+    : totalVotes >= state.expectedPlayerCount && state.players.some(player => player.setupStatus === 'phone')
+      ? copy.categoryConfirming : copy.categoryWaiting;
   const html = `<section class="scene category-scene" data-view="category_select">
     <header class="scene-heading">${kicker(copy.eyebrow)}<div><h1>${escapeHtml(copy.category)}</h1><p>${escapeHtml(copy.categoryBody)}</p><p class="category-voting-seat">${escapeHtml(seatLabel)}</p></div><strong class="vote-total">${totalVotes}<small>${escapeHtml(copy.votes)}</small></strong></header>
+    ${renderSetupSeats(state, context.locale)}
     <ol class="category-grid" aria-label="${escapeHtml(copy.category)}">${cards}</ol>
   </section>`;
-  return rendered(`category:${seat?.playerId ?? 'none'}:${TRIVIA_ROUND_CATEGORY_IDS.map(category => state.categoryVoteCounts[category]).join(':')}`,
+  return rendered(`category:${seat?.playerId ?? 'none'}:${TRIVIA_ROUND_CATEGORY_IDS.map(category => state.categoryVoteCounts[category]).join(':')}:${state.players.map(player => player.setupStatus).join(':')}`,
     `${totalVotes} ${totalVotes === 1 ? copy.vote : copy.votes}.`, html);
 }
 
@@ -294,27 +303,54 @@ function renderResults(state: TriviaState, context: TriviaViewContext): TriviaRe
   const winnerLabel = winners.length > 1 ? copy.winners : copy.winner;
   const rows = players.map(player => resultRow(player, context.locale, player.rank === bestRank)).join('');
   const category = state.result ? TRIVIA_CATEGORY_LABELS[context.locale][state.result.category] : copy.results;
+  const sharedReplay = state.expectedPlayerCount > 1 && !context.stationMode
+    && state.replayVotingSeat !== undefined;
+  const replaySeat = state.replayVotingSeat;
   const actions = context.stationMode
     ? `<p class="results-station-note">${escapeHtml(copy.stationNextRound)}</p>`
     : `<div class="results-actions">${context.canReplay
-      ? `<button id="trivia-replay" class="primary-action" type="button">${escapeHtml(copy.replay)}</button>` : ''}<a id="trivia-exit" class="results-exit" href="/">${escapeHtml(copy.exit)}</a></div>`;
+      ? `<button id="trivia-replay" class="primary-action" type="button"${sharedReplay && !replaySeat ? ' disabled' : ''}>${escapeHtml(sharedReplay ? replaySeat
+        ? copy.replayFor.replace('{name}', replaySeat.name) : copy.replayWait : copy.replay)}</button>` : ''}<a id="trivia-exit" class="results-exit" href="/">${escapeHtml(copy.exit)}</a></div>`;
   const html = `<section class="scene results-scene${context.stationMode ? ' station-managed' : ''}" data-view="results" data-result-id="${escapeHtml(state.result?.resultId ?? 'pending')}">
-    <div class="winner-panel">${kicker(category)}<span>${escapeHtml(winnerLabel)}</span><h1>${escapeHtml(winnerNames || copy.results)}</h1>${winners[0] ? `<strong>${formatScore(winners[0].normalizedScore, context.locale)}<small>${escapeHtml(copy.normalized)}</small></strong>` : ''}${actions}</div>
+    <div class="winner-panel">${kicker(category)}<span>${escapeHtml(winnerLabel)}</span><h1>${escapeHtml(winnerNames || copy.results)}</h1>${winners[0] ? `<strong>${formatScore(winners[0].normalizedScore, context.locale)}<small>${escapeHtml(copy.normalized)}</small></strong>` : ''}${sharedReplay ? renderSetupSeats(state, context.locale) : ''}${actions}</div>
     <section class="final-board" aria-labelledby="final-board-title"><header><div><span>${escapeHtml(copy.results)}</span><h2 id="final-board-title">${escapeHtml(copy.finalBoard)}</h2></div><img src="/brand/Twilio_Logo_Bug_White.svg" alt=""></header><div class="final-rows">${rows}</div></section>
     ${resultTechHtml('trivia', context.locale, { stationManaged: Boolean(context.stationMode) })}
   </section>`;
-  return rendered(`results:${state.result?.resultId ?? 'pending'}`, `${winnerLabel}: ${winnerNames}.`, html);
+  return rendered(`results:${state.result?.resultId ?? 'pending'}:${state.players.map(player => player.setupStatus).join(':')}`,
+    `${winnerLabel}: ${winnerNames}.`, html);
 }
 
 function renderRoster(state: TriviaState, locale: SupportedLocale): string {
   const copy = COPY[locale];
-  const players = state.players.slice().sort((a, b) => a.playerOrder - b.playerOrder);
   return `<ol class="roster-list">${Array.from({ length: state.expectedPlayerCount }, (_, index) => {
-    const player = players[index];
+    const player = state.players.find(candidate => candidate.playerOrder === index);
     if (!player) return `<li class="roster-player empty"><span>${index + 1}</span><div><strong>${escapeHtml(copy.openSeat)}</strong><small>${escapeHtml(copy.waiting)}</small></div><i aria-hidden="true"></i></li>`;
-    const status = !player.connected ? copy.reconnecting : !player.nameConfirmed ? copy.confirming : copy.ready;
-    return `<li class="roster-player${player.connected && player.nameConfirmed ? ' ready' : ''}"><span>${index + 1}</span><div><strong>${escapeHtml(player.name)}</strong><small>${escapeHtml(status)}</small></div><i aria-hidden="true"></i></li>`;
+    const status = setupStatusLabel(player, locale);
+    return `<li class="roster-player${status === copy.ready ? ' ready' : ''}"><span>${index + 1}</span><div><strong>${escapeHtml(player.name)}</strong><small>${escapeHtml(status)}</small></div><i aria-hidden="true"></i></li>`;
   }).join('')}</ol>`;
+}
+
+function renderSetupSeats(state: TriviaState, locale: SupportedLocale): string {
+  const copy = COPY[locale];
+  return `<ol class="setup-seats" aria-label="${escapeHtml(copy.players)}">${state.players.slice()
+    .sort((a, b) => a.playerOrder - b.playerOrder).map(player => {
+      const status = setupStatusLabel(player, locale);
+      return `<li class="setup-seat${status === copy.ready || status === copy.replayReady ? ' ready' : ''}"><b>${player.playerOrder + 1}</b><strong>${escapeHtml(player.name)}</strong><small>${escapeHtml(status)}</small></li>`;
+    }).join('')}</ol>`;
+}
+
+function setupStatusLabel(player: TriviaPublicPlayer, locale: SupportedLocale): string {
+  const copy = COPY[locale];
+  if (!player.connected) return copy.reconnecting;
+  switch (player.setupStatus) {
+    case 'name': return copy.confirming;
+    case 'phone': return copy.phoneMenu;
+    case 'category': return copy.chooseCategory;
+    case 'replay': return copy.replayWaiting;
+    case 'replay_ready': return copy.replayReady;
+    case 'reconnecting': return copy.reconnecting;
+    default: return !player.nameConfirmed ? copy.confirming : copy.ready;
+  }
 }
 
 function playerPill(player: TriviaPublicPlayer, locale: SupportedLocale, answering: boolean): string {

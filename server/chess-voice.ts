@@ -1,9 +1,10 @@
 import { parseCrMessage } from './conversation-relay';
 import { parseChessIntent, describeChessMove, type ChessIntent } from '../shared/chess-intent';
-import type { ChessCommandResult, ChessEvent, ChessPieceType, ChessSquare, ChessState,
+import type { ChessCommandResult, ChessEvent, ChessMoveRecord, ChessPieceType, ChessSquare, ChessState,
   WizardChessSceneSnapshot } from '../shared/chess-protocol';
 import { DEFAULT_LOCALE, resolveLocale, type SupportedLocale } from '../shared/i18n/locales';
 import { formatList, normalizeForMatching } from '../shared/i18n/translate';
+import { isExplicitSpokenName, parseFirstName } from '../shared/spoken-name';
 import type { ChessVoiceMoveChoice } from './chess-room';
 import type { VoiceInterpretFact, VoiceInterpretResult } from './voice-interpreter';
 import { isWizardChessTrigger, parseWizardChessVoiceAction,
@@ -36,10 +37,18 @@ export interface ChessVoiceDeps {
     name: string,
     callSid: string,
     locale: SupportedLocale,
+    stationSeatIndex?: 0 | 1,
+    nameConfirmed?: boolean,
   ): { playerId: string; resumed: boolean } | null;
+  confirmName?(roomCode: string, callSid: string, name: string): boolean;
   leave(roomCode: string, playerId: string, callSid: string): void;
   command(roomCode: string, callSid: string, text: string, locale: SupportedLocale): ChessCommandResult | null;
   restart(roomCode: string, callSid: string): boolean;
+  requestPvpRematch?(roomCode: string, callSid: string): 'unavailable' | 'waiting' | 'ready';
+  beginWelcome?(roomCode: string, callSid: string): (played: boolean) => void;
+  beginWaitingTurn?(roomCode: string, callSid: string): () => void;
+  markWaitingTurnFailed?(roomCode: string, callSid: string): void;
+  markWaitingTurnRecovered?(roomCode: string, callSid: string): void;
   snapshot(roomCode: string): ChessState | null;
   legalMoves?(roomCode: string, callSid: string, locale: SupportedLocale): readonly ChessVoiceMoveChoice[];
   interpret?(spoken: string, locale: SupportedLocale, context: ChessVoiceInterpretContext,
@@ -55,6 +64,10 @@ export class ChessVoiceSession {
   private commandLocale: SupportedLocale = DEFAULT_LOCALE;
   private authoritativeName: string | null = null;
   private stationManaged = false;
+  private stationAssignment: { seatIndex: 0 | 1; expectedPlayers: 1 | 2 } | null = null;
+  private awaitingName = false;
+  private confirmingName = false;
+  private lastObservedPhase: ChessState['phase'] | null = null;
   private active = true;
   private turnEpoch = 0;
   private initiatingResetGameId: number | null = null;
@@ -68,6 +81,11 @@ export class ChessVoiceSession {
   private explicitWizardSkipSceneId: number | null = null;
   private lastWizardStoryReply: { sceneId: number; at: number } | null = null;
   private readonly pendingSpeech = new Set<Promise<unknown>>();
+  private readonly pendingSpeechEpoch = new Map<Promise<unknown>, number>();
+  private waitingTurnRelease: (() => void) | null = null;
+  private waitingPartialTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly failedTurnSpeech = new Map<number, string[]>();
+  private failedWaitingReply: string | null = null;
 
   constructor(private readonly deps: ChessVoiceDeps) {}
 
@@ -80,6 +98,12 @@ export class ChessVoiceSession {
   }
 
   setStationManaged(value: boolean): void { this.stationManaged = value; }
+
+  setStationAssignment(index: number, count: number): void {
+    if ((index === 0 || index === 1) && (count === 1 || count === 2) && index < count) {
+      this.stationAssignment = { seatIndex: index, expectedPlayers: count };
+    }
+  }
 
   handleMessage(raw: string): void {
     if (!this.active) return;
@@ -97,15 +121,31 @@ export class ChessVoiceSession {
       }
       else {
         this.turnEpoch++; // the caller has begun speaking over any queued line
+        const release = this.startWaitingTurn();
+        if (release) this.scheduleWaitingPartialExpiry(release);
         if (message.voicePrompt.trim()) this.rememberWizardUtteranceStart('partial');
       }
     } else if (message.type === 'dtmf') {
+      if (this.awaitingName) return;
       const command = message.digit === '1' ? 'confirm'
         : message.digit === '0' ? 'cancel'
           : message.digit === '9' ? 'help' : '';
       if (command) this.handleFinalPrompt(command);
+      else {
+        const state = this.deps.snapshot(this.roomCode);
+        if (state?.mode === 'pvp' && state.phase === 'finished' && state.result) {
+          // The transport stops its current cue on every key press. An ignored
+          // key still needs a replacement result cue before both replay votes
+          // may release the shared board.
+          this.speak(this.resultLine(state));
+        }
+      }
     } else if (message.type === 'interrupt') {
       this.turnEpoch++;
+      // Relay sends the interrupt before a new partial/final transcript. Reserve
+      // that spoken turn now so the other caller cannot start the board mid-sentence.
+      const release = this.startWaitingTurn();
+      if (release) this.scheduleWaitingPartialExpiry(release);
       this.rememberWizardUtteranceStart('interrupt');
     }
   }
@@ -136,6 +176,8 @@ export class ChessVoiceSession {
       this.wizardUtteranceStart = null;
       this.explicitWizardSkipSceneId = null;
       this.lastWizardStoryReply = null;
+      this.failedWaitingReply = null;
+      this.failedTurnSpeech.clear();
       this.announcedTerminalMoveKey = null;
       const recapAfterReset = this.wizardRecapAfterReset;
       this.wizardRecapAfterReset = false;
@@ -148,9 +190,24 @@ export class ChessVoiceSession {
       if (next?.gameId === reset.gameId) {
         if (recapAfterReset) this.speak(this.wizardFinaleRecapLine());
         this.resetIntroQueuedGameId = reset.gameId;
-        this.speak(this.introduction(next, false), true);
+        const welcomeSettled = next.mode === 'pvp' && this.callSid
+          ? this.deps.beginWelcome?.(this.roomCode, this.callSid) : undefined;
+        this.speak(this.introduction(next, false), true, welcomeSettled);
         if (next.lastMove?.actor === 'computer' && next.ply === 1)
           this.speak(describeChessMove(next.lastMove, this.commandLocale));
+      }
+      return;
+    }
+    const hasMove = events.some(event => event.type === 'move');
+    const forfeit = events.find(event => event.type === 'result' && event.result.reason === 'forfeit');
+    if (!hasMove && forfeit?.type === 'result') {
+      const current = this.deps.snapshot(this.roomCode);
+      if (current?.mode === 'pvp' && current.result?.reason === 'forfeit') {
+        const key = `${current.gameId}:forfeit:${current.result.winner}`;
+        if (this.announcedTerminalMoveKey !== key) {
+          this.announcedTerminalMoveKey = key;
+          this.speak(this.resultLine(current));
+        }
       }
       return;
     }
@@ -163,16 +220,94 @@ export class ChessVoiceSession {
           this.announcedTerminalMoveKey = key;
           // Move events flush before the room-state completion callback. Queue one
           // terminal cue now so station retirement can see and await the result.
-          this.speak(`${describeChessMove(event.move, this.commandLocale)} ${this.resultLine(current)}`);
+          const mover = current.players?.find(player => player.color === event.move.color)?.name
+            ?? (event.move.color === 'w' ? 'White' : 'Black');
+          const narration = current.mode === 'pvp' && event.move.color !== this.ownColor(current)
+            ? describeOpponentHumanMove(event.move, mover, this.commandLocale)
+            : describeChessMove(event.move, this.commandLocale);
+          this.speak(`${narration.replace(/ (?:Checkmate!|Xeque-mate!)$/, '')} ${this.resultLine(current)}`);
         }
       } else if (event.move.actor === 'computer') {
         this.speak(describeChessMove(event.move, this.commandLocale));
+      } else if (current?.mode === 'pvp' && event.move.color !== this.ownColor(current)) {
+        const mover = current.players?.find(player => player.color === event.move.color)?.name
+          ?? (event.move.color === 'w' ? 'White' : 'Black');
+        const turn = current.turn === this.ownColor(current)
+          ? this.commandLocale === 'pt-BR' ? 'Sua vez.' : 'Your turn.'
+          : '';
+        this.speak(`${describeOpponentHumanMove(event.move, mover, this.commandLocale)} ${turn}`.trim());
       }
+    }
+  }
+
+  /** Called after a room state push so the waiting caller hears when both seats are ready. */
+  onStateChanged(): void {
+    if (!this.active || !this.roomCode || !this.playerId) return;
+    const state = this.deps.snapshot(this.roomCode);
+    if (!state) return;
+    const previous = this.lastObservedPhase;
+    this.lastObservedPhase = state.phase;
+    if (state.mode !== 'pvp' || this.awaitingName || this.confirmingName) return;
+    if (previous === 'waiting' && (state.phase === 'playing' || state.phase === 'pending')) {
+      const current = state.players?.find(player => player.color === state.turn)?.name
+        ?? (state.turn === 'w' ? 'White' : 'Black');
+      this.speak(state.turn === this.ownColor(state)
+        ? this.commandLocale === 'pt-BR' ? 'Os dois jogadores estão prontos. Sua vez.'
+          : 'Both players are ready. Your turn.'
+        : this.commandLocale === 'pt-BR' ? `Os dois jogadores estão prontos. É a vez de ${current}.`
+          : `Both players are ready. ${current} moves first.`);
+    } else if (previous && previous !== 'waiting' && state.phase === 'waiting' && !state.result) {
+      this.speak(this.commandLocale === 'pt-BR'
+        ? 'A partida foi pausada. Aguardando o outro jogador voltar à chamada.'
+        : 'The match is paused. Waiting for the other player to reconnect.');
     }
   }
 
   async whenSpeechSettled(): Promise<void> {
     while (this.pendingSpeech.size) await Promise.allSettled([...this.pendingSpeech]);
+  }
+
+  private async whenTurnSpeechSettled(epoch: number): Promise<void> {
+    for (;;) {
+      const pending = [...this.pendingSpeech]
+        .filter(speech => this.pendingSpeechEpoch.get(speech) === epoch);
+      if (!pending.length) return;
+      await Promise.allSettled(pending);
+    }
+  }
+
+  private noteWaitingTurnSpeechFailure(epoch: number, line: string): void {
+    const code = this.roomCode;
+    if (!this.active || epoch !== this.turnEpoch || !this.waitingTurnRelease
+      || !code || this.deps.snapshot(code)?.phase !== 'waiting') return;
+    const failed = this.failedTurnSpeech.get(epoch) ?? [];
+    if (!failed.includes(line)) failed.push(line);
+    this.failedTurnSpeech.set(epoch, failed);
+  }
+
+  private startWaitingTurn(): (() => void) | null {
+    const code = this.roomCode, callSid = this.callSid;
+    const state = code ? this.deps.snapshot(code) : null;
+    const next = code && callSid && state?.mode === 'pvp' && state.phase === 'waiting'
+      ? this.deps.beginWaitingTurn?.(code, callSid) ?? null : null;
+    const previous = this.waitingTurnRelease;
+    this.waitingTurnRelease = next;
+    previous?.();
+    return next;
+  }
+
+  private finishWaitingTurn(release: (() => void) | null): void {
+    if (!release || this.waitingTurnRelease !== release) return;
+    this.waitingTurnRelease = null;
+    if (this.waitingPartialTimer) clearTimeout(this.waitingPartialTimer);
+    this.waitingPartialTimer = null;
+    release();
+  }
+
+  private scheduleWaitingPartialExpiry(release: () => void): void {
+    if (this.waitingPartialTimer) clearTimeout(this.waitingPartialTimer);
+    this.waitingPartialTimer = setTimeout(() => this.finishWaitingTurn(release), 30_000);
+    this.waitingPartialTimer.unref?.();
   }
 
   handleReplaced(): void {
@@ -181,6 +316,9 @@ export class ChessVoiceSession {
     this.clearWizardFinaleTimer();
     this.clearWizardReadyWatch();
     this.wizardUtteranceStart = null;
+    this.failedTurnSpeech.clear();
+    this.failedWaitingReply = null;
+    this.finishWaitingTurn(this.waitingTurnRelease);
   }
 
   handleClose(): void {
@@ -190,9 +328,12 @@ export class ChessVoiceSession {
     this.clearWizardFinaleTimer();
     this.clearWizardReadyWatch();
     this.wizardUtteranceStart = null;
+    this.failedTurnSpeech.clear();
+    this.failedWaitingReply = null;
     if (this.roomCode && this.playerId && this.callSid) {
       this.deps.leave(this.roomCode, this.playerId, this.callSid);
     }
+    this.finishWaitingTurn(this.waitingTurnRelease);
   }
 
   private handleSetup(callSid: string, parameters: Record<string, string>): void {
@@ -200,8 +341,14 @@ export class ChessVoiceSession {
     const roomCode = parameters['roomCode']?.trim().toUpperCase();
     if (!roomCode) return;
     this.commandLocale = resolveLocale(parameters['commandLocale'] ?? parameters['locale'], DEFAULT_LOCALE);
-    const name = this.authoritativeName ?? (this.commandLocale === 'pt-BR' ? 'Mago' : 'Wizard');
-    const binding = this.deps.bind(roomCode, name, callSid.trim(), this.commandLocale);
+    const before = this.deps.snapshot(roomCode);
+    const seatIndex = this.stationAssignment?.seatIndex;
+    const placeholder = this.stationAssignment?.expectedPlayers === 2 || before?.mode === 'pvp'
+      ? this.commandLocale === 'pt-BR' ? `Jogador ${(seatIndex ?? 0) + 1}` : `Player ${(seatIndex ?? 0) + 1}`
+      : this.commandLocale === 'pt-BR' ? 'Mago' : 'Wizard';
+    const name = this.authoritativeName ?? placeholder;
+    const binding = this.deps.bind(roomCode, name, callSid.trim(), this.commandLocale,
+      seatIndex, Boolean(this.authoritativeName));
     if (!binding) {
       this.speak(this.commandLocale === 'pt-BR'
         ? 'Este tabuleiro já está sendo comandado por outro jogador.'
@@ -213,6 +360,17 @@ export class ChessVoiceSession {
     this.callSid = callSid.trim();
     const state = this.deps.snapshot(roomCode);
     if (!state) return;
+    this.lastObservedPhase = state.phase;
+    const ownSeat = state.players?.find(player => player.playerId === this.playerId);
+    const needsName = !this.authoritativeName
+      && (state.mode === 'pvp' || this.stationManaged);
+    this.awaitingName = needsName && !ownSeat?.nameConfirmed;
+    if (this.awaitingName) {
+      this.speak(this.commandLocale === 'pt-BR'
+        ? 'Antes de jogar, qual é seu primeiro nome?'
+        : 'Before we play, what is your first name?');
+      return;
+    }
     if (state.wizardScene) {
       this.speak(this.wizardSceneLine(state.wizardScene));
       if (state.wizardScene.phase === 'story') this.watchWizardReady(state.wizardScene.id);
@@ -227,7 +385,9 @@ export class ChessVoiceSession {
       this.speak(this.resultLine(state));
       return;
     }
-    this.speak(this.introduction(state, binding.resumed), true);
+    const welcomeSettled = state.mode === 'pvp'
+      ? this.deps.beginWelcome?.(roomCode, this.callSid) : undefined;
+    this.speak(this.introduction(state, binding.resumed), true, welcomeSettled);
     if (state.lastMove?.actor === 'computer' && (state.ply === 1 || binding.resumed)) {
       this.speak(describeChessMove(state.lastMove, this.commandLocale));
     }
@@ -236,8 +396,81 @@ export class ChessVoiceSession {
   private handleFinalPrompt(spoken: string,
     utteranceStart: WizardUtteranceStart | null = null): void {
     if (!this.roomCode || !this.callSid || !spoken.trim()) return;
+    const release = this.startWaitingTurn();
+    if (this.waitingPartialTimer) clearTimeout(this.waitingPartialTimer);
+    this.waitingPartialTimer = null;
+    try {
+      this.handleFinalPromptCore(spoken, utteranceStart);
+    } finally {
+      if (release) {
+        const epoch = this.turnEpoch;
+        queueMicrotask(() => { void this.whenTurnSpeechSettled(epoch).then(() => {
+          if (this.active && this.turnEpoch === epoch && this.waitingTurnRelease === release) {
+            const failed = this.failedTurnSpeech.get(epoch);
+            if (failed?.length && this.roomCode && this.callSid) {
+              this.failedWaitingReply = failed.join(' ');
+              this.deps.markWaitingTurnFailed?.(this.roomCode, this.callSid);
+            }
+          }
+          this.failedTurnSpeech.delete(epoch);
+          this.finishWaitingTurn(release);
+        }, () => {
+          this.failedTurnSpeech.delete(epoch);
+          this.finishWaitingTurn(release);
+        }); });
+      }
+    }
+  }
+
+  private handleFinalPromptCore(spoken: string,
+    utteranceStart: WizardUtteranceStart | null = null): void {
+    if (!this.roomCode || !this.callSid || !spoken.trim()) return;
     this.turnEpoch++;
+    if (this.awaitingName) {
+      const name = parseChessCallerName(spoken, this.commandLocale);
+      if (!name || !this.deps.confirmName) {
+        this.speak(this.commandLocale === 'pt-BR'
+          ? 'Não entendi seu nome. Diga apenas seu primeiro nome.'
+          : 'I missed your name. Please say just your first name.');
+        return;
+      }
+      this.confirmingName = true;
+      const confirmed = this.deps.confirmName(this.roomCode, this.callSid, name);
+      this.confirmingName = false;
+      if (!confirmed) {
+        this.speak(this.commandLocale === 'pt-BR'
+          ? 'Não consegui confirmar seu nome. Tente novamente.'
+          : 'I could not confirm your name. Please try again.');
+        return;
+      }
+      this.awaitingName = false;
+      const named = this.deps.snapshot(this.roomCode);
+      if (named) {
+        this.lastObservedPhase = named.phase;
+        const welcomeSettled = named.mode === 'pvp'
+          ? this.deps.beginWelcome?.(this.roomCode, this.callSid) : undefined;
+        this.speak(this.introduction(named, false), true, welcomeSettled);
+      }
+      return;
+    }
     const before = this.deps.snapshot(this.roomCode);
+    if (before?.mode === 'pvp' && before.phase === 'waiting'
+      && this.playerId && before.phoneRetryPlayerIds?.includes(this.playerId)) {
+      if (this.failedWaitingReply) {
+        const reply = this.failedWaitingReply;
+        const epoch = this.turnEpoch;
+        this.speak(reply, false, played => {
+          if (!played || !this.active || this.turnEpoch !== epoch
+            || !this.roomCode || !this.callSid) return;
+          this.failedWaitingReply = null;
+          this.deps.markWaitingTurnRecovered?.(this.roomCode, this.callSid);
+        });
+        return;
+      }
+      const welcomePlayed = this.deps.beginWelcome?.(this.roomCode, this.callSid);
+      this.speak(this.introduction(before, false), true, welcomePlayed);
+      return;
+    }
     if (before?.wizardScene) {
       const action = parseWizardChessVoiceAction(spoken, this.commandLocale);
       const explicitH3 = action === 'final'
@@ -320,6 +553,27 @@ export class ChessVoiceSession {
     if (!this.roomCode || !this.callSid) return;
     if (this.stationManaged) { this.speak(this.stationWaitLine()); return; }
     const before = this.deps.snapshot(this.roomCode);
+    if (before?.mode === 'pvp') {
+      if (before.phase !== 'finished') {
+        this.speak(this.commandLocale === 'pt-BR'
+          ? 'Terminem esta partida antes de começar outra.'
+          : 'Finish this match before starting another.');
+        return;
+      }
+      const vote = this.deps.requestPvpRematch?.(this.roomCode, this.callSid) ?? 'unavailable';
+      this.speak(vote === 'ready'
+        ? this.commandLocale === 'pt-BR'
+          ? 'Os dois pediram outra partida. O tabuleiro vai reiniciar depois que os avisos nas chamadas terminarem.'
+          : 'Both callers requested another match. The board will restart after the phone announcements finish.'
+        : vote === 'waiting'
+          ? this.commandLocale === 'pt-BR'
+            ? 'Seu pedido para jogar de novo foi salvo. Aguardando o outro jogador pedir outra partida.'
+            : 'Your play again request is saved. Waiting for the other caller to say play again.'
+          : this.commandLocale === 'pt-BR'
+            ? 'Para outra partida, os dois jogadores precisam estar conectados. Se uma chamada terminou, iniciem uma nova partida.'
+            : 'Both callers must be connected for a rematch. If a call ended, start a new match.');
+      return;
+    }
     if (before?.phase !== 'finished') {
       this.speak(this.commandLocale === 'pt-BR'
         ? 'Termine esta partida antes de começar outra.'
@@ -489,11 +743,12 @@ export class ChessVoiceSession {
     const roomCode = this.roomCode, callSid = this.callSid;
     const before = this.deps.snapshot(roomCode);
     if (!before) return;
+    const perspective = this.playerPerspective(before);
     const epoch = this.turnEpoch;
     const legalMoves = this.deps.legalMoves(roomCode, callSid, this.commandLocale);
-    const facts = this.factsFor(before, legalMoves);
+    const facts = this.factsFor(perspective, legalMoves);
     if (readOnlyInquiry && !before.wizardScene) {
-      const direct = directLegalAnswer(spoken, this.commandLocale, before, legalMoves, facts);
+      const direct = directLegalAnswer(spoken, this.commandLocale, perspective, legalMoves, facts);
       if (direct) { this.speak(direct); return; }
     }
     if (!this.deps.interpret) {
@@ -591,8 +846,12 @@ export class ChessVoiceSession {
           ? this.wizardInquiryFallback(before.wizardScene) : this.legalQuestionHelp());
         else this.runCommand(spoken);
       })
-      .finally(() => this.pendingSpeech.delete(pending));
+      .finally(() => {
+        this.pendingSpeech.delete(pending);
+        this.pendingSpeechEpoch.delete(pending);
+      });
     this.pendingSpeech.add(pending);
+    this.pendingSpeechEpoch.set(pending, epoch);
   }
 
   private factsFor(state: ChessState, legalMoves: readonly ChessVoiceMoveChoice[]): VoiceInterpretFact[] {
@@ -614,21 +873,33 @@ export class ChessVoiceSession {
       return facts;
     }
     const ownTurn = state.turn === state.humanColor;
+    const turnOwner = state.players?.find(player => player.color === state.turn)?.name
+      ?? (state.turn === 'w' ? 'White' : 'Black');
     const facts: VoiceInterpretFact[] = [
       { id: 'turn', text: this.commandLocale === 'pt-BR'
-        ? ownTurn ? 'É sua vez de jogar.' : 'É a vez do rival.'
-        : ownTurn ? 'It is your turn.' : 'It is the rival’s turn.' },
+        ? ownTurn ? 'É sua vez de jogar.' : state.mode === 'pvp' ? `É a vez de ${turnOwner}.` : 'É a vez do rival.'
+        : ownTurn ? 'It is your turn.' : state.mode === 'pvp' ? `It is ${turnOwner}'s turn.` : 'It is the rival’s turn.' },
       { id: 'side', text: this.commandLocale === 'pt-BR'
         ? `Você joga com as ${state.humanColor === 'w' ? 'brancas' : 'pretas'}.`
         : `You play ${state.humanColor === 'w' ? 'White' : 'Black'}.` },
       { id: 'hints_remaining', text: this.commandLocale === 'pt-BR'
-        ? `Você tem ${state.hintsRemaining} dicas restantes nesta partida.`
-        : `You have ${state.hintsRemaining} hints left in this game.` },
+        ? `Você tem ${state.hintsRemainingByColor?.[state.humanColor] ?? state.hintsRemaining} dicas restantes nesta partida.`
+        : `You have ${state.hintsRemainingByColor?.[state.humanColor] ?? state.hintsRemaining} hints left in this game.` },
     ];
-    if (state.lastMove) facts.push({ id: 'last_move', text: describeChessMove(state.lastMove, this.commandLocale) });
-    if (state.pendingMove) facts.push({ id: 'pending_move', text: this.commandLocale === 'pt-BR'
-      ? `A jogada ${state.pendingMove.san} está aguardando sua confirmação.`
-      : `The move ${state.pendingMove.san} is waiting for your confirmation.` });
+    if (state.lastMove) {
+      const mover = state.players?.find(player => player.color === state.lastMove!.color)?.name
+        ?? (state.lastMove.color === 'w' ? 'White' : 'Black');
+      facts.push({ id: 'last_move', text: state.mode === 'pvp' && state.lastMove.color !== state.humanColor
+        ? describeOpponentHumanMove(state.lastMove, mover, this.commandLocale)
+        : describeChessMove(state.lastMove, this.commandLocale) });
+    }
+    if (state.pendingMove) facts.push({ id: 'pending_move', text: state.mode === 'pvp' && !ownTurn
+      ? this.commandLocale === 'pt-BR'
+        ? `A jogada ${state.pendingMove.san} aguarda confirmação de ${turnOwner}.`
+        : `The move ${state.pendingMove.san} is waiting for ${turnOwner} to confirm.`
+      : this.commandLocale === 'pt-BR'
+        ? `A jogada ${state.pendingMove.san} está aguardando sua confirmação.`
+        : `The move ${state.pendingMove.san} is waiting for your confirmation.` });
     facts.push(...legalMoveFacts(state, legalMoves, this.commandLocale));
     return facts;
   }
@@ -657,12 +928,32 @@ export class ChessVoiceSession {
   }
 
   private introduction(state: ChessState, resumed: boolean): string {
-    const side = state.humanColor === 'w'
+    const ownColor = this.ownColor(state);
+    const side = ownColor === 'w'
       ? (this.commandLocale === 'pt-BR' ? 'Brancas' : 'White')
       : (this.commandLocale === 'pt-BR' ? 'Pretas' : 'Black');
-    const opening = state.humanColor === 'w'
+    const opening = ownColor === 'w'
       ? (this.commandLocale === 'pt-BR' ? 'peão de E dois para E quatro' : 'pawn from E two to E four')
       : (this.commandLocale === 'pt-BR' ? 'peão de E sete para E cinco' : 'pawn from E seven to E five');
+    if (state.mode === 'pvp') {
+      const own = state.players?.find(player => player.playerId === this.playerId)?.name
+        ?? (ownColor === 'w' ? 'White' : 'Black');
+      const opponent = state.players?.find(player => player.color !== ownColor)?.name;
+      const waiting = state.phase === 'waiting';
+      const phonesFinishing = (state.players?.length ?? 0) === 2
+        && state.players!.every(player => player.connected && player.nameConfirmed)
+        && Boolean(state.phonePendingPlayerIds?.length);
+      if (this.commandLocale === 'pt-BR') return waiting
+        ? phonesFinishing
+          ? `${own}, você joga com as ${side}. Os dois jogadores estão conectados. O tabuleiro começará quando as orientações nas duas chamadas terminarem.`
+          : `${own}, você joga com as ${side}. Aguardando o outro jogador confirmar o nome e conectar a chamada. O tabuleiro começará quando os dois estiverem prontos.`
+        : `${own}, você joga com as ${side}${opponent ? ` contra ${opponent}` : ''}. ${ownColor === 'w' ? 'Sua vez primeiro.' : 'As Brancas jogam primeiro.'} Diga seu lance e depois confirme ou cancele.`;
+      return waiting
+        ? phonesFinishing
+          ? `${own}, you play ${side}. Both callers are connected. The board starts after both phone introductions finish.`
+          : `${own}, you play ${side}. Waiting for the other caller to connect and confirm their name. The board starts when both players are ready.`
+        : `${own}, you play ${side}${opponent ? ` against ${opponent}` : ''}. ${ownColor === 'w' ? 'You move first.' : 'White moves first.'} Say your move, then confirm or cancel.`;
+    }
     if (this.commandLocale === 'pt-BR') {
       return resumed
         ? `Bem-vindo de volta ao Xadrez por Voz da Twilio Conversation Relay. Você joga com as ${side}. Diga sua jogada ou ajuda.`
@@ -674,12 +965,35 @@ export class ChessVoiceSession {
   }
 
   private resultLine(state: ChessState): string {
-    const won = state.result?.winner === state.humanColor;
+    const ownColor = this.ownColor(state);
+    const won = state.result?.winner === ownColor;
     const drew = state.result?.winner === null;
     const next = this.stationManaged ? this.stationWaitLine()
       : this.commandLocale === 'pt-BR'
         ? 'Se quiser outra partida, diga jogar de novo.'
         : 'Say play again for a new game.';
+    if (state.mode === 'pvp') {
+      const pvpNext = this.stationManaged ? this.stationWaitLine()
+        : state.players?.some(player => !player.connected)
+          ? this.commandLocale === 'pt-BR'
+            ? 'Se a outra chamada voltar, os dois podem dizer jogar de novo. Se ela terminou, iniciem uma nova partida para dois jogadores.'
+            : 'If the other call reconnects, both can say play again. If it ended, start a new two-player match.'
+        : this.commandLocale === 'pt-BR'
+          ? 'Os dois jogadores podem dizer jogar de novo em suas chamadas para outra partida.'
+          : 'Both callers can say play again on their phones for another match.';
+      const opponent = state.players?.find(player => player.color !== ownColor)?.name
+        ?? (ownColor === 'w' ? 'Black' : 'White');
+      const outcome = drew
+        ? this.commandLocale === 'pt-BR' ? 'A partida terminou empatada.' : 'The match ends in a draw.'
+        : state.result?.reason === 'forfeit'
+          ? this.commandLocale === 'pt-BR'
+            ? won ? `${opponent} saiu da chamada. Você venceu por desistência.` : 'Você saiu da partida. O rival venceu por desistência.'
+            : won ? `${opponent} left the call. You win by forfeit.` : 'You left the match. Your opponent wins by forfeit.'
+          : this.commandLocale === 'pt-BR'
+            ? won ? `Xeque-mate! Você venceu ${opponent}.` : `Xeque-mate. ${opponent} venceu.`
+            : won ? `Checkmate! You beat ${opponent}.` : `Checkmate. ${opponent} wins.`;
+      return `${outcome} ${pvpNext}`;
+    }
     if (this.commandLocale === 'pt-BR') {
       const outcome = drew ? 'Empate.' : won
         ? 'Xeque-mate! Você venceu o duelo de magos.'
@@ -698,11 +1012,24 @@ export class ChessVoiceSession {
       : 'The station will prepare the next game.';
   }
 
-  private speak(line: string, throughComputerReply = false): void {
+  private ownColor(state: ChessState): 'w' | 'b' {
+    return state.players?.find(player => player.playerId === this.playerId)?.color ?? state.humanColor;
+  }
+
+  private playerPerspective(state: ChessState): ChessState {
+    const ownColor = this.ownColor(state);
+    return ownColor === state.humanColor ? state : {
+      ...state, humanColor: ownColor, computerColor: ownColor === 'w' ? 'b' : 'w',
+    };
+  }
+
+  private speak(line: string, throughComputerReply = false,
+    onSettled?: (played: boolean) => void): void {
     const epoch = this.turnEpoch;
     const roomCode = this.roomCode;
     const current = roomCode ? this.deps.snapshot(roomCode) : null;
-    const result = this.deps.say(line, () => {
+    let result: void | Promise<boolean>;
+    try { result = this.deps.say(line, () => {
       const live = roomCode ? this.deps.snapshot(roomCode) : null;
       if (!this.active || epoch !== this.turnEpoch) return false;
       if (!current) return true;
@@ -716,12 +1043,36 @@ export class ChessVoiceSession {
       return throughComputerReply && live.revision === current.revision + 1
         && live.ply === current.ply + 1 && live.lastMove?.actor === 'computer'
         && current.phase === 'playing' && (live.phase === 'playing' || live.phase === 'finished');
-    });
-    if (!result || typeof (result as Promise<boolean>).then !== 'function') return;
+    }); } catch {
+      if (!onSettled) this.noteWaitingTurnSpeechFailure(epoch, line);
+      onSettled?.(false);
+      return;
+    }
+    if (!result || typeof (result as Promise<boolean>).then !== 'function') {
+      onSettled?.(true);
+      return;
+    }
     let tracked!: Promise<unknown>;
-    tracked = Promise.resolve(result).catch(() => false).finally(() => this.pendingSpeech.delete(tracked));
+    tracked = Promise.resolve(result).then(played => {
+      if (played !== true && !onSettled) this.noteWaitingTurnSpeechFailure(epoch, line);
+      onSettled?.(played === true);
+    }, () => {
+      if (!onSettled) this.noteWaitingTurnSpeechFailure(epoch, line);
+      onSettled?.(false);
+    }).finally(() => {
+      this.pendingSpeech.delete(tracked);
+      this.pendingSpeechEpoch.delete(tracked);
+    });
     this.pendingSpeech.add(tracked);
+    this.pendingSpeechEpoch.set(tracked, epoch);
   }
+}
+
+function parseChessCallerName(spoken: string, locale: SupportedLocale): string | null {
+  const name = parseFirstName(spoken, locale);
+  if (!name) return null;
+  if (!isExplicitSpokenName(spoken, locale) && parseChessIntent(spoken, locale).kind !== 'unknown') return null;
+  return name;
 }
 
 function spokenMoveFromId(id: string): string {
@@ -807,6 +1158,26 @@ const RANK_NAME: Record<SupportedLocale, readonly string[]> = {
 
 function sayChessSquare(square: ChessSquare, locale: SupportedLocale): string {
   return `${square[0]!.toUpperCase()} ${RANK_NAME[locale][Number(square[1]) - 1]}`;
+}
+
+function describeOpponentHumanMove(move: ChessMoveRecord, mover: string, locale: SupportedLocale): string {
+  const target = sayChessSquare(move.to, locale);
+  const source = sayChessSquare(move.from, locale);
+  const piece = PIECE_NAME[locale][move.piece][0];
+  if (locale === 'pt-BR') {
+    const opening = move.castle
+      ? `${mover} fez roque ${move.castle === 'king' ? 'pequeno' : 'grande'}.`
+      : move.captured
+        ? `O ${piece} de ${mover} captura seu ${PIECE_NAME[locale][move.captured][0]} em ${target}.`
+        : `${mover} move seu ${piece} de ${source} para ${target}.`;
+    return `${opening}${move.promotion ? ` O peão vira ${PIECE_NAME[locale][move.promotion][0]}.` : ''}${move.checkmate ? ' Xeque-mate!' : move.check ? ' Xeque!' : ''}`;
+  }
+  const opening = move.castle
+    ? `${mover} castles ${move.castle === 'king' ? 'kingside' : 'queenside'}.`
+    : move.captured
+      ? `${mover}'s ${piece} captures your ${PIECE_NAME[locale][move.captured][0]} on ${target}.`
+      : `${mover} moves a ${piece} from ${source} to ${target}.`;
+  return `${opening}${move.promotion ? ` The pawn becomes a ${PIECE_NAME[locale][move.promotion][0]}.` : ''}${move.checkmate ? ' Checkmate!' : move.check ? ' Check!' : ''}`;
 }
 
 function currentLegalMoves(state: ChessState, choices: readonly ChessVoiceMoveChoice[]): LegalChessMove[] {

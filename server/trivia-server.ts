@@ -17,12 +17,16 @@ import {
   type TriviaServerMessage,
 } from '../shared/trivia-protocol';
 import type { TriviaAudioRetryResult, TriviaVoiceSnapshot } from './trivia-voice';
-import { TriviaRoom, type TriviaRoomOptions } from './trivia-room';
+import { TriviaRoom, type TriviaRoomOptions, type TriviaSetupPhase } from './trivia-room';
 
 export interface TriviaVoiceJoinOptions {
   readonly stationFixed?: boolean;
   readonly allowReplay?: boolean;
   readonly participantIndex?: number;
+  /** Tracks real phone setup before their join is published to peer callers. */
+  readonly voiceSetup?: boolean;
+  /** An issued standalone phone call must wait for its screen before leaving the lobby. */
+  readonly requireDisplay?: boolean;
 }
 
 interface Connection {
@@ -34,6 +38,7 @@ interface Connection {
   hostAuthorized?: boolean;
   displayAuthenticated?: boolean;
   keyboardTester?: boolean;
+  requestedStandaloneSeats?: 1 | 2 | 3 | 4;
   locale?: SupportedLocale;
   isAlive: boolean;
 }
@@ -105,6 +110,7 @@ export class TriviaServer {
     answerCueReady: Set<string>;
     questionPoints: Map<string, number>;
   }>();
+  private readonly voiceDisplayRequired = new Set<string>();
   private readonly localKeyboardPlayerIds = new Map<string, Set<string>>();
   private readonly paintedQuestionViews = new Map<string, { key: string; host: Connection }>();
   private readonly roomFactory: (code: string, options: TriviaRoomOptions) => TriviaRoom;
@@ -233,6 +239,7 @@ export class TriviaServer {
     this.rooms.delete(code);
     this.roomBanks.delete(code);
     this.voiceRuntime.delete(code);
+    this.voiceDisplayRequired.delete(code);
     this.localKeyboardPlayerIds.delete(code);
     this.paintedQuestionViews.delete(code);
     this.standaloneAudioRetries.delete(code);
@@ -413,14 +420,24 @@ export class TriviaServer {
         this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'Invalid display token.' });
         return;
       }
+      if (stationDisplay && msg.count !== undefined) {
+        this.rejectAuthority(conn);
+        return;
+      }
       if (!this.rooms.has(code) && this.rooms.size >= this.maxRooms) {
         this.send(conn, { type: 'error', code: 'room_capacity', message: 'Trivia room capacity is exhausted.' });
+        return;
+      }
+      const room = this.room(code);
+      const seatForbidden = msg.count !== undefined && this.hosts.has(code) && this.hosts.get(code) !== conn;
+      if (msg.count !== undefined && !seatForbidden && !room.configureStandaloneSeats(msg.count)) {
+        this.send(conn, { type: 'error', code: 'setup_locked', message: 'The room setup is already in use.' });
         return;
       }
       conn.roomCode = code;
       conn.display = true;
       conn.hostAuthorized = !stationDisplay || conn.hostAuthorized === true;
-      const room = this.room(code);
+      conn.requestedStandaloneSeats = stationDisplay ? undefined : msg.count;
       this.cancelResultReconnect(code);
       room.setPreferredLocale(this.preferredLocale(code));
       if (conn.displayAuthenticated) this.onDisplayAuthenticated?.(conn.ws);
@@ -428,6 +445,25 @@ export class TriviaServer {
       if (conn.displayAuthenticated || (!this.hosts.has(code) && conn.hostAuthorized)) this.hosts.set(code, conn);
       this.pushHostIdentity(code);
       this.pushState(code);
+      if (seatForbidden) this.rejectAuthority(conn);
+      return;
+    }
+
+    if (msg.type === 'configure_seats') {
+      const code = canonicalRoomCode(msg.roomCode);
+      const room = this.rooms.get(code);
+      if (conn.roomCode === code && conn.display && !this.requiresDisplayAuth(code)
+        && !this.isAuthorizedHost(code, conn)) conn.requestedStandaloneSeats = msg.count;
+      if (!room || conn.roomCode !== code || conn.playerId || !conn.display
+        || !this.isAuthorizedHost(code, conn) || this.requiresDisplayAuth(code)) {
+        this.rejectAuthority(conn);
+      } else if (!room.configureStandaloneSeats(msg.count)) {
+        this.send(conn, { type: 'error', code: 'setup_locked', message: 'The room setup is already in use.' });
+      } else {
+        conn.requestedStandaloneSeats = msg.count;
+        if (room.phase === 'lobby') this.cancelResultReconnect(code);
+        this.pushState(code);
+      }
       return;
     }
 
@@ -445,6 +481,13 @@ export class TriviaServer {
         if (!isHost) this.rejectAuthority(conn);
         else if (!room.voteCategoryFromDisplay(msg.playerId, msg.category)) {
           this.send(conn, { type: 'error', code: 'select_rejected', message: 'This voting seat already voted or changed.' });
+        }
+        break;
+      case 'display_replay':
+        if (!isHost) this.rejectAuthority(conn);
+        else if (room.state().replayVotingSeat?.playerId !== msg.playerId
+          || !room.advance(msg.playerId)) {
+          this.send(conn, { type: 'error', code: 'not_ready', message: 'Finish the current replay step first.' });
         }
         break;
       case 'view_rendered': {
@@ -721,6 +764,7 @@ export class TriviaServer {
     if (!code) return;
     conn.roomCode = undefined;
     conn.display = false;
+    conn.requestedStandaloneSeats = undefined;
     if (this.hosts.get(code) === conn) {
       this.hosts.delete(code);
       this.invalidateDisplayReady(code);
@@ -731,10 +775,26 @@ export class TriviaServer {
   }
 
   private designateHost(code: string): void {
-    const next = [...this.conns].find(candidate => candidate.roomCode === code && candidate.display
-      && (this.requiresDisplayAuth(code) ? candidate.displayAuthenticated : candidate.hostAuthorized)
-      && candidate.ws.readyState === WebSocket.OPEN);
-    if (next) this.hosts.set(code, next);
+    this.hosts.delete(code);
+    for (const candidate of this.conns) {
+      if (candidate.roomCode !== code || !candidate.display
+        || !(this.requiresDisplayAuth(code) ? candidate.displayAuthenticated : candidate.hostAuthorized)
+        || candidate.ws.readyState !== WebSocket.OPEN) continue;
+      const requestedSeats = candidate.requestedStandaloneSeats;
+      if (!this.requiresDisplayAuth(code) && requestedSeats !== undefined
+        && !this.rooms.get(code)?.configureStandaloneSeats(requestedSeats)) {
+        // A rejected count must not become the room's call destination on host handoff.
+        candidate.roomCode = undefined;
+        candidate.display = false;
+        candidate.hostAuthorized = false;
+        candidate.requestedStandaloneSeats = undefined;
+        this.send(candidate, { type: 'error', code: 'setup_locked',
+          message: 'The room setup is already in use.' });
+        continue;
+      }
+      this.hosts.set(code, candidate);
+      break;
+    }
     this.pushHostIdentity(code);
   }
 
@@ -812,6 +872,7 @@ export class TriviaServer {
     this.rooms.delete(code);
     this.roomBanks.delete(code);
     this.voiceRuntime.delete(code);
+    this.voiceDisplayRequired.delete(code);
     this.localKeyboardPlayerIds.delete(code);
     this.paintedQuestionViews.delete(code);
     this.standaloneAudioRetries.delete(code);
@@ -835,16 +896,59 @@ export class TriviaServer {
     room.setPreferredLocale(preferredLocale ?? this.preferredLocale(code));
     const stationFixed = options.stationFixed ?? this.requiresDisplayAuth(code);
     const allowReplay = options.allowReplay ?? !stationFixed;
-    if (expectedPlayers !== undefined && !room.expectHumanPlayers(expectedPlayers, true, {
+    const target = room.standaloneSeatsFixed && !stationFixed ? room.expectedPlayerCount : expectedPlayers;
+    if (target !== undefined && !room.expectHumanPlayers(target, true, {
       stationFixed,
       allowReplay,
     })) return null;
-    if (expectedPlayers === undefined && !room.setRosterPolicy({ stationFixed, allowReplay })) return null;
+    if (target === undefined && !room.setRosterPolicy({ stationFixed, allowReplay })) return null;
     const result = room.addPlayer(name, nameConfirmed, options.participantIndex);
     if ('error' in result) return null;
+    if (options.voiceSetup) room.registerVoicePlayer(result.playerId);
+    if (options.requireDisplay && !stationFixed) this.voiceDisplayRequired.add(code);
     this.flush(room);
     this.pushState(code);
     return result.playerId;
+  }
+
+  voiceConfigureStandaloneSeats(code: string, count: number): boolean {
+    code = canonicalRoomCode(code);
+    const room = this.rooms.get(code);
+    if (!room?.configureStandaloneSeats(count)) return false;
+    if (room.phase === 'lobby') this.cancelResultReconnect(code);
+    this.pushState(code);
+    return true;
+  }
+
+  voiceBeginSetupSpeech(code: string, playerId: string, phase: TriviaSetupPhase):
+    ((completed?: boolean) => void) | null {
+    code = canonicalRoomCode(code);
+    const room = this.rooms.get(code);
+    const release = room?.beginSetupSpeech(playerId, phase);
+    if (!release) return null;
+    this.pushState(code);
+    return completed => {
+      release(completed);
+      this.pushState(code);
+    };
+  }
+
+  voiceBeginMenuTurn(code: string, playerId: string, phase: TriviaSetupPhase): (() => void) | null {
+    code = canonicalRoomCode(code);
+    const room = this.rooms.get(code);
+    const release = room?.beginMenuTurn(playerId, phase);
+    if (!release) return null;
+    this.pushState(code);
+    let settled = false;
+    return () => {
+      if (settled) return;
+      settled = true;
+      release();
+      if (this.rooms.get(code) !== room) return;
+      this.flush(room);
+      this.pushState(code);
+      this.syncTimingLoop();
+    };
   }
 
   voiceSetName(code: string, playerId: string, name: string): boolean {
@@ -867,6 +971,10 @@ export class TriviaServer {
     code = canonicalRoomCode(code);
     const room = this.rooms.get(code);
     if (!room || (room.phase === 'results' && !room.allowReplay)) return false;
+    if (room.phase === 'lobby' && this.voiceDisplayRequired.has(code) && !this.hasLiveHostDisplay(code)) {
+      this.pushState(code);
+      return false;
+    }
     const advanced = room.advance(playerId);
     this.flush(room);
     if (room.phase === 'loading') this.pushHostIdentity(code);
@@ -1129,6 +1237,8 @@ export class TriviaServer {
       expectedPlayerCount: state.expectedPlayerCount,
       hasExpectedPlayers: state.hasExpectedPlayers,
       automaticSetup: state.automaticSetup,
+      awaitingDisplay: room.phase === 'lobby' && this.voiceDisplayRequired.has(code)
+        && !this.hasLiveHostDisplay(code),
       players: state.players.map(player => ({
         playerId: player.playerId,
         name: player.name,
@@ -1136,6 +1246,8 @@ export class TriviaServer {
         connected: player.connected,
         rawScore: player.rawScore,
         correctCount: player.correctCount,
+        setupStatus: player.setupStatus,
+        replayReady: player.replayReady,
       })),
       categoryVoteCounts: state.categoryVoteCounts,
       myCategoryVote: room.categoryVoteFor(playerId),

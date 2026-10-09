@@ -4,6 +4,231 @@ import { STEP, MAX_PLAYERS } from '../shared/constants';
 import { arcadeGameDefinition } from '../shared/arcade-games';
 
 describe('Room', () => {
+  it('keeps the existing lobby start shortcut for a one-seat display', () => {
+    const room = new Room('ONE-SEAT', 1, { carCount: 1, maps: ['Silver Lake'] });
+    expect(room.configureStandaloneSeats(1)).toBe(true);
+    room.addPlayer('Ada');
+    expect(room.start()).toBe(true);
+    expect(room.phase).toBe('countdown');
+  });
+
+  it('keeps a display-selected two-caller room waiting when one named caller disconnects during setup', () => {
+    const room = new Room('TWO-SEATS', 1, { carCount: 2, maps: ['Silver Lake'] });
+    expect(room.configureStandaloneSeats(2)).toBe(true);
+    const first = room.addPlayer('Ada') as { playerId: string };
+    const second = room.addPlayer('Bo') as { playerId: string };
+    room.removePlayer(second.playerId);
+
+    expect(room.canAdvance(first.playerId)).toBe(false);
+    expect(room.humanPlayerTarget).toBe(2);
+    expect(room.addPlayer('Cy')).toMatchObject({ playerId: expect.any(String) });
+    expect(room.canAdvance(first.playerId)).toBe(true);
+  });
+
+  it('accepts the first two-seat display choice after one phone caller enters the lobby', () => {
+    const room = new Room('LATE-DISPLAY', 1, { carCount: 2, maps: ['Silver Lake'] });
+    const first = room.addPlayer('Ada') as { playerId: string };
+    room.registerVoicePlayer(first.playerId);
+    const finishFirstCue = room.beginMenuAudio(first.playerId, 'lobby');
+    expect(room.lobbyPlayers()[0]).toMatchObject({ name: 'Ada', setupStatus: 'phone' });
+
+    expect(room.configureStandaloneSeats(2)).toBe(true);
+    expect(room.humanPlayerTarget).toBe(2);
+    expect(room.lobbyPlayers()[0]).toMatchObject({ name: 'Ada', setupStatus: 'phone' });
+    finishFirstCue();
+    expect(room.canAdvance(first.playerId)).toBe(false);
+
+    const second = room.addPlayer('Bo') as { playerId: string };
+    room.registerVoicePlayer(second.playerId);
+    const finishSecondCue = room.beginMenuAudio(second.playerId, 'lobby');
+    expect(room.canAdvance(first.playerId)).toBe(false);
+    finishSecondCue();
+    expect(room.canAdvance(first.playerId)).toBe(true);
+  });
+
+  it('accepts the same seat count when a display reconnects during a shared menu', () => {
+    const room = new Room('DISPLAY-RECONNECT', 1, { carCount: 2, maps: ['Silver Lake'] });
+    expect(room.configureStandaloneSeats(2)).toBe(true);
+    const ada = room.addPlayer('Ada') as { playerId: string };
+    room.addPlayer('Bo');
+    room.advance(ada.playerId);
+    expect(room.phase).toBe('car_select');
+
+    expect(room.configureStandaloneSeats(2)).toBe(true);
+    expect(room.configureStandaloneSeats(1)).toBe(false);
+    expect(room.phase).toBe('car_select');
+    expect(room.humanPlayerTarget).toBe(2);
+  });
+
+  it('holds each shared menu until both callers finish hearing its current phone cues', () => {
+    const room = new Room('PHONE-GATE', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const a = room.addPlayer('Ada') as { playerId: string };
+    const b = room.addPlayer('Bo') as { playerId: string };
+    room.registerVoicePlayer(a.playerId);
+    room.registerVoicePlayer(b.playerId);
+    const finishAdaLobby = room.beginMenuAudio(a.playerId, 'lobby');
+    const finishBoLobby = room.beginMenuAudio(b.playerId, 'lobby');
+
+    finishAdaLobby();
+    expect(room.canAdvance(a.playerId)).toBe(false);
+    expect(room.lobbyPlayers().map(player => player.setupStatus)).toEqual(['ready', 'phone']);
+    finishBoLobby();
+    expect(room.advance(a.playerId)).toBe(true);
+    expect(room.phase).toBe('car_select');
+    expect(room.touchSelectionTarget()).toBeNull();
+
+    const finishAdaCar = room.beginMenuAudio(a.playerId, 'car_select');
+    const finishBoCar = room.beginMenuAudio(b.playerId, 'car_select');
+    room.selectCar(a.playerId, 0);
+    room.selectCar(b.playerId, 1);
+    finishAdaCar();
+    expect(room.canAdvance(a.playerId)).toBe(false);
+    expect(room.touchSelectionTarget()).toBeNull();
+    finishBoCar();
+    expect(room.canAdvance(a.playerId)).toBe(true);
+  });
+  it('accepts an explicit voice next while the speaker is talking, but still waits for the other phone', () => {
+    const room = new Room('VOICE-NEXT', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const ada = room.addPlayer('Ada') as { playerId: string };
+    const bo = room.addPlayer('Bo') as { playerId: string };
+    room.registerVoicePlayer(ada.playerId);
+    room.registerVoicePlayer(bo.playerId);
+    room.beginMenuAudio(ada.playerId, 'lobby')();
+    room.beginMenuAudio(bo.playerId, 'lobby')();
+    room.advance(ada.playerId);
+    room.selectCar(ada.playerId, 0);
+    room.selectCar(bo.playerId, 1);
+    const finishAdaCar = room.beginMenuAudio(ada.playerId, 'car_select');
+    const finishBoCar = room.beginMenuAudio(bo.playerId, 'car_select');
+
+    expect(room.advance(ada.playerId, true)).toBe(false);
+    finishBoCar();
+    expect(room.advance(ada.playerId)).toBe(false);
+    expect(room.advance(ada.playerId, true)).toBe(true);
+    finishAdaCar();
+    expect(room.phase).toBe('map_select');
+
+    room.selectMap('Silver Lake', ada.playerId);
+    room.selectMap('Silver Lake', bo.playerId);
+    room.beginMenuAudio(bo.playerId, 'map_select')();
+    room.beginMenuAudio(ada.playerId, 'map_select');
+    expect(room.advance(ada.playerId)).toBe(false);
+    expect(room.advance(ada.playerId, true)).toBe(true);
+    expect(room.phase).toBe('countdown');
+  });
+  it('does not let Back rewind an organic two-caller menu', () => {
+    const room = new Room('ORGANIC-DUO', 1, { carCount: 2, maps: ['Silver Lake'] });
+    const a = room.addPlayer('Ada') as { playerId: string };
+    room.addPlayer('Bo');
+
+    expect(room.advance(a.playerId)).toBe(true);
+    expect(room.phase).toBe('car_select');
+    room.back();
+    expect(room.phase).toBe('car_select');
+  });
+  it('does not count an unowned host track vote in a shared standalone race', () => {
+    const room = new Room('TRACK-VOTES', 1, { carCount: 2, maps: ['Silver Lake', 'Drift'] });
+    room.configureStandaloneSeats(2);
+    const a = room.addPlayer('Ada') as { playerId: string };
+    const b = room.addPlayer('Bo') as { playerId: string };
+    room.advance(a.playerId);
+    room.selectCar(a.playerId, 0);
+    room.selectCar(b.playerId, 1);
+    room.advance(a.playerId);
+
+    expect(room.selectMap('Drift')).toBe(false);
+    expect(room.mapVotes().counts).toEqual({});
+    room.selectMap('Silver Lake', a.playerId);
+    room.selectMap('Silver Lake', b.playerId);
+    expect(room.mapVotes().counts).toEqual({ 'Silver Lake': 2 });
+    expect(room.selectedMap).toBe('Silver Lake');
+  });
+
+  it('holds a two-caller result until both recaps settle and both callers request a rematch', () => {
+    const room = new Room('RESULT-CONSENT', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const a = room.addPlayer('Ada') as { playerId: string };
+    const b = room.addPlayer('Bo') as { playerId: string };
+    room.registerVoicePlayer(a.playerId);
+    room.registerVoicePlayer(b.playerId);
+    room.beginMenuAudio(a.playerId, 'lobby')();
+    room.beginMenuAudio(b.playerId, 'lobby')();
+    expect(room.advance(a.playerId)).toBe(true);
+    room.selectCar(a.playerId, 0);
+    room.selectCar(b.playerId, 1);
+    room.beginMenuAudio(a.playerId, 'car_select')();
+    room.beginMenuAudio(b.playerId, 'car_select')();
+    expect(room.advance(a.playerId)).toBe(true);
+    room.selectMap('Silver Lake', a.playerId);
+    room.selectMap('Silver Lake', b.playerId);
+    room.beginMenuAudio(a.playerId, 'map_select')();
+    room.beginMenuAudio(b.playerId, 'map_select')();
+    expect(room.advance(a.playerId)).toBe(true);
+    for (let i = 0; i < 60 * 120 && room.phase !== 'results'; i++) room.tick(STEP);
+    expect(room.phase).toBe('results');
+
+    const finishAdaRecap = room.beginMenuAudio(a.playerId, 'results');
+    const finishBoRecap = room.beginMenuAudio(b.playerId, 'results');
+    expect(room.advance(a.playerId)).toBe(false);
+    expect(room.phase).toBe('results');
+    finishAdaRecap();
+    expect(room.advance(b.playerId)).toBe(false);
+    expect(room.phase).toBe('results');
+    finishBoRecap();
+    expect(room.completeSharedReplayIfReady()).toBe(true);
+    expect(room.phase).toBe('car_select');
+  });
+  it('keeps a same-count result reconnect but accepts a new count after the group leaves', () => {
+    const room = new Room('RELAUNCH-COUNT', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const a = room.addPlayer('Ada') as { playerId: string };
+    const b = room.addPlayer('Bo') as { playerId: string };
+    room.advance(a.playerId);
+    room.selectCar(a.playerId, 0);
+    room.selectCar(b.playerId, 1);
+    room.advance(a.playerId);
+    room.selectMap('Silver Lake', a.playerId);
+    room.selectMap('Silver Lake', b.playerId);
+    room.advance(a.playerId);
+    for (let i = 0; i < 60 * 120 && room.phase !== 'results'; i++) room.tick(STEP);
+    room.removePlayer(a.playerId);
+    room.removePlayer(b.playerId);
+
+    const standings = room.results();
+    expect(room.configureStandaloneSeats(2)).toBe(true);
+    expect(room.phase).toBe('results');
+    expect(room.results()).toEqual(standings);
+    expect(room.configureStandaloneSeats(1)).toBe(true);
+    expect(room.phase).toBe('lobby');
+    expect(room.humanPlayerTarget).toBe(1);
+    expect(room.results()).toEqual([]);
+  });
+  it('starts a fresh fixed-caller lobby when a new caller arrives after the prior group leaves', () => {
+    const room = new Room('NEW-GROUP', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.configureStandaloneSeats(2);
+    const a = room.addPlayer('Ada') as { playerId: string };
+    const b = room.addPlayer('Bo') as { playerId: string };
+    room.advance(a.playerId);
+    room.selectCar(a.playerId, 0);
+    room.selectCar(b.playerId, 1);
+    room.advance(a.playerId);
+    room.selectMap('Silver Lake', a.playerId);
+    room.selectMap('Silver Lake', b.playerId);
+    room.advance(a.playerId);
+    for (let i = 0; i < 60 * 120 && room.phase !== 'results'; i++) room.tick(STEP);
+    room.removePlayer(a.playerId);
+    room.removePlayer(b.playerId);
+    expect(room.phase).toBe('results');
+
+    const next = room.addPlayer('Cy', undefined, undefined, false);
+    expect(next).toMatchObject({ playerId: expect.any(String) });
+    expect(room.phase).toBe('lobby');
+    expect(room.humanPlayerTarget).toBe(2);
+    expect(room.lobbyPlayers()).toMatchObject([{ name: 'Cy', setupStatus: 'name' }]);
+    expect(room.canAdvance((next as { playerId: string }).playerId)).toBe(false);
+  });
   it('requires a name in the lobby but keeps a visible selection menu when an unnamed caller joins late', () => {
     const room = new Room('NAMES', 1, { carCount: 2, maps: ['Silver Lake'] });
     const caller = room.addPlayer('Racer 1234', undefined, undefined, false); if ('error' in caller) throw new Error(caller.error);
@@ -60,6 +285,15 @@ describe('Room', () => {
     expect(room.snapshot()?.cars.map(car => car.name)).toEqual(['Ada Returns', 'Rex']);
   });
 
+  it('labels a station caller by their assigned seat even when Player 2 calls first', () => {
+    room.expectHumanPlayers(2);
+    const second = room.addPlayer('Bo', undefined, 1) as { playerId: string };
+    expect(room.lobbyPlayers()).toMatchObject([{ playerId: second.playerId, lane: 1 }]);
+    const first = room.addPlayer('Ada', undefined, 0) as { playerId: string };
+    expect(room.lobbyPlayers().map(player => [player.playerId, player.lane]))
+      .toEqual([[first.playerId, 0], [second.playerId, 1]]);
+  });
+
   it('keeps two station players car picks and map votes independent', () => {
     room=new Room('4821',1,{carCount:3,maps:['Silver Lake','Drift']});room.expectHumanPlayers(2);
     const a=room.addPlayer('Ada',undefined,0) as {playerId:string};
@@ -77,6 +311,23 @@ describe('Room', () => {
     expect(room.phase).toBe('countdown');
     expect(room.snapshot()?.cars.map(car=>car.carIndex)).toEqual([1,2]);
     expect(room.mapVotes().counts).toEqual({'Silver Lake':1,Drift:1});
+  });
+
+  it('accepts independent same-phase choices from either caller, including the same car and track', () => {
+    const room = new Room('SIMULTANEOUS', 1, { carCount: 2, maps: ['Silver Lake'] });
+    room.expectHumanPlayers(2);
+    const a = room.addPlayer('Ada', undefined, 0) as { playerId: string };
+    const b = room.addPlayer('Bo', undefined, 1) as { playerId: string };
+    room.advance(a.playerId);
+
+    expect(room.canSelectCar(b.playerId)).toBe(true);
+    expect(room.selectCar(b.playerId, 0)).toBe(true);
+    expect(room.selectCar(a.playerId, 0)).toBe(true);
+    expect(room.advance(b.playerId)).toBe(true);
+    expect(room.canSelectMap(a.playerId)).toBe(true);
+    expect(room.selectMap('Silver Lake', a.playerId)).toBe(true);
+    expect(room.selectMap('Silver Lake', b.playerId)).toBe(true);
+    expect(room.mapVotes().counts).toEqual({ 'Silver Lake': 2 });
   });
 
   it('identifies the next caller seat for shared-screen car and track taps', () => {

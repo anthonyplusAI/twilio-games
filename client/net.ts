@@ -24,7 +24,11 @@ export class GameConnection {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   /** The identity to replay on reconnect (last join or spectate), so we rejoin the same room. */
   private identity: { type: 'join'; roomCode: string; name: string; locale?: SupportedLocale;
-    rendererReadyGate?: boolean } | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; displayToken?: string } | null = null;
+    rendererReadyGate?: boolean; keyboardSession?: { id: string; generation: number; seats?: 1 | 2 } }
+    | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; displayToken?: string; count?: 1 | 2 } | null = null;
+  private displaySeats: { type: 'configure_seats'; roomCode: string; count: 1 | 2 } | null = null;
+  private pendingKeyboardRelease: { type: 'release_keyboard_session'; roomCode: string;
+    keyboardSession: { id: string; generation: number } } | null = null;
 
   constructor(private url: string, private locale?: SupportedLocale) {
     this.connect();
@@ -42,10 +46,17 @@ export class GameConnection {
       else if (m.type === 'lobby') this.onLobbyCb?.(m);
       else if (m.type === 'select_state') this.onSelectCb?.(m);
       else if (m.type === 'results') this.onResultsCb?.(m);
+      else if (m.type === 'keyboard_session_released' && this.pendingKeyboardRelease
+        && m.roomCode === this.pendingKeyboardRelease.roomCode
+        && m.keyboardSession?.id === this.pendingKeyboardRelease.keyboardSession.id
+        && m.keyboardSession?.generation === this.pendingKeyboardRelease.keyboardSession.generation)
+        this.pendingKeyboardRelease = null;
     };
     this.ws.onopen = () => {
       this.backoff = 500;                       // reset backoff on a successful connect
       if (this.identity) this.rawSend(this.identity);   // re-establish room membership
+      if (this.identity?.type === 'spectate' && this.pendingKeyboardRelease?.roomCode === this.identity.roomCode)
+        this.rawSend(this.pendingKeyboardRelease);
     };
     this.ws.onclose = () => { if (!this.closed) this.scheduleReconnect(); };
     // onerror precedes onclose in browsers; let onclose drive the retry (avoid double-scheduling).
@@ -74,17 +85,42 @@ export class GameConnection {
   /** A control belongs to the screen/round where it was entered. Identity is replayed
    * on reconnect; a delayed control must not change a later round. */
   private send(o: unknown) { this.rawSend(o); }
-  join(roomCode: string, name: string, rendererReadyGate = false) {
+  join(roomCode: string, name: string, rendererReadyGate = false,
+    keyboardSession?: { id: string; generation: number; seats?: 1 | 2 }) {
     this.identity = { type: 'join', roomCode, name, ...(this.locale ? { locale: this.locale } : {}),
-      ...(rendererReadyGate ? { rendererReadyGate: true } : {}) };
+      ...(rendererReadyGate ? { rendererReadyGate: true } : {}),
+      ...(keyboardSession ? { keyboardSession } : {}) };
     this.rawSend(this.identity); // onopen sends it when the initial socket is still connecting
   }
   spectate(roomCode: string, displayToken?: string) {
-    this.identity = { type: 'spectate', roomCode, ...(this.locale ? { locale: this.locale } : {}), ...(displayToken ? { displayToken } : {}) };
+    this.identity = { type: 'spectate', roomCode, ...(this.locale ? { locale: this.locale } : {}),
+      ...(displayToken ? { displayToken } : {}),
+      ...(this.displaySeats?.roomCode === roomCode ? { count: this.displaySeats.count } : {}) };
     this.rawSend(this.identity); // onopen sends it when the initial socket is still connecting
   }
+  /** New choices use configure_seats; the latest choice is also part of future spectate identities. */
+  configureSeats(roomCode: string, count: 1 | 2): void {
+    this.displaySeats = { type: 'configure_seats', roomCode, count };
+    if (this.identity?.type === 'spectate' && this.identity.roomCode === roomCode) {
+      this.identity = { ...this.identity, count };
+      this.rawSend(this.displaySeats);
+    }
+  }
+  /** The still-connected display can release its own keyboard tester if that tester socket dies. */
+  releaseKeyboardSession(roomCode: string, keyboardSession: { id: string; generation: number }): void {
+    if (this.identity?.type !== 'spectate' || this.identity.roomCode !== roomCode) return;
+    this.pendingKeyboardRelease = { type: 'release_keyboard_session', roomCode, keyboardSession };
+    this.rawSend(this.pendingKeyboardRelease);
+  }
   /** Drop this connection's player slot but stay connected as a spectator (shared-screen toggle). */
-  leave() { if (this.identity?.type === 'join') this.identity = { type: 'spectate', roomCode: this.identity.roomCode, ...(this.locale ? { locale: this.locale } : {}) }; this.send({ type: 'leave' }); }
+  leave() {
+    if (this.identity?.type !== 'join') { this.send({ type: 'leave' }); return; }
+    const roomCode = this.identity.roomCode;
+    this.identity = { type: 'spectate', roomCode, ...(this.locale ? { locale: this.locale } : {}),
+      ...(this.displaySeats?.roomCode === roomCode ? { count: this.displaySeats.count } : {}) };
+    this.send({ type: 'leave' });
+    this.rawSend(this.identity);
+  }
   ready() { this.send({ type: 'ready' }); }
   restart() { this.send({ type: 'restart' }); }
   sendIntent(i: Intent) { this.send({ type: 'intent', intent: i }); }

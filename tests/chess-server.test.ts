@@ -32,6 +32,312 @@ async function hostChess(roomFactory?: (code: string) => ChessRoom): Promise<{ p
 }
 
 describe('Voice Chess display transport', () => {
+  it('converts a waiting station PvP seat to a playable solo seat after a no-show', () => {
+    const chess = new ChessServer({ random: () => 0 });
+    chessServer = chess;
+    expect(chess.configureMatch('NO-SHOW', 2)).toBe(true);
+    expect(chess.voiceJoin('NO-SHOW', 'Ben', 'CA-black', 'en-US', true, 1, true))
+      .toEqual({ playerId: 'c2', resumed: false });
+    expect(chess.findRoom('NO-SHOW')?.state()).toMatchObject({ mode: 'pvp', phase: 'waiting' });
+
+    const reconcile = (chess as ChessServer & {
+      reconcileStationMatch?: (roomCode: string, expectedHumans: 1 | 2) => boolean;
+    }).reconcileStationMatch;
+    expect(reconcile?.call(chess, 'NO-SHOW', 1)).toBe(true);
+    expect(chess.findRoom('NO-SHOW')?.state()).toMatchObject({ mode: 'solo', phase: 'playing',
+      players: [expect.objectContaining({ playerId: 'c2', name: 'Ben', connected: true })] });
+    expect(chess.voiceLegalMoves('NO-SHOW', 'CA-black', 'en-US'))
+      .toContainEqual(expect.objectContaining({ id: 'e2e4' }));
+  });
+
+  it('never changes a live station Chess match into solo play', () => {
+    const chess = new ChessServer({ random: () => 0 });
+    chessServer = chess;
+    chess.configureMatch('LIVE-DUEL', 2);
+    chess.voiceJoin('LIVE-DUEL', 'Ada', 'CA-white', 'en-US', true, 0, true);
+    chess.voiceJoin('LIVE-DUEL', 'Ben', 'CA-black', 'en-US', true, 1, true);
+    chess.voiceBeginWelcome('LIVE-DUEL', 'CA-white')(true);
+    chess.voiceBeginWelcome('LIVE-DUEL', 'CA-black')(true);
+    const room = chess.findRoom('LIVE-DUEL')!;
+    const gameId = room.state().gameId;
+
+    const reconcile = (chess as ChessServer & {
+      reconcileStationMatch?: (roomCode: string, expectedHumans: 1 | 2) => boolean;
+    }).reconcileStationMatch;
+    expect(reconcile?.call(chess, 'LIVE-DUEL', 1)).toBe(false);
+    expect(room.state()).toMatchObject({ mode: 'pvp', phase: 'playing', gameId });
+  });
+
+  it('ignores a welcome completion from a replaced call socket', () => {
+    const chess = new ChessServer({ random: () => 0 });
+    chessServer = chess;
+    chess.configureMatch('DUEL', 2);
+    chess.voiceJoin('DUEL', 'Ada', 'CA-white', 'en-US');
+    chess.voiceJoin('DUEL', 'Ben', 'CA-black', 'en-US');
+    const staleWhiteWelcome = chess.voiceBeginWelcome('DUEL', 'CA-white');
+    chess.voiceBeginWelcome('DUEL', 'CA-black')(true);
+    expect(chess.findRoom('DUEL')?.state()).toMatchObject({ phase: 'waiting',
+      phonePendingPlayerIds: ['c1'] });
+
+    chess.voiceSetConnected('DUEL', 'CA-white', false);
+    chess.voiceJoin('DUEL', 'Ada', 'CA-white', 'en-US');
+    staleWhiteWelcome(true);
+    expect(chess.findRoom('DUEL')?.state()).toMatchObject({ phase: 'waiting',
+      phonePendingPlayerIds: ['c1'] });
+    chess.voiceBeginWelcome('DUEL', 'CA-white')(true);
+    expect(chess.findRoom('DUEL')?.state()).toMatchObject({ phase: 'playing',
+      phonePendingPlayerIds: [] });
+  });
+
+  it('does not start PvP after failed audio and ignores an older superseded welcome', () => {
+    const chess = new ChessServer({ random: () => 0 });
+    chessServer = chess;
+    chess.configureMatch('DUEL', 2);
+    chess.voiceJoin('DUEL', 'Ada', 'CA-white', 'en-US');
+    chess.voiceJoin('DUEL', 'Ben', 'CA-black', 'en-US');
+    const firstWhiteWelcome = chess.voiceBeginWelcome('DUEL', 'CA-white');
+    chess.voiceBeginWelcome('DUEL', 'CA-black')(true);
+    firstWhiteWelcome(false);
+    expect(chess.snapshot('DUEL')).toMatchObject({ phase: 'waiting',
+      phoneRetryPlayerIds: ['c1'] });
+
+    const retryWhiteWelcome = chess.voiceBeginWelcome('DUEL', 'CA-white');
+    firstWhiteWelcome(true);
+    expect(chess.snapshot('DUEL')).toMatchObject({ phase: 'waiting',
+      phonePendingPlayerIds: ['c1'], phoneRetryPlayerIds: [] });
+    retryWhiteWelcome(true);
+    expect(chess.snapshot('DUEL')).toMatchObject({ phase: 'playing',
+      phonePendingPlayerIds: [] });
+  });
+
+  it('needs both rematch votes and both result phone recaps before resetting the shared board', async () => {
+    const chess = new ChessServer({ roomFactory: code => new ChessRoom(code, { mode: 'pvp',
+      initialFen: '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1' }) });
+    chessServer = chess;
+    let finishRecaps!: () => void;
+    const recaps = new Promise<void>(resolve => { finishRecaps = resolve; });
+    chess.setPvpRematchSpeechBarrier(() => recaps);
+    chess.voiceJoin('DUEL', 'Ada', 'CA-white', 'en-US');
+    chess.voiceJoin('DUEL', 'Ben', 'CA-black', 'en-US');
+    chess.voiceBeginWelcome('DUEL', 'CA-white')(true);
+    chess.voiceBeginWelcome('DUEL', 'CA-black')(true);
+    chess.voiceCommand('DUEL', 'CA-white', 'queen to G7', 'en-US');
+    chess.voiceCommand('DUEL', 'CA-white', 'confirm', 'en-US');
+    const finished = chess.findRoom('DUEL')!.state();
+    expect(finished.phase).toBe('finished');
+
+    expect(chess.voiceRequestPvpRematch('DUEL', 'CA-white')).toBe('waiting');
+    expect(chess.snapshot('DUEL')).toMatchObject({ rematchReadyPlayerIds: ['c1'],
+      rematchWaitingForPhone: false, gameId: finished.gameId });
+    expect(chess.voiceRequestPvpRematch('DUEL', 'CA-black')).toBe('ready');
+    await Promise.resolve();
+    expect(chess.snapshot('DUEL')).toMatchObject({ phase: 'finished', gameId: finished.gameId,
+      rematchReadyPlayerIds: ['c1', 'c2'], rematchWaitingForPhone: true });
+
+    finishRecaps();
+    await vi.waitFor(() => expect(chess.snapshot('DUEL')).toMatchObject({
+      gameId: finished.gameId + 1, phase: 'waiting', result: null,
+      phonePendingPlayerIds: ['c1', 'c2'],
+    }));
+    chess.voiceBeginWelcome('DUEL', 'CA-white')(true);
+    expect(chess.findRoom('DUEL')!.state().phase).toBe('waiting');
+    chess.voiceBeginWelcome('DUEL', 'CA-black')(true);
+    expect(chess.findRoom('DUEL')!.state().phase).toBe('playing');
+  });
+
+  it('cancels an in-flight rematch when a caller disconnects and waits for their fresh vote', async () => {
+    const chess = new ChessServer({ roomFactory: code => new ChessRoom(code, { mode: 'pvp',
+      initialFen: '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1' }) });
+    chessServer = chess;
+    const settle: Array<() => void> = [];
+    chess.setPvpRematchSpeechBarrier(() => new Promise<void>(resolve => settle.push(resolve)));
+    chess.voiceJoin('DUEL', 'Ada', 'CA-white', 'en-US');
+    chess.voiceJoin('DUEL', 'Ben', 'CA-black', 'en-US');
+    chess.voiceBeginWelcome('DUEL', 'CA-white')(true);
+    chess.voiceBeginWelcome('DUEL', 'CA-black')(true);
+    chess.voiceCommand('DUEL', 'CA-white', 'queen to G7', 'en-US');
+    chess.voiceCommand('DUEL', 'CA-white', 'confirm', 'en-US');
+    const finishedGameId = chess.findRoom('DUEL')!.state().gameId;
+
+    chess.voiceRequestPvpRematch('DUEL', 'CA-white');
+    chess.voiceRequestPvpRematch('DUEL', 'CA-black');
+    await vi.waitFor(() => expect(settle).toHaveLength(1));
+    chess.voiceSetConnected('DUEL', 'CA-black', false);
+    settle[0]!();
+    await Promise.resolve();
+    expect(chess.snapshot('DUEL')).toMatchObject({ gameId: finishedGameId,
+      phase: 'finished', rematchReadyPlayerIds: ['c1'], rematchWaitingForPhone: false });
+
+    chess.voiceJoin('DUEL', 'Ben', 'CA-black', 'en-US');
+    expect(chess.voiceRequestPvpRematch('DUEL', 'CA-black')).toBe('ready');
+    await vi.waitFor(() => expect(settle).toHaveLength(2));
+    expect(chess.findRoom('DUEL')!.state().gameId).toBe(finishedGameId);
+    settle[1]!();
+    await vi.waitFor(() => expect(chess.findRoom('DUEL')!.state().gameId).toBe(finishedGameId + 1));
+  });
+
+  it('lets an unnamed standalone solo caller play immediately while preserving the optional name flag for PvP', () => {
+    const chess = new ChessServer({ random: () => 0 });
+    chessServer = chess;
+    expect(chess.voiceJoin('SOLO', 'Wizard', 'CA-solo', 'en-US', false, undefined, false))
+      .toEqual({ playerId: 'c1', resumed: false });
+    expect(chess.findRoom('SOLO')?.state()).toMatchObject({ mode: 'solo', phase: 'playing',
+      players: [{ name: 'Wizard', nameConfirmed: true }] });
+  });
+
+  it('binds station callers to assigned White and Black seats even when Black arrives first', async () => {
+    vi.useFakeTimers();
+    const chess = new ChessServer({ random: () => 0.99, computerDelayMs: 20 });
+    chessServer = chess;
+    try {
+      expect(chess.configureMatch('DUEL', 2)).toBe(true);
+      expect(chess.findRoom('DUEL')?.state()).toMatchObject({ mode: 'pvp', ply: 0, phase: 'waiting' });
+      expect(chess.voiceJoin('DUEL', 'Ben', 'CA-black', 'en-US', true, 1)).toEqual({ playerId: 'c2', resumed: false });
+      expect(chess.voiceJoin('DUEL', 'Ada', 'CA-white', 'en-US', true, 0)).toEqual({ playerId: 'c1', resumed: false });
+      chess.voiceBeginWelcome('DUEL', 'CA-black')(true);
+      chess.voiceBeginWelcome('DUEL', 'CA-white')(true);
+      expect(chess.voiceJoin('DUEL', 'Extra', 'CA-third', 'en-US', true)).toBeNull();
+      expect(chess.findRoom('DUEL')?.state()).toMatchObject({ phase: 'playing', players: [
+        { playerId: 'c1', color: 'w', name: 'Ada', connected: true },
+        { playerId: 'c2', color: 'b', name: 'Ben', connected: true },
+      ] });
+      expect(chess.voiceLegalMoves('DUEL', 'CA-black', 'en-US')).toEqual([]);
+      expect(chess.voiceCommand('DUEL', 'CA-black', 'E7 to E5', 'en-US')?.code).toBe('not_your_turn');
+      expect(chess.voiceCommand('DUEL', 'CA-white', 'E2 to E4', 'en-US')?.code).toBe('proposed');
+      expect(chess.voiceCommand('DUEL', 'CA-black', 'confirm', 'en-US')?.code).toBe('not_your_turn');
+      expect(chess.voiceCommand('DUEL', 'CA-white', 'confirm', 'en-US')?.code).toBe('confirmed');
+      vi.advanceTimersByTime(1_000);
+      expect(chess.findRoom('DUEL')?.state()).toMatchObject({ ply: 1, turn: 'b' });
+      expect(chess.voiceLegalMoves('DUEL', 'CA-black', 'en-US'))
+        .toContainEqual(expect.objectContaining({ id: 'e7e5' }));
+      expect(chess.voiceSetConnected('DUEL', 'CA-black', false)).toBe(true);
+      expect(chess.findRoom('DUEL')?.state().phase).toBe('waiting');
+      expect(chess.voiceJoin('DUEL', 'Ben', 'CA-black', 'en-US', true, 1))
+        .toEqual({ playerId: 'c2', resumed: true });
+      chess.voiceBeginWelcome('DUEL', 'CA-black')(true);
+      expect(chess.findRoom('DUEL')?.state().phase).toBe('playing');
+      chess.voiceLeave('DUEL', 'CA-black');
+      expect(chess.findRoom('DUEL')?.state()).toMatchObject({
+        phase: 'finished', result: { reason: 'forfeit', winner: 'w' },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lets a viewing screen select two-player mode before calls and locks the mode after join', () => {
+    const chess = new ChessServer({ random: () => 0 });
+    chessServer = chess;
+    const frames: Array<Record<string, any>> = [];
+    const ws = { readyState: WebSocket.OPEN,
+      send: (text: string) => frames.push(JSON.parse(text)), terminate: () => {} };
+    const watched = { ws, roomCode: 'DUEL', locale: 'en-US', authenticatedRoomCode: null, alive: true };
+    (chess as unknown as { displays: Set<unknown> }).displays.add(watched);
+    const send = (message: Record<string, unknown>) =>
+      (chess as unknown as { onMessage: (display: unknown, raw: string) => void })
+        .onMessage(watched, JSON.stringify(message));
+    chess.getOrCreateRoom('DUEL');
+    send({ type: 'display_set_mode', roomCode: 'DUEL', mode: 'pvp' });
+    expect(chess.findRoom('DUEL')?.state()).toMatchObject({ mode: 'pvp', ply: 0 });
+    expect(chess.voiceJoin('DUEL', 'Ada', 'CA-white', 'en-US', false, undefined, false))
+      .toMatchObject({ playerId: 'c1' });
+    expect(chess.findRoom('DUEL')?.state()).toMatchObject({ phase: 'waiting', players: [
+      { name: 'Ada', nameConfirmed: false },
+    ] });
+    expect(chess.voiceConfirmName('DUEL', 'CA-white', 'Ada')).toBe(true);
+    send({ type: 'display_set_mode', roomCode: 'DUEL', mode: 'solo' });
+    expect(frames.some(frame => frame.code === 'mode_locked')).toBe(true);
+    expect(chess.findRoom('DUEL')?.state().mode).toBe('pvp');
+  });
+
+  it('locks the requested standalone mode before registering a display for phone calls', () => {
+    const chess = new ChessServer({ random: () => 0 });
+    chessServer = chess;
+    const frames: Array<Record<string, any>> = [];
+    const ws = { readyState: WebSocket.OPEN,
+      send: (value: string) => frames.push(JSON.parse(value)), terminate: () => {} };
+    const displayConnection = { ws, roomCode: null, locale: 'en-US',
+      authenticatedRoomCode: null, alive: true };
+    (chess as unknown as { displays: Set<unknown> }).displays.add(displayConnection);
+    let modeAtRegistration: string | undefined;
+    chess.setOnDisplayRegistered(() => {
+      modeAtRegistration = chess.findRoom('DUEL')?.mode;
+      chess.voiceJoin('DUEL', 'Ada', 'CA-white', 'en-US', false, undefined, false);
+    });
+
+    (chess as unknown as { onMessage: (display: unknown, raw: string) => void })
+      .onMessage(displayConnection, JSON.stringify({ type: 'spectate', roomCode: 'DUEL',
+        mode: 'pvp', locale: 'en-US' }));
+
+    expect(modeAtRegistration).toBe('pvp');
+    expect(chess.findRoom('DUEL')?.state()).toMatchObject({ mode: 'pvp',
+      phase: 'waiting', players: [{ name: 'Ada', nameConfirmed: false }] });
+    expect(frames).toContainEqual(expect.objectContaining({ type: 'chess_state', mode: 'pvp' }));
+    expect(frames.filter(frame => frame.type === 'chess_state').every(frame => frame.mode === 'pvp'))
+      .toBe(true);
+  });
+
+  it('does not register a two-player display against an already joined solo match', () => {
+    const chess = new ChessServer({ random: () => 0 });
+    chessServer = chess;
+    chess.voiceJoin('DUEL', 'Ada', 'CA-solo', 'en-US');
+    const frames: Array<Record<string, any>> = [];
+    const ws = { readyState: WebSocket.OPEN,
+      send: (value: string) => frames.push(JSON.parse(value)), terminate: () => {} };
+    const displayConnection = { ws, roomCode: null, locale: 'en-US',
+      authenticatedRoomCode: null, alive: true };
+    (chess as unknown as { displays: Set<unknown> }).displays.add(displayConnection);
+    let registered = false;
+    chess.setOnDisplayRegistered(() => { registered = true; });
+
+    (chess as unknown as { onMessage: (display: unknown, raw: string) => void })
+      .onMessage(displayConnection, JSON.stringify({ type: 'spectate', roomCode: 'DUEL',
+        mode: 'pvp' }));
+
+    expect(frames).toContainEqual(expect.objectContaining({ type: 'error', code: 'mode_locked' }));
+    expect(displayConnection.roomCode).toBeNull();
+    expect(registered).toBe(false);
+    expect(chess.findRoom('DUEL')?.mode).toBe('solo');
+  });
+
+  it('keeps a finished standalone two-caller result until the remaining caller leaves', () => {
+    const chess = new ChessServer({ random: () => 0 });
+    chessServer = chess;
+    const ws = { readyState: WebSocket.OPEN, send: () => {}, terminate: () => {} };
+    (chess as unknown as { displays: Set<unknown> }).displays.add({ ws, roomCode: 'DUEL',
+      locale: 'en-US', authenticatedRoomCode: null, alive: true });
+    chess.configureMatch('DUEL', 2);
+    chess.voiceJoin('DUEL', 'Ada', 'CA-white', 'en-US');
+    chess.voiceJoin('DUEL', 'Ben', 'CA-black', 'en-US');
+    chess.voiceLeave('DUEL', 'CA-black');
+    expect(chess.findRoom('DUEL')?.state()).toMatchObject({
+      phase: 'finished', result: { reason: 'forfeit', winner: 'w' },
+    });
+    expect(chess.voiceJoin('DUEL', 'Charlie', 'CA-third', 'en-US')).toBeNull();
+    expect(chess.findRoom('DUEL')?.state().players).toHaveLength(2);
+    chess.voiceLeave('DUEL', 'CA-white');
+    expect(chess.voiceJoin('DUEL', 'Charlie', 'CA-new', 'en-US'))
+      .toEqual({ playerId: 'c1', resumed: false });
+    expect(chess.findRoom('DUEL')?.state()).toMatchObject({
+      phase: 'waiting', ply: 0, players: [{ playerId: 'c1', name: 'Charlie' }],
+    });
+  });
+
+  it('keeps the solo caller authorized after a replay assigns the other color', () => {
+    const chess = new ChessServer({ roomFactory: code => new ChessRoom(code, {
+      humanColor: 'w', initialFen: '7k/6pp/5KQ1/8/8/8/8/8 w - - 0 1',
+      random: () => 0.99,
+    }) });
+    chessServer = chess;
+    chess.voiceJoin('SOLO', 'Ada', 'CA-solo', 'en-US');
+    chess.voiceCommand('SOLO', 'CA-solo', 'queen to G7', 'en-US');
+    chess.voiceCommand('SOLO', 'CA-solo', 'confirm', 'en-US');
+    expect(chess.findRoom('SOLO')?.state().phase).toBe('finished');
+    expect(chess.voiceRestart('SOLO', 'CA-solo')).toBe(true);
+    expect(chess.findRoom('SOLO')?.state()).toMatchObject({ humanColor: 'b', turn: 'b' });
+    expect(chess.voiceLegalMoves('SOLO', 'CA-solo', 'en-US').length).toBeGreaterThan(0);
+  });
+
   it('recognizes only a bound standalone display in its current room', async () => {
     const { port, chess } = await hostChess();
     chess.setDisplayAuthenticationRequirement(code => code === 'MAGE' || code === 'ALT');

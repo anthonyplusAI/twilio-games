@@ -12,15 +12,24 @@ export function fighterIntroStage(remaining: number): FighterIntroStage {
   return 'faceoff';
 }
 export interface FighterLobbyPlayer {
-  playerId: string; name: string; fighterId: string | null; side: 'p1' | 'p2' | null; isAi: boolean;
+  playerId: string; name: string; nameConfirmed?: boolean;
+  fighterId: string | null; side: 'p1' | 'p2' | null; isAi: boolean;
 }
 export interface FighterState {
   roomCode: string; phase: FighterPhase; players: FighterLobbyPlayer[];
   /** Solo rival chosen during arena setup so its real model can load before the fight. */
   aiFighterId: string | null;
-  selectedMap: string | null; mapVotesByPlayerId:Record<string,string>; world: FighterWorld | null;
+  selectedMap: string | null; mapVotesByPlayerId:Record<string,string>; mapVoteTied:boolean; world: FighterWorld | null;
   expectedPlayerCount: number; hasExpectedPlayers: boolean;
   automaticSetup:boolean;
+  /** Each caller confirms the current shared setup screen before it can change. */
+  advanceReadyPlayerIds:string[]; backReadyPlayerIds:string[];
+  /** Current menu audio or AI response still pending on these phone connections. */
+  phonePendingPlayerIds:string[]; phoneDisconnectedPlayerIds:string[];
+  /** Current caller input or AI interpretation has not finished. */
+  phoneTurnPendingPlayerIds:string[];
+  /** A Relay cue failed or was interrupted; this caller must hear a fresh menu cue. */
+  phoneRetryPlayerIds:string[];
   loadingGeneration: number;
   hudPresented:boolean; resultsPresented:boolean;
   intro: number | null;
@@ -29,9 +38,10 @@ export interface FighterState {
 }
 
 export type FighterClientMessage =
-  | { type: 'join'; roomCode: string; name: string; sessionId?: string; locale?: SupportedLocale }
-  | { type: 'spectate'; roomCode: string; locale?: SupportedLocale }
+  | { type: 'join'; roomCode: string; name: string; sessionId?: string; locale?: SupportedLocale; initialSeatCount?: 1 | 2 }
+  | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; initialSeatCount?: 1 | 2 }
   | { type: 'display_auth'; roomCode: string; token: string }
+  | { type: 'configure_seats'; roomCode: string; count: 1 | 2 }
   | { type: 'select_fighter'; fighterId: string }
   | { type: 'select_map'; mapId: string }
   | { type: 'display_select_fighter'; playerId: string; fighterId: string }
@@ -42,6 +52,7 @@ export type FighterClientMessage =
   | { type: 'ready'; loadingGeneration: number }
   | { type: 'retry_loading'; loadingGeneration: number }
   | { type: 'back' }
+  | { type: 'release_session'; roomCode: string; sessionId: string }
   | { type: 'leave'; sessionId?: string };
 
 export type FighterServerMessage =
@@ -51,6 +62,7 @@ export type FighterServerMessage =
   | { type: 'fighter_roster'; fighters: FighterRosterEntry[]; maps: FighterMapEntry[] }
   | ({ type: 'fighter_state' } & FighterState)
   | { type: 'fighter_events'; events: FighterEvent[] }
+  | { type: 'session_released'; roomCode: string; sessionId: string }
   | { type: 'show_results'; loadingGeneration:number }
   | { type: 'error'; code: string; message: string };
 
@@ -64,15 +76,23 @@ export function parseFighterClientMessage(raw: string): FighterClientMessage | {
     case 'join':
       if (!short(m.roomCode, 16) || !short(m.name, 40)) return error('bad_join', 'roomCode + name required');
       if (m.sessionId !== undefined && !short(m.sessionId, 128)) return error('bad_join', 'invalid sessionId');
+      if (m.initialSeatCount !== undefined && m.initialSeatCount !== 1 && m.initialSeatCount !== 2)
+        return error('bad_join', 'initialSeatCount must be one or two');
       return { type: 'join', roomCode: m.roomCode as string, name: m.name as string,
         ...(typeof m.sessionId === 'string' ? { sessionId: m.sessionId } : {}),
-        ...(isSupportedLocale(m.locale) ? { locale: m.locale } : {}) };
-    case 'spectate': return short(m.roomCode, 16)
-      ? { type: 'spectate', roomCode: m.roomCode as string, ...(isSupportedLocale(m.locale) ? { locale: m.locale } : {}) }
+        ...(isSupportedLocale(m.locale) ? { locale: m.locale } : {}),
+        ...(m.initialSeatCount !== undefined ? { initialSeatCount: m.initialSeatCount as 1 | 2 } : {}) };
+    case 'spectate': return short(m.roomCode, 16) && (m.initialSeatCount === undefined || m.initialSeatCount === 1 || m.initialSeatCount === 2)
+      ? { type: 'spectate', roomCode: m.roomCode as string, ...(isSupportedLocale(m.locale) ? { locale: m.locale } : {}),
+        ...(m.initialSeatCount !== undefined ? { initialSeatCount: m.initialSeatCount as 1 | 2 } : {}) }
       : error('bad_spectate', 'roomCode required');
     case 'display_auth':
       if (!short(m.roomCode, 16) || !short(m.token, 256)) return error('bad_display_auth', 'roomCode + token required');
       return { type: 'display_auth', roomCode: m.roomCode as string, token: m.token as string };
+    case 'configure_seats':
+      return short(m.roomCode, 16) && (m.count === 1 || m.count === 2)
+        ? { type: 'configure_seats', roomCode: m.roomCode as string, count: m.count }
+        : error('bad_configuration', 'roomCode and one or two seats required');
     case 'select_fighter': return short(m.fighterId) ? { type: 'select_fighter', fighterId: m.fighterId as string } : error('bad_select', 'fighterId required');
     case 'select_map': return short(m.mapId) ? { type: 'select_map', mapId: m.mapId as string } : error('bad_select', 'mapId required');
     case 'display_select_fighter': return short(m.playerId) && short(m.fighterId)
@@ -96,6 +116,9 @@ export function parseFighterClientMessage(raw: string): FighterClientMessage | {
         ? { type: 'retry_loading', loadingGeneration: m.loadingGeneration as number }
         : error('bad_ready', 'invalid loadingGeneration');
     case 'back': return { type: 'back' };
+    case 'release_session': return short(m.roomCode, 16) && short(m.sessionId, 128)
+      ? { type: 'release_session', roomCode: m.roomCode as string, sessionId: m.sessionId as string }
+      : error('bad_release', 'roomCode + sessionId required');
     case 'leave': return { type: 'leave', ...(typeof m.sessionId === 'string' ? { sessionId: m.sessionId } : {}) };
     default: return error('unknown_type', `unknown type ${String(m.type)}`);
   }

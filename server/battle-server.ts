@@ -12,7 +12,7 @@ import { rosterEntries } from '../shared/monster-roster';
 import type { BattleEvent, BattleAction } from '../shared/battle-world';
 import { DEFAULT_LOCALE, type SupportedLocale } from '../shared/i18n/locales';
 
-interface Conn { ws: WebSocket; roomCode?: string; playerId?: string; sessionId?: string; isAlive: boolean; locale?: SupportedLocale; display?: boolean; stationDisplay?: boolean; hostAuthorized?: boolean; }
+interface Conn { ws: WebSocket; roomCode?: string; playerId?: string; sessionId?: string; isAlive: boolean; locale?: SupportedLocale; display?: boolean; stationDisplay?: boolean; hostAuthorized?: boolean; requestedPlayerCount?: 1 | 2; }
 interface PlayerSession {
   roomCode: string;
   playerId: string;
@@ -33,6 +33,7 @@ interface BattleEventLedger {
 // it comfortably under typical idle-timeout windows.
 const HEARTBEAT_MS = 30_000;
 const PLAYER_RECONNECT_GRACE_MS = 30_000;
+const RELEASE_TOMBSTONE_MS = 60_000;
 export const BATTLE_RESULT_RECONNECT_GRACE_MS = 60_000;
 
 export class BattleServer {
@@ -40,6 +41,7 @@ export class BattleServer {
   private conns = new Set<Conn>();
   private rooms = new Map<string, BattleRoom>();
   private playerSessions = new Map<string, PlayerSession>();
+  private releasedSessions = new Map<string, number>();
   private heartbeat: ReturnType<typeof setInterval> | null = null;
   private seedCounter = 0x1234abcd;
   private readonly port: number | undefined;
@@ -166,6 +168,9 @@ export class BattleServer {
         if (!this.allowBrowserPlayer(msg.roomCode)) {
           this.send(conn, { type: 'error', code: 'station_voice_only', message: 'station_voice_only' }); return;
         }
+        if (msg.sessionId && this.wasSessionReleased(msg.sessionId)) {
+          this.send(conn, { type: 'error', code: 'session_released', message: 'session_released' }); return;
+        }
         if (conn.playerId && conn.roomCode) {
           this.send(conn, { type: 'joined', playerId: conn.playerId, roomCode: conn.roomCode });
           this.pushState(conn.roomCode);
@@ -181,8 +186,10 @@ export class BattleServer {
           }
         }
         const room = this.room(msg.roomCode);
+        const hadPlayer = room.playerCount >= 1;
         const res = room.addPlayer(msg.name);
         if ('error' in res) { this.send(conn, { type: 'error', code: res.error, message: res.error }); return; }
+        if (hadPlayer) room.expectHumanPlayers(2, false);
         this.clearResultReconnectTimer(msg.roomCode);
         conn.roomCode = msg.roomCode; conn.playerId = res.playerId; conn.sessionId = msg.sessionId;
         if (msg.sessionId) this.rememberPlayerSession(msg.sessionId, conn);
@@ -197,22 +204,46 @@ export class BattleServer {
         if (stationDisplay && (!this.displayToken || msg.displayToken !== this.displayToken)) {
           this.send(conn, { type: 'error', code: 'bad_display_auth', message: 'bad_display_auth' }); return;
         }
+        const room = this.room(msg.roomCode);
+        const leader = this.displayLeaders.get(msg.roomCode);
+        const otherLeaderActive = Boolean(leader && leader !== conn
+          && this.isDisplayLeader(leader, msg.roomCode));
+        const initialCount = msg.playerCount !== undefined && !stationDisplay && !otherLeaderActive;
+        // A rejected count must not turn this socket into an eligible phone destination.
+        if (initialCount && !room.configureDisplayPlayers(msg.playerCount!)) {
+          if (conn.roomCode) this.detachDisplay(conn);
+          this.send(conn, { type: 'error', code: 'setup_in_progress',
+            message: 'Set player count before setup advances.' });
+          return;
+        }
         conn.stationDisplay = stationDisplay;
         conn.display = true;
         conn.hostAuthorized = !stationDisplay || msg.displayToken === this.displayToken;
+        conn.requestedPlayerCount = stationDisplay ? undefined : msg.playerCount;
         if (this.displayToken && msg.displayToken === this.displayToken) this.onDisplayAuthenticated?.(conn.ws);
         const priorRoom=conn.roomCode;
         if(priorRoom&&priorRoom!==msg.roomCode&&this.displayLeaders.get(priorRoom)===conn){
           this.displayLeaders.delete(priorRoom);
           this.rooms.get(priorRoom)?.invalidateResultsPresentation();
         }
-        this.room(msg.roomCode);
         conn.roomCode = msg.roomCode;   // display / spectator: no slot
         this.clearResultReconnectTimer(msg.roomCode);
         this.designateDisplayLeader(msg.roomCode);
+        if (msg.playerCount && !initialCount) this.applyDisplayPlayerCount(conn, msg.roomCode, msg.playerCount);
         if(priorRoom&&priorRoom!==msg.roomCode){this.designateDisplayLeader(priorRoom);this.pushState(priorRoom);this.reapIfEmpty(priorRoom);}
         this.pushState(msg.roomCode);
         if(this.isDisplayLeader(conn,msg.roomCode))this.replayPendingEvents(conn,msg.roomCode);
+        break;
+      }
+      case 'configure_players': {
+        const code = conn.roomCode;
+        if (!code) { this.rejectAuthority(conn); break; }
+        if (conn.display && !conn.stationDisplay && !this.isDisplayLeader(conn, code))
+          conn.requestedPlayerCount = msg.count;
+        if (this.applyDisplayPlayerCount(conn, code, msg.count)) {
+          conn.requestedPlayerCount = msg.count;
+          this.pushState(code);
+        }
         break;
       }
       case 'select_monster':
@@ -221,6 +252,11 @@ export class BattleServer {
       case 'display_select_monster':
         this.withRoom(conn,room=>{
           if(!this.isDisplayLeader(conn,room.code)){this.rejectAuthority(conn);return;}
+          if (room.requiresIndividualSetupReady && room.isSetupReady(msg.playerId)) {
+            this.send(conn, { type:'error',code:'caller_ready_locked',
+              message:'The caller confirmed this monster. Ask them to change it on their phone.' });
+            return;
+          }
           if(!room.selectMonster(msg.playerId,msg.monsterId))
             this.send(conn,{type:'error',code:'select_rejected',message:'That monster or player is unavailable.'});
           else this.pushState(room.code);
@@ -251,6 +287,13 @@ export class BattleServer {
       case 'advance':
         this.withRoom(conn, (room) => {
           if(!conn.playerId&&!this.isDisplayLeader(conn,room.code)){this.rejectAuthority(conn);return;}
+          if (!conn.playerId && (
+            room.requiresIndividualSetupReady && (room.phase === 'lobby' || room.phase === 'monster_select')
+            || room.phase === 'results' && room.requiresCallerRematchControl
+          )) {
+            this.send(conn, { type: 'error', code: 'caller_ready_required', message: 'Each caller must confirm this menu on their own phone.' });
+            return;
+          }
           if (!this.allowBrowserPlayer(room.code) && room.phase === 'results') {
             this.send(conn, { type:'error',code:'station_requeue_required',message:'station_requeue_required' });
             return;
@@ -267,6 +310,10 @@ export class BattleServer {
       case 'back':
         this.withRoom(conn, (room) => {
           if(!conn.playerId&&!this.isDisplayLeader(conn,room.code)){this.rejectAuthority(conn);return;}
+          if (!conn.playerId && room.requiresIndividualSetupReady && room.phase === 'monster_select') {
+            this.send(conn, { type: 'error', code: 'caller_ready_required', message: 'Each caller changes only their own monster.' });
+            return;
+          }
           const owner=conn.playerId??room.lobbyPlayers().find(player=>!player.isAi)?.playerId;
           if(!room.back(owner))this.send(conn,{type:'error',code:'not_ready',message:'There is no earlier menu.'});
           else this.pushState(room.code);
@@ -283,7 +330,9 @@ export class BattleServer {
           });
         }
         if (msg.sessionId) {
+          this.rememberReleasedSession(msg.sessionId);
           this.releasePlayerSession(msg.sessionId);
+          this.send(conn, { type: 'session_released', sessionId: msg.sessionId });
         }
         if(code)this.detachDisplay(conn);
         break;
@@ -300,11 +349,38 @@ export class BattleServer {
   private designateDisplayLeader(code: string): void {
     const current = this.displayLeaders.get(code);
     if (current && this.conns.has(current) && current.ws.readyState === WebSocket.OPEN
-      && current.roomCode === code && current.display && current.hostAuthorized) return;
-    const next = [...this.conns].find(conn => conn.roomCode === code && conn.display
-      && conn.hostAuthorized && conn.ws.readyState === WebSocket.OPEN);
-    if (next) this.displayLeaders.set(code, next);
-    else this.displayLeaders.delete(code);
+      && current.roomCode === code && current.display && current.hostAuthorized) {
+      this.pushHostIdentity(code);
+      return;
+    }
+    this.displayLeaders.delete(code);
+    for (const candidate of this.conns) {
+      if (candidate.roomCode !== code || !candidate.display || !candidate.hostAuthorized
+        || candidate.ws.readyState !== WebSocket.OPEN) continue;
+      const requestedCount = candidate.requestedPlayerCount;
+      if (this.allowBrowserPlayer(code) && requestedCount !== undefined
+        && !this.rooms.get(code)?.configureDisplayPlayers(requestedCount)) {
+        // A standby with a conflicting count cannot become an eligible voice destination.
+        candidate.roomCode = undefined;
+        candidate.display = false;
+        candidate.stationDisplay = false;
+        candidate.hostAuthorized = false;
+        candidate.requestedPlayerCount = undefined;
+        this.send(candidate, { type: 'error', code: 'setup_in_progress',
+          message: 'Set player count before setup advances.' });
+        continue;
+      }
+      this.displayLeaders.set(code, candidate);
+      break;
+    }
+    this.pushHostIdentity(code);
+  }
+
+  private pushHostIdentity(code: string): void {
+    for (const conn of this.conns) if (conn.roomCode === code) {
+      this.send(conn, { type: 'host_identity', roomCode: code,
+        isHost: this.isDisplayLeader(conn, code) });
+    }
   }
 
   private isDisplayLeader(conn: Conn, code: string): boolean {
@@ -318,6 +394,7 @@ export class BattleServer {
       this.displayLeaders.delete(code);this.rooms.get(code)?.invalidateResultsPresentation();
     }
     conn.roomCode=undefined;conn.display=false;conn.stationDisplay=false;conn.hostAuthorized=false;
+    conn.requestedPlayerCount=undefined;
     this.designateDisplayLeader(code);this.pushState(code);
     const leader=this.displayLeaders.get(code);if(leader)this.replayPendingEvents(leader,code);
     this.reapIfEmpty(code);
@@ -325,6 +402,19 @@ export class BattleServer {
 
   private rejectAuthority(conn: Conn): void {
     this.send(conn, { type: 'error', code: 'forbidden', message: 'Only the active display can control this menu.' });
+  }
+
+  private applyDisplayPlayerCount(conn: Conn, code: string, count: 1 | 2): boolean {
+    if (!this.isDisplayLeader(conn, code)) { this.rejectAuthority(conn); return false; }
+    if (!this.allowBrowserPlayer(code)) {
+      this.send(conn, { type: 'error', code: 'station_managed', message: 'The station controls player count.' });
+      return false;
+    }
+    if (!this.rooms.get(code)?.configureDisplayPlayers(count)) {
+      this.send(conn, { type: 'error', code: 'setup_in_progress', message: 'Set player count before setup advances.' });
+      return false;
+    }
+    return true;
   }
 
   private ackEvent(conn: Conn, room: BattleRoom, generation: number, eventId: number): void {
@@ -395,6 +485,7 @@ export class BattleServer {
     const session = this.playerSessions.get(sessionId);
     if (!session || session.conn !== conn) return false;
     if (session.leaveTimer) clearTimeout(session.leaveTimer);
+    this.rooms.get(session.roomCode)?.clearSetupReady(session.playerId);
     session.conn = null;
     const leaveTimer = setTimeout(() => {
       const current = this.playerSessions.get(sessionId);
@@ -417,11 +508,33 @@ export class BattleServer {
     this.playerSessions.delete(sessionId);
   }
 
+  private rememberReleasedSession(sessionId: string): void {
+    const now = Date.now();
+    for (const [id, expiresAt] of this.releasedSessions) if (expiresAt <= now) this.releasedSessions.delete(id);
+    this.releasedSessions.set(sessionId, now + RELEASE_TOMBSTONE_MS);
+    if (this.releasedSessions.size > 4096) this.releasedSessions.delete(this.releasedSessions.keys().next().value!);
+  }
+
+  private wasSessionReleased(sessionId: string): boolean {
+    const expiresAt = this.releasedSessions.get(sessionId);
+    if (!expiresAt) return false;
+    if (expiresAt > Date.now()) return true;
+    this.releasedSessions.delete(sessionId);
+    return false;
+  }
+
   private releasePlayerSession(sessionId: string): void {
     const session = this.playerSessions.get(sessionId);
     if (!session) return;
     if (session.leaveTimer) clearTimeout(session.leaveTimer);
     this.playerSessions.delete(sessionId);
+    // A release may arrive on a reconnecting socket while the old socket still appears
+    // open to the server. Clear its association so a late close cannot remove a new seat.
+    if (session.conn) {
+      session.conn.playerId = undefined;
+      session.conn.sessionId = undefined;
+      if (!session.conn.display) session.conn.roomCode = undefined;
+    }
     this.rooms.get(session.roomCode)?.removePlayer(session.playerId);
     this.pushState(session.roomCode);
     this.reapIfEmpty(session.roomCode);
@@ -472,6 +585,7 @@ export class BattleServer {
     const msg: BattleServerMessage = {
       type: 'battle_state', roomCode, phase: room.phase,
       players: room.lobbyPlayers(), snapshot: room.snapshot(),
+      expectedPlayerCount: room.expectedPlayerCount,
       generation: room.generation, resultsPresented: room.resultsPresented,
       canAdvanceLobby: room.canAdvanceLobby, canStartBattle: room.canStart(),
       activeSide: room.activeSide(), activeMenu: room.activeMenu(),
@@ -485,7 +599,8 @@ export class BattleServer {
       const owner = c.playerId ?? firstHuman;
       const canRematch = this.allowBrowserPlayer(roomCode)
         && (c.playerId ? room.canStartNextRound(c.playerId)
-          : this.isDisplayLeader(c, roomCode) && !!owner && room.canStartNextRound(owner));
+          : !room.requiresCallerRematchControl && this.isDisplayLeader(c, roomCode)
+            && !!owner && room.canStartNextRound(owner));
       this.send(c, { ...msg, canRematch });
     }
     this.onRoomState?.(roomCode);
@@ -599,7 +714,29 @@ export class BattleServer {
   }
   voiceSetName(code: string, playerId: string, name: string): void {
     const room = this.rooms.get(code); if (!room) return;
-    room.setPlayerInfo(playerId,{name});room.expectHumanPlayers(Math.max(1,room.playerCount),false);this.pushState(code);
+    room.setPlayerInfo(playerId,{name});this.pushState(code);
+  }
+  voiceClearSetupReady(code: string, playerId: string): boolean {
+    const room = this.rooms.get(code); if (!room) return false;
+    const changed = room.clearSetupReady(playerId);
+    if (changed) this.pushState(code);
+    return changed;
+  }
+  voiceBeginMenuSpeech(code: string, playerId: string, phase: 'lobby' | 'monster_select' | 'results'):
+    ((delivered: boolean) => void) | null {
+    const room = this.rooms.get(code);
+    const release = room?.beginVoiceMenuSpeech(playerId, phase);
+    if (!room || !release) return null;
+    // The voice session may open its first cue during a room-state callback. Publish after that
+    // callback unwinds, so the display sees the phone wait without reentering speech generation.
+    queueMicrotask(() => { if (this.rooms.get(code) === room) this.pushState(code); });
+    return delivered => {
+      if (this.rooms.get(code) !== room) return;
+      const previousPhase = room.phase;
+      release(delivered);
+      if (room.phase !== previousPhase) this.flushEvents(room);
+      this.pushState(code);
+    };
   }
   voiceExpectHumanPlayers(code:string,count:number,activeEnginePlayerIds?:readonly string[]):void {
     const room=this.rooms.get(code);if(!room)return;
@@ -709,6 +846,7 @@ export class BattleServer {
     for (const code of this.resultReconnectTimers.keys()) this.clearResultReconnectTimer(code);
     for (const session of this.playerSessions.values()) if (session.leaveTimer) clearTimeout(session.leaveTimer);
     this.playerSessions.clear();
+    this.releasedSessions.clear();
     for (const { timer } of this.aiTimers.values()) clearTimeout(timer);
     this.aiTimers.clear();
     for (const timer of this.resultsTimers.values()) clearTimeout(timer);
@@ -724,6 +862,7 @@ export class BattleServer {
       for (const code of this.resultReconnectTimers.keys()) this.clearResultReconnectTimer(code);
       for (const session of this.playerSessions.values()) if (session.leaveTimer) clearTimeout(session.leaveTimer);
       this.playerSessions.clear();
+      this.releasedSessions.clear();
       for (const { timer } of this.aiTimers.values()) clearTimeout(timer);
       this.aiTimers.clear();
       for (const timer of this.resultsTimers.values()) clearTimeout(timer);

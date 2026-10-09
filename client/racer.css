@@ -50,10 +50,20 @@ html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); c
   overflow: hidden; border: 1px solid color-mix(in srgb, var(--player-color, var(--red)) 72%, white);
   border-left: 5px solid var(--player-color, var(--red)); border-radius: 10px;
   background: rgba(0,13,37,.82); box-shadow: 0 8px 28px rgba(0,0,0,.45); backdrop-filter: blur(8px);
+  color: #FFFFFF;
 }
 .split-player:first-child .split-player-card { top: 76px; }
-.split-player-card span { display: block; color: var(--ink-dim); font-family: var(--mono); font-size: 10px; letter-spacing: .15em; text-transform: uppercase; }
-.split-player-card strong { display: block; overflow: hidden; color: var(--ink); font-family: var(--disp); font-size: 20px; line-height: 1.1; text-overflow: ellipsis; white-space: nowrap; }
+.split-player-card > span { display: block; color: #D7E1F8; font-family: var(--mono); font-size: 10px; letter-spacing: .15em; text-transform: uppercase; }
+.split-player-card strong { display: block; overflow: hidden; color: #FFFFFF; font-family: var(--disp); font-size: 20px; line-height: 1.1; text-overflow: ellipsis; white-space: nowrap; }
+.split-stats { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.split-stat { display: flex; align-items: baseline; gap: 5px; padding: 4px 7px; border-radius: 6px;
+  background: rgba(255,255,255,.12); color: #FFFFFF; font: 700 13px var(--mono); }
+.split-stat small { color: #D7E1F8; font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
+.split-stat b { color: #FFFFFF; font: 800 14px var(--disp); }
+.split-stat.nitro.ready { background: rgba(255,210,63,.24); }
+.split-stat.nitro.ready b { color: #FFDC66; }
+.split-stat.nitro.active { background: rgba(54,209,220,.25); }
+.split-stat.nitro.active b { color: #7CF5FF; }
 
 /* ───────── Boot veil (covers scene assembly behind the immediately usable menus) ───────── */
 #veil {
@@ -231,6 +241,12 @@ html[data-theme="light"] .cl-row.cl-power :is(.cl-say,.cl-action) { color:#0E3E9
 .chip .plabel { font-size: 11px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-mute); }
 .chip .nm { font-weight: 800; font-size: 18px; }
 .chip .car { color: var(--ink-dim); font-size: 13px; }
+.chip-awaiting { border-style: dashed; background: transparent; }
+.chip .setup-status { display: inline-flex; align-items: center; min-height: 24px; padding: 3px 8px;
+  border: 1px solid var(--glass-brd-2); border-radius: 999px; color: var(--ink);
+  background: var(--glass-2); font: 700 12px var(--text); white-space: nowrap; }
+.chip .setup-status.is-ready { border-color: #27895d; background: rgba(54,224,138,.16); }
+.chip .setup-status.is-phone, .chip .setup-status.is-reconnecting { border-color: #b4851a; background: rgba(255,210,63,.18); }
 .chip-empty { color: var(--ink-mute); font-size: 16px; min-height: 60px; display: flex; align-items: center; justify-content: center; }
 @keyframes chip-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
@@ -315,6 +331,14 @@ html[data-theme="light"] .res-hero-kicker { color:#B10F23; }
 .results-screen .scr-foot { flex: none; padding: 10px 24px 0; }
 .results-screen:not(.station-result) .scr-foot { position: sticky; top: 0; z-index: 2;
   border-bottom: 1px solid var(--glass-brd); background: var(--bg-2); }
+.replay-progress { flex: none; display: flex; flex-wrap: wrap; justify-content: center; gap: 8px;
+  width: min(800px, calc(100% - 48px)); margin: 9px auto 0; }
+.replay-progress-player { flex: 1 1 220px; min-width: 0; display: flex; align-items: center;
+  justify-content: space-between; gap: 10px; padding: 8px 12px; border: 1px solid var(--glass-brd-2);
+  border-radius: 10px; background: var(--glass); font: 700 12px var(--text); }
+.replay-progress-player strong { min-width: 0; overflow-wrap: anywhere; color: var(--ink); }
+.replay-progress-player span { color: var(--ink-dim); text-align: right; }
+.replay-progress-player.is-ready { border-color: var(--green); }
 .results-wrap { flex: 1; display: flex; gap: 30px; max-width: 1200px; width: 100%; margin: 0 auto;
   justify-content: center; align-items: center; padding: 14px 26px; }
 .results-screen .results-wrap { flex: 1 0 auto; align-items: flex-start; padding-top: 12px; }
@@ -499,6 +523,7 @@ body.in-menu #hud, body.in-menu #hint, body.in-menu #ticker, body.in-menu #gauge
   .results-screen .scr-head { order: 0; }
   .results-screen .res-hero { order: 1; }
   .results-screen .scr-foot { order: 2; }
+  .results-screen .replay-progress { order: 3; width: calc(100% - 20px); }
   .results-screen .res-list { order: 3; flex: none; width: calc(100% - 20px); margin: 12px auto 0; }
   .results-screen .racer-result-tech { order: 4; margin-top: 12px; }
   .results-screen .board { order: 5; width: calc(100% - 20px); margin: 12px auto 24px; }
@@ -516,6 +541,8 @@ body.in-menu #hud, body.in-menu #hint, body.in-menu #ticker, body.in-menu #gauge
   .split-player-card { left: 10px; max-width: 70vw; padding: 6px 10px; }
   .split-player:first-child .split-player-card { top: 66px; }
   .split-player-card strong { font-size: 16px; }
+  .split-stat { font-size: 11px; }
+  .split-stat b { font-size: 12px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .results-screen .res-row, .results-screen .scr-title { animation: none; }

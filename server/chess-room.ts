@@ -4,11 +4,12 @@ import { DEFAULT_LOCALE, type SupportedLocale } from '../shared/i18n/locales';
 import { normalizeForMatching } from '../shared/i18n/translate';
 import type {
   ChessColor, ChessCommandResult, ChessEvent, ChessFeedback, ChessFeedbackCode,
-  ChessHint, ChessMovePreview, ChessMoveRecord, ChessPendingMove, ChessPieceType,
+  ChessHint, ChessMode, ChessMovePreview, ChessMoveRecord, ChessPendingMove, ChessPieceType, ChessPlayerSeat,
   ChessResult, ChessSelection, ChessSquare, ChessState, ChessFile,
 } from '../shared/chess-protocol';
 
 export interface ChessRoomOptions {
+  mode?: ChessMode;
   random?: () => number;
   /** Optional legal position for a match or a focused rules test. Reset starts standard chess. */
   initialFen?: string;
@@ -51,6 +52,14 @@ export class ChessRoom {
   private readonly aiDepth: number;
   private readonly aiNodeBudget: number;
   private readonly aiTimeBudgetMs: number;
+  private modeValue: ChessMode;
+  private readonly seatsValue: Record<ChessColor, ChessPlayerSeat | null> = { w: null, b: null };
+  private readonly welcomeReady: Record<ChessColor, boolean> = { w: true, b: true };
+  private readonly welcomeNeedsRetry: Record<ChessColor, boolean> = { w: false, b: false };
+  private readonly waitingTurnNeedsRetry: Record<ChessColor, boolean> = { w: false, b: false };
+  private readonly waitingPhoneTurns: Record<ChessColor, Set<symbol>> = { w: new Set(), b: new Set() };
+  private pvpEverReady = false;
+  private readonly pvpHintsRemaining: Record<ChessColor, number> = { w: MAX_HINTS, b: MAX_HINTS };
   private humanColorValue: ChessColor;
   private playerConnectedValue = false;
   private gameIdValue = 1;
@@ -67,26 +76,185 @@ export class ChessRoom {
   private events: ChessEvent[] = [];
 
   constructor(readonly code: string, options: ChessRoomOptions = {}) {
+    this.modeValue = options.mode ?? 'solo';
     this.random = options.random ?? Math.random;
     this.aiDepth = boundedInteger(options.aiDepth, 2, 1, 4);
     this.aiNodeBudget = boundedInteger(options.aiNodeBudget, 2_500, 100, 20_000);
     this.aiTimeBudgetMs = boundedInteger(options.aiTimeBudgetMs, 800, 20, 1_000);
-    this.humanColorValue = options.humanColor ?? (this.random() < 0.5 ? 'w' : 'b');
+    this.humanColorValue = this.modeValue === 'pvp' ? 'w'
+      : options.humanColor ?? (this.random() < 0.5 ? 'w' : 'b');
     this.chess = new Chess(options.initialFen);
     this.resultValue = this.detectResult();
-    if (!this.resultValue && this.chess.turn() !== this.humanColorValue) this.commitComputerMove(true);
+    if (this.modeValue === 'solo' && !this.resultValue
+      && this.chess.turn() !== this.humanColorValue) this.commitComputerMove(true);
   }
 
   get phase(): ChessState['phase'] {
     if (this.resultValue) return 'finished';
-    if (!this.playerConnectedValue) return 'waiting';
+    if (!this.readyToPlay()) return 'waiting';
     return this.pendingValue ? 'pending' : 'playing';
   }
+  get mode(): ChessMode { return this.modeValue; }
   get humanColor(): ChessColor { return this.humanColorValue; }
-  get playerConnected(): boolean { return this.playerConnectedValue; }
+  get playerConnected(): boolean { return this.readyToPlay(); }
 
-  legalVoiceMoves(locale: SupportedLocale = DEFAULT_LOCALE): ChessVoiceMoveChoice[] {
-    if (!this.playerConnectedValue || this.resultValue || this.chess.turn() !== this.humanColorValue) return [];
+  /** Select a match format before a caller is seated. The host enforces that boundary. */
+  configureMode(mode: ChessMode): ChessState {
+    if (this.modeValue === mode) return this.state();
+    this.modeValue = mode;
+    this.seatsValue.w = null;
+    this.seatsValue.b = null;
+    this.welcomeReady.w = mode !== 'pvp';
+    this.welcomeReady.b = mode !== 'pvp';
+    this.welcomeNeedsRetry.w = false;
+    this.welcomeNeedsRetry.b = false;
+    this.waitingTurnNeedsRetry.w = false;
+    this.waitingTurnNeedsRetry.b = false;
+    this.waitingPhoneTurns.w.clear();
+    this.waitingPhoneTurns.b.clear();
+    this.playerConnectedValue = false;
+    this.pvpEverReady = false;
+    this.events = [];
+    return this.reset();
+  }
+
+  private readyToPlay(): boolean {
+    if (this.modeValue === 'pvp') return Boolean(this.seatsValue.w?.connected
+      && this.seatsValue.w.nameConfirmed && this.welcomeReady.w
+      && !this.waitingPhoneTurns.w.size && !this.waitingTurnNeedsRetry.w
+      && this.seatsValue.b?.connected && this.seatsValue.b.nameConfirmed && this.welcomeReady.b
+      && !this.waitingPhoneTurns.b.size && !this.waitingTurnNeedsRetry.b);
+    const seat = this.seatsValue[this.humanColorValue];
+    return this.playerConnectedValue && (!seat || seat.nameConfirmed);
+  }
+
+  setPlayerSeat(color: ChessColor, playerId: string, name: string, connected: boolean,
+    nameConfirmed: boolean, welcomeReady = true): void {
+    this.seatsValue[color] = { color, playerId, name, connected, nameConfirmed };
+    this.waitingPhoneTurns[color].clear();
+    this.welcomeReady[color] = welcomeReady;
+    this.welcomeNeedsRetry[color] = false;
+    this.waitingTurnNeedsRetry[color] = false;
+    if (this.modeValue === 'solo' && color === this.humanColorValue) this.playerConnectedValue = connected;
+    if (this.readyToPlay() && this.modeValue === 'pvp') this.pvpEverReady = true;
+  }
+
+  confirmPlayerName(color: ChessColor, name: string): boolean {
+    const seat = this.seatsValue[color];
+    const trimmed = name.trim().slice(0, 40);
+    if (!seat || !trimmed) return false;
+    seat.name = trimmed;
+    seat.nameConfirmed = true;
+    if (this.readyToPlay() && this.modeValue === 'pvp') this.pvpEverReady = true;
+    return true;
+  }
+
+  setPlayerSeatConnected(color: ChessColor, connected: boolean): void {
+    const seat = this.seatsValue[color];
+    if (!seat || seat.connected === connected) return;
+    seat.connected = connected;
+    if (!connected && this.modeValue === 'pvp') {
+      this.welcomeReady[color] = false;
+      this.welcomeNeedsRetry[color] = false;
+      this.waitingTurnNeedsRetry[color] = false;
+      this.waitingPhoneTurns[color].clear();
+    }
+    if (this.modeValue === 'solo' && color === this.humanColorValue) this.playerConnectedValue = connected;
+    if (!connected) {
+      this.pendingValue = null;
+      this.clearSelection();
+    }
+    if (this.readyToPlay() && this.modeValue === 'pvp') this.pvpEverReady = true;
+  }
+
+  /** A replacement phone session must finish its own cue before play resumes. */
+  setPlayerWelcomePending(color: ChessColor): boolean {
+    if (this.modeValue !== 'pvp' || !this.seatsValue[color]) return false;
+    const changed = this.welcomeReady[color] || this.welcomeNeedsRetry[color]
+      || this.waitingTurnNeedsRetry[color];
+    this.welcomeReady[color] = false;
+    this.welcomeNeedsRetry[color] = false;
+    this.waitingTurnNeedsRetry[color] = false;
+    return changed;
+  }
+
+  clearWaitingPhoneTurns(color: ChessColor): void {
+    this.waitingPhoneTurns[color].clear();
+  }
+
+  /** Include an in-flight waiting-room question and its spoken reply in the start gate. */
+  beginWaitingPhoneTurn(color: ChessColor): (() => boolean) | null {
+    if (this.modeValue !== 'pvp' || this.phase !== 'waiting' || !this.seatsValue[color]?.connected) return null;
+    const token = Symbol('waiting phone turn');
+    this.waitingPhoneTurns[color].add(token);
+    return () => {
+      if (!this.waitingPhoneTurns[color].delete(token)) return false;
+      if (this.readyToPlay()) this.pvpEverReady = true;
+      return true;
+    };
+  }
+
+  markPlayerWelcomeReady(color: ChessColor): boolean {
+    const seat = this.seatsValue[color];
+    if (this.modeValue !== 'pvp' || !seat?.connected || !seat.nameConfirmed
+      || this.welcomeReady[color]) return false;
+    this.welcomeReady[color] = true;
+    this.welcomeNeedsRetry[color] = false;
+    if (this.readyToPlay()) this.pvpEverReady = true;
+    return true;
+  }
+
+  /** A failed Relay cue cannot count as guidance heard by this caller. */
+  markPlayerWelcomeFailed(color: ChessColor): boolean {
+    const seat = this.seatsValue[color];
+    if (this.modeValue !== 'pvp' || !seat?.connected || !seat.nameConfirmed
+      || this.welcomeReady[color] || this.welcomeNeedsRetry[color]) return false;
+    this.welcomeNeedsRetry[color] = true;
+    return true;
+  }
+
+  markWaitingPhoneTurnFailed(color: ChessColor): boolean {
+    const seat = this.seatsValue[color];
+    if (this.modeValue !== 'pvp' || this.phase !== 'waiting'
+      || !seat?.connected || !seat.nameConfirmed
+      || this.waitingTurnNeedsRetry[color]) return false;
+    this.waitingTurnNeedsRetry[color] = true;
+    return true;
+  }
+
+  markWaitingPhoneTurnRecovered(color: ChessColor): boolean {
+    if (!this.waitingTurnNeedsRetry[color]) return false;
+    this.waitingTurnNeedsRetry[color] = false;
+    if (this.readyToPlay()) this.pvpEverReady = true;
+    return true;
+  }
+
+  removePlayerSeat(color: ChessColor, retireNoShow = false): void {
+    const seat = this.seatsValue[color];
+    if (!seat) return;
+    seat.connected = false;
+    this.welcomeNeedsRetry[color] = false;
+    this.waitingTurnNeedsRetry[color] = false;
+    this.waitingPhoneTurns[color].clear();
+    this.pendingValue = null;
+    this.clearSelection();
+    if (this.modeValue === 'solo') {
+      this.playerConnectedValue = false;
+      this.seatsValue[color] = null;
+      return;
+    }
+    const opponent = this.seatsValue[opposite(color)];
+    if (!this.resultValue && opponent && (this.pvpEverReady || (opponent.connected && !retireNoShow))) {
+      this.resultValue = { reason: 'forfeit', winner: opposite(color) };
+      this.events.push({ type: 'result', result: { ...this.resultValue } });
+    } else if (!this.pvpEverReady) {
+      this.seatsValue[color] = null;
+    }
+  }
+
+  legalVoiceMoves(locale: SupportedLocale = DEFAULT_LOCALE,
+    actingColor: ChessColor = this.humanColorValue): ChessVoiceMoveChoice[] {
+    if (!this.readyToPlay() || this.resultValue || this.chess.turn() !== actingColor) return [];
     const names: Record<ChessPieceType, string> = locale === 'pt-BR'
       ? { p: 'peão', n: 'cavalo', b: 'bispo', r: 'torre', q: 'dama', k: 'rei' }
       : { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen', k: 'king' };
@@ -104,11 +272,27 @@ export class ChessRoom {
   }
 
   state(): ChessState {
+    const players = [this.seatsValue.w, this.seatsValue.b]
+      .filter((seat): seat is ChessPlayerSeat => seat !== null).map(seat => ({ ...seat }));
     return {
       roomCode: this.code,
       gameId: this.gameIdValue,
       phase: this.phase,
-      playerConnected: this.playerConnectedValue,
+      playerConnected: this.readyToPlay(),
+      mode: this.modeValue,
+      players,
+      phonePendingPlayerIds: this.modeValue === 'pvp'
+        ? players.filter(seat => seat.connected && seat.nameConfirmed
+          && (!this.welcomeReady[seat.color] || this.waitingPhoneTurns[seat.color].size > 0
+            || this.waitingTurnNeedsRetry[seat.color]))
+          .map(seat => seat.playerId) : undefined,
+      phoneTurnPendingPlayerIds: this.modeValue === 'pvp'
+        ? players.filter(seat => this.waitingPhoneTurns[seat.color].size > 0)
+          .map(seat => seat.playerId) : undefined,
+      phoneRetryPlayerIds: this.modeValue === 'pvp'
+        ? players.filter(seat => seat.connected && seat.nameConfirmed
+          && (this.welcomeNeedsRetry[seat.color] || this.waitingTurnNeedsRetry[seat.color]))
+          .map(seat => seat.playerId) : undefined,
       humanColor: this.humanColorValue,
       computerColor: opposite(this.humanColorValue),
       turn: this.chess.turn(),
@@ -120,7 +304,9 @@ export class ChessRoom {
       ply: this.plyValue,
       selection: this.selectionValue ? { ...this.selectionValue } : null,
       pendingMove: this.pendingValue ? { ...this.pendingValue } : null,
-      hintsRemaining: this.hintsRemainingValue,
+      hintsRemaining: this.modeValue === 'pvp'
+        ? this.pvpHintsRemaining[this.chess.turn()] : this.hintsRemainingValue,
+      hintsRemainingByColor: this.modeValue === 'pvp' ? { ...this.pvpHintsRemaining } : undefined,
       hint: this.hintValue ? { ...this.hintValue } : null,
       lastMove: this.lastMoveValue ? { ...this.lastMoveValue } : null,
       result: this.resultValue ? { ...this.resultValue } : null,
@@ -144,12 +330,23 @@ export class ChessRoom {
     }
   }
 
-  handleVoiceCommand(text: string, locale: SupportedLocale = DEFAULT_LOCALE): ChessCommandResult {
+  handleVoiceCommand(text: string, locale: SupportedLocale = DEFAULT_LOCALE,
+    actingColor: ChessColor = this.humanColorValue): ChessCommandResult {
     const intent = parseChessIntent(text, locale);
-    if (!this.playerConnectedValue) {
-      return this.respond('waiting', inLanguage(locale, 'Waiting for the player to connect.', 'Aguardando o jogador se conectar.'));
+    if (this.modeValue === 'pvp' && this.resultValue) {
+      return this.respond('finished', inLanguage(locale,
+        'The match is over. Both connected callers can say play again. If a call ended, start a new two-player match.',
+        'A partida terminou. Os dois jogadores conectados podem dizer jogar de novo. Se uma chamada terminou, iniciem uma nova partida para dois jogadores.'));
+    }
+    if (!this.readyToPlay()) {
+      return this.respond('waiting', inLanguage(locale,
+        this.modeValue === 'pvp' ? 'Waiting for both players to connect and confirm their names.' : 'Waiting for the player to connect.',
+        this.modeValue === 'pvp' ? 'Aguardando os dois jogadores se conectarem e confirmarem seus nomes.' : 'Aguardando o jogador se conectar.'));
     }
     if (intent.kind === 'reset') {
+      if (this.modeValue === 'pvp') return this.respond('illegal', inLanguage(locale,
+          'Finish this match before starting another.',
+          'Terminem esta partida antes de começar outra.'));
       if (!this.resultValue) return this.respond('illegal', inLanguage(locale, 'Finish this game before starting another.', 'Termine esta partida antes de começar outra.'));
       this.reset();
       return this.respond('reset', inLanguage(locale, 'A new enchanted match begins.', 'Uma nova partida encantada começa.'));
@@ -158,12 +355,12 @@ export class ChessRoom {
       return this.respond('finished', inLanguage(locale, 'The match is over. Say play again for a new game.', 'A partida acabou. Diga jogar de novo para começar outra.'));
     }
     switch (intent.kind) {
-      case 'confirm': return this.confirmMove(undefined, locale);
-      case 'cancel': return this.cancelMove(locale);
-      case 'hint': return this.requestHint(locale);
-      case 'select': return this.selectPiece(intent, locale);
-      case 'move': return this.selectSpokenSource(text, intent.query, locale)
-        ?? this.proposeQuery(intent.query, locale);
+      case 'confirm': return this.confirmMove(undefined, locale, actingColor);
+      case 'cancel': return this.cancelMove(locale, actingColor);
+      case 'hint': return this.requestHint(locale, actingColor);
+      case 'select': return this.selectPiece(intent, locale, actingColor);
+      case 'move': return this.selectSpokenSource(text, intent.query, locale, actingColor)
+        ?? this.proposeQuery(intent.query, locale, actingColor);
       case 'help': return this.respond('help', inLanguage(locale,
         'Say a piece and destination; I infer a unique legal source. If several fit, add its square or file. You can pause before the destination. Confirm or cancel my proposal. Say castle for castling, or ask for a hint. You have three hints per game.',
         'Diga a peça e o destino; encontrarei a origem legal se for única. Se houver mais de uma, diga a casa ou coluna. Você pode pausar antes do destino. Confirme ou cancele minha proposta. Diga roque, ou peça uma dica. Você tem três dicas por partida.'));
@@ -173,15 +370,17 @@ export class ChessRoom {
     }
   }
 
-  proposeMove(text: string, locale: SupportedLocale = DEFAULT_LOCALE): ChessCommandResult {
+  proposeMove(text: string, locale: SupportedLocale = DEFAULT_LOCALE,
+    actingColor: ChessColor = this.humanColorValue): ChessCommandResult {
     const intent = parseChessIntent(text, locale);
     return intent.kind === 'move'
-      ? this.proposeQuery(intent.query, locale)
+      ? this.proposeQuery(intent.query, locale, actingColor)
       : this.respond('unknown', inLanguage(locale, 'Say a piece and destination square.', 'Diga uma peça e a casa de destino.'));
   }
 
-  confirmMove(expectedRevision?: number, locale: SupportedLocale = DEFAULT_LOCALE): ChessCommandResult {
-    const guard = this.guardHumanAction(locale);
+  confirmMove(expectedRevision?: number, locale: SupportedLocale = DEFAULT_LOCALE,
+    actingColor: ChessColor = this.humanColorValue): ChessCommandResult {
+    const guard = this.guardHumanAction(locale, actingColor);
     if (guard) return guard;
     const pending = this.pendingValue;
     if (!pending) return this.respond('no_pending', inLanguage(locale, 'There is no move to confirm.', 'Não há jogada para confirmar.'));
@@ -201,8 +400,13 @@ export class ChessRoom {
     return this.respond('confirmed', describeChessMove(committed, locale));
   }
 
-  cancelMove(locale: SupportedLocale = DEFAULT_LOCALE): ChessCommandResult {
-    if (!this.playerConnectedValue) {
+  cancelMove(locale: SupportedLocale = DEFAULT_LOCALE,
+    actingColor: ChessColor = this.humanColorValue): ChessCommandResult {
+    if (this.modeValue === 'pvp') {
+      const guard = this.guardHumanAction(locale, actingColor);
+      if (guard) return guard;
+    }
+    if (!this.readyToPlay()) {
       return this.respond('waiting', inLanguage(locale, 'Waiting for the player to connect.', 'Aguardando o jogador se conectar.'));
     }
     if (!this.pendingValue && !this.selectionValue) {
@@ -213,20 +417,23 @@ export class ChessRoom {
     return this.respond('cancelled', inLanguage(locale, 'Move cancelled. The pieces stay put.', 'Jogada cancelada. As peças ficam no lugar.'));
   }
 
-  private requestHint(locale: SupportedLocale): ChessCommandResult {
-    const guard = this.guardHumanAction(locale);
+  private requestHint(locale: SupportedLocale, actingColor: ChessColor): ChessCommandResult {
+    const guard = this.guardHumanAction(locale, actingColor);
     if (guard) return guard;
     if (this.pendingValue) return this.respond('hint_unavailable', inLanguage(locale,
       'Confirm or cancel the proposed move before asking for a hint.',
       'Confirme ou cancele a jogada proposta antes de pedir uma dica.'));
     if (this.hintValue?.revision === this.revisionValue) return this.respond('hint', this.hintLine(this.hintValue, locale));
-    if (this.hintsRemainingValue === 0) return this.respond('hint_limit', inLanguage(locale,
+    const remaining = this.modeValue === 'pvp'
+      ? this.pvpHintsRemaining[actingColor] : this.hintsRemainingValue;
+    if (remaining === 0) return this.respond('hint_limit', inLanguage(locale,
       'You have used all three hints for this game. It is still your move.',
       'Você já usou as três dicas desta partida. Ainda é sua vez.'));
     const move = this.chooseHintMove();
     if (!move) return this.respond('hint_unavailable', inLanguage(locale,
       'There is no legal move to suggest right now.', 'Não há jogada legal para sugerir agora.'));
-    this.hintsRemainingValue--;
+    if (this.modeValue === 'pvp') this.pvpHintsRemaining[actingColor]--;
+    else this.hintsRemainingValue--;
     this.hintValue = { from: move.from, to: move.to, piece: move.piece, san: move.san, revision: this.revisionValue };
     return this.respond('hint', this.hintLine(this.hintValue, locale));
   }
@@ -235,7 +442,8 @@ export class ChessRoom {
     const names: Record<ChessPieceType, string> = locale === 'pt-BR'
       ? { p: 'peão', n: 'cavalo', b: 'bispo', r: 'torre', q: 'dama', k: 'rei' }
       : { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen', k: 'king' };
-    const used = MAX_HINTS - this.hintsRemainingValue;
+    const used = MAX_HINTS - (this.modeValue === 'pvp'
+      ? this.pvpHintsRemaining[this.chess.turn()] : this.hintsRemainingValue);
     const castle = hint.san === 'O-O' ? 'king' : hint.san === 'O-O-O' ? 'queen' : null;
     if (castle) return inLanguage(locale,
       `Hint ${used} of ${MAX_HINTS}: try castling ${castle === 'king' ? 'kingside' : 'queenside'}. The move is yours to choose.`,
@@ -247,31 +455,66 @@ export class ChessRoom {
 
   /** Call separately after publishing the human move. Expected revision rejects stale timers. */
   playComputerMove(expectedRevision?: number): ChessMoveRecord | null {
-    if (!this.playerConnectedValue || (expectedRevision !== undefined && expectedRevision !== this.revisionValue)) return null;
+    if (this.modeValue !== 'solo' || !this.readyToPlay()
+      || (expectedRevision !== undefined && expectedRevision !== this.revisionValue)) return null;
     return this.commitComputerMove(false);
   }
 
   /** Replay requires an explicit command; this method is also available to a trusted host. */
   reset(): ChessState {
+    const previousSoloSeat = this.modeValue === 'solo'
+      ? this.seatsValue.w ?? this.seatsValue.b : null;
     this.gameIdValue += 1;
     this.revisionValue += 1;
     this.plyValue = 0;
     this.chess = new Chess();
-    this.humanColorValue = this.random() < 0.5 ? 'w' : 'b';
+    this.humanColorValue = this.modeValue === 'pvp' ? 'w' : this.random() < 0.5 ? 'w' : 'b';
+    this.seatsValue.w = null;
+    this.seatsValue.b = null;
+    this.welcomeReady.w = this.modeValue !== 'pvp';
+    this.welcomeReady.b = this.modeValue !== 'pvp';
+    this.welcomeNeedsRetry.w = false;
+    this.welcomeNeedsRetry.b = false;
+    this.waitingTurnNeedsRetry.w = false;
+    this.waitingTurnNeedsRetry.b = false;
+    this.waitingPhoneTurns.w.clear();
+    this.waitingPhoneTurns.b.clear();
+    if (previousSoloSeat) this.seatsValue[this.humanColorValue] = {
+      ...previousSoloSeat, color: this.humanColorValue,
+    };
+    if (this.modeValue === 'pvp') {
+      this.playerConnectedValue = false;
+      this.pvpEverReady = false;
+    }
     this.selectionValue = null;
     this.pendingValue = null;
     this.hintsRemainingValue = MAX_HINTS;
+    this.pvpHintsRemaining.w = MAX_HINTS;
+    this.pvpHintsRemaining.b = MAX_HINTS;
     this.hintValue = null;
     this.lastMoveValue = null;
     this.resultValue = null;
     this.feedbackValue = null;
     this.events = [{ type: 'reset', gameId: this.gameIdValue, revision: this.revisionValue }];
-    if (this.humanColorValue === 'b') this.commitComputerMove(true);
+    if (this.modeValue === 'solo' && this.humanColorValue === 'b') this.commitComputerMove(true);
     return this.state();
   }
 
-  private selectPiece(intent: { piece?: ChessPieceType; from?: ChessSquare; fromFile?: ChessFile }, locale: SupportedLocale): ChessCommandResult {
-    const guard = this.guardHumanAction(locale);
+  /** Preserve both named calls; the next board waits for each fresh phone welcome. */
+  rematchPvp(): ChessState | null {
+    if (this.modeValue !== 'pvp' || !this.resultValue) return null;
+    const white = this.seatsValue.w, black = this.seatsValue.b;
+    if (!white?.connected || !white.nameConfirmed || !black?.connected || !black.nameConfirmed) return null;
+    const seats = [{ ...white }, { ...black }];
+    this.reset();
+    for (const seat of seats) this.setPlayerSeat(seat.color, seat.playerId, seat.name,
+      seat.connected, seat.nameConfirmed, false);
+    return this.state();
+  }
+
+  private selectPiece(intent: { piece?: ChessPieceType; from?: ChessSquare; fromFile?: ChessFile },
+    locale: SupportedLocale, actingColor: ChessColor): ChessCommandResult {
+    const guard = this.guardHumanAction(locale, actingColor);
     if (guard) return guard;
     if (intent.from && intent.fromFile && intent.from[0] !== intent.fromFile) {
       return this.respond('illegal', inLanguage(locale,
@@ -292,7 +535,7 @@ export class ChessRoom {
     }
     if (intent.from) {
       const piece = this.chess.get(intent.from);
-      if (!piece || piece.color !== this.humanColorValue || (intent.piece && intent.piece !== piece.type)) {
+      if (!piece || piece.color !== actingColor || (intent.piece && intent.piece !== piece.type)) {
         return this.respond('illegal', inLanguage(locale, 'That square has no piece of yours.', 'Essa casa não tem uma peça sua.'));
       }
       this.selectionValue = { from: intent.from, piece: piece.type };
@@ -309,18 +552,20 @@ export class ChessRoom {
   }
 
   /** A bare "pawn E2" names the pawn already on E2, not an impossible move onto itself. */
-  private selectSpokenSource(text: string, query: ChessMoveQuery, locale: SupportedLocale): ChessCommandResult | null {
+  private selectSpokenSource(text: string, query: ChessMoveQuery, locale: SupportedLocale,
+    actingColor: ChessColor): ChessCommandResult | null {
     if (!query.to || query.from || query.fromFile || query.castle !== undefined || query.captureOnly || query.promotion) return null;
     const normalized = normalizeForMatching(text, locale);
     if (/\b(?:to|toward|towards|into|onto|para|pra)\b/.test(normalized)) return null;
     const occupant = this.chess.get(query.to);
-    if (!occupant || occupant.color !== this.humanColorValue
+    if (!occupant || occupant.color !== actingColor
       || (query.piece && query.piece !== occupant.type)) return null;
-    return this.selectPiece({ from: query.to, piece: occupant.type }, locale);
+    return this.selectPiece({ from: query.to, piece: occupant.type }, locale, actingColor);
   }
 
-  private proposeQuery(query: ChessMoveQuery, locale: SupportedLocale): ChessCommandResult {
-    const guard = this.guardHumanAction(locale);
+  private proposeQuery(query: ChessMoveQuery, locale: SupportedLocale,
+    actingColor: ChessColor): ChessCommandResult {
+    const guard = this.guardHumanAction(locale, actingColor);
     if (guard) return guard;
     this.pendingValue = null;
     const replacesSelection = Boolean(query.from || query.fromFile || query.castle !== undefined
@@ -375,14 +620,14 @@ export class ChessRoom {
     return this.respond('proposed', confirmation);
   }
 
-  private guardHumanAction(locale: SupportedLocale): ChessCommandResult | null {
-    if (!this.playerConnectedValue) {
+  private guardHumanAction(locale: SupportedLocale, actingColor: ChessColor): ChessCommandResult | null {
+    if (!this.readyToPlay()) {
       return this.respond('waiting', inLanguage(locale, 'Waiting for the player to connect.', 'Aguardando o jogador se conectar.'));
     }
     if (this.resultValue) {
       return this.respond('finished', inLanguage(locale, 'The match has ended. Say play again for a new game.', 'A partida acabou. Diga jogar de novo para começar outra.'));
     }
-    if (this.chess.turn() !== this.humanColorValue) {
+    if (this.chess.turn() !== actingColor) {
       return this.respond('not_your_turn', inLanguage(locale, 'Wait for the rival to move.', 'Aguarde a jogada do rival.'));
     }
     return null;
@@ -433,7 +678,7 @@ export class ChessRoom {
   }
 
   private commitComputerMove(allowDisconnected: boolean): ChessMoveRecord | null {
-    if ((!allowDisconnected && !this.playerConnectedValue) || this.resultValue
+    if (this.modeValue !== 'solo' || (!allowDisconnected && !this.readyToPlay()) || this.resultValue
       || this.chess.turn() === this.humanColorValue) return null;
     const best = this.chooseComputerMove();
     return best ? this.commitMove(best, 'computer') : null;

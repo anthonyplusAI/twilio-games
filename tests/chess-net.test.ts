@@ -48,6 +48,55 @@ afterEach(() => {
 });
 
 describe('ChessConnection wizard scene control', () => {
+  it('chooses an explicit solo mode for a one-caller relaunch after PvP', async () => {
+    const net = await import('../client/chess/chess-net') as {
+      chessModeForLaunch?: (query: URLSearchParams, stationManaged: boolean) => 'solo' | 'pvp' | null;
+    };
+    expect(net.chessModeForLaunch?.(new URLSearchParams('players=2'), false)).toBe('pvp');
+    expect(net.chessModeForLaunch?.(new URLSearchParams('players=1'), false)).toBe('solo');
+    expect(net.chessModeForLaunch?.(new URLSearchParams(), false)).toBe('solo');
+    expect(net.chessModeForLaunch?.(new URLSearchParams('players=2'), true)).toBeNull();
+
+    const connection = new ChessConnection('ws://chess', 'ROOM', null, 'en-US', 'solo');
+    sockets[0]!.open();
+    expect(sent(sockets[0]!)).toContainEqual({ type: 'spectate', roomCode: 'ROOM',
+      locale: 'en-US', mode: 'solo' });
+    connection.close();
+  });
+
+  it('requests the chosen shared-screen Chess mode atomically on subscribe and reconnect', () => {
+    const connection = new ChessConnection('ws://chess', 'ROOM', null, 'en-US', 'pvp');
+    sockets[0]!.open();
+    expect(sent(sockets[0]!)).toEqual([
+      { type: 'spectate', roomCode: 'ROOM', locale: 'en-US', mode: 'pvp' },
+    ]);
+    sockets[0]!.disconnect();
+    vi.advanceTimersByTime(500);
+    sockets[1]!.open();
+    expect(sent(sockets[1]!)).toEqual([
+      { type: 'spectate', roomCode: 'ROOM', locale: 'en-US', mode: 'pvp' },
+    ]);
+    connection.close();
+  });
+
+  it('waits for the selected two-caller mode before showing its first board', () => {
+    const connection = new ChessConnection('ws://chess', 'ROOM', null, 'en-US', 'pvp');
+    const states: ChessState[] = [];
+    const events: unknown[] = [];
+    connection.onState(state => states.push(state));
+    connection.onEvents(items => events.push(...items));
+    sockets[0]!.open();
+    sockets[0]!.message({ ...chessState(null), mode: 'solo', ply: 1 });
+    sockets[0]!.message({ type: 'chess_events', events: [{ type: 'feedback', feedback: {
+      code: 'waiting', text: 'Old solo board', sequence: 1,
+    } }] });
+    expect(states).toEqual([]);
+    expect(events).toEqual([]);
+    sockets[0]!.message({ ...chessState(null), mode: 'pvp', phase: 'waiting', ply: 0 });
+    expect(states).toMatchObject([{ mode: 'pvp', phase: 'waiting', ply: 0 }]);
+    connection.close();
+  });
+
   it('resends the highest finished dialogue cursor after reconnect until server state confirms it', () => {
     const connection = new ChessConnection('ws://chess', 'ROOM', 'display-token', 'en-US');
     connection.reportWizardProgress(7, 1);

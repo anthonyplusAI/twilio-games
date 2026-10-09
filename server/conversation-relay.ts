@@ -51,6 +51,9 @@ export type RoomLike = {
   isWaitingForNextRound?(playerId: string): boolean;
   canAdvance?(playerId?: string): boolean;
   results?(): readonly RaceResult[];
+  registerVoicePlayer?(playerId: string): void;
+  disconnectVoicePlayer?(playerId: string): void;
+  beginMenuAudio?(playerId: string, phase: string): () => void;
 };
 
 const DTMF_TO_INTENT: Record<string, Intent> = {
@@ -117,6 +120,8 @@ export class ConversationRelayAdapter {
   private stationParticipantIndex = 0;
   private stationParticipantCount = 1;
   private active=true;
+  private readonly pendingMenuCueReleases = new Set<() => void>();
+  private menuInputHold: { phase: string; release: () => void } | null = null;
   private callSid='';
   private setupPromptPhase:string|null=null;
   private lastFinalCommand:{text:string;at:number;source:'setup'|'race'}|null=null;
@@ -139,6 +144,62 @@ export class ConversationRelayAdapter {
   /** Language selected by Conversation Relay setup; defaults to English for legacy callers. */
   get locale(): SupportedLocale { return this.commandLocale; }
 
+  /** Relay resolves a sent cue after tokensPlayed (or its bounded playback estimate). Keep this
+   * caller's menu seat pending through that playback so another caller cannot move the screen. */
+  private say(text: string, guard?: () => boolean): unknown {
+    const phase = this.roomCode ? this.deps.phaseOf?.(this.roomCode) : null;
+    const menuSpeech = phase && this.playerId && this.isSynchronizedMenuPhase(phase)
+      && (!guard || guard());
+    const release = menuSpeech ? this.room?.beginMenuAudio?.(this.playerId!, phase!) : undefined;
+    const roomCode = this.roomCode;
+    if (release && roomCode) this.deps.onSetupChanged?.(roomCode, phase!);
+    let released = false;
+    const finishCue = () => {
+      if (released) return;
+      released = true;
+      this.pendingMenuCueReleases.delete(finishCue);
+      release?.();
+      if (release && roomCode && this.active) this.deps.onSetupChanged?.(roomCode, phase!);
+    };
+    if (release) this.pendingMenuCueReleases.add(finishCue);
+    try {
+      const delivery = this.deps.say?.(text, guard);
+      if (delivery && typeof (delivery as PromiseLike<unknown>).then === 'function')
+        return Promise.resolve(delivery).then(result => {
+          if (result !== false) finishCue();
+          return result;
+        }, () => false);
+      if (delivery !== false) finishCue();
+      return delivery;
+    } catch {
+      return false;
+    }
+  }
+
+  /** User speech cancels older audio, but the menu must remain held until the new turn has
+   * installed its own reply/AI gate. Interim transcripts keep the hold through the final frame. */
+  private reserveMenuInput(): void {
+    const phase = this.roomCode ? this.deps.phaseOf?.(this.roomCode) : null;
+    if (!phase || !this.playerId || !this.isSynchronizedMenuPhase(phase)) return;
+    if (this.menuInputHold?.phase === phase) return;
+    this.finishMenuInput();
+    const release = this.room?.beginMenuAudio?.(this.playerId, phase);
+    if (!release) return;
+    this.menuInputHold = { phase, release };
+    this.deps.onSetupChanged?.(this.roomCode!, phase);
+  }
+
+  private finishMenuInput(): void {
+    const hold = this.menuInputHold;
+    this.menuInputHold = null;
+    hold?.release();
+    if (hold && this.roomCode && this.active) this.deps.onSetupChanged?.(this.roomCode, hold.phase);
+  }
+
+  private releaseInterruptedMenuCues(): void {
+    for (const release of [...this.pendingMenuCueReleases]) release();
+  }
+
   /** Called by the voice registry when THIS caller's room emits a game event. Speaks the caller-
    *  relevant lines. Key moments (countdown/go/finish) always speak; mid-race "arcade" lines
    *  (hit-streak/fell-to-last/took-lead) are THROTTLED — at most one every CHATTY_GAP ms — so spoken
@@ -155,6 +216,7 @@ export class ConversationRelayAdapter {
   private myFinishPlace: number | null = null;
   private menuSpeechRevision = 0;
   private lastMenuPrompt: { kind: 'enter_car_select' | 'enter_map_select'; at: number } | null = null;
+  private pendingMenuTurnRelease: (() => void) | null = null;
   onGameEvent(ev: GameEvent): void {
     const eventPhase = ev.kind === 'enter_car_select' || ev.kind === 'car_picked' ? 'car_select'
       : ev.kind === 'enter_map_select' || ev.kind === 'map_picked' ? 'map_select' : null;
@@ -162,10 +224,14 @@ export class ConversationRelayAdapter {
     if ((currentPhase&&currentPhase!==this.introPhase) || eventPhase!==this.introPhase) this.introExpired=true;
     const now = Date.now();
     if (ev.kind === 'car_picked' || ev.kind === 'map_picked') {
-      // A touch can revise the visible choice without changing the phase. Expire queued menu
-      // guidance before emitting its replacement; a voice-origin pick keeps its own reply alive.
-      this.menuSpeechRevision++;
-      if (!('spokenReplyPlayerId' in ev && ev.spokenReplyPlayerId === this.playerId)) this.turnEpoch++;
+      // Choices belong to separate callers. Another caller's pick must not cancel this caller's
+      // guidance or pending AI answer on the same screen. A touch for this caller supersedes old
+      // guidance and gets a fresh spoken confirmation below.
+      if (ev.playerId === undefined || ev.playerId === this.playerId) {
+        this.releaseInterruptedMenuCues();
+        this.menuSpeechRevision++;
+        if (!('spokenReplyPlayerId' in ev && ev.spokenReplyPlayerId === this.playerId)) this.turnEpoch++;
+      }
     }
     if ('spokenReplyPlayerId' in ev && ev.spokenReplyPlayerId === this.playerId) return;
     if (ev.kind === 'go' || ev.kind === 'countdown') {
@@ -185,7 +251,7 @@ export class ConversationRelayAdapter {
       const phase=ev.kind==='enter_car_select'?'car_select':'map_select';
       if(this.stationManaged&&this.roomCode&&this.playerId
         &&this.deps.setupTurnFor?.(this.roomCode,this.playerId,phase)==='waiting'){
-        this.deps.say?.(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitingForPlayers'),
+        this.say(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitingForPlayers'),
           this.phaseGuard(phase));
         return;
       }
@@ -195,7 +261,7 @@ export class ConversationRelayAdapter {
         (ev.kind==='map_picked'&&ev.playerId!==undefined&&ev.playerId!==this.playerId))){
       const phase=ev.kind==='car_picked'?'car_select':'map_select';
       if(this.deps.setupTurnFor?.(this.roomCode,this.playerId,phase)==='active'){
-        this.deps.say?.(createTranslator(this.commandLocale,RACER_MESSAGES)(
+        this.say(createTranslator(this.commandLocale,RACER_MESSAGES)(
           phase==='car_select'?'voice.helpCar':'voice.helpMap',
         ),this.phaseGuard(phase));
         return;
@@ -204,7 +270,7 @@ export class ConversationRelayAdapter {
     if (isChattyEvent(ev.kind)) {
       if (now - this.lastChattyAt < CHATTY_GAP_MS) return;   // too soon → stay quiet
       const line = lineForEvent(ev, this.playerId, this.lineSeq, this.commandLocale);
-      if (line) { this.lastChattyAt = now; this.lineSeq++; this.deps.say?.(line,this.phaseGuardAny('racing')); }
+      if (line) { this.lastChattyAt = now; this.lineSeq++; this.say(line,this.phaseGuardAny('racing')); }
       return;
     }
     if (ev.kind === 'finish' && this.playerId && ev.playerId === this.playerId) {
@@ -230,7 +296,7 @@ export class ConversationRelayAdapter {
             : ev.kind === 'countdown' ? this.phaseGuard('countdown')
               : ev.kind === 'go' ? this.phaseGuard('racing')
                 : ev.kind === 'finish' ? this.phaseGuardAny('racing','results') : undefined;
-      this.deps.say?.(line, guard);
+      this.say(line, guard);
     }
   }
 
@@ -251,7 +317,7 @@ export class ConversationRelayAdapter {
   private speakResultRecap(text: string, asOneCue = false, guard?: () => boolean): void {
     const lines = asOneCue ? [text] : text.split(/(?<=[.!?])\s+/);
     for (const line of lines.map(part => part.trim()).filter(Boolean)) {
-      this.trackResultPlayback(this.deps.say?.(line, guard ?? this.phaseGuardAny('results','finished')));
+      this.trackResultPlayback(this.say(line, guard ?? this.phaseGuardAny('results','finished')));
     }
   }
 
@@ -348,12 +414,13 @@ export class ConversationRelayAdapter {
           this.stationManaged ? this.stationParticipantIndex : undefined, nameConfirmed);
         if ('error' in res) {
           console.log(`[CR] addPlayer rejected: ${res.error} → unbound (caller cannot drive)`);
-          this.deps.say?.(createTranslator(this.commandLocale, RACER_MESSAGES)('voice.roomFull'));
+          this.say(createTranslator(this.commandLocale, RACER_MESSAGES)('voice.roomFull'));
           return;
         }
         const confirmed = room.hasConfirmedName?.(res.playerId) ?? this.deps.hasPlayerName?.(code, res.playerId);
         if(!this.authoritativeName&&resumed?.name&&confirmed===true)this.authoritativeName=resumed.name.slice(0,50);
         this.room = room; this.playerId = res.playerId; this.roomCode = code;
+        room.registerVoicePlayer?.(res.playerId);
         this.awaitingName = !nameConfirmed && confirmed === false;
         console.log(`[CR] bound caller to player ${res.playerId} lane ${res.lane} in room ${code}`);
         // Register for this room's game events + greet the caller. Send each greeting SENTENCE as its
@@ -364,7 +431,7 @@ export class ConversationRelayAdapter {
         // Relay can speak an obsolete greeting over another menu.
         if (resumed?.resumed !== true) {
           const introEpoch = this.introEpoch;
-          this.deps.say?.(greetingLines(this.commandLocale)[0]!,
+          this.say(greetingLines(this.commandLocale)[0]!,
             () => {
               const phase=this.deps.phaseOf?.(code);
               if(phase&&phase!==this.introPhase)this.introExpired=true;
@@ -373,18 +440,23 @@ export class ConversationRelayAdapter {
             });
         }
         if(this.waitingForPreviousRacers()) {
-          this.deps.say?.(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitNextRound'),
+          this.say(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitNextRound'),
             this.phaseGuard('results'));
         } else if(this.authoritativeName)this.speakNamedArrival(resumed?.resumed===true);
-        else if(resumed?.resumed===true){const text=createTranslator(this.commandLocale,RACER_MESSAGES);this.deps.say?.(text('voice.returned'),this.phaseGuard(beforeJoinPhase));if((this.deps.phaseOf?.(code)??'lobby')==='lobby')this.deps.say?.(text('voice.helpLobby'),this.phaseGuard('lobby'));else this.speakPhaseGuidance();}
+        else if(resumed?.resumed===true){const text=createTranslator(this.commandLocale,RACER_MESSAGES);this.say(text('voice.returned'),this.phaseGuard(beforeJoinPhase));if((this.deps.phaseOf?.(code)??'lobby')==='lobby')this.say(text('voice.helpLobby'),this.phaseGuard('lobby'));else this.speakPhaseGuidance();}
         else if((this.deps.phaseOf?.(code)??'lobby')==='lobby') {
           const lines=greetingLines(this.commandLocale);
-          this.deps.say?.(lines[1]!,this.phaseGuard('lobby'));
-          this.deps.say?.(lines[2]!,()=>this.phaseGuard('lobby')()&&!this.nameConfirmed());
+          this.say(lines[1]!,this.phaseGuard('lobby'));
+          this.say(lines[2]!,()=>this.phaseGuard('lobby')()&&!this.nameConfirmed());
         } else this.speakPhaseGuidance();
         break;
       }
       case 'prompt': {
+        this.reserveMenuInput();
+        this.releaseInterruptedMenuCues();
+        if (msg.last) queueMicrotask(() => this.finishMenuInput());
+        this.pendingMenuTurnRelease?.();
+        this.pendingMenuTurnRelease = null;
         this.introEpoch++;
         this.resultSpeechEpoch++;
         const requestEpoch = ++this.turnEpoch;
@@ -404,12 +476,12 @@ export class ConversationRelayAdapter {
             ?? this.deps.hasPlayerName?.(this.roomCode, this.playerId) ?? false;
           if (confirmed) this.awaitingName = false;
           const phase = this.deps.phaseOf?.(this.roomCode) ?? phaseAtFrame ?? 'lobby';
-          if (reply) this.deps.say?.(reply, this.phaseGuard(phase));
-          else this.deps.say?.(createTranslator(this.commandLocale, RACER_MESSAGES)('voice.greeting.2'), this.phaseGuard(phase));
+          if (reply) this.say(reply, this.phaseGuard(phase));
+          else this.say(createTranslator(this.commandLocale, RACER_MESSAGES)('voice.greeting.2'), this.phaseGuard(phase));
           break;
         }
         if (msg.last && this.waitingForPreviousRacers()) {
-          this.deps.say?.(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitNextRound'),
+          this.say(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitNextRound'),
             this.phaseGuardAny('results','finished'));
           break;
         }
@@ -426,7 +498,7 @@ export class ConversationRelayAdapter {
               const resultEpoch=this.resultSpeechEpoch,resultCallSid=this.callSid;
               this.speakResultRecap(answer,true,()=>this.recapDone&&this.resultSpeechEpoch===resultEpoch
                 &&this.callSid===resultCallSid);
-            }else this.deps.say?.(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitOperator'));
+            }else this.say(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitOperator'));
           }
           break;
         }
@@ -441,7 +513,7 @@ export class ConversationRelayAdapter {
               : phase === 'results' || phase === 'finished' ? 'voice.helpResults'
                 : phase === 'racing' || phase === 'countdown' ? 'voice.help'
                   : this.authoritativeName || (this.roomCode && this.playerId && this.deps.hasPlayerName?.(this.roomCode,this.playerId)) ? 'voice.helpLobbyNamed' : 'voice.helpLobby';
-          this.deps.say?.(createTranslator(this.commandLocale, RACER_MESSAGES)(key), phase ? this.phaseGuard(phase) : undefined);
+          this.say(createTranslator(this.commandLocale, RACER_MESSAGES)(key), phase ? this.phaseGuard(phase) : undefined);
           break;
         }
         const setupPhase=this.roomCode?this.deps.phaseOf?.(this.roomCode):null;
@@ -453,7 +525,7 @@ export class ConversationRelayAdapter {
           const reply=this.deps.handleSetupUtterance?.(this.roomCode,this.playerId,msg.voicePrompt,this.commandLocale)??null;
           const currentPhase=this.deps.phaseOf?.(this.roomCode)??setupPhase;
           this.lastFinalCommand={text:msg.voicePrompt.trim().toLocaleLowerCase(this.commandLocale),at:now,source:'setup'};
-          if(reply)this.deps.say?.(reply,this.phaseGuard(currentPhase));
+          if(reply)this.say(reply,this.phaseGuard(currentPhase));
           else if(this.deps.converse)this.requestConversation(msg.voicePrompt.trim(),requestEpoch,currentPhase);
           else this.speakPhaseFallback(currentPhase);
           break;
@@ -501,6 +573,11 @@ export class ConversationRelayAdapter {
         break;
       }
       case 'dtmf': {
+        this.reserveMenuInput();
+        this.releaseInterruptedMenuCues();
+        queueMicrotask(() => this.finishMenuInput());
+        this.pendingMenuTurnRelease?.();
+        this.pendingMenuTurnRelease = null;
         this.introEpoch++;
         this.resultSpeechEpoch++;
         console.log(`[CR] dtmf digit=${msg.digit}${this.playerId ? '' : ' (NOT BOUND)'}`);
@@ -515,10 +592,32 @@ export class ConversationRelayAdapter {
           }
         } else if (/^\d+$/.test(msg.digit)) {
           this.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: msg.digit, last: true }));
+        } else if (phase && this.isSynchronizedMenuPhase(phase)) {
+          // Relay has already interrupted this caller's old cue. An unsupported key still needs
+          // fresh current-screen guidance, and that replacement must hold the shared menu.
+          this.turnEpoch++;
+          if (phase === 'results' || phase === 'finished') {
+            if (this.waitingForPreviousRacers()) this.speakPhaseFallback(phase);
+            else if (this.resultRecapText) {
+              const resultEpoch = this.resultSpeechEpoch, resultCallSid = this.callSid;
+              this.speakResultRecap(this.resultRecapText, true, this.stationManaged
+                ? () => this.recapDone && this.resultSpeechEpoch === resultEpoch
+                  && this.callSid === resultCallSid
+                : this.phaseGuardAny('results', 'finished'));
+            }
+            else {
+              this.recapDone = false;
+              this.requestResultRecap();
+            }
+          } else this.speakPhaseFallback(phase);
         }
         break;
       }
       case 'interrupt': {
+        this.reserveMenuInput();
+        this.releaseInterruptedMenuCues();
+        this.pendingMenuTurnRelease?.();
+        this.pendingMenuTurnRelease = null;
         // Barge-in: the caller talked over the host. Conversation Relay already stopped the TTS on its
         // side; we bump the epoch so any in-flight conversational reply is dropped (not spoken late),
         // and clear the current utterance's fired-intents so their next words are read fresh.
@@ -541,8 +640,8 @@ export class ConversationRelayAdapter {
     if(!this.authoritativeName||!this.roomCode)return;
     const text=createTranslator(this.commandLocale,RACER_MESSAGES);
     const phase=this.deps.phaseOf?.(this.roomCode)??'lobby';
-    this.deps.say?.(text(resumed?'voice.returnedNamed':'voice.welcomeNamed',{name:this.authoritativeName}),this.phaseGuard(phase));
-    if(!resumed){this.deps.say?.(text('voice.greeting.1'),this.phaseGuard(phase));this.deps.say?.(text('voice.controlsIntro'),this.phaseGuard(phase));}
+    this.say(text(resumed?'voice.returnedNamed':'voice.welcomeNamed',{name:this.authoritativeName}),this.phaseGuard(phase));
+    if(!resumed){this.say(text('voice.greeting.1'),this.phaseGuard(phase));this.say(text('voice.controlsIntro'),this.phaseGuard(phase));}
     this.speakPhaseGuidance();
   }
 
@@ -551,9 +650,11 @@ export class ConversationRelayAdapter {
     const text=createTranslator(this.commandLocale,RACER_MESSAGES);
     const phase=this.deps.phaseOf?.(this.roomCode)??'lobby';
     if(this.waitingForPreviousRacers()){
-      this.deps.say?.(text('voice.waitNextRound'),this.phaseGuard(phase));return;
+      this.say(text('voice.waitNextRound'),this.phaseGuard(phase));return;
     }
-    if(this.stationManaged&&['results','finished'].includes(phase)){this.requestResultRecap();return;}
+    // A replacement Relay adapter missed the original race_over event. Give that caller the
+    // personal standings again before their result menu can count as heard.
+    if(['results','finished'].includes(phase)){this.requestResultRecap();return;}
     const waiting=this.stationManaged&&this.playerId&&['car_select','map_select'].includes(phase)
       &&this.deps.setupTurnFor?.(this.roomCode,this.playerId,phase)==='waiting';
     const key=waiting?'voice.waitingForPlayers'
@@ -562,12 +663,23 @@ export class ConversationRelayAdapter {
       :phase==='racing'||phase==='countdown'?'voice.help'
       :phase==='results'||phase==='finished'?(this.stationManaged?'voice.waitOperator':'voice.helpResults')
       :'voice.helpLobbyNamed';
-    this.deps.say?.(text(key), this.phaseGuard(phase));
+    this.say(text(key), this.phaseGuard(phase));
   }
 
   handleClose(preservePlayer = false): void {
     this.active=false;this.turnEpoch++;
+    // Mark the seat unavailable before settling any interrupted result or AI turn. A settled
+    // turn can trigger a rematch check, which must see the disconnected caller first.
+    if (this.playerId && preservePlayer) this.room?.disconnectVoicePlayer?.(this.playerId);
+    this.releaseInterruptedMenuCues();
+    this.finishMenuInput();
+    this.pendingMenuTurnRelease?.();
+    this.pendingMenuTurnRelease = null;
     this.deps.unregister?.(this);
+    if (this.playerId && preservePlayer) {
+      if (this.roomCode) this.deps.onSetupChanged?.(this.roomCode,
+        this.deps.phaseOf?.(this.roomCode) ?? 'lobby');
+    }
     // Prefer leaveRoom (drops the slot AND reaps an empty room); fall back to plain removePlayer.
     if (this.playerId && !preservePlayer) {
       if (this.roomCode && this.deps.leaveRoom) this.deps.leaveRoom(this.roomCode, this.playerId);
@@ -578,6 +690,10 @@ export class ConversationRelayAdapter {
 
   private isCallIntroPhase(phase:string):boolean{
     return phase==='lobby'||phase==='car_select'||phase==='map_select';
+  }
+
+  private isSynchronizedMenuPhase(phase: string): boolean {
+    return this.isCallIntroPhase(phase) || phase === 'results' || phase === 'finished';
   }
 
   private phaseGuard(expectedPhase:string):()=>boolean{
@@ -620,6 +736,20 @@ export class ConversationRelayAdapter {
     const isActiveTurn = () => epoch === this.turnEpoch && this.active;
     const isCurrent = () => isActiveTurn() && (!requestPhase || !this.deps.phaseOf
       || this.deps.phaseOf(roomCode) === requestPhase);
+    const releaseMenuTurn = requestPhase && this.isSynchronizedMenuPhase(requestPhase)
+      ? this.room?.beginMenuAudio?.(playerId, requestPhase) : undefined;
+    let menuTurnFinished = false;
+    const finishMenuTurn = () => {
+      if (!releaseMenuTurn || menuTurnFinished) return;
+      menuTurnFinished = true;
+      releaseMenuTurn();
+      if (this.pendingMenuTurnRelease === finishMenuTurn) this.pendingMenuTurnRelease = null;
+      if (this.active) this.deps.onSetupChanged?.(roomCode, requestPhase!);
+    };
+    if (releaseMenuTurn) {
+      this.pendingMenuTurnRelease = finishMenuTurn;
+      this.deps.onSetupChanged?.(roomCode, requestPhase!);
+    }
     let speech!:Promise<void>;
     speech=this.deps.converse(roomCode, playerId, text, this.commandLocale, isCurrent, readOnlyInquiry)
       .then(result => {
@@ -628,17 +758,18 @@ export class ConversationRelayAdapter {
         const reply=typeof result==='string'?result:result.text;
         const expectedPhase=typeof result==='string'?requestPhase:result.phase;
         if (expectedPhase && this.deps.phaseOf?.(roomCode) !== expectedPhase) return;
-        this.deps.say?.(reply, expectedPhase ? this.phaseGuard(expectedPhase) : undefined);
+        return Promise.resolve(this.say(reply, expectedPhase ? this.phaseGuard(expectedPhase) : undefined))
+          .then(() => undefined);
       })
       .catch(() => { if (isCurrent()) this.speakBriefContextCue(requestPhase); })
-      .finally(()=>this.pendingSpeech.delete(speech));
+      .finally(()=>{ finishMenuTurn(); this.pendingSpeech.delete(speech); });
     this.pendingSpeech.add(speech);
   }
 
   private speakPhaseFallback(phase: string | null): void {
     const text = createTranslator(this.commandLocale, RACER_MESSAGES);
     if(this.waitingForPreviousRacers()){
-      this.deps.say?.(text('voice.waitNextRound'),this.phaseGuardAny('results','finished'));
+      this.say(text('voice.waitNextRound'),this.phaseGuardAny('results','finished'));
       return;
     }
     const waiting=this.stationManaged&&this.roomCode&&this.playerId&&phase
@@ -651,12 +782,12 @@ export class ConversationRelayAdapter {
           : phase === 'racing' || phase === 'countdown' ? 'voice.help'
             : this.authoritativeName || (this.roomCode && this.playerId
               && this.deps.hasPlayerName?.(this.roomCode, this.playerId)) ? 'voice.helpLobbyNamed' : 'voice.helpLobby';
-    this.deps.say?.(text(key), phase ? this.phaseGuard(phase) : undefined);
+    this.say(text(key), phase ? this.phaseGuard(phase) : undefined);
   }
 
   private speakBriefContextCue(phase:string|null):void {
     if(this.waitingForPreviousRacers()){
-      this.deps.say?.(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitNextRound'),
+      this.say(createTranslator(this.commandLocale,RACER_MESSAGES)('voice.waitNextRound'),
         this.phaseGuardAny('results','finished'));
       return;
     }
@@ -666,7 +797,7 @@ export class ConversationRelayAdapter {
       :phase==='racing'||phase==='countdown'?'voice.briefRace'
       :phase==='results'||phase==='finished'?(this.stationManaged?'voice.waitOperator':'voice.briefResults')
       :'voice.briefLobby';
-    this.deps.say?.(text(key),phase?this.phaseGuard(phase):undefined);
+    this.say(text(key),phase?this.phaseGuard(phase):undefined);
   }
 }
 

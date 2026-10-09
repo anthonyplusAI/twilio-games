@@ -1,8 +1,14 @@
-import type { ChessEvent, ChessServerMessage, ChessState } from '../../shared/chess-protocol';
+import type { ChessEvent, ChessMode, ChessServerMessage, ChessState } from '../../shared/chess-protocol';
 import { WIZARD_CHESS_DIALOGUE } from '../../shared/wizard-chess-scene';
 import { withDisplaySession } from '../display-session';
 
 export type ChessConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'closed';
+
+/** Every standalone launch names its mode so a previous match cannot supply a stale default. */
+export function chessModeForLaunch(query: URLSearchParams, stationManaged: boolean): ChessMode | null {
+  if (stationManaged) return null;
+  return query.get('players') === '2' ? 'pvp' : 'solo';
+}
 
 export function chessWebSocketUrl(page: Location): string {
   if (page.protocol !== 'http:' && page.protocol !== 'https:') {
@@ -27,7 +33,8 @@ export class ChessConnection {
   private clockListener?: (offsetMs: number) => void;
 
   constructor(private readonly url: string, private readonly roomCode: string,
-    private readonly displayToken: string | null, private readonly locale: string) {
+    private readonly displayToken: string | null, private readonly locale: string,
+    private readonly preferredMode: ChessMode | null = null) {
     this.connect();
   }
 
@@ -76,6 +83,7 @@ export class ChessConnection {
     if (this.stopped) return;
     const generation = ++this.generation;
     const socket = this.socket = new WebSocket(withDisplaySession(this.url));
+    let preferredModeReceived = this.preferredMode === null;
     this.connectionListener?.(generation === 1 ? 'connecting' : 'reconnecting');
     socket.onopen = () => {
       if (this.stopped || generation !== this.generation) return;
@@ -90,7 +98,9 @@ export class ChessConnection {
       // WebSocket frames are ordered. Synchronize before subscribing so a
       // reconnecting display can time the scene before its first snapshot.
       synchronize();
-      socket.send(JSON.stringify({ type: 'spectate', roomCode: this.roomCode, locale: this.locale }));
+      // Commit standalone mode in the subscription itself, before the room can accept a phone call.
+      socket.send(JSON.stringify({ type: 'spectate', roomCode: this.roomCode,
+        locale: this.locale, ...(this.preferredMode ? { mode: this.preferredMode } : {}) }));
       this.sendPendingWizardSkip(socket);
       this.sendPendingWizardProgress(socket);
       if (this.clockTimer) clearInterval(this.clockTimer);
@@ -110,6 +120,9 @@ export class ChessConnection {
       if (!value || typeof value !== 'object' || !('type' in value)) return;
       const message = value as ChessServerMessage;
       if (message.type === 'chess_state' && Array.isArray(message.pieces)) {
+        // Keep a state from an older or incompatible mode off this display.
+        if (this.preferredMode && message.mode !== this.preferredMode) return;
+        preferredModeReceived = true;
         const pending = this.pendingWizardSkip;
         if (pending !== null && (message.wizardScene?.id !== pending
           || message.wizardScene.phase !== 'story')) this.pendingWizardSkip = null;
@@ -121,7 +134,8 @@ export class ChessConnection {
         }
         this.stateListener?.(message);
       }
-      else if (message.type === 'chess_events' && Array.isArray(message.events)) this.eventListener?.(message.events);
+      else if (message.type === 'chess_events' && Array.isArray(message.events)
+        && preferredModeReceived) this.eventListener?.(message.events);
       else if (message.type === 'error') this.errorListener?.(message.code, message.message);
       else if (message.type === 'clock_sync'
         && Number.isFinite(message.clientSentAtMs) && Number.isFinite(message.serverNowMs)) {

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { TriviaServer } from '../server/trivia-server';
 import {
   TRIVIA_SPEECH_MAX_ATTEMPTS,
   TRIVIA_SPEECH_RETRY_DELAY_MS,
@@ -33,7 +34,168 @@ const portugueseChoices: readonly TriviaVoiceChoice[] = [
   { id: 'vienna', text: 'Viena', aliases: ['Wien'] },
 ];
 
+function lobbyRecoverySession(say: (text: string, callNumber: number) => Promise<TriviaSpeechOutcome>) {
+  const server = new TriviaServer();
+  const code = 'LOBBY-RECOVERY';
+  server.getOrCreateRoom(code);
+  if (!server.voiceConfigureStandaloneSeats(code, 2)) throw new Error('fixed seats unavailable');
+  const other = server.voiceJoin(code, 'Grace', 2, true, 'en-US', { voiceSetup: true })!;
+  server.voiceBeginSetupSpeech(code, other, 'lobby')!(true);
+  const retryTimers: Array<{ callback: () => void; delayMs: number }> = [];
+  const spoken: string[] = [];
+  let session!: TriviaVoiceSession;
+  server.setOnRoomState(() => session?.onStateChanged());
+  session = new TriviaVoiceSession({
+    bind: (_code, name) => {
+      const playerId = server.voiceJoin(code, name, 2, true, 'en-US', { voiceSetup: true });
+      return playerId ? { playerId, resumed: false } : null;
+    },
+    leave: (_code, playerId) => server.voiceLeave(code, playerId),
+    setName: (_code, playerId, name) => server.voiceSetName(code, playerId, name),
+    voteCategory: (_code, playerId, category) => server.voiceVoteCategory(code, playerId, category),
+    advance: (_code, playerId) => server.voiceAdvance(code, playerId),
+    beginSetupSpeech: (_code, playerId, phase) => server.voiceBeginSetupSpeech(code, playerId, phase),
+    beginMenuTurn: (_code, playerId, phase) => server.voiceBeginMenuTurn(code, playerId, phase),
+    beginPromptDelivery: () => null,
+    questionPromptReady: () => false,
+    questionPromptSkipped: () => false,
+    beginAnswerCueDelivery: () => null,
+    questionAnswerCueReady: () => false,
+    questionAnswerCueSkipped: () => false,
+    beginRevealDelivery: () => null,
+    questionRevealReady: () => false,
+    queueEarlyAnswer: () => false,
+    pauseAudio: () => false,
+    retryQuestion: () => 'unavailable',
+    beginAnswerResolution: () => null,
+    finishAnswerResolution: () => false,
+    answerAt: () => false,
+    snapshot: (_code, playerId, locale) => server.voiceSnapshot(code, playerId, locale),
+    say: text => {
+      spoken.push(text);
+      return say(text, spoken.length);
+    },
+    preemptSpeech: () => {},
+    setTimer: (callback, delayMs) => {
+      const timer = { callback, delayMs };
+      retryTimers.push(timer);
+      return timer as unknown as ReturnType<typeof setTimeout>;
+    },
+    clearTimer: timer => {
+      const index = retryTimers.indexOf(timer as unknown as { callback: () => void; delayMs: number });
+      if (index >= 0) retryTimers.splice(index, 1);
+    },
+  });
+  session.setExpectedPlayers(2);
+  session.setAuthoritativeName('Ada');
+  return {
+    server, session, code, other, retryTimers, spoken,
+    setup() {
+      session.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-LOBBY',
+        customParameters: { roomCode: code, commandLocale: 'en-US' } }));
+    },
+    close() { session.handleClose(); server.stopLoopOnly(); },
+  };
+}
+
 describe('TriviaVoiceSession setup and categories', () => {
+  it('waits for a missing standalone display and retries the solo lobby when it returns', async () => {
+    const game = harness(baseState({ automaticSetup: true, awaitingDisplay: true }));
+    game.setup();
+    await game.session.whenSpeechSettled();
+    expect(game.calls.advances).toBe(0);
+    expect(game.state.phase).toBe('lobby');
+    expect(game.spoken.some(line => /game screen to connect/i.test(line.text))).toBe(true);
+
+    game.setState({ awaitingDisplay: false });
+    game.session.onStateChanged();
+    expect(game.calls.advances).toBe(1);
+    expect(game.state.phase).toBe('category_select');
+  });
+
+  it.each(['failed', 'interrupted'] as const)(
+    'replays lobby guidance after an initial %s cue so both real callers can reach categories',
+    async failedOutcome => {
+      const game = lobbyRecoverySession(async (_text, callNumber) => callNumber === 1
+        ? failedOutcome : 'played');
+      try {
+        game.setup();
+        await flushMicrotasks();
+        expect(game.server.findRoom(game.code)!.state()).toMatchObject({ phase: 'lobby', expectedPlayerCount: 2 });
+        expect(game.server.findRoom(game.code)!.state().players.some(player => player.setupStatus === 'phone')).toBe(true);
+        expect(game.retryTimers).toHaveLength(1);
+
+        game.retryTimers[0]!.callback();
+        await flushMicrotasks();
+        expect(game.server.findRoom(game.code)!.phase).toBe('category_select');
+        expect(game.spoken.filter(line => /I will ask each question/i.test(line))).toHaveLength(2);
+      } finally {
+        game.close();
+      }
+    },
+  );
+
+  it('starts a fresh lobby recovery after a caller leaves while an older recovery cue is still pending', async () => {
+    let laterLobby = false;
+    const game = lobbyRecoverySession((text, callNumber) => {
+      if (callNumber === 1) return Promise.resolve('failed');
+      if (/I will ask each question/i.test(text) && callNumber > 3 && !laterLobby) {
+        return new Promise<TriviaSpeechOutcome>(() => {});
+      }
+      if (laterLobby && /Waiting for all 2 players/i.test(text)) return Promise.resolve('failed');
+      return Promise.resolve('played');
+    });
+    try {
+      game.setup();
+      await flushMicrotasks();
+      const firstRetry = game.retryTimers.shift();
+      expect(firstRetry).toBeDefined();
+      firstRetry!.callback();
+      await flushMicrotasks();
+      const first = game.session.boundPlayerId!;
+      const room = game.server.findRoom(game.code)!;
+      expect(room.phase).toBe('lobby');
+      expect(room.setName(first, 'Ada')).toBe(true);
+      game.server.voiceBeginSetupSpeech(game.code, first, 'lobby')!(true);
+      expect(room.phase).toBe('category_select');
+
+      laterLobby = true;
+      game.server.voiceLeave(game.code, game.other);
+      await flushMicrotasks();
+      expect(room.state()).toMatchObject({ phase: 'lobby', hasExpectedPlayers: false,
+        players: [{ playerId: first, name: 'Ada', setupStatus: 'phone' }] });
+      expect(game.retryTimers).toHaveLength(1);
+    } finally {
+      game.close();
+    }
+  });
+
+  it('requires a display-cast category vote to be heard and lets the caller retry an interruption', async () => {
+    const game = harness(baseState({
+      phase: 'category_select', automaticSetup: true, expectedPlayerCount: 2, myCategoryVote: 'science',
+      categoryVoteCounts: { ...emptyVotes(), science: 2 },
+      players: [player({ setupStatus: 'phone' }), player({ playerId: 't2', name: 'Grace', setupStatus: 'ready' })],
+    }), 'en-US', { resumed: true, trackSetupSpeech: true, deferCategoryConfirmation: true });
+    game.setup();
+    expect(game.calls.setupSpeech).toEqual(['category_select']);
+    expect(game.calls.advances).toBe(0);
+    game.interrupt();
+    game.settleCategoryConfirmation('interrupted');
+    await flushMicrotasks();
+    expect(game.calls.setupSpeechSettled).toEqual([{ phase: 'category_select', completed: false }]);
+    expect(game.state.phase).toBe('category_select');
+
+    game.prompt('science');
+    expect(game.calls.setupSpeech).toEqual(['category_select', 'category_select']);
+    game.settleCategoryConfirmation('played');
+    await game.session.whenSpeechSettled();
+    expect(game.calls.setupSpeechSettled).toEqual([
+      { phase: 'category_select', completed: false },
+      { phase: 'category_select', completed: true },
+    ]);
+    expect(game.state.phase).toBe('loading');
+  });
+
   it('never asks for or captures a name after the display has left onboarding', () => {
     const unconfirmed = player({ name: 'Player', nameConfirmed: false });
     const category = harness(baseState({ phase: 'category_select', myName: 'Player',
@@ -1117,6 +1279,75 @@ describe('TriviaVoiceSession question playback and answers', () => {
     expect(result.spoken.filter(item => /Ada wins with a leaderboard score of 2,600/i.test(item.text))).toHaveLength(1);
   });
 
+  it('keeps result replay unready after interrupted recap until the caller requests it again', async () => {
+    const initial = resultState([resultPlayer('t1', 'Ada', 2_600, 2, 1)]);
+    const game = harness({ ...initial, players: [player({ setupStatus: 'phone' })] }, 'en-US', {
+      resumed: true, deferResult: true, manualTimers: true, trackSetupSpeech: true,
+    });
+    game.setup();
+    expect(game.calls.setupSpeech).toEqual(['results']);
+    game.interrupt();
+    game.settleResult('interrupted');
+    await game.session.whenSpeechSettled();
+    game.session.onStateChanged();
+    expect(game.calls.setupSpeechSettled).toEqual([{ phase: 'results', completed: false }]);
+    expect(game.spoken.filter(item => /Ada wins with a leaderboard score of 2,600/i.test(item.text))).toHaveLength(1);
+
+    game.prompt('play again');
+    expect(game.calls.setupSpeech).toEqual(['results', 'results']);
+    game.settleResult('played');
+    await game.session.whenSpeechSettled();
+    expect(game.calls.setupSpeechSettled).toEqual([
+      { phase: 'results', completed: false },
+      { phase: 'results', completed: true },
+    ]);
+    expect(game.state.players[0]?.setupStatus).toBe('ready');
+  });
+
+  it('lets a solo caller request a rematch after two failed result recaps', async () => {
+    const initial = resultState([resultPlayer('t1', 'Ada', 2_600, 2, 1)]);
+    const game = harness({ ...initial, players: [player({ setupStatus: 'phone' })] }, 'en-US', {
+      resumed: true, deferResult: true, manualTimers: true, trackSetupSpeech: true,
+    });
+    game.setup();
+    game.settleResult('failed');
+    await eventually(() => game.retryTimerCount === 1);
+    game.runNextRetryTimer();
+    game.settleResult('failed');
+    await game.session.whenSpeechSettled();
+    expect(game.calls.setupSpeech).toEqual(['results', 'results']);
+    expect(game.state.players[0]?.setupStatus).toBe('phone');
+    expect(game.retryTimerCount).toBe(0);
+
+    game.prompt('play again');
+    expect(game.calls.advances).toBe(1);
+    expect(game.state.phase).toBe('category_select');
+  });
+
+  it('requires a fresh result recap for a shared caller after two failed deliveries', async () => {
+    const initial = resultState([resultPlayer('t1', 'Ada', 2_600, 2, 1)]);
+    const game = harness({ ...initial, expectedPlayerCount: 2, automaticSetup: true,
+      players: [player({ setupStatus: 'phone' }),
+        player({ playerId: 't2', name: 'Grace', setupStatus: 'ready' })] }, 'en-US', {
+      resumed: true, deferResult: true, manualTimers: true, trackSetupSpeech: true,
+    });
+    game.setup();
+    game.settleResult('failed');
+    await eventually(() => game.retryTimerCount === 1);
+    game.runNextRetryTimer();
+    game.settleResult('failed');
+    await game.session.whenSpeechSettled();
+    expect(game.calls.setupSpeech).toEqual(['results', 'results']);
+    expect(game.state.players[0]?.setupStatus).toBe('phone');
+
+    game.prompt('play again');
+    expect(game.calls.advances).toBe(0);
+    expect(game.calls.setupSpeech).toEqual(['results', 'results', 'results']);
+    game.settleResult('played');
+    await game.session.whenSpeechSettled();
+    expect(game.state.players[0]?.setupStatus).toBe('ready');
+  });
+
   it('retries a technically failed required reading once, then pauses the unstarted clock', async () => {
     const game = harness(questionPromptState(), 'en-US', {
       alwaysFailQuestion: true,
@@ -1297,12 +1528,12 @@ describe('TriviaVoiceSession reconnect, reveal, and lifecycle', () => {
   });
 
   it.each([
-    { locale: 'en-US' as const, name: 'Ada', result: /Ada wins\. 2,600 points; 2 correct/i,
+    { locale: 'en-US' as const, name: 'Ada', result: /Ada wins\. Your leaderboard score: 2,600; 2 correct/i,
       technology: /Twilio Conversation Relay.*transcribed phone answers.*scored.*screen.*spoke results/i,
       guidance: /Check messages for coins to replay/i },
-    { locale: 'pt-BR' as const, name: 'Ana', result: /Ana venceu\. 2\.600 pontos; 2 acertos/i,
+    { locale: 'pt-BR' as const, name: 'Ana', result: /Ana venceu\. Sua pontuação no ranking: 2\.600; 2 acertos/i,
       technology: /Twilio Conversation Relay.*transcreve.*pontua.*tela.*narra/i,
-      guidance: /Veja o SMS.*moedas.*jogar de novo/i },
+      guidance: /Moedas no SMS.*Jogue de novo/i },
   ])('queues a compact $locale station result before slow Relay playback settles', async row => {
     const game = harness(resultState([
       resultPlayer('t1', row.name, 2_600, 2, 1),
@@ -1324,6 +1555,20 @@ describe('TriviaVoiceSession reconnect, reveal, and lifecycle', () => {
     await waiting;
     expect(settled).toBe(true);
     expect(game.retryTimerCount).toBe(0);
+  });
+
+  it('distinguishes the winner from a losing caller’s personal station score', async () => {
+    const state = resultState([
+      resultPlayer('t2', 'Ada', 2_600, 2, 1),
+      resultPlayer('t1', 'Grace', 1_200, 1, 2),
+    ]);
+    const game = harness({ ...state, myName: 'Grace' }, 'en-US', { resumed: true });
+    game.session.setStationManaged(true);
+    game.setup();
+    await game.session.whenSpeechSettled();
+    const announcement = game.spoken.map(line => line.text).join(' ');
+    expect(announcement).toMatch(/Ada wins\. Your leaderboard score: 1,200; 1 correct/i);
+    expect(announcement).not.toMatch(/Ada wins\. 1,200 points/i);
   });
 
   it.each([
@@ -1435,6 +1680,8 @@ interface HarnessOptions {
   resolveIntent?: (request: TriviaIntentRequest) => Promise<TriviaIntentResult>;
   retryOutcome?: 'limit' | 'unavailable';
   acceptAnswerCue?: boolean;
+  trackSetupSpeech?: boolean;
+  deferCategoryConfirmation?: boolean;
 }
 
 function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US', options: HarnessOptions = {}) {
@@ -1446,6 +1693,7 @@ function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US'
   let cueResolver: ((outcome: TriviaSpeechOutcome) => void) | null = null;
   let revealResolvers: Array<(outcome: TriviaSpeechOutcome) => void> = [];
   let resultResolvers: Array<(outcome: TriviaSpeechOutcome) => void> = [];
+  let categoryConfirmationResolver: ((outcome: TriviaSpeechOutcome) => void) | null = null;
   const retryTimers: Array<{ callback: () => void; delayMs: number }> = [];
   const retryDelays: number[] = [];
   const spoken: { text: string; isCurrent?: () => boolean }[] = [];
@@ -1466,6 +1714,8 @@ function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US'
     resolutionFinishes: [] as number[],
     leaves: 0,
     preempts: 0,
+    setupSpeech: [] as Array<'lobby' | 'category_select' | 'results'>,
+    setupSpeechSettled: [] as Array<{ phase: 'lobby' | 'category_select' | 'results'; completed: boolean }>,
   };
 
   const setState = (patch: Partial<TriviaVoiceSnapshot>) => { state = { ...state, ...patch }; };
@@ -1488,7 +1738,8 @@ function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US'
     },
   } : {};
 
-  const session = new TriviaVoiceSession({
+  let session!: TriviaVoiceSession;
+  session = new TriviaVoiceSession({
     bind: (_code, _name, _callSid, _locale, _nameConfirmed, expectedPlayers, participantIndex) => {
       calls.bindExpectedPlayers.push(expectedPlayers);
       calls.bindParticipantIndexes.push(participantIndex);
@@ -1635,9 +1886,22 @@ function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US'
       return true;
     },
     snapshot: () => state,
+    beginSetupSpeech: options.trackSetupSpeech ? (_code, _playerId, phase) => {
+      calls.setupSpeech.push(phase);
+      return completed => {
+        calls.setupSpeechSettled.push({ phase, completed: completed === true });
+        if (phase === 'category_select' || phase === 'results') {
+          updateMe({ setupStatus: completed ? 'ready' : 'phone' });
+          session.onStateChanged();
+        }
+      };
+    } : undefined,
     resolveIntent: options.resolveIntent,
     say: (text, isCurrent) => {
       spoken.push({ text, ...(isCurrent ? { isCurrent } : {}) });
+      if (options.deferCategoryConfirmation && /Science selected\./i.test(text)) {
+        return new Promise<TriviaSpeechOutcome>(resolve => { categoryConfirmationResolver = resolve; });
+      }
       if (options.deferCue && /^(?:The choices are|As opções são)/i.test(text)) {
         return new Promise<TriviaSpeechOutcome>(resolve => { cueResolver = resolve; });
       }
@@ -1650,7 +1914,7 @@ function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US'
       if (options.deferReveal && /^(?:Correct!|Incorrect\.|Time's up\.|Correto!|Incorreto\.|Tempo esgotado\.)/i.test(text)) {
         return new Promise<TriviaSpeechOutcome>(resolve => { revealResolvers.push(resolve); });
       }
-      if (options.deferResult && /wins with a leaderboard score|tie between|wins\. [\d,.]+ points|venceu\. [\d,.]+ pontos/i.test(text)) {
+      if (options.deferResult && /wins with a leaderboard score|tie between|wins\. Your leaderboard score|venceu\. Sua pontuação no ranking/i.test(text)) {
         return new Promise<TriviaSpeechOutcome>(resolve => { resultResolvers.push(resolve); });
       }
       return Promise.resolve('played' as const);
@@ -1699,6 +1963,12 @@ function harness(initial: TriviaVoiceSnapshot, locale: SupportedLocale = 'en-US'
       cueResolver = null;
       resolve(speechOutcome(outcome));
     },
+    settleCategoryConfirmation(outcome: boolean | TriviaSpeechOutcome) {
+      if (!categoryConfirmationResolver) throw new Error('category confirmation is not pending');
+      const resolve = categoryConfirmationResolver;
+      categoryConfirmationResolver = null;
+      resolve(speechOutcome(outcome));
+    },
     settleReveal(outcome: boolean | TriviaSpeechOutcome) {
       settleResolvers(revealResolvers, outcome, 'reveal');
       revealResolvers = [];
@@ -1726,6 +1996,7 @@ function baseState(overrides: Partial<TriviaVoiceSnapshot> = {}): TriviaVoiceSna
     expectedPlayerCount: 1,
     hasExpectedPlayers: true,
     automaticSetup: false,
+    awaitingDisplay: false,
     players: [player()],
     categoryVoteCounts: emptyVotes(),
     myCategoryVote: null,

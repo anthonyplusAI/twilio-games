@@ -14,6 +14,15 @@ describe('parseBattleClientMessage', () => {
       .toEqual({ type: 'spectate', roomCode: '4821', locale: 'pt-BR' });
   });
 
+  it('parses and validates an atomic display player count', () => {
+    expect(parseBattleClientMessage(JSON.stringify({ type: 'spectate', roomCode: '4821', playerCount: 2 })))
+      .toEqual({ type: 'spectate', roomCode: '4821', playerCount: 2 });
+    expect(parseBattleClientMessage(JSON.stringify({ type: 'spectate', roomCode: '4821', playerCount: 1 })))
+      .toEqual({ type: 'spectate', roomCode: '4821', playerCount: 1 });
+    expect(parseBattleClientMessage(JSON.stringify({ type: 'spectate', roomCode: '4821', playerCount: 3 })))
+      .toMatchObject({ type: 'error', code: 'bad_player_count' });
+  });
+
   it('parses and validates the optional reconnect session id', () => {
     expect(parseBattleClientMessage(JSON.stringify({ type: 'join', roomCode: '4821', name: 'Ada', sessionId: 'session-1' })))
       .toEqual({ type: 'join', roomCode: '4821', name: 'Ada', sessionId: 'session-1' });
@@ -38,6 +47,15 @@ describe('parseBattleClientMessage', () => {
       .toEqual({type:'ack_event',generation:2,eventId:4});
     expect(parseBattleClientMessage('{"type":"ack_results","generation":2}'))
       .toEqual({type:'ack_results',generation:2});
+  });
+
+  it('accepts only one- or two-caller display setup requests', () => {
+    expect(parseBattleClientMessage('{"type":"configure_players","count":2}'))
+      .toEqual({ type: 'configure_players', count: 2 });
+    expect(parseBattleClientMessage('{"type":"configure_players","count":1}'))
+      .toEqual({ type: 'configure_players', count: 1 });
+    expect(parseBattleClientMessage('{"type":"configure_players","count":3}'))
+      .toMatchObject({ type: 'error' });
   });
 
   it('parses the four turn actions (choose_action)', () => {

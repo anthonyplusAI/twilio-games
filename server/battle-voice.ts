@@ -32,6 +32,13 @@ export interface BattleVoiceSnapshot {
   myMonsterType: string | null;
   canAdvanceLobby: boolean;
   canStartBattle: boolean;
+  /** Two-caller setup advances only after each caller confirms the current menu. */
+  mySetupReady?: boolean;
+  setupPlayerCount?: number;
+  /** Live seats; may be smaller than the expected count after a caller leaves. */
+  currentCallerCount?: number;
+  /** The other caller currently in this room, which can differ from the finished duel opponent. */
+  currentOtherCallerName?: string | null;
   canRematch: boolean;
   foeName: string | null;
   foeMonsterName: string | null;
@@ -67,10 +74,14 @@ export interface BattleVoiceDeps {
   openFight(code: string, playerId: string): boolean | void;
   backMenu(code: string, playerId: string): boolean | void;
   backSetup?(code: string, playerId: string): boolean;
+  clearSetupReady?(code: string, playerId: string): boolean;
   continueResults?(code: string, playerId: string): boolean;
   chooseAction(code: string, playerId: string, action: BattleAction): boolean | void;
   advance(code: string, playerId: string): boolean;
   say(text: string, isCurrent?: () => boolean): unknown; // Relay TTS may return a playback promise
+  /** Reserve this caller's menu while Relay prepares and plays a response. */
+  beginMenuSpeech?(code: string, playerId: string, phase: 'lobby' | 'monster_select' | 'results'):
+    ((delivered: boolean) => void) | null;
   /** Schedule `fn` after `ms` (injected so tests can drive the paced-commentary clock synchronously). */
   setTimer(fn: () => void, ms: number): void;
   snapshot(code: string, playerId: string, locale?: SupportedLocale): BattleVoiceSnapshot | null;
@@ -93,6 +104,7 @@ export class BattleVoiceSession {
   private lineSeq = 0;
   private turnEpoch = 0;   // barge-in guard for in-flight LLM replies (mirrors the racer adapter)
   private pendingInterpret: AbortController | null = null;
+  private pendingInputSpeech: ((delivered: boolean) => void) | null = null;
   private lastPhase: BattleVoiceSnapshot['phase'] | null = null;
   private lastCanRematch = false;
   private commandLocale: SupportedLocale = DEFAULT_LOCALE;
@@ -107,10 +119,13 @@ export class BattleVoiceSession {
   private applyingSetupChange=false;
   private lastCanAdvanceLobby=false;
   private lastCanStartBattle=false;
+  private lastMySetupReady=false;
   private lastMyMonsterId:string|null=null;
   private lastStateScope: string | null = null;
   private lastResultsNarratedKey: string | null = null;
   private lastResultsPresentationTimedOut = false;
+  private lastCurrentCallerCount: number | null = null;
+  private lastCurrentOtherCallerName: string | null = null;
   private beatSpeechEpoch = 0;
   private pendingTerminalSpeech = new Set<Promise<void>>();
   private text: (key: MonstersMessageKey, values?: MessageValues) => string = createTranslator(DEFAULT_LOCALE, MONSTERS_MESSAGES);
@@ -130,16 +145,50 @@ export class BattleVoiceSession {
   get locale(): SupportedLocale { return this.commandLocale; }
 
   /** A Relay line can sit behind earlier TTS. Recheck the exact visible state when its turn arrives. */
-  private sayCurrent(text: string, extra?: () => boolean): void {
+  private sayCurrent(text: string, extra?: () => boolean, reserved?: ((delivered: boolean) => void) | null): void {
     const code = this.code, playerId = this.playerId, epoch = this.turnEpoch;
     const snapshot = code && playerId ? this.deps.snapshot(code, playerId, this.commandLocale) : null;
-    if (!code || !playerId || !snapshot) return;
-    const scope = JSON.stringify(snapshot);
-    this.deps.say(text, () => {
+    if (!code || !playerId || !snapshot) { reserved?.(false); return; }
+    // Setup instructions belong to this caller's current decision. The other caller can join,
+    // name, or pick a monster without making that instruction stale.
+    const setupSpeech = snapshot.phase === 'lobby' || snapshot.phase === 'monster_select';
+    const scope = setupSpeech ? this.semanticScope(snapshot) : JSON.stringify(snapshot);
+    const release = reserved ?? this.beginMenuSpeech(snapshot.phase);
+    const delivery = this.deps.say(text, () => {
       if (this.code !== code || this.playerId !== playerId || this.turnEpoch !== epoch || extra && !extra()) return false;
       const current = this.deps.snapshot(code, playerId, this.commandLocale);
-      return current !== null && JSON.stringify(current) === scope;
+      return current !== null && (setupSpeech ? this.semanticScope(current) : JSON.stringify(current)) === scope;
     });
+    this.settleMenuSpeech(delivery, release);
+  }
+
+  private beginMenuSpeech(phase: BattleVoiceSnapshot['phase']): ((delivered: boolean) => void) | null {
+    if (!this.code || !this.playerId || phase === 'battle') return null;
+    return this.deps.beginMenuSpeech?.(this.code, this.playerId, phase) ?? null;
+  }
+
+  private settleMenuSpeech(delivery: unknown, release: ((delivered: boolean) => void) | null): void {
+    if (!release) return;
+    if (!delivery || typeof (delivery as PromiseLike<unknown>).then !== 'function') {
+      release(true);
+      return;
+    }
+    void Promise.resolve(delivery as PromiseLike<unknown>).then(
+      outcome => release(outcome === 'played' || outcome === 'estimated'),
+      () => release(false),
+    );
+  }
+
+  private beginInputSpeech(): void {
+    if (this.pendingInputSpeech || !this.code || !this.playerId) return;
+    const phase = this.deps.snapshot(this.code, this.playerId, this.commandLocale)?.phase;
+    if (phase) this.pendingInputSpeech = this.beginMenuSpeech(phase);
+  }
+
+  private settleInputSpeech(delivered: boolean): void {
+    const release = this.pendingInputSpeech;
+    this.pendingInputSpeech = null;
+    release?.(delivered);
   }
 
   /** A painted beat is still true after the next animation frame. Let a short line
@@ -175,12 +224,14 @@ export class BattleVoiceSession {
   private sayCallIntro(text:string):void{
     const code=this.code,playerId=this.playerId,callSid=this.callSid,epoch=this.introEpoch;
     const phase=code&&playerId?this.deps.snapshot(code,playerId,this.commandLocale)?.phase:null;
-    this.deps.say(text,()=>{
+    const release=phase&&this.isCallIntroPhase(phase)?this.beginMenuSpeech(phase):null;
+    const delivery=this.deps.say(text,()=>{
       const current=code&&playerId?this.deps.snapshot(code,playerId,this.commandLocale):null;
       if(current&&current.phase!==phase)this.introExpired=true;
       return Boolean(code&&playerId&&current&&this.code===code&&this.playerId===playerId
         &&this.callSid===callSid&&this.introEpoch===epoch&&!this.introExpired&&current.phase===phase);
     });
+    this.settleMenuSpeech(delivery,release);
   }
 
   private isCallIntroPhase(phase:BattleVoiceSnapshot['phase']):boolean{
@@ -209,15 +260,20 @@ export class BattleVoiceSession {
           this.stationAssignment?.side,this.stationAssignment?.expectedPlayers??(this.authoritativeName?1:undefined),
           this.authoritativeName !== null);
         if (!joined) { this.deps.say(this.text('voice.roomUnavailable')); return; }
+        if (joined.resumed) this.deps.clearSetupReady?.(code, joined.playerId);
         this.code = code; this.playerId = joined.playerId; this.callSid = msg.callSid;
         this.introExpired=false;
         const current = this.deps.snapshot(code, joined.playerId, this.commandLocale);
         const snap = current&&this.authoritativeName?{...current,myName:this.authoritativeName}:current;
         if(snap&&!this.isCallIntroPhase(snap.phase))this.introExpired=true;
-        this.awaitingName = snap?.phase === 'lobby' && !this.authoritativeName && !this.nameIsConfirmed(snap);
+        this.awaitingName = (snap?.phase === 'lobby' || snap?.phase === 'monster_select')
+          && !this.authoritativeName && !this.nameIsConfirmed(snap);
         this.lastStateScope = snap ? this.semanticScope(snap) : null;
         this.lastMyMonsterId=snap?.myMonsterId??null;
+        this.lastMySetupReady=snap?.mySetupReady??false;
         this.lastResultsPresentationTimedOut=snap?.resultsPresentationTimedOut===true;
+        this.lastCurrentCallerCount=snap?.currentCallerCount??null;
+        this.lastCurrentOtherCallerName=snap?.currentOtherCallerName??null;
         this.sayCallIntro(snap?.myName
           ?this.text('voice.welcomeNamed',{name:snap.myName}):this.text('voice.greetingWelcome'));
         this.sayCallIntro(this.text('voice.greetingRelay'));
@@ -243,7 +299,7 @@ export class BattleVoiceSession {
               this.sayCurrent(this.text(snap.phase==='monster_select'?'voice.helpSelect':'voice.howTo'));
             }
           } else if (snap?.phase === 'monster_select') {
-            this.sayCurrent(this.text('voice.helpSelect'));
+            this.sayCurrent(this.text(this.awaitingName ? 'voice.askName' : 'voice.helpSelect'));
           } else if (snap?.phase === 'battle') {
             this.sayCurrent(this.text('voice.currentBattle'));
             this.sayCurrent(this.text('voice.howTo'));
@@ -258,7 +314,10 @@ export class BattleVoiceSession {
         this.cancelNarration();
         const text = msg.voicePrompt.trim();
         this.introEpoch++;
-        if (!msg.last) { this.inputSignal++;this.turnEpoch++;this.pendingInterpret?.abort(); return; }
+        if (!msg.last) {
+          this.beginInputSpeech();
+          this.inputSignal++;this.turnEpoch++;this.pendingInterpret?.abort(); return;
+        }
         if (text) {
           const normalized = normalizeForMatching(text, this.commandLocale);
           const snap = this.deps.snapshot(this.code, this.playerId, this.commandLocale);
@@ -275,15 +334,19 @@ export class BattleVoiceSession {
           const reusableTransition=this.lastFinalCommand
             ?this.isReusableTransition(normalized,this.lastFinalCommand.beforeContext,this.lastFinalCommand.afterContext):false;
           if (this.lastFinalCommand?.text === normalized && now - this.lastFinalCommand.at < repeatWindow
-            && (repeatedTransition || repeatedSameContext)&&!signaledNewUtterance&&!reusableTransition){this.speakReprompt();return;}
+            && (repeatedTransition || repeatedSameContext)&&!signaledNewUtterance&&!reusableTransition){
+            this.speakReprompt();this.settleInputSpeech(true);return;
+          }
           this.handleUtterance(text);
           const afterContext = this.finalCommandContext(this.deps.snapshot(this.code, this.playerId, this.commandLocale));
           this.lastFinalCommand = { text: normalized, beforeContext, afterContext, at: now,inputSignal:this.inputSignal };
         }else this.speakReprompt();
+        this.settleInputSpeech(true);
         break;
       }
       case 'interrupt':
         this.cancelNarration();
+        this.beginInputSpeech();
         this.introEpoch++;
         this.inputSignal++;
         this.turnEpoch++;   // caller barged in → drop any in-flight LLM reply
@@ -297,6 +360,7 @@ export class BattleVoiceSession {
         if (/^[0-9*#]$/.test(digit)) {
           this.handleUtterance(digit === '0' ? this.backCommand() : digit);
         }
+        this.settleInputSpeech(true);
         break;
       }
       case 'error':
@@ -316,8 +380,14 @@ export class BattleVoiceSession {
     const current = this.deps.snapshot(this.code!, this.playerId!, this.commandLocale);
     const snap = current&&this.authoritativeName?{...current,myName:this.authoritativeName}:current;
     if (!snap) { void this.converse(text); return; }
-    if (this.nameIsConfirmed(snap) || snap.phase !== 'lobby') this.awaitingName = false;
-    if (this.awaitingName && snap.phase === 'lobby') {
+    if (this.nameIsConfirmed(snap) || (snap.phase !== 'lobby' && snap.phase !== 'monster_select')) this.awaitingName = false;
+    if (this.awaitingName && (snap.phase === 'lobby' || snap.phase === 'monster_select')) {
+      // A late caller can enter while the other player is already on monster selection.
+      // A monster name is still a choice, never the caller's name.
+      if (snap.phase === 'monster_select' && matchNameOrNumber(text, snap.monsterNames, this.commandLocale) >= 0) {
+        this.sayCurrent(this.text('voice.askName'));
+        return;
+      }
       if (this.captureName(text, snap.phase, true)) { this.awaitingName = false; return; }
       this.sayCurrent(this.text('voice.askName'));
       return;
@@ -347,13 +417,7 @@ export class BattleVoiceSession {
         &&(snap.resultsPresented!==false||snap.resultsPresentationTimedOut===true)
         &&!snap.presentationPending&&!this.draining&&!this.evQ.length
         &&isAdvanceWord(text,this.commandLocale)){
-        if(!this.applySetupChange(()=>this.deps.advance(this.code!,this.playerId!)))
-          this.sayCurrent(this.text('voice.sharedMenuControl'));
-        else{
-          const next=this.deps.snapshot(this.code!,this.playerId!,this.commandLocale);
-          this.sayCurrent(this.text(next?.phase==='lobby'
-            ?next.myName?'voice.helpLobbyNamed':'voice.askName':'voice.rematch'));
-        }
+        if (!this.advanceRematch()) this.sayCurrent(this.text('voice.sharedMenuControl'));
         return;
       }
       if(this.deps.interpret){this.interpret(text,snap);return;}
@@ -376,22 +440,31 @@ export class BattleVoiceSession {
     // ADVANCE / REMATCH: an intent to move forward ("start"/"go"/"choose a monster"/"next"/"rematch")
     // advances the screen — so a spoken action drives the display. Deterministic (no LLM dependency).
     if (isSetupBackWord(text, this.commandLocale) && snap.phase === 'monster_select') {
-      if (!this.deps.backSetup?.(this.code!, this.playerId!)) this.sayCurrent(this.text('voice.sharedMenuControl'));
+      if (!this.applySetupChange(()=>this.deps.backSetup?.(this.code!, this.playerId!)))
+        this.sayCurrent(this.text('voice.sharedMenuControl'));
+      else {
+        const next=this.deps.snapshot(this.code!,this.playerId!,this.commandLocale);
+        this.sayCurrent(this.text(next?.phase==='monster_select'?'voice.pickCleared':'voice.helpLobbyNamed'));
+      }
       return;
     }
     if (isAdvanceWord(text, this.commandLocale)) {
       if (snap.phase === 'lobby') {
-        if (!snap.canAdvanceLobby) { this.sayCurrent(this.text('voice.helpLobbyNamed'));return; }
-        if (!this.applySetupChange(()=>this.deps.advance(this.code!,this.playerId!))) {
+        if (!snap.canAdvanceLobby && !(snap.setupPlayerCount && snap.setupPlayerCount > 1
+          && this.nameIsConfirmed(snap))) {
+          this.sayCurrent(this.text('voice.helpLobbyNamed')); return;
+        }
+        if (!this.advanceSetup(snap)) {
           this.sayCurrent(this.text('voice.sharedMenuControl'));return;
         }
-        this.sayCurrent(this.text('voice.toSelect'));
         return;
       }
       if (snap.phase === 'monster_select') {
         if (!snap.myMonsterId) { this.sayCurrent(this.text('voice.pickFirst')); return; }
-        if (!snap.canStartBattle) { this.sayCurrent(this.text('voice.pickWaiting')); return; }
-        if (!this.deps.advance(this.code!,this.playerId!)) this.sayCurrent(this.text('voice.sharedMenuControl'));
+        if (!snap.canStartBattle && !(snap.setupPlayerCount && snap.setupPlayerCount > 1)) {
+          this.sayCurrent(this.text('voice.pickWaiting')); return;
+        }
+        if (!this.advanceSetup(snap)) this.sayCurrent(this.text('voice.sharedMenuControl'));
         return;   // battle starts → the paced battle-intro handles the talking
       }
     }
@@ -452,6 +525,43 @@ export class BattleVoiceSession {
     else void this.converse(text);
   }
 
+  /** Ready is a per-caller acknowledgement in a two-person menu. Report the actual next phase. */
+  private advanceSetup(before: BattleVoiceSnapshot): boolean {
+    if (!this.code || !this.playerId) return false;
+    const release = this.beginMenuSpeech(before.phase);
+    const accepted = this.applySetupChange(() => this.deps.advance(this.code!, this.playerId!));
+    if (!accepted) { release?.(false); return false; }
+    const next = this.deps.snapshot(this.code, this.playerId, this.commandLocale);
+    if (before.phase === 'lobby') {
+      this.sayCurrent(next?.phase === 'lobby'
+        ? this.text('voice.waitingForReady', { player: next.currentOtherCallerName ?? next.foeName ?? this.text('voice.otherPlayer') })
+        : this.text('voice.toSelect'), undefined, release);
+    } else if (next?.phase === 'monster_select') {
+      this.sayCurrent(this.text('voice.waitingForBattle', {
+        player: next.currentOtherCallerName ?? next.foeName ?? this.text('voice.otherPlayer'),
+      }), undefined, release);
+    } else release?.(true);
+    return true;
+  }
+
+  private advanceRematch(): boolean {
+    if (!this.code || !this.playerId) return false;
+    const release = this.beginMenuSpeech('results');
+    if (!this.applySetupChange(() => this.deps.advance(this.code!, this.playerId!))) {
+      release?.(false);
+      return false;
+    }
+    const next = this.deps.snapshot(this.code, this.playerId, this.commandLocale);
+    this.sayCurrent(next?.phase === 'results'
+      ? (next.currentCallerCount ?? next.setupPlayerCount ?? 1) > 1
+        ? this.text('voice.waitingForRematch', { player: next.currentOtherCallerName ?? next.foeName ?? this.text('voice.otherPlayer') })
+        : this.text('voice.rematchStarting')
+      : next?.phase === 'lobby'
+        ? this.text(next.myName ? 'voice.helpLobbyNamed' : 'voice.askName')
+        : this.text('voice.rematch'), undefined, release);
+    return true;
+  }
+
   private nameIsConfirmed(snap: BattleVoiceSnapshot | null): boolean {
     return Boolean(this.authoritativeName || (snap && (snap.nameConfirmed ?? Boolean(snap.myName))));
   }
@@ -460,13 +570,15 @@ export class BattleVoiceSession {
     return JSON.stringify([
       snap.phase, snap.myName, snap.nameConfirmed, snap.myMonsterId, snap.turn,
       snap.activeSide, snap.activeMenu, snap.whoseTurn, snap.participating,
-      snap.canAdvanceLobby, snap.canStartBattle, snap.canRematch,
+      snap.canAdvanceLobby, snap.canStartBattle, snap.mySetupReady, snap.setupPlayerCount,
+      snap.currentCallerCount, snap.currentOtherCallerName, snap.canRematch,
       snap.generation,snap.presentationPending,snap.resultsPresented,snap.resultsPresentationTimedOut,
     ]);
   }
 
   private semanticActions(snap: BattleVoiceSnapshot): VoiceInterpretRequest['actions'] {
     if (snap.phase === 'lobby') return snap.canAdvanceLobby
+      || ((snap.setupPlayerCount ?? 1) > 1 && this.nameIsConfirmed(snap))
       ? [{ id: 'advance', description: this.commandLocale === 'pt-BR' ? 'Avançar para escolher monstro' : 'Continue to monster selection' }]
       : [];
     if (snap.phase === 'monster_select') {
@@ -475,7 +587,8 @@ export class BattleVoiceSession {
         description: this.commandLocale === 'pt-BR' ? 'Escolher seu monstro' : 'Choose your monster',
         targetIds: snap.monsterNames.flatMap((_, index) => ROSTER[index] ? [ROSTER[index]!.id] : []),
       }];
-      if (snap.canStartBattle) actions.push({ id: 'advance', description: this.commandLocale === 'pt-BR' ? 'Começar batalha' : 'Start battle' });
+      if (snap.myMonsterId && (snap.canStartBattle || (snap.setupPlayerCount ?? 1) > 1))
+        actions.push({ id: 'advance', description: this.commandLocale === 'pt-BR' ? 'Confirmar batalha' : 'Confirm battle' });
       if (!this.stationManaged && this.deps.backSetup) actions.push({ id: 'back_setup', description: this.commandLocale === 'pt-BR' ? 'Voltar ao lobby' : 'Go back to lobby' });
       return actions;
     }
@@ -531,6 +644,10 @@ export class BattleVoiceSession {
   private interpret(spoken: string, snap: BattleVoiceSnapshot): void {
     const interpret = this.deps.interpret;
     if (!interpret || !this.code || !this.playerId) return;
+    // The caller may already have voted ready. Keep this menu visible through both
+    // the AI wait and the answer that follows, even if the other caller votes now.
+    const release = this.beginMenuSpeech(snap.phase);
+    let handled = false;
     const epoch = this.turnEpoch;
     const scope = this.semanticScope(snap);
     const controller = new AbortController();
@@ -549,8 +666,16 @@ export class BattleVoiceSession {
       && Boolean(this.code && this.playerId)
       && Boolean(this.deps.snapshot(this.code!, this.playerId!, this.commandLocale)
         && this.semanticScope(this.deps.snapshot(this.code!, this.playerId!, this.commandLocale)!) === scope);
-    void interpret(request).then(result => {
+    let pending: Promise<VoiceInterpretResult>;
+    try { pending = interpret(request); }
+    catch {
+      if (isCurrent()) { handled = true; this.speakReprompt(); }
+      release?.(handled);
+      return;
+    }
+    void pending.then(result => {
       if (!isCurrent()) return;
+      handled = true;
       const current = this.deps.snapshot(this.code!, this.playerId!, this.commandLocale);
       if (!current) return;
       if (result.kind === 'answer') {
@@ -565,8 +690,9 @@ export class BattleVoiceSession {
         if (!this.executeSemanticAction(result.actionId, result.targetId, current)) this.speakReprompt();
       } else if(result.kind==='clarify') this.speakClarification(result.reason,current);
       else this.sayCurrent(this.text('voice.noAction'));
-    }).catch(() => { if (isCurrent()) this.speakReprompt(); }).finally(() => {
+    }).catch(() => { if (isCurrent()) { handled = true; this.speakReprompt(); } }).finally(() => {
       if (this.pendingInterpret === controller) this.pendingInterpret = null;
+      release?.(handled);
     });
   }
 
@@ -588,9 +714,8 @@ export class BattleVoiceSession {
       this.sayCurrent(this.text(next.canStartBattle ? 'voice.pickReady' : 'voice.pickWaiting'));
       return true;
     }
-    if (actionId === 'advance' && (snap.phase === 'lobby' || snap.phase === 'monster_select')) {
-      return this.deps.advance(this.code, this.playerId);
-    }
+    if (actionId === 'advance' && (snap.phase === 'lobby' || snap.phase === 'monster_select'))
+      return this.advanceSetup(snap);
     if (actionId === 'back_setup' && snap.phase === 'monster_select') return this.deps.backSetup?.(this.code, this.playerId) ?? false;
     if (actionId === 'open_fight' && snap.phase === 'battle' && snap.whoseTurn === 'me') {
       const accepted = snap.activeMenu === 'fight' || this.deps.openFight(this.code, this.playerId) !== false;
@@ -612,7 +737,7 @@ export class BattleVoiceSession {
       return this.deps.continueResults?.(this.code, this.playerId) ?? false;
     if (actionId === 'rematch' && snap.phase === 'results' && snap.canRematch
       && (snap.resultsPresented!==false||snap.resultsPresentationTimedOut===true) && !this.stationManaged)
-      return this.deps.advance(this.code, this.playerId);
+      return this.advanceRematch();
     return false;
   }
 
@@ -677,15 +802,22 @@ export class BattleVoiceSession {
     const epoch = ++this.turnEpoch;
     const before = this.repromptState();
     const isCurrent = () => epoch === this.turnEpoch && !this.isPresentingResults();
+    const phase = this.code && this.playerId ? this.deps.snapshot(this.code, this.playerId, this.commandLocale)?.phase : null;
+    const release = phase ? this.beginMenuSpeech(phase) : null;
+    let handled = false;
     void this.deps.converse(this.code!, this.playerId!, text, isCurrent, this.commandLocale,this.authoritativeName!==null,this.stationManaged,this.authoritativeName)
       .then(reply => {
         if (!isCurrent()) return;
+        handled = true;
         if (reply) this.sayCurrent(reply);
         else if (before === this.repromptState()) this.speakReprompt();
       })
       .catch(() => {
-        if (isCurrent() && before === this.repromptState()) this.speakReprompt();
-      });
+        if (isCurrent()) {
+          handled = true;
+          if (before === this.repromptState()) this.speakReprompt();
+        }
+      }).finally(() => release?.(handled));
   }
 
   private repromptState(): string | null {
@@ -693,7 +825,8 @@ export class BattleVoiceSession {
     const snap = this.deps.snapshot(this.code, this.playerId, this.commandLocale);
     if (!snap) return null;
     return JSON.stringify([
-      snap.phase, snap.myName, snap.myMonsterId, snap.canStartBattle, snap.canRematch,
+      snap.phase, snap.myName, snap.myMonsterId, snap.mySetupReady, snap.canStartBattle, snap.canRematch,
+      snap.currentCallerCount, snap.currentOtherCallerName,
       snap.generation,snap.presentationPending,snap.resultsPresented,snap.resultsPresentationTimedOut,
       snap.canAdvanceLobby,
       snap.turn, snap.activeSide, snap.activeMenu, snap.whoseTurn, snap.myPotions, snap.participating,
@@ -705,9 +838,13 @@ export class BattleVoiceSession {
     const snap = this.deps.snapshot(this.code, this.playerId, this.commandLocale);
     if (!snap) return;
     if (snap.phase === 'lobby') {
-      this.sayCurrent(this.text(snap.myName || this.authoritativeName ? 'voice.helpLobbyNamed' : 'voice.helpLobby'));
+      this.sayCurrent(snap.mySetupReady
+        ? this.text('voice.waitingForReady', { player: snap.currentOtherCallerName ?? snap.foeName ?? this.text('voice.otherPlayer') })
+        : this.text(snap.myName || this.authoritativeName ? 'voice.helpLobbyNamed' : 'voice.helpLobby'));
     } else if (snap.phase === 'monster_select') {
-      this.sayCurrent(this.text(!snap.myMonsterId?'voice.helpSelect':snap.canStartBattle?'voice.pickReady':'voice.pickWaiting'));
+      this.sayCurrent(!this.nameIsConfirmed(snap) ? this.text('voice.askName') : snap.mySetupReady
+        ? this.text('voice.waitingForBattle', { player: snap.currentOtherCallerName ?? snap.foeName ?? this.text('voice.otherPlayer') })
+        : this.text(!snap.myMonsterId?'voice.helpSelect':snap.canStartBattle?'voice.pickReady':'voice.pickWaiting'));
     } else if (snap.phase === 'results') {
       this.sayCurrent(this.resultsStatusText(snap));
     } else if (!snap.participating) {
@@ -728,6 +865,9 @@ export class BattleVoiceSession {
       return this.text(this.stationManaged?'voice.resultsDisplayTimeoutStation':'voice.resultsDisplayTimeout',
         {winner:snap.winnerName??this.text('voice.rival')});
     if(snap.resultsPresented===false)return this.text('voice.resultsPending');
+    if (snap.mySetupReady) return (snap.currentCallerCount ?? snap.setupPlayerCount ?? 1) > 1
+      ? this.text('voice.waitingForRematch', { player: snap.currentOtherCallerName ?? snap.foeName ?? this.text('voice.otherPlayer') })
+      : this.text('voice.rematchStarting');
     return this.text(this.stationManaged?'voice.waitOperator':snap.canRematch?'voice.helpResults':'voice.holdFinal');
   }
 
@@ -748,11 +888,19 @@ export class BattleVoiceSession {
     if(snap&&!this.isCallIntroPhase(snap.phase))this.introExpired=true;
     if (snap && this.nameIsConfirmed(snap)) this.awaitingName = false;
     const scope = snap ? this.semanticScope(snap) : null;
-    if (scope !== this.lastStateScope && !this.applyingSetupChange) {
+    const scopeChanged = scope !== this.lastStateScope;
+    const resultRosterChanged = snap?.phase === 'results' && this.lastPhase === 'results'
+      && ((snap.currentCallerCount ?? null) !== this.lastCurrentCallerCount
+        || (snap.currentOtherCallerName ?? null) !== this.lastCurrentOtherCallerName);
+    if (scopeChanged && !this.applyingSetupChange) {
       this.turnEpoch++;
       this.pendingInterpret?.abort();
     }
     this.lastStateScope = scope;
+    this.lastCurrentCallerCount=snap?.currentCallerCount??null;
+    this.lastCurrentOtherCallerName=snap?.currentOtherCallerName??null;
+    const wasSetupReady = this.lastMySetupReady;
+    this.lastMySetupReady = snap?.mySetupReady ?? false;
     if (snap?.phase === 'battle' && !snap.participating) return;
     if(this.applyingSetupChange){
       this.lastPhase=snap?.phase??null;this.lastCanAdvanceLobby=snap?.canAdvanceLobby??false;
@@ -764,6 +912,7 @@ export class BattleVoiceSession {
     const selectionBecameReady=snap?.phase==='monster_select'&&snap.canStartBattle&&!this.lastCanStartBattle;
     const mySelectionChanged=snap?.phase==='monster_select'&&previousPhase==='monster_select'&&!!snap.myMonsterId
       &&snap.myMonsterId!==this.lastMyMonsterId;
+    const needsReconfirmation = wasSetupReady && !snap?.mySetupReady && snap?.phase === previousPhase;
     if (snap && this.lastPhase !== null && snap.phase !== this.lastPhase) this.turnEpoch++;
     if ((snap?.presentationPending&&snap.resultsPresentationTimedOut!==true) || this.draining || this.evQ.length > 0) {
       this.pendingStateCue = true;
@@ -771,11 +920,33 @@ export class BattleVoiceSession {
       return;
     }
     this.speakStateCue();
-    if(lobbyBecameReady&&previousPhase==='lobby')this.sayCurrent(this.text('voice.helpLobbyNamed'));
+    let setupGuidanceSpoken = false;
+    if(lobbyBecameReady&&previousPhase==='lobby'&&!snap?.mySetupReady) {
+      this.sayCurrent(this.text('voice.helpLobbyNamed'));
+      setupGuidanceSpoken = true;
+    }
     if(mySelectionChanged&&snap){
       this.sayCurrent(this.text('voice.lockedMonster',{name:snap.myMonsterName??snap.myMonsterId!}));
       this.sayCurrent(this.text(snap.canStartBattle?'voice.pickReady':'voice.pickWaiting'));
-    }else if(selectionBecameReady&&previousPhase==='monster_select')this.sayCurrent(this.text('voice.pickReady'));
+      setupGuidanceSpoken = true;
+    }else if(selectionBecameReady&&previousPhase==='monster_select'&&!snap?.mySetupReady){
+      if(snap.myMonsterId)this.sayCurrent(this.text('voice.lockedMonster',{
+        name:snap.myMonsterName??snap.myMonsterId,
+      }));
+      this.sayCurrent(this.text('voice.pickReady'));
+      setupGuidanceSpoken = true;
+    }
+    if (needsReconfirmation && !mySelectionChanged && snap) {
+      if (snap.phase === 'lobby') this.sayCurrent(this.text('voice.reconfirmLobby'));
+      if (snap.phase === 'monster_select') this.sayCurrent(this.text('voice.reconfirmSelect', {
+        monster: snap.myMonsterName ?? this.text('voice.yourMonsterLower'),
+      }));
+      if (snap.phase === 'results') this.sayCurrent(this.text('voice.reconfirmRematch'));
+      setupGuidanceSpoken = true;
+    }
+    if (!setupGuidanceSpoken && scopeChanged && snap?.phase === previousPhase
+      && (snap.phase === 'lobby' || snap.phase === 'monster_select')) this.speakReprompt();
+    if (!setupGuidanceSpoken && resultRosterChanged && snap?.phase === previousPhase) this.speakReprompt();
     this.lastCanAdvanceLobby=snap?.canAdvanceLobby??false;
     this.lastCanStartBattle=snap?.canStartBattle??false;
     this.lastMyMonsterId=snap?.myMonsterId??null;
@@ -953,14 +1124,14 @@ export class BattleVoiceSession {
         if(this.stationManaged)this.sayStationResult(this.resultsStatusText(snap));
         else this.sayCurrent(this.resultsStatusText(snap));
       }
-      if (rematchBecameReady&&!this.stationManaged&&snap?.resultsPresented!==false)
+      if (rematchBecameReady&&!this.stationManaged&&snap?.resultsPresented!==false&&!snap.mySetupReady)
         this.sayCurrent(this.text('voice.rematchReady'));
       if (previous === 'battle' && snap?.phase === 'monster_select') {
         const pick = snap.myMonsterName ? this.text('voice.pickLocked', { monster: snap.myMonsterName }) : '';
         this.sayCurrent(this.text('voice.playerLeft', { pick }));
-        if (!snap.myMonsterId) this.sayCurrent(this.text('voice.helpSelect'));
+        if (!snap.myMonsterId) this.sayCurrent(this.text(this.nameIsConfirmed(snap)?'voice.helpSelect':'voice.askName'));
       }else if(snap?.phase==='monster_select'&&previous!==null&&previous!=='monster_select'){
-        this.sayCurrent(this.text(!snap.myMonsterId?'voice.helpSelect'
+        this.sayCurrent(this.text(!this.nameIsConfirmed(snap)?'voice.askName':!snap.myMonsterId?'voice.helpSelect'
           :snap.canStartBattle?'voice.pickReady':'voice.pickWaiting'));
       }else if(snap?.phase==='lobby'&&previous!==null&&previous!=='lobby'){
         this.sayCurrent(this.text(snap.myName||this.authoritativeName?'voice.helpLobbyNamed':'voice.askName'));
@@ -1013,8 +1184,10 @@ export class BattleVoiceSession {
       return;
     }
     if (snap.phase === 'monster_select') {
+      if (!this.nameIsConfirmed(snap)) { this.sayCurrent(this.text('voice.askName')); return; }
       if (snap.myMonsterName) this.sayCurrent(this.text(
-        snap.canStartBattle ? 'voice.resumeSelectReady' : 'voice.resumeSelectWaiting',
+        (snap.setupPlayerCount ?? 1) > 1 ? 'voice.resumeSelectOwnPick'
+          : snap.canStartBattle ? 'voice.resumeSelectReady' : 'voice.resumeSelectWaiting',
         { monster: snap.myMonsterName },
       ));
       else this.sayCurrent(this.text('voice.resumeSelect'));
@@ -1065,6 +1238,8 @@ export class BattleVoiceSession {
 
   handleClose(): void {
     this.turnEpoch++;this.beatSpeechEpoch++;this.pendingInterpret?.abort();this.cancelNarration();
+    if (this.code && this.playerId) this.deps.clearSetupReady?.(this.code, this.playerId);
+    this.settleInputSpeech(false);
     const preserve=this.stationManaged&&this.code&&this.playerId
       &&this.deps.snapshot(this.code,this.playerId,this.commandLocale)?.phase==='results';
     if (this.code && this.playerId&&!preserve) this.deps.leave(this.code, this.playerId, this.callSid ?? '');
@@ -1077,6 +1252,7 @@ export class BattleVoiceSession {
     this.pendingInterpret?.abort();
     this.cancelNarration();
     this.code = null; this.playerId = null; this.callSid = null;
+    this.settleInputSpeech(false);
   }
 }
 

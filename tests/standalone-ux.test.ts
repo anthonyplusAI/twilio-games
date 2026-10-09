@@ -4,6 +4,15 @@ import { readFileSync } from 'node:fs';
 const readClient = (path: string) => readFileSync(new URL(`../client/${path}`, import.meta.url), 'utf8');
 
 describe('standalone and station display UX', () => {
+  it('uses the selected caller count when launching a game from a fullscreen home screen', () => {
+    const home = readClient('home.ts');
+    const dialog = /function openStandaloneModeDialog\([\s\S]*?\n}/.exec(home)?.[0] ?? '';
+    const fullscreenLaunches = /function wireFullscreenGameLaunches\([\s\S]*?\n}/.exec(home)?.[0] ?? '';
+    expect(dialog).toContain("destination.searchParams.set('players', String(count))");
+    expect(dialog).toContain('fullscreenGameShell.launch(destination.toString())');
+    expect(fullscreenLaunches).toContain('event.defaultPrevented');
+  });
+
   it('presents station game selection as a player vote with automatic fallback', () => {
     const home = readClient('home.ts');
     const css = readClient('home.css');
@@ -48,7 +57,9 @@ describe('standalone and station display UX', () => {
     expect(fighter).toContain('const localAction=isDisplay');
     expect(fighter).toContain("isHost||isDisplay ? ''");
     expect(fighter).toContain('`<p class="phone-play-notice">${t(\'lobby.phonePlay\')}</p>`');
-    expect(fighter).toContain('function toggleLocalPlayer(): void { if (stationDisplay.active) return;');
+    const localPlayerToggle = /function toggleLocalPlayer\(\): void \{[\s\S]*?\n}/.exec(fighter)?.[0] ?? '';
+    expect(localPlayerToggle).toContain('if (stationDisplay.active) return;');
+    expect(localPlayerToggle).toContain('connection.createKeyboardPlayerConnection()');
     expect(fighter).toContain("key === 'p'");
     expect(fighter).not.toContain("t(playerId ? 'lobby.playingHere' : 'lobby.pressP')");
   });

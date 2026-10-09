@@ -17,6 +17,7 @@ import {
 import { TriviaRoom } from '../server/trivia-room';
 import { TriviaServer } from '../server/trivia-server';
 import { TriviaVoiceSession } from '../server/trivia-voice';
+import type { LlmClient, LlmReply } from '../server/llm';
 import { DEFAULT_ROOM } from '../shared/constants';
 import {
   TRIVIA_ANSWER_WINDOW_MS,
@@ -503,13 +504,15 @@ describe('Voice Trivia central runtime', () => {
   });
 
   it('completes four callers once and persists one redacted four-row round idempotently', async () => {
+    const stateWaitMs = 8_000;
     const now = { value: 1_000 };
     const roomCode = 'TRIVIA-FOUR';
     const runtime = await harness({ stationRooms: [roomCode], now });
     const display = await connect(runtime.port, '/trivia?display=1');
     display.ws.send(JSON.stringify({ type: 'display_auth', roomCode, token: DISPLAY_TOKEN }));
     display.ws.send(JSON.stringify({ type: 'spectate', roomCode }));
-    await waitFor(() => display.messages.find(message => message.type === 'host_identity' && message.isHost));
+    await waitFor(() => display.messages.find(message => message.type === 'host_identity' && message.isHost),
+      stateWaitMs);
     const players = ['Ada', 'Grace', 'Linus', 'Margaret'].map(name => (
       runtime.trivia.voiceJoin(roomCode, name, 4, true)!
     ));
@@ -520,14 +523,15 @@ describe('Voice Trivia central runtime', () => {
       type: 'ready',
       loadingGeneration: runtime.trivia.findRoom(roomCode)!.state().loadingGeneration,
     }));
-    await waitFor(() => runtime.trivia.findRoom(roomCode)?.phase === 'countdown' ? true : undefined);
+    await waitFor(() => runtime.trivia.findRoom(roomCode)?.phase === 'countdown' ? true : undefined,
+      stateWaitMs);
     expect(runtime.started).toHaveBeenCalledTimes(1);
 
     const room = runtime.trivia.findRoom(roomCode)!;
     now.value = room.state().countdownEndsAtMs!;
     for (let index = 0; index < 8; index++) {
       await waitFor(() => room.phase === 'question_prompt' && room.state().questionIndex === index
-        ? true : undefined);
+        ? true : undefined, stateWaitMs);
       await finishTrustedQuestionAudio(runtime.trivia, room, display, players);
       expect(room.phase).toBe('question');
       const question = room.state();
@@ -544,7 +548,7 @@ describe('Voice Trivia central runtime', () => {
       expect(room.phase).toBe('reveal');
       now.value = room.state().revealEndsAtMs!;
     }
-    await waitFor(() => room.phase === 'results' ? true : undefined);
+    await waitFor(() => room.phase === 'results' ? true : undefined, stateWaitMs);
     const result = room.state().result!;
     expect(runtime.completed).toHaveBeenCalledTimes(1);
     expect(runtime.completed).toHaveBeenCalledWith('trivia', roomCode, result.players.map(player => ({
@@ -564,7 +568,7 @@ describe('Voice Trivia central runtime', () => {
       const response = await fetch(`${runtime.base}/api/trivia/leaderboard?board=all-time&limit=100`);
       const body = await response.json() as { entries: unknown[] };
       return body.entries.length === 4 ? { response, body } : undefined;
-    });
+    }, stateWaitMs);
     expect(leaderboard.response.headers.get('etag')).toMatch(/^"trivia-leaderboard-/);
     expect(leaderboard.body.entries).toHaveLength(4);
     expect(JSON.stringify(leaderboard.body)).not.toMatch(/playerId|resultId|identityHash|engineResultId/i);
@@ -588,7 +592,7 @@ describe('Voice Trivia central runtime', () => {
     });
     expect(reset.status).toBe(200);
     expect(await reset.json()).toMatchObject({ game: 'trivia', map: 'science', deleted: 4, remaining: 0 });
-  });
+  }, 20_000);
 
   it('runs a production-shaped four-caller Voice Trivia match through HTTP and Relay sockets', async () => {
     const now = { value: 1_000_000 };
@@ -952,7 +956,7 @@ describe('Voice Trivia central runtime', () => {
     for (let index = 0; index < callers.length; index++) {
       const participant = stationVoice.participants[index]!;
       const stationResult = await waitForRelaySpeech(callers[index]!, resultSpeechOffsets[index]!, text => (
-        /Ada wins\. [\d,.]+ points/i.test(text)
+        /Ada wins\. Your leaderboard score: [\d,.]+;/i.test(text)
       ));
       expect(stationResult).toMatch(/Twilio Conversation Relay.*transcribed phone answers.*scored.*screen.*spoke results.*Check messages.*coins.*replay/i);
       expect(stationResult).toContain(`${result.players[index]!.correctCount} correct`);
@@ -1125,6 +1129,45 @@ describe('Voice Trivia central runtime', () => {
     void first;
   });
 
+  it('holds an issued standalone call if its screen drops before Relay binds, then applies the restored seat count', async () => {
+    const runtime = await harness({ standaloneVoiceEnabled: true });
+    const display = await connect(runtime.port, '/trivia?display=1');
+    display.ws.send(JSON.stringify({ type: 'spectate', roomCode: DEFAULT_ROOM, count: 3 }));
+    await waitFor(() => display.messages.find(message => message.type === 'trivia_state'
+      && message.expectedPlayerCount === 3));
+
+    const callSid = 'CA-TRIVIA-DISPLAY-GAP';
+    const incoming = await fetch(`${runtime.base}/voice/incoming`, {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ From: '+14155550199', To: '+18555993809', CallSid: callSid }),
+    });
+    const xml = await incoming.text();
+    expect(xml).toContain('<Parameter name="game" value="trivia"');
+    const parameters = relayParameters(xml);
+
+    const closed = new Promise<void>(resolve => display.ws.once('close', () => resolve()));
+    display.ws.close();
+    await closed;
+    await waitFor(() => runtime.trivia.findRoom(DEFAULT_ROOM) === undefined ? true : undefined);
+
+    const relay = await connect(runtime.port, '/voice');
+    relay.ws.send(JSON.stringify({ type: 'setup', callSid, customParameters: parameters }));
+    const first = await waitFor(() => runtime.trivia.findRoom(DEFAULT_ROOM)?.state().players[0]?.playerId);
+    expect(runtime.trivia.voiceSnapshot(DEFAULT_ROOM, first)?.awaitingDisplay).toBe(true);
+    expect(runtime.trivia.voiceAdvance(DEFAULT_ROOM, first)).toBe(false);
+    expect(runtime.trivia.findRoom(DEFAULT_ROOM)?.phase).toBe('lobby');
+
+    const restored = await connect(runtime.port, '/trivia?display=1');
+    restored.ws.send(JSON.stringify({ type: 'spectate', roomCode: DEFAULT_ROOM, count: 3 }));
+    await waitFor(() => restored.messages.find(message => message.type === 'trivia_state'
+      && message.expectedPlayerCount === 3));
+    expect(runtime.trivia.voiceSnapshot(DEFAULT_ROOM, first)?.awaitingDisplay).toBe(false);
+    expect(runtime.trivia.findRoom(DEFAULT_ROOM)?.state()).toMatchObject({
+      phase: 'lobby', expectedPlayerCount: 3, hasExpectedPlayers: false,
+    });
+    expect(runtime.trivia.voiceJoin(DEFAULT_ROOM, 'Grace', 1, true)).toBeTruthy();
+  });
+
   it('routes quiz voice sessions and resumes the same caller slot after transport replacement', async () => {
     const runtime = await harness({ standaloneVoiceEnabled: true });
     const callSid = 'CA-TRIVIA-RECONNECT';
@@ -1177,12 +1220,12 @@ describe('Voice Trivia central runtime', () => {
     const runtime = await harness();
     const internal = server as unknown as {
       makeTriviaSession(
-        say: () => Promise<boolean>,
+        say: () => Promise<'played'>,
         stationFixed?: () => boolean,
       ): TriviaVoiceSession;
     };
     const bind = (roomCode: string, stationFixed: boolean) => {
-      const session = internal.makeTriviaSession(async () => true, () => stationFixed);
+      const session = internal.makeTriviaSession(async () => 'played' as const, () => stationFixed);
       session.setAuthoritativeName('Ada');
       session.setExpectedPlayers(1);
       session.setStationManaged(stationFixed);
@@ -1209,13 +1252,13 @@ describe('Voice Trivia central runtime', () => {
     const runtime = await harness();
     const internal = server as unknown as {
       makeTriviaSession(
-        say: () => Promise<boolean>,
+        say: () => Promise<'played'>,
         stationFixed?: () => boolean,
       ): TriviaVoiceSession;
       triviaVoiceCallBindings: Map<string, { playerId: string; participantIndex: number | null }>;
     };
     const bind = () => {
-      const session = internal.makeTriviaSession(async () => true, () => true);
+      const session = internal.makeTriviaSession(async () => 'played' as const, () => true);
       session.setAuthoritativeName('Ada');
       session.setExpectedPlayers(4);
       session.setStationManaged(true);
@@ -1248,13 +1291,13 @@ describe('Voice Trivia central runtime', () => {
     const runtime = await harness();
     const internal = server as unknown as {
       makeTriviaSession(
-        say: () => Promise<boolean>,
+        say: () => Promise<'played'>,
         stationFixed?: () => boolean,
       ): TriviaVoiceSession;
       triviaVoiceCallBindings: Map<string, { playerId: string; participantIndex: number | null }>;
     };
     const bind = (callSid: string, name: string, participantIndex: number) => {
-      const session = internal.makeTriviaSession(async () => true, () => true);
+      const session = internal.makeTriviaSession(async () => 'played' as const, () => true);
       session.setAuthoritativeName(name);
       session.setExpectedPlayers(2);
       session.setStationManaged(true);
@@ -1267,7 +1310,8 @@ describe('Voice Trivia central runtime', () => {
     };
     const retained = bind('CA-RETAINED', 'Ada', 0);
     const dropped = bind('CA-DROPPED', 'Grace', 1);
-    expect(runtime.trivia.findRoom('HTTP-RECONCILE')!.phase).toBe('category_select');
+    await waitFor(() => runtime.trivia.findRoom('HTTP-RECONCILE')?.phase === 'category_select'
+      ? true : undefined);
 
     runtime.participantReconcile!(
       'trivia', 'HTTP-RECONCILE', 2,
@@ -1303,13 +1347,13 @@ describe('Voice Trivia central runtime', () => {
     const runtime = await harness({ stationVoice: fixture });
     const internal = server as unknown as {
       makeTriviaSession(
-        say: () => Promise<boolean>,
+        say: () => Promise<'played'>,
         stationFixed?: () => boolean,
       ): TriviaVoiceSession;
       triviaVoiceCallBindings: Map<string, { playerId: string; participantIndex: number | null }>;
     };
     const bind = (callSid: string, name: string, participantIndex: number, expectedPlayers: number) => {
-      const session = internal.makeTriviaSession(async () => true, () => true);
+      const session = internal.makeTriviaSession(async () => 'played' as const, () => true);
       session.setAuthoritativeName(name);
       session.setExpectedPlayers(expectedPlayers);
       session.setStationManaged(true);
@@ -1357,13 +1401,13 @@ describe('Voice Trivia central runtime', () => {
     const runtime = await harness();
     const internal = server as unknown as {
       makeTriviaSession(
-        say: () => Promise<boolean>,
+        say: () => Promise<'played'>,
         stationFixed?: () => boolean,
       ): TriviaVoiceSession;
       triviaVoiceCallBindings: Map<string, { playerId: string; participantIndex: number | null }>;
     };
     const bind = (callSid: string, name: string, participantIndex: number) => {
-      const session = internal.makeTriviaSession(async () => true, () => true);
+      const session = internal.makeTriviaSession(async () => 'played' as const, () => true);
       session.setAuthoritativeName(name);
       session.setExpectedPlayers(4);
       session.setStationManaged(true);
@@ -1396,24 +1440,24 @@ describe('Voice Trivia central runtime', () => {
     expect(replacement.boundPlayerId).not.toBeNull();
     const room = runtime.trivia.findRoom('HTTP-SPARSE')!;
     expect(room.state().players.map(player => player.playerOrder)).toEqual([0, 1, 2, 3]);
-    expect(room.phase).toBe('category_select');
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
     for (const player of room.state().players) {
       expect(runtime.trivia.voiceVoteCategory('HTTP-SPARSE', player.playerId, 'science')).toBe(true);
     }
-    expect(room.phase).toBe('loading');
+    await waitFor(() => room.phase === 'loading' ? true : undefined);
   });
 
   it('reindexes retained Trivia bindings from shrink slots while a new first seat is pending', async () => {
     const runtime = await harness();
     const internal = server as unknown as {
       makeTriviaSession(
-        say: () => Promise<boolean>,
+        say: () => Promise<'played'>,
         stationFixed?: () => boolean,
       ): TriviaVoiceSession;
       triviaVoiceCallBindings: Map<string, { playerId: string; participantIndex: number | null }>;
     };
     const bind = (callSid: string, name: string, participantIndex: number, count: number) => {
-      const session = internal.makeTriviaSession(async () => true, () => true);
+      const session = internal.makeTriviaSession(async () => 'played' as const, () => true);
       session.setAuthoritativeName(name);
       session.setExpectedPlayers(count);
       session.setStationManaged(true);
@@ -1445,11 +1489,11 @@ describe('Voice Trivia central runtime', () => {
     expect(pending.boundPlayerId).not.toBeNull();
     const room = runtime.trivia.findRoom('HTTP-SHRINK-PENDING')!;
     expect(room.state().players.map(player => player.playerOrder)).toEqual([0, 1, 2]);
-    expect(room.phase).toBe('category_select');
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
     for (const player of room.state().players) {
       expect(runtime.trivia.voiceVoteCategory(room.code, player.playerId, 'science')).toBe(true);
     }
-    expect(room.phase).toBe('loading');
+    await waitFor(() => room.phase === 'loading' ? true : undefined);
     expect(room.ready(room.state().loadingGeneration)).toBe(true);
     expect(room.phase).toBe('countdown');
   });
@@ -1457,9 +1501,9 @@ describe('Voice Trivia central runtime', () => {
   it('physically purges a disconnected Trivia caller when the Relay session ends', async () => {
     const runtime = await harness();
     const internal = server as unknown as {
-      makeTriviaSession(say: (text: string) => Promise<boolean>): TriviaVoiceSession;
+      makeTriviaSession(say: (text: string) => Promise<'played'>): TriviaVoiceSession;
     };
-    const session = internal.makeTriviaSession(async () => true);
+    const session = internal.makeTriviaSession(async () => 'played' as const);
     session.setAuthoritativeName('Ada');
     session.handleMessage(JSON.stringify({
       type: 'setup', callSid: 'CA-PERMANENT-END',
@@ -1565,7 +1609,7 @@ describe('Voice Trivia central runtime', () => {
     let estimatedResultMs = 0;
     let resultSettled = false;
     const session = internal.makeTriviaSession(text => {
-      if (!/Ana venceu\. [\d,.]+ pontos/.test(text)) return Promise.resolve('played');
+      if (!/Ana venceu\. Sua pontuação no ranking: [\d,.]+;/.test(text)) return Promise.resolve('played');
       resultLine = text;
       // Model Relay's conservative fallback when Twilio sends no tokensPlayed receipt.
       estimatedResultMs = Math.min(120_000, Math.max(1_200,
@@ -1609,7 +1653,7 @@ describe('Voice Trivia central runtime', () => {
       room.tick();
       session.onStateChanged();
       expect(room.phase).toBe('results');
-      expect(resultLine).toMatch(/Ana venceu.*pontos.*acertos.*Twilio Conversation Relay.*tela.*moedas.*jogar de novo/i);
+      expect(resultLine).toMatch(/Ana venceu.*pontuação no ranking.*acertos.*Twilio Conversation Relay.*tela.*Moedas no SMS.*Jogue de novo/i);
       expect(estimatedResultMs).toBeLessThan(20_000);
       await vi.advanceTimersByTimeAsync(10_000); // the station's result-display hold
       expect(resultSettled).toBe(false);
@@ -1672,6 +1716,433 @@ describe('Voice Trivia central runtime', () => {
     expect(room.phase).toBe('question');
     expect(room.state().answeringStartsAtMs).toBe(now.value);
     expect(spoken.join(' ')).toMatch(/Question 1.*choices are One, .*Two, .*Three, .*Four,/i);
+  });
+
+  it.each(['interim', 'semantic', 'speech'] as const)(
+    'keeps a voted caller on the category menu during their %s follow-up', async stage => {
+    const runtime = await harness();
+    const code = `CATEGORY-${stage.toUpperCase()}`;
+    runtime.trivia.getOrCreateRoom(code);
+    expect(runtime.trivia.voiceConfigureStandaloneSeats(code, 2)).toBe(true);
+    const internal = server as unknown as {
+      llm: LlmClient;
+      makeTriviaSession(
+        say: (text: string, isCurrent?: () => boolean) => Promise<'played'>,
+      ): TriviaVoiceSession;
+    };
+    let finishIntent: ((reply: LlmReply) => void) | undefined;
+    if (stage === 'semantic') internal.llm = {
+      enabled: true,
+      respond: () => new Promise(resolve => { finishIntent = resolve; }),
+    };
+    let holdFollowUp = false;
+    let answerGuard: (() => boolean) | undefined;
+    let finishAnswer!: (outcome: 'played') => void;
+    let finishGraceVote!: (outcome: 'played') => void;
+    const ada = internal.makeTriviaSession((text, isCurrent) => {
+      if (holdFollowUp && (text.startsWith('Choose a category:')
+        || text.startsWith('Science is a trivia category'))) {
+        answerGuard = isCurrent;
+        return new Promise(resolve => { finishAnswer = resolve; });
+      }
+      return Promise.resolve('played');
+    });
+    const grace = internal.makeTriviaSession(text => text === 'Science selected.'
+      ? new Promise(resolve => { finishGraceVote = resolve; })
+      : Promise.resolve('played'));
+    for (const [session, name] of [[ada, 'Ada'], [grace, 'Grace']] as const) {
+      session.setAuthoritativeName(name);
+      session.handleMessage(JSON.stringify({ type: 'setup', callSid: `CA-${name.toUpperCase()}-CATEGORY`,
+        customParameters: { roomCode: code, game: 'trivia', commandLocale: 'en-US' } }));
+    }
+    const room = runtime.trivia.findRoom(code)!;
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
+    await Promise.all([ada.whenSpeechSettled(), grace.whenSpeechSettled()]);
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    await ada.whenSpeechSettled();
+    grace.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    expect(room.state().players.find(player => player.playerId === grace.boundPlayerId)?.setupStatus).toBe('phone');
+
+    holdFollowUp = true;
+    if (stage === 'interim') {
+      ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'What does Science', last: false }));
+      finishGraceVote('played');
+      await waitFor(() => room.state().players.find(player => player.playerId === grace.boundPlayerId)
+        ?.setupStatus === 'ready' ? true : undefined);
+      expect(room.phase).toBe('category_select');
+      expect(room.state().players.find(player => player.playerId === ada.boundPlayerId)?.setupStatus).toBe('phone');
+    }
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'What does Science cover?', last: true }));
+    if (stage === 'semantic') {
+      await waitFor(() => finishIntent ? true : undefined);
+      finishGraceVote('played');
+      await waitFor(() => room.state().players.find(player => player.playerId === grace.boundPlayerId)
+        ?.setupStatus === 'ready' ? true : undefined);
+      expect(room.phase).toBe('category_select');
+      finishIntent!({ say: '', toolCalls: [{ name: 'resolve_voice_turn',
+        args: { kind: 'answer', factId: 'category:science' } }] });
+    }
+    await waitFor(() => answerGuard ? true : undefined);
+    expect(room.phase).toBe('category_select');
+    if (stage === 'speech') {
+      finishGraceVote('played');
+      await waitFor(() => room.state().players.find(player => player.playerId === grace.boundPlayerId)
+        ?.setupStatus === 'ready' ? true : undefined);
+    }
+    expect(room.phase).toBe('category_select');
+    expect(answerGuard?.()).toBe(true);
+
+    finishAnswer('played');
+    await waitFor(() => room.phase === 'loading' ? true : undefined);
+  });
+
+  it('transfers a category caller from an AI turn to a DTMF revision before loading', async () => {
+    const runtime = await harness();
+    const code = 'CATEGORY-DTMF-REVISION';
+    runtime.trivia.getOrCreateRoom(code);
+    expect(runtime.trivia.voiceConfigureStandaloneSeats(code, 2)).toBe(true);
+    const internal = server as unknown as {
+      llm: LlmClient;
+      makeTriviaSession(say: (text: string) => Promise<'played'>): TriviaVoiceSession;
+    };
+    let intentStarted = false;
+    internal.llm = { enabled: true, respond: (_system, _history, _tools, options) => new Promise(resolve => {
+      intentStarted = true;
+      options?.signal?.addEventListener('abort', () => resolve({ say: '', toolCalls: [] }), { once: true });
+    }) };
+    let finishRevision!: (outcome: 'played') => void;
+    const ada = internal.makeTriviaSession(text => text === 'History selected.'
+      ? new Promise(resolve => { finishRevision = resolve; })
+      : Promise.resolve('played'));
+    const grace = internal.makeTriviaSession(async () => 'played');
+    for (const [session, name] of [[ada, 'Ada'], [grace, 'Grace']] as const) {
+      session.setAuthoritativeName(name);
+      session.handleMessage(JSON.stringify({ type: 'setup', callSid: `CA-${name.toUpperCase()}-DTMF`,
+        customParameters: { roomCode: code, game: 'trivia', commandLocale: 'en-US' } }));
+    }
+    const room = runtime.trivia.findRoom(code)!;
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
+    await Promise.all([ada.whenSpeechSettled(), grace.whenSpeechSettled()]);
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    await ada.whenSpeechSettled();
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'What does Science cover?', last: true }));
+    await waitFor(() => intentStarted ? true : undefined);
+    grace.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    await grace.whenSpeechSettled();
+    expect(room.phase).toBe('category_select');
+
+    ada.handleMessage(JSON.stringify({ type: 'dtmf', digit: '4' }));
+    expect(room.phase).toBe('category_select');
+    expect(room.categoryVoteFor(ada.boundPlayerId!)).toBe('history');
+    expect(room.state().players.find(player => player.playerId === ada.boundPlayerId)?.setupStatus).toBe('phone');
+    finishRevision('played');
+    await waitFor(() => room.phase === 'loading' ? true : undefined);
+  });
+
+  it('repeats a category confirmation after an unsupported phone digit', async () => {
+    const runtime = await harness();
+    const code = 'CATEGORY-BAD-DTMF';
+    runtime.trivia.getOrCreateRoom(code);
+    runtime.trivia.voiceConfigureStandaloneSeats(code, 2);
+    const internal = server as unknown as {
+      makeTriviaSession(say: (text: string) => Promise<'played'>): TriviaVoiceSession;
+    };
+    let confirmationCount = 0;
+    let finishFirstConfirmation!: (outcome: 'played') => void;
+    const ada = internal.makeTriviaSession(text => {
+      if (text === 'Science selected.' && ++confirmationCount === 1) {
+        return new Promise(resolve => { finishFirstConfirmation = resolve; });
+      }
+      return Promise.resolve('played');
+    });
+    const grace = internal.makeTriviaSession(async () => 'played');
+    for (const [session, name] of [[ada, 'Ada'], [grace, 'Grace']] as const) {
+      session.setAuthoritativeName(name);
+      session.handleMessage(JSON.stringify({ type: 'setup', callSid: `CA-${name.toUpperCase()}-BAD-DTMF`,
+        customParameters: { roomCode: code, game: 'trivia', commandLocale: 'en-US' } }));
+    }
+    const room = runtime.trivia.findRoom(code)!;
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
+    await Promise.all([ada.whenSpeechSettled(), grace.whenSpeechSettled()]);
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    grace.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    await grace.whenSpeechSettled();
+    expect(room.phase).toBe('category_select');
+    expect(confirmationCount).toBe(1);
+
+    ada.handleMessage(JSON.stringify({ type: 'dtmf', digit: '0' }));
+    await waitFor(() => confirmationCount === 2 ? true : undefined);
+    await waitFor(() => room.phase === 'loading' ? true : undefined);
+    finishFirstConfirmation('played');
+  });
+
+  it('repeats a result recap after an unsupported phone digit', async () => {
+    const now = { value: 0 };
+    const runtime = await harness({ now, manualTriviaClock: true });
+    const code = 'RESULT-BAD-DTMF';
+    runtime.trivia.getOrCreateRoom(code);
+    runtime.trivia.voiceConfigureStandaloneSeats(code, 2);
+    const internal = server as unknown as {
+      makeTriviaSession(say: (text: string) => Promise<'played'>): TriviaVoiceSession;
+    };
+    let recapCount = 0;
+    let finishFirstRecap!: (outcome: 'played') => void;
+    const ada = internal.makeTriviaSession(text => {
+      if (/wins with a leaderboard score/i.test(text) && ++recapCount === 1) {
+        return new Promise(resolve => { finishFirstRecap = resolve; });
+      }
+      return Promise.resolve('played');
+    });
+    const grace = internal.makeTriviaSession(async () => 'played');
+    for (const [session, name] of [[ada, 'Ada'], [grace, 'Grace']] as const) {
+      session.setAuthoritativeName(name);
+      session.handleMessage(JSON.stringify({ type: 'setup', callSid: `CA-${name.toUpperCase()}-RESULT-DTMF`,
+        customParameters: { roomCode: code, game: 'trivia', commandLocale: 'en-US' } }));
+    }
+    const room = runtime.trivia.findRoom(code)!;
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
+    await Promise.all([ada.whenSpeechSettled(), grace.whenSpeechSettled()]);
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    grace.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    await waitFor(() => room.phase === 'loading' ? true : undefined);
+    room.ready(room.state().loadingGeneration);
+    now.value = room.state().countdownEndsAtMs!;
+    room.tick();
+    for (let index = 0; index < 8; index++) {
+      settleRoomQuestionAudio(room, [ada.boundPlayerId!, grace.boundPlayerId!]);
+      now.value = room.state().answeringStartsAtMs!;
+      room.answer(ada.boundPlayerId!, correctChoiceId(room.state().question!.id));
+      room.answer(grace.boundPlayerId!, correctChoiceId(room.state().question!.id));
+      now.value = room.state().revealEndsAtMs!;
+      room.tick();
+    }
+    expect(room.phase).toBe('results');
+    ada.onStateChanged();
+    grace.onStateChanged();
+    await waitFor(() => recapCount === 1 ? true : undefined);
+    ada.handleMessage(JSON.stringify({ type: 'dtmf', digit: '0' }));
+    await waitFor(() => recapCount === 2 ? true : undefined);
+    await ada.whenSpeechSettled();
+    expect(room.phase).toBe('results');
+    expect(room.state().players.find(player => player.playerId === ada.boundPlayerId)?.setupStatus).toBe('replay');
+    finishFirstRecap('played');
+  });
+
+  it('holds the shared lobby while a caller speaks and hears a gameplay answer', async () => {
+    const runtime = await harness();
+    const code = 'LOBBY-CONVERSATION';
+    runtime.trivia.getOrCreateRoom(code);
+    expect(runtime.trivia.voiceConfigureStandaloneSeats(code, 2)).toBe(true);
+    const internal = server as unknown as {
+      llm: LlmClient;
+      makeTriviaSession(
+        say: (text: string, isCurrent?: () => boolean) => Promise<'played'>,
+      ): TriviaVoiceSession;
+    };
+    internal.llm = { enabled: true, respond: async () => ({ say: '', toolCalls: [
+      { name: 'resolve_voice_turn', args: { kind: 'answer', factId: 'gameplay' } },
+    ] }) };
+    let holdFollowUp = false;
+    let answerGuard: (() => boolean) | undefined;
+    let finishAnswer!: (outcome: 'played') => void;
+    let finishGraceIntro!: (outcome: 'played') => void;
+    const ada = internal.makeTriviaSession((text, isCurrent) => {
+      if (holdFollowUp && text.startsWith('I will ask each question')) {
+        answerGuard = isCurrent;
+        return new Promise(resolve => { finishAnswer = resolve; });
+      }
+      return Promise.resolve('played');
+    });
+    const grace = internal.makeTriviaSession(text => text.startsWith('I will ask each question')
+      ? new Promise(resolve => { finishGraceIntro = resolve; })
+      : Promise.resolve('played'));
+    for (const [session, name] of [[ada, 'Ada'], [grace, 'Grace']] as const) {
+      session.setAuthoritativeName(name);
+      session.handleMessage(JSON.stringify({ type: 'setup', callSid: `CA-${name.toUpperCase()}-LOBBY`,
+        customParameters: { roomCode: code, game: 'trivia', commandLocale: 'en-US' } }));
+    }
+    const room = runtime.trivia.findRoom(code)!;
+    await ada.whenSpeechSettled();
+    expect(room.phase).toBe('lobby');
+    expect(room.state().players.find(player => player.playerId === grace.boundPlayerId)?.setupStatus).toBe('phone');
+
+    holdFollowUp = true;
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'How does this', last: false }));
+    finishGraceIntro('played');
+    await grace.whenSpeechSettled();
+    expect(room.phase).toBe('lobby');
+    expect(room.state().players.find(player => player.playerId === ada.boundPlayerId)?.setupStatus).toBe('phone');
+
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'How does this game work?', last: true }));
+    await waitFor(() => answerGuard ? true : undefined);
+    expect(answerGuard?.()).toBe(true);
+    expect(room.phase).toBe('lobby');
+    finishAnswer('played');
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
+  });
+
+  it.each(['settles', 'disconnects'] as const)(
+    'saves a peer replay vote while another caller hears a standings answer and %s', async end => {
+    const now = { value: 0 };
+    const runtime = await harness({ now, manualTriviaClock: true });
+    const code = 'RESULT-CONVERSATION';
+    runtime.trivia.getOrCreateRoom(code);
+    expect(runtime.trivia.voiceConfigureStandaloneSeats(code, 2)).toBe(true);
+    const internal = server as unknown as {
+      llm: LlmClient;
+      makeTriviaSession(
+        say: (text: string, isCurrent?: () => boolean) => Promise<'played'>,
+      ): TriviaVoiceSession;
+    };
+    internal.llm = { enabled: true, respond: async () => ({ say: '', toolCalls: [
+      { name: 'resolve_voice_turn', args: { kind: 'answer', factId: 'standings' } },
+    ] }) };
+    let answerGuard: (() => boolean) | undefined;
+    let finishStandings!: (outcome: 'played') => void;
+    const ada = internal.makeTriviaSession((text, isCurrent) => {
+      if (text.includes('Ada:') && text.includes('Grace:')) {
+        answerGuard = isCurrent;
+        return new Promise(resolve => { finishStandings = resolve; });
+      }
+      return Promise.resolve('played');
+    });
+    const grace = internal.makeTriviaSession(async () => 'played');
+    for (const [session, name] of [[ada, 'Ada'], [grace, 'Grace']] as const) {
+      session.setAuthoritativeName(name);
+      session.handleMessage(JSON.stringify({ type: 'setup', callSid: `CA-${name.toUpperCase()}-RESULT`,
+        customParameters: { roomCode: code, game: 'trivia', commandLocale: 'en-US' } }));
+    }
+    const room = runtime.trivia.findRoom(code)!;
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
+    await Promise.all([ada.whenSpeechSettled(), grace.whenSpeechSettled()]);
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    grace.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    await waitFor(() => room.phase === 'loading' ? true : undefined);
+    room.ready(room.state().loadingGeneration);
+    now.value = room.state().countdownEndsAtMs!;
+    room.tick();
+    for (let index = 0; index < 8; index++) {
+      settleRoomQuestionAudio(room, [ada.boundPlayerId!, grace.boundPlayerId!]);
+      now.value = room.state().answeringStartsAtMs!;
+      room.answer(ada.boundPlayerId!, correctChoiceId(room.state().question!.id));
+      room.answer(grace.boundPlayerId!, correctChoiceId(room.state().question!.id));
+      now.value = room.state().revealEndsAtMs!;
+      room.tick();
+    }
+    expect(room.phase).toBe('results');
+    ada.onStateChanged();
+    grace.onStateChanged();
+    await Promise.all([ada.whenSpeechSettled(), grace.whenSpeechSettled()]);
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'play again', last: true }));
+    await ada.whenSpeechSettled();
+    expect(room.state().players.find(player => player.playerId === ada.boundPlayerId)?.replayReady).toBe(true);
+
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'What were the standings?', last: true }));
+    await waitFor(() => answerGuard ? true : undefined);
+    grace.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'play again', last: true }));
+    await grace.whenSpeechSettled();
+    expect(room.phase).toBe('results');
+    expect(room.state().players.find(player => player.playerId === grace.boundPlayerId)?.replayReady).toBe(true);
+    expect(answerGuard?.()).toBe(true);
+    if (end === 'disconnects') {
+      const adaId = ada.boundPlayerId;
+      ada.handleClose();
+      expect(room.phase).toBe('results');
+      expect(room.state().players.find(player => player.playerId === adaId)?.setupStatus)
+        .toBe('reconnecting');
+      finishStandings('played');
+      return;
+    }
+    finishStandings('played');
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
+  });
+
+  it('replays a pending category confirmation on a replacement phone transport', async () => {
+    const runtime = await harness();
+    const code = 'CATEGORY-REPLACED';
+    runtime.trivia.getOrCreateRoom(code);
+    runtime.trivia.voiceConfigureStandaloneSeats(code, 2);
+    const internal = server as unknown as {
+      makeTriviaSession(say: (text: string) => Promise<'played'>): TriviaVoiceSession;
+    };
+    let finishOldConfirmation!: (outcome: 'played') => void;
+    const first = internal.makeTriviaSession(text => text === 'Science selected.'
+      ? new Promise(resolve => { finishOldConfirmation = resolve; })
+      : Promise.resolve('played'));
+    const grace = internal.makeTriviaSession(async () => 'played');
+    for (const [session, name] of [[first, 'Ada'], [grace, 'Grace']] as const) {
+      session.setAuthoritativeName(name);
+      session.handleMessage(JSON.stringify({ type: 'setup', callSid: `CA-${name.toUpperCase()}-REPLACED`,
+        customParameters: { roomCode: code, game: 'trivia', commandLocale: 'en-US' } }));
+    }
+    const room = runtime.trivia.findRoom(code)!;
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
+    await Promise.all([first.whenSpeechSettled(), grace.whenSpeechSettled()]);
+    first.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    grace.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    await grace.whenSpeechSettled();
+    expect(room.phase).toBe('category_select');
+    expect(room.state().players.find(player => player.playerId === first.boundPlayerId)?.setupStatus).toBe('phone');
+
+    const replacementSpeech: string[] = [];
+    const replacement = internal.makeTriviaSession(async text => {
+      replacementSpeech.push(text);
+      return 'played';
+    });
+    replacement.handleMessage(JSON.stringify({ type: 'setup', callSid: 'CA-ADA-REPLACED',
+      customParameters: { roomCode: code, game: 'trivia', commandLocale: 'en-US' } }));
+    await replacement.whenSpeechSettled();
+    expect(replacement.boundPlayerId).toBe(first.boundPlayerId ?? room.state().players[0]?.playerId);
+    expect(replacementSpeech).toContain('Science selected.');
+    expect(room.phase).toBe('loading');
+    finishOldConfirmation('played');
+  });
+
+  it('releases an interrupted category reply before the next caller finishes voting', async () => {
+    const runtime = await harness();
+    const code = 'CATEGORY-INTERRUPTED';
+    runtime.trivia.getOrCreateRoom(code);
+    runtime.trivia.voiceConfigureStandaloneSeats(code, 2);
+    const internal = server as unknown as {
+      makeTriviaSession(say: (text: string, isCurrent?: () => boolean) => Promise<'played' | 'interrupted'>): TriviaVoiceSession;
+    };
+    let answerCount = 0;
+    let finishOldReply!: (outcome: 'played' | 'interrupted') => void;
+    let oldGuard: (() => boolean) | undefined;
+    let finishGraceVote!: (outcome: 'played' | 'interrupted') => void;
+    const ada = internal.makeTriviaSession((text, isCurrent) => {
+      if (text.startsWith('Choose a category:') && ++answerCount > 1) {
+        if (answerCount === 2) {
+          oldGuard = isCurrent;
+          return new Promise(resolve => { finishOldReply = resolve; });
+        }
+      }
+      return Promise.resolve('played');
+    });
+    const grace = internal.makeTriviaSession(text => text === 'Science selected.'
+      ? new Promise(resolve => { finishGraceVote = resolve; })
+      : Promise.resolve('played'));
+    for (const [session, name] of [[ada, 'Ada'], [grace, 'Grace']] as const) {
+      session.setAuthoritativeName(name);
+      session.handleMessage(JSON.stringify({ type: 'setup', callSid: `CA-${name.toUpperCase()}-INTERRUPTED`,
+        customParameters: { roomCode: code, game: 'trivia', commandLocale: 'en-US' } }));
+    }
+    const room = runtime.trivia.findRoom(code)!;
+    await waitFor(() => room.phase === 'category_select' ? true : undefined);
+    await Promise.all([ada.whenSpeechSettled(), grace.whenSpeechSettled()]);
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    await ada.whenSpeechSettled();
+    grace.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'science', last: true }));
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'What does Science cover?', last: true }));
+    await waitFor(() => oldGuard ? true : undefined);
+    ada.handleMessage(JSON.stringify({ type: 'interrupt' }));
+    expect(oldGuard?.()).toBe(false);
+    ada.handleMessage(JSON.stringify({ type: 'prompt', voicePrompt: 'What does Science cover?', last: true }));
+    await ada.whenSpeechSettled();
+    finishGraceVote('played');
+    await grace.whenSpeechSettled();
+    expect(room.phase).toBe('loading');
+    finishOldReply('interrupted');
   });
 
   it('protects ETag content replacement and keeps an active room on its creation-time bank', async () => {
@@ -1752,13 +2223,13 @@ describe('Voice Trivia central runtime', () => {
     const runtime = await harness();
     const internal = server as unknown as {
       analyticsObserver: AnalyticsObserver;
-      makeTriviaSession(say: () => Promise<boolean>): TriviaVoiceSession;
+      makeTriviaSession(say: () => Promise<'played'>): TriviaVoiceSession;
       abortStationEngine(game: 'trivia', roomCode: string): void;
     };
     const command = vi.spyOn(internal.analyticsObserver, 'voiceCommand');
     const state = vi.spyOn(internal.analyticsObserver, 'triviaState');
     const aborted = vi.spyOn(internal.analyticsObserver, 'triviaAborted');
-    const session = internal.makeTriviaSession(async () => true);
+    const session = internal.makeTriviaSession(async () => 'played' as const);
     session.handleMessage(JSON.stringify({
       type: 'setup', callSid: 'CA-ANALYTICS', customParameters: { roomCode: 'ANALYTICS', game: 'trivia' },
     }));

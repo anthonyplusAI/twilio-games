@@ -16,7 +16,10 @@ function deferred() {
 function state(phase: FighterState['phase'], generation = 4): FighterState {
   return {
     roomCode: 'TEST', phase, loadingGeneration: generation, selectedMap: 'foundry', aiFighterId: null,
-    mapVotesByPlayerId: {}, expectedPlayerCount: 2, hasExpectedPlayers: true, automaticSetup: false, players: [
+    mapVotesByPlayerId: {}, mapVoteTied: false, advanceReadyPlayerIds: [], backReadyPlayerIds: [],
+    phonePendingPlayerIds: [], phoneDisconnectedPlayerIds: [],
+    phoneTurnPendingPlayerIds: [], phoneRetryPlayerIds: [],
+    expectedPlayerCount: 2, hasExpectedPlayers: true, automaticSetup: false, players: [
       { playerId: 'one', name: 'One', side: 'p1', fighterId: 'nyx', isAi: false },
       { playerId: 'two', name: 'Two', side: 'p2', fighterId: 'wraith', isAi: false },
     ], world: null, intro: null, countdown: null, result: null,

@@ -45,12 +45,15 @@ export interface WorldSnapshot {
 // ---- Protocol: client -> server ----
 export type ClientMessage =
   | { type: 'join'; roomCode: string; name: string; color?: string; locale?: SupportedLocale;
-      rendererReadyGate?: boolean }
+      rendererReadyGate?: boolean; keyboardSession?: { id: string; generation: number; seats?: 1 | 2 } }
   | { type: 'intent'; intent: Intent }
   | { type: 'ready' }
   | { type: 'restart' }
-  | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; displayToken?: string }
+  | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; displayToken?: string; count?: 1 | 2 }
+  | { type: 'configure_seats'; roomCode: string; count: 1 | 2 }
   | { type: 'leave' }                              // drop this conn's player slot but stay connected (→ spectator)
+  | { type: 'release_keyboard_session'; roomCode: string;
+      keyboardSession: { id: string; generation: number } }
   | { type: 'select_car'; carIndex: number }      // player claims a car (car_select phase)
   | { type: 'select_map'; map: string }           // pick the level (map_select phase)
   | { type: 'advance' }                            // host: move the flow forward one phase
@@ -66,7 +69,13 @@ export interface MenuTouchState {
   advancePlayerId: string | null;
   canAdvance: boolean;
   canBack: boolean;
+  expectedPlayers?: number;
+  sharedReplayRequiresCalls?: boolean;
+  sharedReplayStatuses?: Array<{ playerId: string;
+    state: 'recap' | 'waiting' | 'ready' | 'reconnecting' | 'left' }>;
 }
+
+export type RacerSetupStatus = 'name' | 'phone' | 'car' | 'map' | 'ready' | 'reconnecting';
 
 export interface LobbyPlayer {
   playerId: string;
@@ -75,6 +84,7 @@ export interface LobbyPlayer {
   lane: number;
   carIndex: number | null;   // chosen car model (car_select), null until picked
   ready: boolean;            // locked their car in
+  setupStatus?: RacerSetupStatus; // current shared-menu progress for this caller
 }
 
 /** A finished race's standings, persisted to the leaderboard + shown on the results screen. */
@@ -90,6 +100,8 @@ export interface RaceResult {
 // ---- Protocol: server -> client ----
 export type ServerMessage =
   | { type: 'joined'; playerId: string; lane: number; roomCode: string }
+  | { type: 'keyboard_session_released'; roomCode: string;
+      keyboardSession: { id: string; generation: number } }
   | { type: 'error'; code: string; message: string }
   | { type: 'items'; items: Item[]; map?: string | null }   // sent once at race start (map = chosen level)
   | { type: 'snapshot'; snapshot: WorldSnapshot } // sent ~30/s during a race

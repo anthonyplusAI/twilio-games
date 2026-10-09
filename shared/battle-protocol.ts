@@ -8,7 +8,8 @@ import { isSupportedLocale, type SupportedLocale } from './i18n/locales';
 /** Client → server. */
 export type BattleClientMessage =
   | { type: 'join'; roomCode: string; name: string; sessionId?: string; locale?: SupportedLocale } // become/resume a player
-  | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; displayToken?: string } // the shared display (no slot)
+  | { type: 'spectate'; roomCode: string; locale?: SupportedLocale; displayToken?: string; playerCount?: 1 | 2 } // the shared display (no slot)
+  | { type: 'configure_players'; count: 1 | 2 }         // standalone display reserves the phone seats
   | { type: 'select_monster'; monsterId: string }           // during monster_select
   | { type: 'display_select_monster'; playerId:string; monsterId:string } // authenticated shared display only
   | { type: 'ack_event'; generation:number; eventId:number } // displayed battle beat
@@ -29,14 +30,17 @@ export interface RosterEntry {
 }
 
 /** A player row for the lobby / monster-select screens. */
-export interface BattleLobbyPlayer { playerId: string; name: string; monsterId: string | null; isAi: boolean; }
+export interface BattleLobbyPlayer { playerId: string; side?: 'a' | 'b'; name: string; nameConfirmed: boolean; monsterId: string | null; setupReady: boolean; phonePending?: boolean; isAi: boolean; }
 
 /** Server → client. */
 export type BattleServerMessage =
   | { type: 'joined'; playerId: string; roomCode: string }
+  | { type: 'session_released'; sessionId: string }
   | { type: 'roster'; monsters: RosterEntry[] }             // sent on connect for the select screen
+  | { type: 'host_identity'; roomCode: string; isHost: boolean }
   | { type: 'battle_state'; roomCode: string; phase: string;
       players: BattleLobbyPlayer[]; snapshot: BattleSnapshot | null;
+      expectedPlayerCount: number;
       generation:number; resultsPresented:boolean;
       canAdvanceLobby:boolean; canStartBattle:boolean;
       activeSide?: 'a' | 'b' | null; activeMenu?: 'root' | 'fight';
@@ -63,9 +67,16 @@ export function parseBattleClientMessage(raw: string): ParseResult {
         ...(isSupportedLocale(m.locale) ? { locale: m.locale } : {}) };
     case 'spectate':
       if (typeof m.roomCode !== 'string') return err('bad_spectate', 'roomCode required');
+      if (m.playerCount !== undefined && m.playerCount !== 1 && m.playerCount !== 2)
+        return err('bad_player_count', 'playerCount must be 1 or 2');
       return { type: 'spectate', roomCode: m.roomCode,
         ...(isSupportedLocale(m.locale) ? { locale: m.locale } : {}),
-        ...(typeof m.displayToken === 'string' ? { displayToken: m.displayToken } : {}) };
+        ...(typeof m.displayToken === 'string' ? { displayToken: m.displayToken } : {}),
+        ...(m.playerCount === 1 || m.playerCount === 2 ? { playerCount: m.playerCount } : {}) };
+    case 'configure_players':
+      return m.count === 1 || m.count === 2
+        ? { type: 'configure_players', count: m.count }
+        : err('bad_player_count', 'count must be 1 or 2');
     case 'select_monster':
       if (typeof m.monsterId !== 'string') return err('bad_select', 'monsterId required');
       return { type: 'select_monster', monsterId: m.monsterId };

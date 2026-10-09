@@ -17,7 +17,7 @@ import { surfaceOptsFromPath } from './track-surface';
 import { mergeLevel, resolveCarScale, resolveItemScale, resolveCamera } from '../shared/level';
 import type { GantryOffset } from '../shared/level';
 import { hudStateFor } from './hud-state';
-import { BOOST_MAX, BOOST_MIN, DEFAULT_ROOM } from '../shared/constants';
+import { BOOST_MAX, BOOST_MIN, DEFAULT_ROOM, LAP_TARGET } from '../shared/constants';
 import { getMusicManager } from './music-manager';
 import { injectMusicToggle } from './music-toggle';
 import { injectFullscreenToggle } from './fullscreen-toggle';
@@ -52,6 +52,11 @@ function localizeStaticPage(): void {
   setText('gPowerLabel', 'hud.power.readyInitial');
   document.getElementById('split-role-1')!.textContent = text('hud.player', { number: 1 });
   document.getElementById('split-role-2')!.textContent = text('hud.player', { number: 2 });
+  for (const seat of [1, 2]) {
+    setText(`split-place-label-${seat}`, 'hud.split.place');
+    setText(`split-lap-label-${seat}`, 'hud.split.lap');
+    setText(`split-nitro-label-${seat}`, 'hud.split.nitro');
+  }
   document.getElementById('gBoost')?.setAttribute('title', text('hud.boostBrakeTitle'));
 }
 
@@ -65,6 +70,10 @@ const isDisplay = pageParams.get('display') === '1';
 const wsOverride = pageParams.get('ws');
 const url = wsOverride ?? `${wsProto}://${location.host}/game${isDisplay?'?display=1':''}`;
 const conn = new GameConnection(url, locale);
+const keyboardPlayerUrl = new URL(url, location.href);
+keyboardPlayerUrl.searchParams.delete('display');
+keyboardPlayerUrl.searchParams.delete('displaySessionId');
+let keyboardPlayerConn: GameConnection | null = null;
 const input = new KeyboardAdapter();
 const assets = new AssetLoader();
 const renderer = new Renderer(document.getElementById('app')!, assets);
@@ -80,6 +89,10 @@ const big = document.getElementById('big')!;
 const lobbyEl = document.getElementById('lobby')!;
 const splitLabelsEl = document.getElementById('split-labels')!;
 const splitNameEls = [document.getElementById('split-name-1')!, document.getElementById('split-name-2')!];
+const splitPlaceEls = [document.getElementById('split-place-1')!, document.getElementById('split-place-2')!];
+const splitLapEls = [document.getElementById('split-lap-1')!, document.getElementById('split-lap-2')!];
+const splitNitroEls = [document.getElementById('split-nitro-1')!, document.getElementById('split-nitro-2')!];
+const splitNitroPills = [document.getElementById('split-nitro-pill-1')!, document.getElementById('split-nitro-pill-2')!];
 
 function paintSplitLabels(snap: import('../shared/types').WorldSnapshot | null): void {
   const show = snap?.cars.length === 2;
@@ -88,6 +101,12 @@ function paintSplitLabels(snap: import('../shared/types').WorldSnapshot | null):
   snap.cars.forEach((car, index) => {
     splitNameEls[index]!.textContent = car.name;
     splitNameEls[index]!.parentElement!.style.setProperty('--player-color', car.color);
+    splitPlaceEls[index]!.textContent = `#${car.place}`;
+    splitLapEls[index]!.textContent = `${Math.min(car.lap, LAP_TARGET)}/${LAP_TARGET}`;
+    splitNitroEls[index]!.textContent = car.powerActive > 0
+      ? text('hud.split.active') : `×${Math.max(0, car.power)}`;
+    splitNitroPills[index]!.classList.toggle('active', car.powerActive > 0);
+    splitNitroPills[index]!.classList.toggle('ready', car.powerActive <= 0 && car.power > 0);
   });
 }
 
@@ -286,7 +305,7 @@ function stopAttract() {
   if (attractFallbackTimer) { clearTimeout(attractFallbackTimer); attractFallbackTimer = null; }
   if (attract.isRunning) { attract.stop(); renderer.clearCars(); }   // remove the demo cars so they
                                                                      // don't sit frozen during the race
-  renderer.setSpectator(isDisplay);   // back to the player's chase cam (or stay spectator on a display)
+  renderer.setSpectator(isDisplay && !displayIsPlaying);   // restore the keyboard player's camera when one has joined
 }
 
 let racePreparationGeneration = 0;
@@ -765,7 +784,9 @@ function boot() {
   // awaiting loadManifest() (19 GLBs + Draco) and a synchronous 19-car thumbnail render, which is
   // why the screen sat blank (with just the static HUD) for a second or more.
   conn.onJoined((playerId) => { renderer.setMyId(playerId); });
-  input.onIntent((i) => { if (!screens.isVisible) conn.sendIntent(i); });
+  input.onIntent((i) => {
+    if (!screens.isVisible) (isDisplay ? keyboardPlayerConn : conn)?.sendIntent(i);
+  });
   if (isDisplay) renderer.setSpectator(true);
   screens.bindHostKeys();   // ← back · → / Enter advance (only while a screen is visible)
   bindFlowDigits();          // 1-9 select a car/map by number (stands in for SMS)
@@ -778,19 +799,54 @@ function boot() {
   // not a player. It can still drive the whole flow (ready/advance/back/restart/select_map key off the
   // connection's room, not a playerId), so the game starts with ZERO players and fills up as people
   // call in. A device player join()s with their own name + gets a car.
-  if (isDisplay) conn.spectate(roomCode, stationDisplay.displayToken ?? undefined);
+  if (isDisplay) {
+    if (!stationDisplay.active) conn.configureSeats(roomCode, pageParams.get('players') === '2' ? 2 : 1);
+    conn.spectate(roomCode, stationDisplay.displayToken ?? undefined);
+  }
   else conn.join(roomCode, name, true);
 
-  // SHARED-SCREEN "I'm playing" TOGGLE (P): the screen defaults to spectator, but the operator can
-  // opt IN to also play on this keyboard (joins as a real player + car), and opt back OUT (drops the
-  // slot, stays the display). Keeps the screen unambiguous — it's a spectator unless you say otherwise.
+  // SHARED-SCREEN "I'm playing" TOGGLE (P): keep the display's spectator socket bound while a
+  // separate keyboard-player socket joins. Other callers must still find this shared display.
   if (isDisplay && !stationDisplay.active) {
+    // This page instance owns only its keyboard seat. A copied tab gets a different token; each
+    // P-on increments the generation so a delayed join from an older socket cannot take it back.
+    const keyboardSessionId = [...crypto.getRandomValues(new Uint8Array(16))]
+      .map(byte => byte.toString(16).padStart(2, '0')).join('');
+    let keyboardJoinGeneration = 0;
     addEventListener('keydown', (e) => {
       if (e.key !== 'p' && e.key !== 'P') return;
-      if (displayIsPlaying) { conn.leave(); renderer.setMyId(''); renderer.setSpectator(true); displayIsPlaying = false; }
-      else { conn.join(roomCode, name, true); displayIsPlaying = true; }   // onJoined sets myId → chase cam
+      if (displayIsPlaying) {
+        conn.releaseKeyboardSession(roomCode, {
+          id: keyboardSessionId, generation: keyboardJoinGeneration,
+        });
+        keyboardPlayerConn?.leave();
+        keyboardPlayerConn?.dispose(); keyboardPlayerConn = null;
+        renderer.setMyId(''); renderer.setSpectator(true); displayIsPlaying = false;
+      } else {
+        const playerConn = new GameConnection(keyboardPlayerUrl.toString(), locale);
+        keyboardPlayerConn = playerConn;
+        playerConn.onJoined(playerId => {
+          if (keyboardPlayerConn !== playerConn) return;
+          renderer.setMyId(playerId);
+          renderer.setSpectator(false);
+        });
+        playerConn.onError((code, message) => {
+          console.error(`Keyboard player error [${code}]: ${message}`);
+          if (keyboardPlayerConn !== playerConn) return;
+          playerConn.dispose(); keyboardPlayerConn = null;
+          renderer.setMyId(''); renderer.setSpectator(true); displayIsPlaying = false;
+          screens.setSelfPlaying(false);
+          big.textContent = text(code === 'room_full' ? 'error.roomFull' : 'error.generic');
+        });
+        playerConn.join(roomCode, name, true, {
+          id: keyboardSessionId, generation: ++keyboardJoinGeneration,
+          seats: pageParams.get('players') === '2' ? 2 : 1,
+        });
+        displayIsPlaying = true;
+      }
       screens.setSelfPlaying(displayIsPlaying);
     });
+    addEventListener('pagehide', () => keyboardPlayerConn?.dispose(), { once: true });
   }
 
   // Fetch the join phone number (server config) so the lobby QR + copy show the real number. Fire-

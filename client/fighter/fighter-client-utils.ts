@@ -1,4 +1,30 @@
 import type { FighterConnectionState } from './fighter-net';
+import type { FighterLobbyPlayer, FighterState } from '../../shared/fighter-protocol';
+
+export type FighterSharedSeatStatus = 'shared.waitingSeat' | 'shared.phoneReconnect'
+  | 'shared.phonePending' | 'shared.phonePendingVote' | 'shared.phoneRetry'
+  | 'shared.phoneConversation' | 'shared.backRequested'
+  | 'shared.ready' | 'shared.naming' | 'shared.choosingFighter'
+  | 'shared.choosingArena' | 'shared.waitingConfirm';
+
+export function fighterSharedSeatStatus(
+  state: FighterState, player: FighterLobbyPlayer | null | undefined,
+): FighterSharedSeatStatus {
+  if (!player) return 'shared.waitingSeat';
+  const ready = state.advanceReadyPlayerIds.includes(player.playerId);
+  const back = state.backReadyPlayerIds.includes(player.playerId);
+  if (state.phoneDisconnectedPlayerIds.includes(player.playerId)) return 'shared.phoneReconnect';
+  if (state.phoneRetryPlayerIds.includes(player.playerId)) return 'shared.phoneRetry';
+  if (state.phoneTurnPendingPlayerIds.includes(player.playerId)) return 'shared.phoneConversation';
+  if (state.phonePendingPlayerIds.includes(player.playerId))
+    return ready || back ? 'shared.phonePendingVote' : 'shared.phonePending';
+  if (back) return 'shared.backRequested';
+  if (ready) return 'shared.ready';
+  if (state.phase === 'lobby' && player.nameConfirmed === false) return 'shared.naming';
+  if (state.phase === 'fighter_select' && !player.fighterId) return 'shared.choosingFighter';
+  if (state.phase === 'map_select' && !state.mapVotesByPlayerId[player.playerId]) return 'shared.choosingArena';
+  return 'shared.waitingConfirm';
+}
 
 export type FighterResultActionState = 'station' | 'rematch' | 'viewer' | 'reconnecting' | 'unavailable';
 

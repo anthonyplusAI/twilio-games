@@ -331,8 +331,10 @@ describe('station engine room lifecycle', () => {
     const ada = battle.voiceJoin(roomCode, 'Ada')!;
     const grace = battle.voiceJoin(roomCode, 'Grace')!;
     battle.voiceAdvance(roomCode,ada);
+    battle.voiceAdvance(roomCode,grace);
     battle.voiceSelectMonster(roomCode, ada, 'sparkmouse');
     battle.voiceSelectMonster(roomCode, grace, 'embertail');
+    battle.voiceAdvance(roomCode,ada);
     battle.voiceAdvance(roomCode,grace);
     const room = battle.findRoom(roomCode)!;
 

@@ -33,6 +33,11 @@
     #vm-hud .brandbug { width: 22px; height: 22px; }
     #vm-hud .htitle { font-family: 'Twilio Sans Display', ui-sans-serif, system-ui, sans-serif;
       font-weight:800;color:var(--theme-text);letter-spacing:.02em;font-size:15px; }
+    @media (max-width: 520px) {
+      #music-toggle-container :is(.music-toggle,.fullscreen-toggle) {
+        top: max(12px, env(safe-area-inset-top)); bottom: auto;
+      }
+    }
   </style>
 </head>
 <body>

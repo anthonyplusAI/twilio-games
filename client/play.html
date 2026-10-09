@@ -13,10 +13,22 @@
   <div id="app">
     <div id="split-labels" class="split-labels" aria-label="Split-screen racers" hidden>
       <div class="split-player">
-        <div class="split-player-card"><span id="split-role-1">Player 1</span><strong id="split-name-1"></strong></div>
+        <div class="split-player-card"><span id="split-role-1">Player 1</span><strong id="split-name-1"></strong>
+          <div class="split-stats" aria-live="off">
+            <span class="split-stat"><small id="split-place-label-1">Place</small><b id="split-place-1">—</b></span>
+            <span class="split-stat"><small id="split-lap-label-1">Lap</small><b id="split-lap-1">—</b></span>
+            <span class="split-stat nitro" id="split-nitro-pill-1"><small id="split-nitro-label-1">Nitro</small><b id="split-nitro-1">—</b></span>
+          </div>
+        </div>
       </div>
       <div class="split-player">
-        <div class="split-player-card"><span id="split-role-2">Player 2</span><strong id="split-name-2"></strong></div>
+        <div class="split-player-card"><span id="split-role-2">Player 2</span><strong id="split-name-2"></strong>
+          <div class="split-stats" aria-live="off">
+            <span class="split-stat"><small id="split-place-label-2">Place</small><b id="split-place-2">—</b></span>
+            <span class="split-stat"><small id="split-lap-label-2">Lap</small><b id="split-lap-2">—</b></span>
+            <span class="split-stat nitro" id="split-nitro-pill-2"><small id="split-nitro-label-2">Nitro</small><b id="split-nitro-2">—</b></span>
+          </div>
+        </div>
       </div>
     </div>
     <!-- Keep the scene veil and menu in the same stacking context: the QR/name menu

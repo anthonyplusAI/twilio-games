@@ -6,7 +6,7 @@ import { FighterActorLoadCoordinator, FighterWarmupRetryBudget, fighterActorLoad
 import { FIGHTERS, FIGHTER_ASSET_VERSION, fighterAssetFirstAttemptMs, loadAnimationSources, preferProceduralFighterAssets } from './fighter-assets';
 import { FighterAtmosphere, fighterAtmosphereSpec, type FighterAtmosphereSpec } from './fighter-atmosphere';
 import { FighterConnection, type FighterConnectionState } from './fighter-net';
-import { fighterResultActionState, isInteractiveShortcutTarget, resolveNumericSelection } from './fighter-client-utils';
+import { fighterResultActionState, fighterSharedSeatStatus, isInteractiveShortcutTarget, resolveNumericSelection } from './fighter-client-utils';
 import { frameStaticPortraitArena, proceduralFallbackCamera, responsiveVerticalFov, shouldUseLivePortraitArena } from './fighter-camera';
 import { getSoundEffectsManager } from '../sound-effects';
 import { getMusicManager } from '../music-manager';
@@ -87,6 +87,7 @@ const roomCode = params.get('room') || DEFAULT_ROOM;
 const wsProtocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const connection = new FighterConnection(`${wsProtocol}//${location.host}/fighter${isDisplay?'?display=1':''}`, locale);
 connection.setDisplayAuth(roomCode, isDisplay ? stationDisplay.displayToken : null);
+let keyboardPlayerConn: FighterConnection | null = null;
 
 const arenaSize = () => ({ width: Math.max(1, arena.clientWidth || innerWidth), height: Math.max(1, arena.clientHeight || innerHeight) });
 const initialArenaSize = arenaSize();
@@ -181,7 +182,7 @@ let sentResultReceipt='';
 localizeStaticUi();
 
 connection.onRoster((fighters, mapEntries) => { roster = fighters; maps = mapEntries; renderFlow(); });
-connection.onJoined(id => { playerId = id; renderFlow(); });
+connection.onJoined(id => { if (!keyboardPlayerConn) { playerId = id; renderFlow(); } });
 connection.onEvents(handleEvents);
 connection.onShowResults(generation => {
   if (state && generation < state.loadingGeneration) return;
@@ -278,6 +279,8 @@ connection.onState(next => {
   scheduleFightReceipt();
 });
 connection.spectate(roomCode);
+if (!stationDisplay.active && (params.get('players') === '1' || params.get('players') === '2'))
+  connection.setStandaloneSeats(roomCode, params.get('players') === '2' ? 2 : 1);
 let phoneQrGeneration = 0;
 const stopVoiceNumberUpdates = watchVoiceNumber(locale, async number => {
   const generation = ++phoneQrGeneration;
@@ -299,6 +302,7 @@ addEventListener('pagehide', () => {
   stopVoiceNumberUpdates(); actorLoadCoordinator.clear();
   clearActorWarmupRetryTimers();
   if (readyTimer) { clearTimeout(readyTimer); readyTimer = null; }
+  releaseKeyboardPlayer();
 }, { once: true });
 
 function setLoading(progress: number, label: string): void {
@@ -356,6 +360,10 @@ function renderFlow(): void {
   const countdownKey = state.countdown === null ? null : Math.ceil(state.countdown) > 3 ? 'ready' : Math.ceil(state.countdown);
   const introKey = state.intro === null ? null : fighterIntroStage(state.intro);
   const key = JSON.stringify([state.phase, state.players, state.selectedMap, state.mapVotesByPlayerId,
+    state.expectedPlayerCount, state.automaticSetup, state.hasExpectedPlayers,
+    state.advanceReadyPlayerIds, state.backReadyPlayerIds,
+    state.phonePendingPlayerIds, state.phoneDisconnectedPlayerIds,
+    state.phoneTurnPendingPlayerIds, state.phoneRetryPlayerIds,
     introKey, countdownKey, playerId, touchTargetPlayerId, isHost, roster, maps, phoneNumber, flowMessage]);
   if (key === lastOverlayKey || state.phase === 'fight' || state.phase === 'victory' || state.phase === 'results') {
     if (state.phase === 'fight' || state.phase === 'victory' || state.phase === 'results') overlay.replaceChildren();
@@ -364,6 +372,9 @@ function renderFlow(): void {
   lastOverlayKey = key;
   lastPhase = state.phase;
   if (state.phase === 'lobby') {
+    const sharedStatus = sharedMenuStatus(state);
+    const lobbyAdvance = isSharedSetup(state) && !playerId ? ''
+      : `<button id="flow-next" ${state.hasExpectedPlayers && isHost ? '' : 'disabled'}>${t('lobby.chooseFighters')}</button>`;
     const joinCard=stationDisplay.active
       ? `<div class="station-call-card"><strong>${t('lobby.stationTitle')}</strong><span>${t('lobby.stationBody')}</span></div>`
       : `<div class="qr-card">${phoneQr ? `<img src="${escapeHtml(phoneQr)}" alt="${t('lobby.qrAlt')}">` : ''}<strong>${t('lobby.scanToJoin')}</strong><span>${escapeHtml(phoneNumber)}</span></div>`;
@@ -373,7 +384,7 @@ function renderFlow(): void {
     const localAction=isDisplay
       ? stationDisplay.active?'':`<p class="phone-play-notice">${t('lobby.phonePlay')}</p>`
       : `<button id="local-join">${t('lobby.playingHere')}</button>`;
-    overlay.innerHTML = `<section class="flow-panel lobby-panel"><div class="lobby-head"><h1>${t('app.title')}</h1><p>${t(stationDisplay.active?'lobby.stationTagline':'lobby.tagline')}</p></div><div class="lobby-layout">${joinCard}<div class="lobby-center"><h2>${t('lobby.getStarted')}</h2><ol class="join-steps">${steps.map((step,index)=>`<li><b>${index+1}</b><span>${t(step)}</span></li>`).join('')}</ol><div class="player-list"><h2>${t(state.players.length ? 'lobby.challengers' : 'lobby.title')}</h2>${state.players.length ? state.players.map(playerChip).join('') : `<p>${t('lobby.waitingFirst')}</p>`}</div></div><aside class="how-to"><h2>${t('lobby.howToFight')}</h2><p>${t('lobby.rules')}</p><div class="instruction-grid"><span><b>${t('command.forward')}</b> ${t('instruction.forward')}</span><span><b>${t('command.back')}</b> ${t('instruction.back')}</span><span><b>${t('command.jump')}</b> ${t('instruction.jump')}</span><span><b>${t('command.punch')}</b> ${t('instruction.punch')}</span><span><b>${t('command.kick')}</b> ${t('instruction.kick')}</span><span><b>${t('command.block')}</b> ${t('instruction.block')}</span></div><p class="voice-tip">${t('lobby.voiceTip')}</p></aside></div><div class="flow-actions lobby-actions">${localAction}<button id="flow-next" ${state.players.length && isHost ? '' : 'disabled'}>${t('lobby.chooseFighters')}</button></div>${isHost||isDisplay ? '' : `<p class="flow-hint">${t('lobby.viewOnly')}</p>`}</section>`;
+    overlay.innerHTML = `<section class="flow-panel lobby-panel"><div class="lobby-head"><h1>${t('app.title')}</h1><p>${t(stationDisplay.active?'lobby.stationTagline':'lobby.tagline')}</p></div><div class="lobby-layout">${joinCard}<div class="lobby-center"><h2>${t('lobby.getStarted')}</h2><ol class="join-steps">${steps.map((step,index)=>`<li><b>${index+1}</b><span>${t(step)}</span></li>`).join('')}</ol><div class="player-list"><h2>${t(state.players.length ? 'lobby.challengers' : 'lobby.title')}</h2>${state.players.length ? state.players.map(playerChip).join('') : `<p>${t('lobby.waitingFirst')}</p>`}</div>${sharedStatus}</div><aside class="how-to"><h2>${t('lobby.howToFight')}</h2><p>${t('lobby.rules')}</p><div class="instruction-grid"><span><b>${t('command.forward')}</b> ${t('instruction.forward')}</span><span><b>${t('command.back')}</b> ${t('instruction.back')}</span><span><b>${t('command.jump')}</b> ${t('instruction.jump')}</span><span><b>${t('command.punch')}</b> ${t('instruction.punch')}</span><span><b>${t('command.kick')}</b> ${t('instruction.kick')}</span><span><b>${t('command.block')}</b> ${t('instruction.block')}</span></div><p class="voice-tip">${t('lobby.voiceTip')}</p></aside></div><div class="flow-actions lobby-actions">${localAction}${lobbyAdvance}</div>${isHost||isDisplay ? '' : `<p class="flow-hint">${t('lobby.viewOnly')}</p>`}</section>`;
   } else if (state.phase === 'fighter_select') {
     const allPicked = state.hasExpectedPlayers && state.players.length > 0 && state.players.every(player => player.fighterId);
     const target=activeTouchPlayer(state);
@@ -381,13 +392,17 @@ function renderFlow(): void {
       const owner = state!.players.find(player => player.fighterId === fighter.id);
       return { id: fighter.id, name: localizedFighterName(fighter), detail: owner ? t('select.selectedBy', { name: owner.name }) : localizedFighterTitle(fighter), color: fighter.color, number: index + 1,
         selected:owner?.playerId===target?.playerId,taken:Boolean(owner&&owner.playerId!==target?.playerId) };
-    }), 'fighter', allPicked && isHost,touchPicker(state,target,'fighter'));
+    }), 'fighter', allPicked && isHost,touchPicker(state,target,'fighter'),sharedMenuStatus(state));
   } else if (state.phase === 'map_select') {
     const target=activeTouchPlayer(state);
     const allVotes=state.hasExpectedPlayers&&state.players.filter(player=>!player.isAi)
       .every(player=>Boolean(state!.mapVotesByPlayerId[player.playerId]));
-    overlay.innerHTML = selectScreen(t('select.arenaTitle'), t('select.arenaDescription'), maps.map((map, index) => ({ id: map.id, name: localizedMapName(map), detail: localizedMapBlurb(map), color: map.color, number: index + 1,
-      selected:state!.mapVotesByPlayerId[target?.playerId??'']===map.id,taken:false })), 'map', allVotes && isHost,touchPicker(state,target,'map'));
+    const drawnMap=maps.find(map=>map.id===state!.selectedMap);
+    const description=state.mapVoteTied&&drawnMap
+      ? `${t('select.arenaDescription')} ${t('shared.arenaTie',{name:localizedMapName(drawnMap)})}`
+      :t('select.arenaDescription');
+    overlay.innerHTML = selectScreen(t('select.arenaTitle'), description, maps.map((map, index) => ({ id: map.id, name: localizedMapName(map), detail: localizedMapBlurb(map), color: map.color, number: index + 1,
+      selected:state!.mapVotesByPlayerId[target?.playerId??'']===map.id,taken:false })), 'map', allVotes && isHost,touchPicker(state,target,'map'),sharedMenuStatus(state));
   } else if (state.phase === 'loading') {
     overlay.innerHTML = `<section class="countdown-screen loading-arena"><span>${t('loading.preparingStage')}</span><strong>${t('loading.loading')}</strong><small>${escapeHtml(localizedMapName(maps.find(map => map.id === state!.selectedMap)))}</small></section>`;
   } else if (state.phase === 'intro') {
@@ -406,8 +421,31 @@ function renderFlow(): void {
   });
 }
 
-function selectScreen(title: string, description: string, cards: { id: string; name: string; detail: string; color: string; number: number; selected: boolean; taken: boolean }[], kind: 'fighter'|'map', ready: boolean,picker=''): string {
-  return `<section class="flow-panel selection-panel"><span class="flow-kicker">${t('app.title')}</span><h1 tabindex="-1">${title}</h1><p>${description}</p>${picker}<div class="select-grid ${kind}-grid">${cards.map(card => { const preview = kind === 'fighter' ? roster.find(entry => entry.id === card.id)?.preview : maps.find(map => map.id === card.id)?.preview; return `<button class="select-card ${card.selected ? 'selected' : ''} ${card.taken ? 'taken' : ''}" data-${kind}="${card.id}" aria-pressed="${card.selected}" aria-label="${String(card.number).padStart(2, '0')}, ${escapeHtml(card.name)}, ${escapeHtml(card.detail)}" style="--card-color:${card.color}" ${card.taken && kind === 'fighter' ? 'disabled' : ''}><div class="card-preview" aria-hidden="true" ${preview ? `style="background-image:url('${preview}')"` : ''}></div><span class="number">${String(card.number).padStart(2, '0')}</span><strong>${escapeHtml(card.name)}</strong><span>${escapeHtml(card.detail)}</span></button>`; }).join('')}</div><div class="flow-actions"><button id="flow-back" class="secondary">${t('select.back')}</button><button id="flow-next" ${ready ? '' : 'disabled'}>${t(kind === 'map' ? 'select.startFight' : 'select.chooseArena')}</button></div><div class="flow-hint">${t('select.hint')}</div></section>`;
+function isSharedSetup(current: FighterState): boolean {
+  return current.automaticSetup && current.expectedPlayerCount === 2;
+}
+
+function sharedMenuStatus(current: FighterState): string {
+  if (!isSharedSetup(current)) return '';
+  const prompt = current.phase === 'map_select' ? 'shared.startPrompt' : 'shared.nextPrompt';
+  const seats = (['p1', 'p2'] as const).map(side => {
+    const player = current.players.find(candidate => candidate.side === side && !candidate.isAi);
+    const ready = Boolean(player && current.advanceReadyPlayerIds.includes(player.playerId)
+      && !current.phonePendingPlayerIds.includes(player.playerId)
+      && !current.phoneDisconnectedPlayerIds.includes(player.playerId));
+    const status = fighterSharedSeatStatus(current, player);
+    return `<div class="shared-setup-seat ${ready ? 'is-ready' : ''}"><b>${side.toUpperCase()}</b><strong>${escapeHtml(player?.name ?? t('shared.waitingSeat'))}</strong><span>${t(status)}</span></div>`;
+  }).join('');
+  return `<div class="shared-setup-state" role="status" aria-live="polite"><p>${t(prompt)}</p><div class="shared-setup-seats">${seats}</div></div>`;
+}
+
+function selectScreen(title: string, description: string, cards: { id: string; name: string; detail: string; color: string; number: number; selected: boolean; taken: boolean }[], kind: 'fighter'|'map', ready: boolean,picker='',sharedStatus=''): string {
+  const shared = Boolean(state && isSharedSetup(state));
+  const localControls = !shared || Boolean(playerId);
+  const actions = localControls
+    ? `<div class="flow-actions"><button id="flow-back" class="secondary">${t('select.back')}</button><button id="flow-next" ${ready ? '' : 'disabled'}>${t(kind === 'map' ? 'select.startFight' : 'select.chooseArena')}</button></div>`
+    : '';
+  return `<section class="flow-panel selection-panel"><span class="flow-kicker">${t('app.title')}</span><h1 tabindex="-1">${title}</h1><p>${description}</p>${picker}${sharedStatus}<div class="select-grid ${kind}-grid">${cards.map(card => { const preview = kind === 'fighter' ? roster.find(entry => entry.id === card.id)?.preview : maps.find(map => map.id === card.id)?.preview; return `<button class="select-card ${card.selected ? 'selected' : ''} ${card.taken ? 'taken' : ''}" data-${kind}="${card.id}" data-state-label="${t(kind === 'map' ? 'select.voted' : 'select.locked')}" aria-pressed="${card.selected}" aria-label="${String(card.number).padStart(2, '0')}, ${escapeHtml(card.name)}, ${escapeHtml(card.detail)}" style="--card-color:${card.color}" ${card.taken && kind === 'fighter' ? 'disabled' : ''}><div class="card-preview" aria-hidden="true" ${preview ? `style="background-image:url('${preview}')"` : ''}></div><span class="number">${String(card.number).padStart(2, '0')}</span><strong>${escapeHtml(card.name)}</strong><span>${escapeHtml(card.detail)}</span></button>`; }).join('')}</div>${actions}<div class="flow-hint">${t(shared ? 'shared.backPrompt' : 'select.hint')}</div></section>`;
 }
 
 function activeTouchPlayer(current:FighterState):FighterLobbyPlayer|null{
@@ -489,21 +527,27 @@ function reloadForAssetRetry(): void {
 }
 
 function wireFlowButtons(): void {
-  $('flow-next')?.addEventListener('click', () => { flowMessage = ''; connection.advance(); });
-  $('flow-back')?.addEventListener('click', () => { if (isHost) connection.back(); });
+  $('flow-next')?.addEventListener('click', () => { flowMessage = ''; advanceMenu(); });
+  $('flow-back')?.addEventListener('click', () => { if (isHost) backMenu(); });
   $('local-join')?.addEventListener('click', toggleLocalPlayer);
   for(const button of overlay.querySelectorAll<HTMLElement>('[data-touch-player]'))button.addEventListener('click',()=>{
     touchTargetPlayerId=button.dataset.touchPlayer??null;lastOverlayKey='';renderFlow();
   });
   for (const button of overlay.querySelectorAll<HTMLElement>('[data-fighter]')) button.addEventListener('click', () => {
     if(!state)return;flowMessage='';
-    if(isHost){const target=activeTouchPlayer(state);if(target)connection.displaySelectFighter(target.playerId,button.dataset.fighter!);}
-    else if(playerId)connection.selectFighter(button.dataset.fighter!);
+    if(isHost){const target=activeTouchPlayer(state);if(target){
+      if(target.playerId===playerId&&keyboardPlayerConn)keyboardPlayerConn.selectFighter(button.dataset.fighter!);
+      else connection.displaySelectFighter(target.playerId,button.dataset.fighter!);
+    }}
+    else if(playerId)(keyboardPlayerConn ?? connection).selectFighter(button.dataset.fighter!);
   });
   for (const button of overlay.querySelectorAll<HTMLElement>('[data-map]')) button.addEventListener('click', () => {
     if(!state)return;flowMessage='';
-    if(isHost){const target=activeTouchPlayer(state);if(target)connection.displaySelectMap(target.playerId,button.dataset.map!);}
-    else if(playerId)connection.selectMap(button.dataset.map!);
+    if(isHost){const target=activeTouchPlayer(state);if(target){
+      if(target.playerId===playerId&&keyboardPlayerConn)keyboardPlayerConn.selectMap(button.dataset.map!);
+      else connection.displaySelectMap(target.playerId,button.dataset.map!);
+    }}
+    else if(playerId)(keyboardPlayerConn ?? connection).selectMap(button.dataset.map!);
   });
 }
 
@@ -883,18 +927,82 @@ function updateNames(next: FighterState): void {
   }
 }
 function playerChip(player: FighterState['players'][number]): string { return `<div class="player-chip"><strong>${escapeHtml(player.name)}</strong><span>${t(player.isAi ? 'status.cpu' : 'status.connected')}</span></div>`; }
-function toggleLocalPlayer(): void { if (stationDisplay.active) return; if (playerId) { connection.leave(roomCode); playerId = null; } else connection.join(roomCode, t('player.keyboard')); renderFlow(); }
+function advanceMenu(): void {
+  if (playerId && keyboardPlayerConn) keyboardPlayerConn.advance();
+  else connection.advance();
+}
+function backMenu(): void {
+  if (playerId && keyboardPlayerConn) keyboardPlayerConn.back();
+  else connection.back();
+}
+function releaseKeyboardPlayer(): void {
+  if (keyboardPlayerConn) {
+    keyboardPlayerConn.leaveAndClose(roomCode);
+    keyboardPlayerConn = null; playerId = null; touchTargetPlayerId = null;
+  }
+}
+function toggleLocalPlayer(): void {
+  if (stationDisplay.active) return;
+  if (keyboardPlayerConn) releaseKeyboardPlayer();
+  else {
+    const playerConn = connection.createKeyboardPlayerConnection();
+    keyboardPlayerConn = playerConn;
+    playerConn.onJoined(id => {
+      if (keyboardPlayerConn !== playerConn) return;
+      playerId = id; touchTargetPlayerId = id; renderFlow(); syncResultActions();
+    });
+    playerConn.onConnectionState(status => {
+      if (keyboardPlayerConn !== playerConn || status === 'connected') return;
+      playerId = null; touchTargetPlayerId = null; renderFlow(); syncResultActions();
+    });
+    playerConn.onError((code, message) => {
+      console.error(`[fighter keyboard] ${code}: ${message}`);
+      if (keyboardPlayerConn !== playerConn) return;
+      flowMessage = localizedServerError(code) ?? t('error.invalidResponse');
+      if (code === 'room_full' || code === 'station_voice_only') {
+        playerConn.leaveAndClose(roomCode);
+        keyboardPlayerConn = null; playerId = null; touchTargetPlayerId = null;
+      }
+      lastOverlayKey = ''; renderFlow(); syncResultActions();
+    });
+    playerConn.join(roomCode, t('player.keyboard'));
+  }
+  renderFlow(); syncResultActions();
+}
 function announce(text: string): void { voiceCommand.textContent = text.replace('-', ' '); voiceFeed.classList.remove('heard'); void (voiceFeed as HTMLElement).offsetWidth; voiceFeed.classList.add('heard'); }
 function flashButton(command: FighterCommand): void { const button = commandButtons.find(item => item.dataset.command === command); button?.classList.add('active'); setTimeout(() => button?.classList.remove('active'), 220); }
 function showImpact(text: string, defender: FighterId): void { document.body.classList.remove('shake'); void document.body.offsetWidth; document.body.classList.add('shake'); const element = document.createElement('div'); element.className = 'impact'; element.style.left = defender === 'p1' ? '39%' : '61%'; element.textContent = text; document.body.appendChild(element); setTimeout(() => element.remove(), 600); }
 function syncResultActions(): void {
   const action = fighterResultActionState(stationDisplay.active, isHost, fighterConnectionState, state?.phase);
-  rematch.hidden = action !== 'rematch';
+  const shared = Boolean(state && isSharedSetup(state) && !stationDisplay.active);
+  rematch.hidden = action !== 'rematch' || shared && !playerId;
   resultExit.hidden = action === 'station';
   resultStationNext.hidden = action !== 'station';
-  resultActionStatus.hidden = action !== 'viewer' && action !== 'reconnecting';
-  resultActionStatus.textContent = action === 'reconnecting' ? t('result.reconnecting')
+  resultActionStatus.hidden = !shared && action !== 'viewer' && action !== 'reconnecting';
+  resultActionStatus.setAttribute('role', 'status');
+  resultActionStatus.setAttribute('aria-live', 'polite');
+  const summary = action === 'reconnecting' ? t('result.reconnecting')
+    : shared && state?.phoneDisconnectedPlayerIds.length ? t('shared.rematchReconnect')
+    : shared && state?.phoneRetryPlayerIds.length ? t('shared.rematchPhoneRetry')
+    : shared && state?.phonePendingPlayerIds.length
+      ? t('shared.rematchPhonePending', { count: state.advanceReadyPlayerIds.length })
+    : shared ? t('shared.rematchReady', { count: state?.advanceReadyPlayerIds.length ?? 0 })
     : action === 'viewer' ? t('result.hostOnly') : '';
+  if (shared && state && action === 'rematch') {
+    const seats = (['p1', 'p2'] as const).map(side => {
+      const player = state!.players.find(candidate => candidate.side === side && !candidate.isAi);
+      const status = fighterSharedSeatStatus(state!, player);
+      const ready = player && state!.advanceReadyPlayerIds.includes(player.playerId)
+        && !state!.phonePendingPlayerIds.includes(player.playerId)
+        && !state!.phoneDisconnectedPlayerIds.includes(player.playerId);
+      return `<span class="result-setup-seat${ready ? ' is-ready' : ''}"><b>${side.toUpperCase()}</b> `
+        + `<strong>${escapeHtml(player?.name ?? t('shared.waitingSeat'))}</strong> `
+        + `<span>${escapeHtml(t(status))}</span></span>`;
+    }).join(' ');
+    const markup = `<span class="result-status-copy">${escapeHtml(summary)}</span>`
+      + ` <span class="result-setup-seats">${seats}</span>`;
+    if (resultActionStatus.innerHTML !== markup) resultActionStatus.innerHTML = markup;
+  } else resultActionStatus.textContent = summary;
   if (rematch.hidden && document.activeElement === rematch && !resultExit.hidden) resultExit.focus();
 }
 function showResult(winner: FighterId): void {
@@ -1245,9 +1353,6 @@ function localizeStaticUi(): void {
   resultStationNext.textContent = t('result.stationNext');
   syncResultActions();
   loadingLabel.textContent = t('loading.combatSystem'); loadingFill.parentElement?.setAttribute('aria-label', t('loading.combatSystem'));
-  const lockStyle = document.createElement('style');
-  lockStyle.textContent = `.select-card.selected::after{content:${JSON.stringify(t('select.locked'))}}`;
-  document.head.append(lockStyle);
   const music = document.querySelector<HTMLButtonElement>('#music-toggle');
   const localizeMusic = () => {
     if (!music) return;
@@ -1349,13 +1454,13 @@ const keyCommands: Record<string, FighterCommand> = { a: 'back', d: 'forward', w
 addEventListener('keydown', event => {
   if (event.repeat || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || isInteractiveShortcutTarget(event.target)) return;
   const key = event.key.toLowerCase(), command = keyCommands[key]; let handled = false;
-  if (state?.phase === 'fight' && command) { connection.command(command); handled = true; }
+  if (state?.phase === 'fight' && command) { if (playerId) (keyboardPlayerConn ?? connection).command(command); handled = true; }
   else if (key === 'p') { toggleLocalPlayer(); handled = true; }
   else if (key === 'enter' && isHost && fighterConnectionState === 'connected'
     && (state?.phase !== 'results' || fighterResultActionState(stationDisplay.active, isHost, fighterConnectionState, state?.phase) === 'rematch')) {
-    connection.advance(); handled = true;
+    advanceMenu(); handled = true;
   }
-  else if (key === 'backspace' && isHost) { connection.back(); handled = true; }
+  else if (key === 'backspace' && isHost) { backMenu(); handled = true; }
   else if (/^\d$/.test(key) && (state?.phase === 'fighter_select' || state?.phase === 'map_select')) { handleNumericSelection(key); handled = true; }
   if (handled) event.preventDefault();
 });
@@ -1367,10 +1472,15 @@ function handleNumericSelection(key: string): void {
     const id = entries[number - 1]?.id; if (!id) return;
     if(isHost&&state){
       const target=activeTouchPlayer(state);if(!target)return;
-      if(state.phase==='fighter_select')connection.displaySelectFighter(target.playerId,id);
-      else if(state.phase==='map_select')connection.displaySelectMap(target.playerId,id);
-    }else if(state?.phase==='fighter_select'&&playerId)connection.selectFighter(id);
-    else if(state?.phase==='map_select'&&playerId)connection.selectMap(id);
+      if(state.phase==='fighter_select'){
+        if(target.playerId===playerId&&keyboardPlayerConn)keyboardPlayerConn.selectFighter(id);
+        else connection.displaySelectFighter(target.playerId,id);
+      }else if(state.phase==='map_select'){
+        if(target.playerId===playerId&&keyboardPlayerConn)keyboardPlayerConn.selectMap(id);
+        else connection.displaySelectMap(target.playerId,id);
+      }
+    }else if(state?.phase==='fighter_select'&&playerId)(keyboardPlayerConn??connection).selectFighter(id);
+    else if(state?.phase==='map_select'&&playerId)(keyboardPlayerConn??connection).selectMap(id);
   };
   if (next.selection) select(next.selection);
   else if (next.waiting) numericTimer = setTimeout(() => {
@@ -1387,12 +1497,13 @@ addEventListener('resize', () => {
   else updateCameraProjection();
 });
 rematch.addEventListener('click', () => {
-  if (fighterResultActionState(stationDisplay.active, isHost, fighterConnectionState, state?.phase) === 'rematch') connection.advance();
+  if (fighterResultActionState(stationDisplay.active, isHost, fighterConnectionState, state?.phase) === 'rematch') advanceMenu();
 });
 for (const link of document.querySelectorAll<HTMLAnchorElement>('.game-home, #result a[href="/"]')) {
   link.addEventListener('click', event => {
     if (stationDisplay.active) { event.preventDefault(); return; }
-    event.preventDefault(); connection.leaveAndClose(roomCode); setTimeout(() => { location.href = '/'; }, 60);
+    event.preventDefault(); releaseKeyboardPlayer();
+    connection.leaveAndClose(roomCode); setTimeout(() => { location.href = '/'; }, 60);
   });
 }
 
