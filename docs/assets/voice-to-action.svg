@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="480" viewBox="0 0 1440 480" role="img" aria-labelledby="title description">
+  <title id="title">Your voice changes the game</title>
+  <desc id="description">A player calls from a phone and says boost. Twilio Voice carries the command to Voice Racer, where the car accelerates on a shared screen.</desc>
+  <defs>
+    <linearGradient id="backdrop" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#000D25"/>
+      <stop offset="1" stop-color="#1B2850"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#283B5D"/>
+      <stop offset="1" stop-color="#101D35"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#000510" flood-opacity=".5"/>
+    </filter>
+  </defs>
+
+  <rect width="1440" height="480" rx="24" fill="url(#backdrop)"/>
+  <rect x="48" y="34" width="7" height="50" rx="3" fill="#EF223A"/>
+  <text x="73" y="70" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="700">YOUR VOICE CHANGES THE GAME</text>
+  <text x="74" y="103" fill="#C9D5EA" font-family="Arial, Helvetica, sans-serif" font-size="19">A phone call becomes the controller for the shared screen.</text>
+
+  <g filter="url(#shadow)">
+    <rect x="84" y="132" width="268" height="278" rx="35" fill="#12213F" stroke="#DCE6F7" stroke-width="7"/>
+    <rect x="103" y="151" width="230" height="238" rx="18" fill="#263B60"/>
+    <rect x="174" y="139" width="88" height="7" rx="4" fill="#7186A6"/>
+    <rect x="129" y="173" width="179" height="36" rx="18" fill="#EF223A"/>
+    <text x="218" y="197" text-anchor="middle" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">CALL CONNECTED</text>
+    <text x="133" y="247" fill="#DCE6F7" font-family="Arial, Helvetica, sans-serif" font-size="18">You say</text>
+    <rect x="124" y="263" width="191" height="75" rx="17" fill="#FFFFFF"/>
+    <path d="M151 338 L138 352 L183 338" fill="#FFFFFF"/>
+    <text x="220" y="312" text-anchor="middle" fill="#000D25" font-family="Arial, Helvetica, sans-serif" font-size="32" font-weight="700">“BOOST!”</text>
+    <circle cx="218" cy="367" r="10" fill="#EF223A"/>
+  </g>
+
+  <path d="M404 273 C418 260 418 246 404 233 M427 288 C454 267 454 238 427 217" fill="none" stroke="#73D6EA" stroke-width="6" stroke-linecap="round"/>
+  <path d="M484 276 H712" fill="none" stroke="#EF223A" stroke-width="11" stroke-linecap="round"/>
+  <path d="M713 256 L746 276 L713 296 Z" fill="#EF223A"/>
+  <text x="598" y="246" text-anchor="middle" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700">TWILIO VOICE</text>
+  <text x="598" y="317" text-anchor="middle" fill="#B7C9E4" font-family="Arial, Helvetica, sans-serif" font-size="16">COMMAND SENT</text>
+
+  <g filter="url(#shadow)">
+    <rect x="779" y="133" width="576" height="275" rx="20" fill="#172540" stroke="#DCE6F7" stroke-width="7"/>
+    <rect x="799" y="153" width="536" height="235" rx="8" fill="url(#screen)"/>
+    <path d="M799 248 L913 189 L1016 247 Z M1004 250 L1153 177 L1335 251 Z" fill="#213354"/>
+    <path d="M1015 199 L1102 199 L1310 388 L827 388 Z" fill="#3F4C63"/>
+    <path d="M1059 201 L1100 201 L1264 388 M1013 228 L870 388" fill="none" stroke="#BCECF5" stroke-width="5" opacity=".85"/>
+    <path d="M1070 215 L1050 263 M1130 267 L1185 330" fill="none" stroke="#DCE6F7" stroke-width="4" stroke-dasharray="13 13" opacity=".7"/>
+    <path d="M934 327 L984 314 M926 343 L977 332 M919 359 L971 349" fill="none" stroke="#7BE6FF" stroke-width="6" stroke-linecap="round" opacity=".8"/>
+    <path d="M998 325 L1030 300 L1140 300 L1180 329 L1150 347 L1021 347 Z" fill="#EF223A" stroke="#FF7785" stroke-width="5"/>
+    <path d="M1046 302 L1072 278 L1126 278 L1142 302 Z" fill="#9CD7E9"/>
+    <circle cx="1045" cy="349" r="15" fill="#0A1021" stroke="#A9B8CE" stroke-width="5"/>
+    <circle cx="1145" cy="349" r="15" fill="#0A1021" stroke="#A9B8CE" stroke-width="5"/>
+    <rect x="819" y="169" width="169" height="31" rx="9" fill="#000D25" opacity=".9"/>
+    <text x="904" y="190" text-anchor="middle" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">VOICE RACER</text>
+    <rect x="1151" y="169" width="162" height="31" rx="9" fill="#EF223A"/>
+    <text x="1232" y="190" text-anchor="middle" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">BOOST ACTIVE</text>
+    <path d="M1055 409 H1082 V422 H996 V430 H1139 V422 H1082 V409" fill="#DCE6F7"/>
+  </g>
+
+  <text x="218" y="452" text-anchor="middle" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700">YOUR PHONE</text>
+  <text x="1066" y="452" text-anchor="middle" fill="#FFFFFF" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700">THE SHARED GAME SCREEN</text>
+</svg>

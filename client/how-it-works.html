@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#000D25">
-  <meta name="description" content="See how Twilio Conversation Relay turns a phone call into a move on the Twilio Games shared screen.">
+  <meta name="description" content="See how a phone call becomes a game move and explore the Twilio architecture behind Twilio Games.">
   <title>How it's made · Twilio Games</title>
   <link rel="icon" href="/brand/Twilio_Logo_Bug_White.svg">
   <script src="/theme-init.js"></script>
@@ -39,96 +39,111 @@
         <div class="hero-copy">
           <div class="hero-marker"><span class="marker-line" aria-hidden="true"></span><span data-copy="heroMarker">How the voice arcade works</span></div>
           <h1 id="heroTitle"><span data-copy="heroTitleOne">A phone call</span> <span data-copy="heroTitleTwo">moves the game.</span></h1>
-          <p class="hero-lead" data-copy="heroLead">Your phone is the controller. Twilio Conversation Relay listens and speaks, while the game server decides what your words mean right now. Everyone sees the move on one shared screen.</p>
+          <p class="hero-lead" data-copy="heroLead">Call from your phone and say your move. Twilio carries the conversation, the game checks the action, and the shared screen updates. You hear the result on the same call.</p>
           <div class="hero-actions">
             <button id="runDemo" class="run-button" type="button">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7z"/></svg>
               <span data-copy="run">Run a voice turn</span>
             </button>
-            <a class="text-link" href="#architecture" data-copy="jump">See the architecture</a>
+            <a class="text-link" href="#architecture" data-copy="jump">For builders: see the architecture</a>
           </div>
           <p class="demo-example"><span data-copy="exampleLabel">Example from Voice Racer</span><strong data-copy="exampleQuote">“Give me a boost.”</strong></p>
         </div>
 
         <div class="signal-board" id="signalBoard" data-step="0" data-running="false" role="group" aria-label="Voice turn diagram">
-          <div class="board-topline"><span data-copy="boardTop">A single voice turn</span><span class="board-readout"><i aria-hidden="true"></i><span data-copy="boardMode">Live route</span></span></div>
+          <div class="board-topline"><span data-copy="boardTop">A single voice turn</span><span class="board-readout" data-copy="boardMode">Example flow</span></div>
           <ol class="signal-route">
             <li class="route-node" data-node="1">
               <span class="node-index">01</span>
               <div class="node-icon" aria-hidden="true"><svg viewBox="0 0 48 48"><rect x="13" y="4" width="22" height="40" rx="5"/><path d="M20 9h8M22 38h4"/><path d="M5 18v12M42 18v12"/></svg></div>
-              <h2 data-copy="phoneTitle">Your phone</h2>
-              <p data-copy="phoneBody">You speak into a regular call. No controller app is needed.</p>
+              <strong class="route-title" data-copy="phoneTitle">Your phone</strong>
+              <p data-copy="phoneBody">Say a move in a regular call.</p>
             </li>
             <li class="route-node" data-node="2">
               <span class="node-index">02</span>
               <div class="node-icon" aria-hidden="true"><svg viewBox="0 0 48 48"><circle cx="24" cy="24" r="5"/><circle cx="7" cy="24" r="3"/><circle cx="41" cy="24" r="3"/><circle cx="24" cy="7" r="3"/><circle cx="24" cy="41" r="3"/><path d="M10 24h9m10 0h9M24 10v9m0 10v9"/></svg></div>
-              <h2>Conversation Relay</h2>
-              <p data-copy="relayBody">Twilio turns speech into a transcript and carries the reply back as voice.</p>
+              <strong class="route-title">Conversation Relay</strong>
+              <p data-copy="relayBody">Twilio carries your words and the reply.</p>
             </li>
             <li class="route-node" data-node="3">
               <span class="node-index">03</span>
               <div class="node-icon" aria-hidden="true"><svg viewBox="0 0 48 48"><rect x="5" y="7" width="38" height="34" rx="5"/><path d="M12 17h24M12 24h24M12 31h15"/><circle cx="37" cy="31" r="2"/></svg></div>
-              <h2 data-copy="serverTitle">Game server</h2>
-              <p data-copy="serverBody">The current game checks the request, then updates its room.</p>
+              <strong class="route-title" data-copy="serverTitle">Game server</strong>
+              <p data-copy="serverBody">The game checks the move against its rules.</p>
             </li>
             <li class="route-node" data-node="4">
               <span class="node-index">04</span>
               <div class="node-icon" aria-hidden="true"><svg viewBox="0 0 48 48"><rect x="3" y="7" width="42" height="28" rx="3"/><path d="M24 35v7m-10 0h20M11 22l7-6 5 5 7-8 7 8"/></svg></div>
-              <h2 data-copy="displayTitle">Shared screen</h2>
-              <p data-copy="displayBody">A live game connection sends the new state to the display.</p>
+              <strong class="route-title" data-copy="displayTitle">Shared screen</strong>
+              <p data-copy="displayBody">Everyone sees the result together.</p>
             </li>
           </ol>
           <div class="return-lane" data-node="5">
             <svg viewBox="0 0 30 30" aria-hidden="true"><path d="M25 15H8m0 0 6-6m-6 6 6 6"/></svg>
-            <span><strong data-copy="returnTitle">The game speaks back</strong><small data-copy="returnBody">Twilio plays the next cue through the same call.</small></span>
+            <span><strong data-copy="returnTitle">The game speaks back</strong><small data-copy="returnBody">Hear the next cue on your phone.</small></span>
             <div class="sound-bars" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
           </div>
           <p id="demoStatus" class="board-status" role="status" aria-live="polite" data-copy="ready">Ready to trace a voice command.</p>
         </div>
       </div>
-      <div class="hero-foot"><strong data-copy="oneRoom">One room, one game state.</strong><span data-copy="oneRoomBody">Key spoken cues and graphics come from the same game result, so victory and scoring match on phone and screen.</span></div>
+    </section>
+
+    <section class="entry-branch section-wrap" aria-labelledby="entryTitle">
+      <h2 id="entryTitle" data-copy="entryTitle">Two ways to join</h2>
+      <ul>
+        <li><strong data-copy="standalonePath">Pick a game</strong><span data-copy="standalonePathBody">Open its screen and scan the call QR.</span></li>
+        <li><strong data-copy="stationPath">Join a live station</strong><span data-copy="stationPathBody">Join through Twilio Messaging when available; the station gives you a game and caller slot.</span></li>
+      </ul>
+    </section>
+
+    <section class="features section-wrap" aria-labelledby="featuresTitle">
+      <div class="section-intro feature-intro">
+        <span class="section-cue" data-copy="featuresCue">Playing by voice</span>
+        <h2 id="featuresTitle" data-copy="featuresTitle">Talk like a player.</h2>
+        <p data-copy="featuresLead">Say what you want to do. The game checks each action against its current rules.</p>
+      </div>
+      <div class="feature-list">
+        <article><h3 data-copy="interruptTitle">Jump into the conversation</h3><p data-copy="interruptBody">Speak over a greeting or menu; your choice can start before the voice finishes.</p></article>
+        <article><h3 data-copy="naturalTitle">Use your own words</h3><p data-copy="naturalBody">Speak in your own accent or phrasing. The game uses the current screen to interpret your request and asks when it is unsure.</p></article>
+        <article><h3 data-copy="touchTitle">Tap a visible menu</h3><p data-copy="touchBody">Anyone by the screen can tap a menu, while the caller controls live moves and answers by voice.</p></article>
+      </div>
     </section>
 
     <section class="architecture section-wrap" id="architecture" aria-labelledby="architectureTitle">
       <div class="section-intro">
-        <span class="section-cue" data-copy="architectureCue">Under the hood</span>
-        <h2 id="architectureTitle" data-copy="architectureTitle">What connects the call to the screen?</h2>
-        <p data-copy="architectureLead">The live path has three handoffs. Twilio handles the call. The server owns the rules. The browser draws the current room.</p>
+        <span class="section-cue" data-copy="architectureCue">For builders</span>
+        <h2 id="architectureTitle" data-copy="architectureTitle">From call to shared screen</h2>
+        <p data-copy="architectureLead">Twilio handles speech; the game server validates actions. What players hear and see comes from the same validated state.</p>
       </div>
       <div class="architecture-rows">
         <article class="architecture-row">
           <span class="row-number">01</span>
-          <div><h3 data-copy="connectTitle">Connect the call</h3><p data-copy="connectBody">When a call arrives, Twilio sends a signed request (a webhook). The server identifies the game room and returns TwiML, Twilio’s call instructions, to connect Conversation Relay.</p></div>
-          <code>POST /voice/incoming<br>&lt;ConversationRelay&gt;</code>
+          <div><h3 data-copy="connectTitle">Connect the call</h3><p data-copy="connectBody">Twilio sends a signed webhook. The server validates it, selects the game room, and returns TwiML to connect the call to Conversation Relay.</p></div>
         </article>
         <article class="architecture-row">
           <span class="row-number">02</span>
-          <div><h3 data-copy="interpretTitle">Understand the turn</h3><p data-copy="interpretBody">Quick commands take a fast path. For less direct speech, an optional AI interpreter chooses only from actions and facts available on the current screen. The game validates the choice before changing state.</p></div>
-          <code>WebSocket /voice<br><span data-copy="allowedAction">current phase → allowed action</span></code>
+          <div><h3 data-copy="interpretTitle">Validate the move</h3><p data-copy="interpretBody">Direct commands take a fast path. For flexible speech, optional AI selects from actions allowed on the current screen; the game validates the result.</p></div>
         </article>
         <article class="architecture-row">
           <span class="row-number">03</span>
-          <div><h3 data-copy="renderTitle">Render the result</h3><p data-copy="renderBody">A live browser connection (WebSocket) carries the room state. The browser draws the race, board, battle, stage, or score. When the voice guide is active, it describes the same result.</p></div>
-          <code>/game · /battle · /fighter<br>/karaoke · /trivia · /chess · /ws/owl</code>
+          <div><h3 data-copy="renderTitle">Update both sides</h3><p data-copy="renderBody">The server sends validated room state over WebSocket to the browser and a matching spoken reply through Conversation Relay.</p></div>
         </article>
       </div>
       <details class="code-tour">
         <summary>
-          <span class="code-tour-icon" aria-hidden="true">&lt;/&gt;</span>
           <span class="code-tour-heading">
-            <span class="section-cue" data-copy="codeCue">For curious builders</span>
-            <strong data-copy="codeTitle">See the Twilio code behind a voice turn</strong>
-            <small data-copy="codeTeaser">Two short excerpts from the live call path</small>
+            <strong data-copy="codeTitle">Inspect the call path</strong>
+            <small data-copy="codeTeaser">Two source excerpts: connection and spoken reply</small>
           </span>
           <span class="code-tour-toggle" aria-hidden="true">+</span>
         </summary>
         <div class="code-tour-body">
-          <p class="code-tour-intro" data-copy="codeIntro">These are shortened excerpts from this app’s server. The URL and room code are examples; the English ElevenLabs voice, interruption settings, and reply fields match the current flow.</p>
+          <p class="code-tour-intro" data-copy="codeIntro">These excerpts are shortened from the app server. The URL and room code are examples; the default English ElevenLabs voice, interruption settings, and reply fields match the current flow.</p>
           <p class="code-tour-scroll-tip" data-copy="codeScrollTip">Swipe a code block sideways to read a full line.</p>
           <div class="code-samples">
             <article class="code-sample">
               <div class="code-sample-heading"><span>01 / TwiML</span><h3 data-copy="codeConnectTitle">Connect the caller</h3></div>
-              <p data-copy="codeConnectBody">The incoming-call webhook returns instructions that open Conversation Relay. These settings let players cut into greetings and replies.</p>
+              <p data-copy="codeConnectBody">The webhook returns TwiML that opens Conversation Relay and lets callers interrupt greetings and replies.</p>
               <pre><code>&lt;Connect
   action="https://example.com/voice/session-ended"&gt;
   &lt;ConversationRelay
@@ -148,7 +163,7 @@
             </article>
             <article class="code-sample">
               <div class="code-sample-heading"><span>02 / WebSocket</span><h3 data-copy="codeReplyTitle">Speak the response</h3></div>
-              <p data-copy="codeReplyBody">Relay sends the caller’s transcript as a prompt. After the game checks the action, the server sends reply text for Twilio to speak.</p>
+              <p data-copy="codeReplyBody">Relay sends the transcript as a prompt. After validation, the server streams reply text for Twilio to speak.</p>
               <pre><code>ws.send(JSON.stringify({
   type: 'text',
   token: wireTokens[index],
@@ -160,52 +175,23 @@
               <a href="https://github.com/anthonyplusAI/twilio-games/blob/main/server/http-server.ts" target="_blank" rel="noopener noreferrer" data-copy="codeReplySource">View voice reply source ↗</a>
             </article>
           </div>
-          <p class="code-tour-note" data-copy="codeNote">The display gets the validated room state over a separate game WebSocket, so what players hear and see comes from the same action.</p>
         </div>
       </details>
-      <div class="entry-branch">
-        <div><h3 data-copy="entryTitle">How players reach the call</h3><p data-copy="entryBody">Both entry paths lead to the same live voice connection.</p></div>
-        <ol>
-          <li><strong data-copy="standalonePath">Standalone</strong><span data-copy="standalonePathBody">Choose a game, open its display, then scan its call QR.</span></li>
-          <li><strong data-copy="stationPath">Live station</strong><span data-copy="stationPathBody">Join and vote through Twilio Messaging where available; the station assigns a game and caller slot.</span></li>
-        </ol>
-      </div>
     </section>
 
-    <section class="features section-wrap" aria-labelledby="featuresTitle">
-      <div class="section-intro feature-intro">
-        <span class="section-cue" data-copy="featuresCue">Made for people</span>
-        <h2 id="featuresTitle" data-copy="featuresTitle">You can talk like a player.</h2>
-        <p data-copy="featuresLead">The call is a conversation, not a list of magic phrases. The game still checks every action against its rules.</p>
+    <aside class="karaoke-note section-wrap" aria-labelledby="karaokeTitle">
+      <div class="karaoke-note-copy">
+        <h2 id="karaokeTitle" data-copy="karaokeTitle">Karaoke briefly switches to live audio.</h2>
+        <p data-copy="karaokeSummary">During a song, the call carries live audio for timing and pitch, then returns to the voice guide for the score.</p>
       </div>
-      <div class="feature-list">
-        <article><div class="feature-mark" aria-hidden="true">↯</div><div><h3 data-copy="interruptTitle">Cut in whenever you’re ready</h3><p data-copy="interruptBody">Speak over a welcome, menu, or explanation. Conversation Relay reports your speech while the voice is still talking, so the next choice can start right away.</p></div></article>
-        <article><div class="feature-mark" aria-hidden="true">≈</div><div><h3 data-copy="naturalTitle">Say it your way</h3><p data-copy="naturalBody">Players can speak in their own accent or wording. Twilio transcribes the call; game-word hints help with names, and the current screen helps resolve likely misheard words. Ambiguous requests get a short follow-up.</p></div></article>
-        <article><div class="feature-mark" aria-hidden="true">◎</div><div><h3 data-copy="touchTitle">Tap menus on the shared screen</h3><p data-copy="touchBody">Anyone nearby can tap a visible menu or selector. Live moves, attacks, answers, and racing commands stay with the phone player.</p></div></article>
-      </div>
-    </section>
-
-    <aside class="karaoke-lane section-wrap" aria-labelledby="karaokeTitle">
-      <div class="karaoke-symbol" aria-hidden="true"><svg viewBox="0 0 80 80"><path d="M25 51a12 12 0 0 1-17-17l20-20a12 12 0 0 1 17 17L25 51Zm10-27 21 21m-9 9 9-9 16 16-9 9-16-16ZM24 53l-9 9m-6 9h22"/></svg></div>
-      <div><span class="section-cue" data-copy="karaokeCue">A special performance lane</span><h2 id="karaokeTitle" data-copy="karaokeTitle">Karaoke switches from talking to singing.</h2><p data-copy="karaokeBody">Conversation Relay guides song choice and asks for explicit consent. During the song, an authenticated inbound Twilio Media Stream carries only the caller’s audio. The server measures timing and pitch, while Deepgram recognizes lyrics. Conversation Relay returns to announce the score.</p></div>
-      <div class="karaoke-route" aria-label="Karaoke audio route"><span>Relay</span><b>→</b><span>Media Stream</span><b>→</b><span data-copy="score">Score</span><b>→</b><span>Relay</span></div>
+      <details class="karaoke-details">
+        <summary data-copy="karaokeDetails">How the audio handoff works</summary>
+        <p data-copy="karaokeBody">Conversation Relay guides song choice and asks for explicit consent. During the song, an authenticated inbound Twilio Media Stream carries only the caller’s audio. The server measures timing and pitch while Deepgram recognizes lyrics. Conversation Relay returns to announce the score.</p>
+      </details>
     </aside>
-
-    <section class="games section-wrap" aria-labelledby="gamesTitle">
-      <div class="section-intro games-intro"><span class="section-cue" data-copy="gamesCue">Seven ways to play</span><h2 id="gamesTitle" data-copy="gamesTitle">One voice arcade. Different rules.</h2></div>
-      <ul class="game-list">
-        <li><strong>Voice Racer</strong><span data-copy="racerVerb">Boost through the course</span></li>
-        <li><strong>Voice Monsters</strong><span data-copy="monstersVerb">Call a creature move</span></li>
-        <li><strong>Voice Fighter</strong><span data-copy="fighterVerb">Attack or block</span></li>
-        <li><strong>Voice Karaoke</strong><span data-copy="karaokeVerb">Sing on the beat</span></li>
-        <li><strong>Voice Trivia</strong><span data-copy="triviaVerb">Answer out loud</span></li>
-        <li><strong>Voice Chess</strong><span data-copy="chessVerb">Move and castle</span></li>
-        <li><strong>Talking Owl</strong><span data-copy="owlVerb">Talk and play with an owl</span></li>
-      </ul>
-    </section>
   </main>
 
-  <footer class="page-footer"><div><strong data-copy="footerTitle">Now try the real thing.</strong><p data-copy="footerBody">Open the home screen to choose a game or join a live station, then call when prompted.</p></div><a href="/" data-copy="footerAction">Open the arcade</a><a class="docs-link" href="https://www.twilio.com/docs/voice/twiml/connect/conversationrelay" target="_blank" rel="noopener noreferrer" data-copy="docs">Conversation Relay docs</a></footer>
+  <footer class="page-footer"><div class="footer-copy"><strong data-copy="footerTitle">Try a game. Explore the code.</strong><p data-copy="footerBody">Open the arcade to play, or follow the source and docs to see the call path in detail.</p></div><a class="footer-action" href="/" data-copy="footerAction">Open the arcade</a><a class="repo-link" href="https://github.com/anthonyplusAI/twilio-games" target="_blank" rel="noopener noreferrer"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2.5 2.9 6 6.6 1-4.8 4.7 1.1 6.6-5.8-3.1-5.8 3.1 1.1-6.6-4.8-4.7 6.6-1z"/></svg><span data-copy="repo">Star on GitHub</span></a><a class="docs-link" href="https://www.twilio.com/docs/voice/twiml/connect/conversationrelay" target="_blank" rel="noopener noreferrer" data-copy="docs">Conversation Relay docs</a></footer>
   <script type="module" src="./how-it-works.ts"></script>
 </body>
 </html>
