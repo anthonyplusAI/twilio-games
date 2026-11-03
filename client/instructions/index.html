@@ -1,10 +1,10 @@
 <!doctype html>
-<html lang="pt-BR" data-theme="light">
+<html lang="en-US" data-theme="light">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#FFFFFF">
-  <title>Como jogar | Twilio Games</title>
+  <title>How to play | Twilio Games</title>
   <link rel="icon" href="/brand/Twilio_Logo_Bug_White.svg">
   <script src="/theme-init.js"></script>
   <link rel="stylesheet" href="/theme.css">
@@ -13,40 +13,40 @@
 <body>
   <main class="instructions-shell">
     <header>
-      <a class="instructions-brand" href="/" aria-label="Voltar para Twilio Games">
+      <a class="instructions-brand" href="/" aria-label="Back to Twilio Games">
         <img src="/brand/Twilio_Logo_Bug_White.svg" alt="">
         <span>Twilio Games</span>
       </a>
-      <button id="themeToggle" type="button" title="Tema escuro" aria-label="Tema escuro">
+      <button id="themeToggle" type="button" title="Dark theme" aria-label="Dark theme">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"></path></svg>
       </button>
     </header>
 
     <section class="instructions-hero">
-      <p class="eyebrow">Experiência controlada por voz</p>
-      <h1>Use sua voz para jogar.</h1>
-      <p>Toque no jogo na tela, ligue pelo celular e siga as instruções da inteligência artificial.</p>
-      <aside><strong>A tela é sensível ao toque.</strong> Toque no jogo para começar.</aside>
+      <p class="eyebrow" data-copy="heroEyebrow">Voice-controlled experience</p>
+      <h1 data-copy="heroTitle">Use your voice to play.</h1>
+      <p data-copy="heroBody">Choose a game on the screen, call from your phone, and follow the spoken prompts.</p>
+      <aside><strong data-copy="touchTitle">The screen responds to touch.</strong> <span data-copy="touchBody">Tap a game to begin.</span></aside>
     </section>
 
     <section class="instructions-card" aria-labelledby="steps-title">
       <div>
-        <p class="eyebrow">Passo a passo</p>
-        <h2 id="steps-title">Como começar</h2>
+        <p class="eyebrow" data-copy="stepsEyebrow">Step by step</p>
+        <h2 id="steps-title" data-copy="stepsTitle">Get started</h2>
       </div>
       <ol>
-        <li><span>1</span><p><strong>Inicie o jogo</strong>Toque no jogo na tela principal para começar.</p></li>
-        <li><span>2</span><p><strong>Siga as instruções na tela</strong>O jogo mostrará um código QR quando estiver pronto.</p></li>
-        <li><span>3</span><p><strong>Escaneie o código QR</strong>Use a câmera do seu celular. Esta experiência funciona com números brasileiros (+55).</p></li>
-        <li><span>4</span><p><strong>Faça a ligação</strong>Toque em ligar e permaneça na chamada durante toda a partida.</p></li>
-        <li><span>5</span><p><strong>Escute a inteligência artificial</strong>Ela vai pedir seu primeiro nome e explicar o próximo passo.</p></li>
-        <li><span>6</span><p><strong>Fale os comandos em voz alta</strong>Escolha lutadores e movimentos usando sua voz.</p></li>
+        <li><span>1</span><p><strong data-copy="step1Title">Start a game</strong><span data-copy="step1Body">Tap a game on the main screen to begin.</span></p></li>
+        <li><span>2</span><p><strong data-copy="step2Title">Follow the screen</strong><span data-copy="step2Body">The game shows a QR code when it is ready.</span></p></li>
+        <li><span>3</span><p><strong data-copy="step3Title">Scan the QR code</strong><span data-copy="step3Body">Use your phone camera to open the call link.</span></p></li>
+        <li><span>4</span><p><strong data-copy="step4Title">Make the call</strong><span data-copy="step4Body">Tap Call and stay on the line while you play.</span></p></li>
+        <li><span>5</span><p><strong data-copy="step5Title">Listen to the voice guide</strong><span data-copy="step5Body">It may ask for your first name and explain what to do next.</span></p></li>
+        <li><span>6</span><p><strong data-copy="step6Title">Say your moves aloud</strong><span data-copy="step6Body">Use voice commands for the game you chose.</span></p></li>
       </ol>
     </section>
 
     <footer>
-      <strong class="display-note">Aguarde sua vez para jogar na tela.</strong>
-      <span>Com tecnologia Twilio Conversation Relay</span>
+      <strong class="display-note" data-copy="footerNote">Watch the shared screen for your turn.</strong>
+      <span data-copy="powered">Powered by Twilio Conversation Relay</span>
     </footer>
   </main>
   <script type="module" src="./instructions.ts"></script>
