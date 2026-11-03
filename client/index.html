@@ -15,22 +15,38 @@
       <img src="/brand/Twilio_Logo_Bug_White.svg" alt="Twilio">
       <div><strong>Twilio Games</strong><span id="brandTagline">One screen. Your phone. Your voice.</span></div>
     </div>
-    <a id="howItWorksLink" class="header-how-link" href="/how-it-works.html">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="4.5" cy="12" r="2.5"></circle><circle cx="19.5" cy="5" r="2.5"></circle><circle cx="19.5" cy="19" r="2.5"></circle><path d="M7 11.3 17 5.8M7 12.7 17 18.2"></path></svg>
-      <span>How it’s made</span>
+    <a id="githubStarLink" class="header-github-link" href="https://github.com/anthonyplusAI/twilio-games" target="_blank" rel="noopener noreferrer" aria-label="Star on GitHub" title="Star on GitHub">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 2.5 2.9 5.9 6.5.9-4.7 4.6 1.1 6.5-5.8-3.1-5.8 3.1 1.1-6.5-4.7-4.6 6.5-.9L12 2.5Z"></path></svg>
+      <span class="github-full-label">Star on GitHub</span>
     </a>
     <div id="header-controls">
       <span id="connectionState" class="sr-only" role="status" aria-live="polite">Connecting</span>
-      <a id="instructionsLink" class="header-icon-button" href="/instructions" title="Instruções" aria-label="Instruções">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M9.7 9a2.4 2.4 0 1 1 3.7 2c-.9.5-1.4 1.1-1.4 2M12 17h.01"></path></svg>
-      </a>
-      <a id="operatorLink" class="header-icon-button" href="/operator" title="Operator console" aria-label="Operator console">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"></circle><path d="M3.5 19a5.5 5.5 0 0 1 11 0"></path><circle cx="18" cy="15" r="2.5"></circle><path d="M18 10.5v2M18 17.5v2M13.5 15h2M20.5 15h2M14.8 11.8l1.4 1.4M19.8 16.8l1.4 1.4M21.2 11.8l-1.4 1.4M16.2 16.8l-1.4 1.4"></path></svg>
-      </a>
-      <button id="fullscreenToggle" class="header-icon-button" type="button" title="Enter fullscreen" aria-label="Enter fullscreen">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"></path></svg>
-      </button>
-      <button id="themeToggle" class="header-icon-button" type="button" title="Dark theme" aria-label="Dark theme"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"></path></svg></button>
+      <details id="headerOptions" class="header-options">
+        <summary id="headerOptionsToggle"><span id="optionsLabel">Options</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg></summary>
+        <div id="headerOptionsPanel" class="header-options-panel" role="group" aria-labelledby="optionsLabel">
+          <div class="header-options-group">
+            <a id="howItWorksLink" class="header-how-link" href="/how-it-works.html" aria-label="How it’s made" title="How it’s made">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="4.5" cy="12" r="2.5"></circle><circle cx="19.5" cy="5" r="2.5"></circle><circle cx="19.5" cy="19" r="2.5"></circle><path d="M7 11.3 17 5.8M7 12.7 17 18.2"></path></svg>
+              <span>How it’s made</span>
+            </a>
+            <a id="instructionsLink" class="header-icon-button" href="/instructions" title="Instruções" aria-label="Instruções">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M9.7 9a2.4 2.4 0 1 1 3.7 2c-.9.5-1.4 1.1-1.4 2M12 17h.01"></path></svg>
+            </a>
+          </div>
+          <div id="headerSettingsGroup" class="header-options-group">
+            <button id="fullscreenToggle" class="header-icon-button" type="button" title="Enter fullscreen" aria-label="Enter fullscreen">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"></path></svg>
+            </button>
+            <button id="themeToggle" class="header-icon-button" type="button" title="Dark theme" aria-label="Dark theme"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"></path></svg></button>
+          </div>
+          <div id="headerLanguageGroup" class="header-options-group"></div>
+          <div class="header-options-group">
+            <a id="operatorLink" class="header-icon-button" href="/operator" title="Operator console" aria-label="Operator console">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3"></circle><path d="M3.5 19a5.5 5.5 0 0 1 11 0"></path><circle cx="18" cy="15" r="2.5"></circle><path d="M18 10.5v2M18 17.5v2M13.5 15h2M20.5 15h2M14.8 11.8l1.4 1.4M19.8 16.8l-1.4 1.4M21.2 11.8l-1.4 1.4M16.2 16.8l-1.4 1.4"></path></svg>
+            </a>
+          </div>
+        </div>
+      </details>
     </div>
   </header>
 
