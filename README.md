@@ -22,6 +22,12 @@
   <a href="https://github.com/anthonyplusAI/twilio-games"><img src="https://img.shields.io/badge/Star%20this%20repo-GitHub-EF223A?style=for-the-badge&logo=github&logoColor=white" alt="Star Twilio Games on GitHub"></a>
 </p>
 
+## Watch the launch film
+
+{{GITHUB_VIDEO_URL}}
+
+*58-second overview pairing captured gameplay with illustrated phone interactions and editorial caller audio.*
+
 ## How the arcade works
 
 1. **Join:** At an event, scan the station QR code and join by SMS or WhatsApp where available.
