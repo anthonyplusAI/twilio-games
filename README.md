@@ -24,7 +24,7 @@
 
 ## Watch the launch film
 
-{{GITHUB_VIDEO_URL}}
+https://github.com/user-attachments/assets/5ae30813-05be-4e36-8562-ec6dd25e2525
 
 *58-second overview pairing captured gameplay with illustrated phone interactions and editorial caller audio.*
 
